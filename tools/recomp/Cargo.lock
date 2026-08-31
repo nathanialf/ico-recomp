@@ -191,12 +191,6 @@ dependencies = [
 [[package]]
 name = "ee-emit"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "ingest",
- "r5900-decode",
- "rayon",
-]
 
 [[package]]
 name = "ee-interp"
@@ -369,8 +363,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "ee-emit",
- "ingest",
  "r5900-decode",
  "rayon",
  "serde",
