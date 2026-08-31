@@ -1,0 +1,24 @@
+# Boot -> title -> NEW GAME -> vibration prompt -> stage load.
+# Usage: ICORECOMP_INPUT_SCRIPT=docs/scripts/newgame.pad
+#
+# Menu flow (decomp: src/st00a.c func_0020DAC8, src/kanbanBoot.c
+# func_001B1800/func_001B19E8/func_001B15F0, src/layout_texture.c
+# lt_switch_layout): START on the title screen brings up the boot menu
+# (layout 9, 1.5 s fade-in, input locked until the memory card poll
+# answers). With no save the menu switches itself to the single-item
+# NEW GAME screen (layout 0x0A). CROSS confirms (START also accepted);
+# TRIANGLE cancels. The confirm lands only after the fade completes
+# (InitStageLight() == 2), so each press below leaves fade margin.
+# Confirming NEW GAME opens the vibration ON/OFF prompt (layout 6);
+# confirming that starts the game (StageManager mode 2).
+#
+# Timings verified against the runtime log: the second CROSS triggers the
+# title BGM fade plus sceCdStSTART(35925), then the stage stream
+# sceCdStINIT/StSTART(lbn=19456) with StREAD bursts, a wave of actor
+# threads, and a steady per-frame VU1 render loop.
+480 start
+490 none
+900 cross
+910 none
+1140 cross
+1150 none

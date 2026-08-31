@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 void rt_vlog(const char* component, const char* fmt, va_list ap) {
     std::fprintf(stderr, "[icorecomp][%s] ", component);
@@ -43,6 +44,24 @@ void rt_dump_registers(const R5900Context* ctx) {
         (unsigned long long)ctx->lo.u64x[1], (unsigned long long)ctx->lo.u64x[0],
         (unsigned long long)ctx->hi.u64x[1], (unsigned long long)ctx->hi.u64x[0]);
     std::fprintf(stderr, "  sa = 0x%08x  fcr31 = 0x%08x\n", ctx->sa, ctx->fcr31);
+    /* Guest stack scan: words in [sp, sp+0x800) that look like text
+     * addresses. Not a real unwind, but with ra it usually names the
+     * caller chain well enough to locate a fault. */
+    uint32_t sp = (uint32_t)ctx->r[29].u64x[0];
+    if (sp >= 0x1000 && sp < 0x02000000) {
+        std::fprintf(stderr, "[icorecomp][regs] stack scan from sp=0x%08x:\n", sp);
+        int shown = 0;
+        for (uint32_t a = sp & ~3u; a < sp + 0x800 && shown < 24; a += 4) {
+            uint8_t* page = g_pages[a >> 16];
+            if (!page) break;
+            uint32_t v;
+            std::memcpy(&v, page + (a & 0xFFFF), 4);
+            if (v >= 0x00100000 && v < 0x00300000 && (v & 3) == 0) {
+                std::fprintf(stderr, "    [sp+0x%03x] 0x%08x\n", a - sp, v);
+                ++shown;
+            }
+        }
+    }
     std::fflush(stderr);
 }
 

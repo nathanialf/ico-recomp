@@ -36,6 +36,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -50,7 +51,24 @@ public:
         if (path && path[0]) {
             m_file = std::fopen(path, "wb");
             if (m_file) {
-                rt_log("gs", "dump writer: recording paraLLEl-GS raw stream to %s", path);
+                /* Optional recording window, for capturing a short slice of
+                 * a long run without filling the disk: start at field
+                 * ICORECOMP_GS_DUMP_FROM (default 0) and record
+                 * ICORECOMP_GS_DUMP_FIELDS fields (default 0 = unlimited).
+                 * A windowed capture starts with a priv snapshot; VRAM
+                 * contents uploaded before the window are absent, so the
+                 * first frames may miss long-lived textures. */
+                const char* from = std::getenv("ICORECOMP_GS_DUMP_FROM");
+                const char* count = std::getenv("ICORECOMP_GS_DUMP_FIELDS");
+                if (from && from[0]) m_from = std::strtoull(from, nullptr, 10);
+                if (count && count[0]) m_count = std::strtoull(count, nullptr, 10);
+                if (m_from || m_count) {
+                    rt_log("gs", "dump writer: recording paraLLEl-GS raw stream to %s "
+                        "(window: fields %" PRIu64 "..%" PRIu64 ")",
+                        path, m_from, m_count ? m_from + m_count : UINT64_MAX);
+                } else {
+                    rt_log("gs", "dump writer: recording paraLLEl-GS raw stream to %s", path);
+                }
             } else {
                 rt_log("gs", "dump writer: FAILED to open %s, recording disabled", path);
             }
@@ -68,7 +86,11 @@ public:
         ++m_packets[path];
         m_qwords[path] += qwords;
         m_transfer_since_vsync = true;
-        if (m_file) {
+        if (m_file && in_window()) {
+            if (!m_window_open) {
+                write_priv_snapshot();
+                m_window_open = true;
+            }
             const uint8_t type = 0;
             const uint8_t p = (uint8_t)path;
             const uint32_t size = qwords * 16u;
@@ -102,16 +124,20 @@ public:
     bool vsync(unsigned field) override {
         ++m_vsyncs;
         bool presented = m_transfer_since_vsync;
-        if (m_file) {
-            uint8_t type = 3; /* PrivRegisters snapshot */
-            std::fwrite(&type, 1, 1, m_file);
-            std::fwrite(m_lo, sizeof(uint64_t), kBankQw64, m_file);
-            std::fwrite(m_hi, sizeof(uint64_t), kBankQw64, m_file);
-            type = 1; /* Vsync */
+        if (m_file && in_window()) {
+            write_priv_snapshot();
+            uint8_t type = 1; /* Vsync */
             const uint8_t f = (uint8_t)(field & 1);
             std::fwrite(&type, 1, 1, m_file);
             std::fwrite(&f, 1, 1, m_file);
             std::fflush(m_file); /* keep truncated runs replayable */
+            m_window_open = true;
+        } else if (m_file && m_window_open && !in_window()) {
+            /* Window just closed: stop touching the file so the capture
+             * stays a clean [from, from+count) slice. */
+            std::fclose(m_file);
+            m_file = nullptr;
+            rt_log("gs", "dump writer: window complete at field %" PRIu64 ", file closed", m_vsyncs);
         }
         m_transfer_since_vsync = false;
         return presented;
@@ -133,7 +159,21 @@ public:
     }
 
 private:
+    bool in_window() const {
+        return m_vsyncs >= m_from && (m_count == 0 || m_vsyncs < m_from + m_count);
+    }
+
+    void write_priv_snapshot() {
+        uint8_t type = 3; /* PrivRegisters snapshot */
+        std::fwrite(&type, 1, 1, m_file);
+        std::fwrite(m_lo, sizeof(uint64_t), kBankQw64, m_file);
+        std::fwrite(m_hi, sizeof(uint64_t), kBankQw64, m_file);
+    }
+
     FILE* m_file = nullptr;
+    uint64_t m_from = 0;
+    uint64_t m_count = 0;
+    bool m_window_open = false;
     uint64_t m_lo[kBankQw64] = {};
     uint64_t m_hi[kBankQw64] = {};
     uint64_t m_packets[3] = {};

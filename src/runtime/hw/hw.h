@@ -63,6 +63,11 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v);
  * STR and raises D_STAT itself, possibly later, when a command produces or
  * consumes the data). */
 void rt_ipu_dma_kick(int ch);
+/* 128-bit CPU store to the toIPU FIFO window (0x10007010): appends one
+ * qword to the bitstream input and resumes a stalled command. The game
+ * primes SETIQ table data this way before the movie player switches the
+ * feed to DMA ch4. */
+void rt_ipu_fifo_feed(const uint8_t* qw16);
 /* dmac.cpp: pointers into the ch3/ch4 register file for the IPU module.
  * which: 0=CHCR 1=MADR 2=QWC 3=TADR. */
 uint32_t* rt_dmac_ipu_reg(int ch, int which);

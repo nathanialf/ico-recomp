@@ -1287,13 +1287,28 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
             rt_log("ipu", "write to read-only IPU register 0x%08x = 0x%llx ignored", addr, (unsigned long long)v);
             return true;
         case 0x10007010:
-            rt_fatal("ipu", nullptr, "direct write to the toIPU FIFO window (0x%08x = 0x%llx); "
-                "not in this binary's census (feed is DMA ch4)", addr, (unsigned long long)v);
+            /* Only 128-bit stores are in this binary's census; those are
+             * routed through rt_ipu_fifo_feed by mmio.cpp before this
+             * dispatcher runs. A narrower store reaching here is new. */
+            rt_fatal("ipu", nullptr, "sub-qword write to the toIPU FIFO window (0x%08x = 0x%llx); "
+                "not in this binary's census (feeds are DMA ch4 and 128-bit stores)",
+                addr, (unsigned long long)v);
         case 0x10007000:
             rt_fatal("ipu", nullptr, "write to the fromIPU FIFO window 0x10007000");
         default:
             return false;
     }
+}
+
+void rt_ipu_fifo_feed(const uint8_t* qw16) {
+    static uint64_t n = 0;
+    size_t base = g_in.size();
+    g_in.resize(base + 16);
+    std::memcpy(g_in.data() + base, qw16, 16);
+    if (rt_trace() || is_pow2(++n)) {
+        rt_log("ipu", "toIPU FIFO qword store (input now %zu bits) [#%" PRIu64 "]", avail_bits(), n);
+    }
+    run_pending();
 }
 
 /* ---- selftest hooks (used by hw/ipu_selftest.cpp only) ------------------- */

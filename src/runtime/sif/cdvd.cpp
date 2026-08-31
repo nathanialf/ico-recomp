@@ -156,11 +156,21 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
         rt_fatal("cdvd", rt_sched_current_ctx(),
             "sceCdRead datapattern 0x%02x not modeled (only 2048-byte sectors)", datapattern);
     }
+    /* The streaming loader's prefetch window slides off the end of the
+     * disc once it runs through the trailing LDUMMY padding file (observed
+     * after the title transition: overlapping fno=0x0D reads advancing
+     * ~376 sectors each). On hardware those reads fail in the lead-out and
+     * the streamer shrugs it off; here we zero-fill and log so the run
+     * stays alive without hiding the event. */
+    if ((uint64_t)lbn + sectors > rt_iso_total_sectors()) {
+        rt_log("cdvd", "read past end of disc (lbn=%u sectors=%u, disc has %u): zero-filling %u sectors",
+            lbn, sectors, rt_iso_total_sectors(),
+            (uint32_t)((uint64_t)lbn + sectors - (lbn < rt_iso_total_sectors() ? rt_iso_total_sectors() : lbn)));
+    }
     uint8_t sec[2048];
     for (uint32_t i = 0; i < sectors; ++i) {
         if (!rt_iso_read_sector(lbn + i, sec)) {
-            rt_fatal("cdvd", rt_sched_current_ctx(),
-                "sceCdRead past end of disc: LSN %u (disc has %u sectors)", lbn + i, rt_iso_total_sectors());
+            std::memset(sec, 0, sizeof(sec));
         }
         if (to_iop) {
             std::memcpy(rt_iop_ptr(buf + i * 2048), sec, 2048);

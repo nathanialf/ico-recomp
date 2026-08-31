@@ -380,6 +380,9 @@ bool rt_hw_fifo_write128(uint32_t addr, const rc_u128* val) {
         case 0x10006000: /* GIF FIFO: direct PATH3 qword */
             rt_gif_submit(2, val->u8x, 1);
             return true;
+        case 0x10007010: /* toIPU FIFO: SETIQ table priming by CPU store */
+            rt_ipu_fifo_feed(val->u8x);
+            return true;
         default:
             return false;
     }
