@@ -1,0 +1,23 @@
+# ROM-derived output. Never committed; no game data in this repo (see README).
+/generated/
+/gen/
+
+# user-supplied game data
+*.iso
+*.bin
+*.cue
+*.elf
+*.rom
+baserom/
+assets/
+saves/
+
+# build trees
+/build/
+/out/
+target/
+CMakeUserPresets.json
+
+# editor/tool droppings
+.cache/
+compile_commands.json

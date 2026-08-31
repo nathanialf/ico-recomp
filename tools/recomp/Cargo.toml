@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/r5900-decode",
+    "crates/vu-decode",
+    "crates/ingest",
+    "crates/ee-emit",
+    "crates/vu-emit",
+    "crates/ee-interp",
+    "crates/recomp-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+object = "0.36"
+clap = { version = "4", features = ["derive"] }
+sha1 = "0.10"
+rayon = "1"

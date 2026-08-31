@@ -1,0 +1,26 @@
+# Inputs consumed from the sibling ICO decomp checkout (read-only).
+# No data from these paths may be copied into this repository.
+
+[decomp]
+root = "../ico"
+elf = "baserom/baseelf.elf"
+rom = "baserom/baseelf.rom"
+splat_yaml = "config/ico.us.yaml"
+symbol_addrs = "config/symbol_addrs.us.txt"
+asm_dir = "asm"
+vu1_sources = [
+    "src/cluster.S",
+    "src/mesh.S",
+    "src/normal_c.S",
+    "src/normal_l.S",
+    "src/particle.S",
+]
+
+[pins]
+# SHA-1 of the retail US boot ELF / flat ROM view; refuse to run on mismatch.
+elf_sha1 = "a4d8fc1948fb2da2395f3863a94a3b93de55de14"
+
+[target]
+entry = 0x00100008
+vram_base = 0x00100000
+gp = 0x006388F0
