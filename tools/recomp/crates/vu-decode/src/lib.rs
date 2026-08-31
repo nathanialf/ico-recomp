@@ -225,10 +225,9 @@ pub fn decode_program(bytes: &[u8]) -> Result<Vec<Bundle>, String> {
         ));
     }
     let mut out = Vec::with_capacity(bytes.len() / 8);
-    for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(chunk);
-        out.push(Bundle::from_le_bytes((i * 8) as u32, &b));
+    let (chunks, _) = bytes.as_chunks::<8>();
+    for (i, b) in chunks.iter().enumerate() {
+        out.push(Bundle::from_le_bytes((i * 8) as u32, b));
     }
     Ok(out)
 }

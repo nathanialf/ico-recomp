@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+rayon.workspace = true
+ingest = { path = "../ingest" }
+r5900-decode = { path = "../r5900-decode" }

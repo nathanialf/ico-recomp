@@ -1,3 +1,4 @@
+mod ee;
 mod verify_decode;
 
 use std::path::PathBuf;
