@@ -271,13 +271,136 @@ int64_t h_SifGetReg(const Args& a) {
     return (int64_t)(int32_t)v;
 }
 
-int64_t h_Deci2Call(const Args& a) {
-    static bool warned = false;
-    if (!warned) {
-        rt_log("syscall", "WARNING: Deci2Call(cmd=0x%x, ...): DECI2 (debug TTY) stubbed, returning 1", a.a0);
-        warned = true;
+/* ---- DECI2 manager HLE --------------------------------------------------
+ *
+ * The kernel's Deci2Call syscall (0x7C) backs the SDK TTY output path
+ * (scePrintf). Protocol facts (SDK deci2.h, plus the vendor handler's
+ * observed contract): sceDeci2Open(proto, opt, handler) registers an event
+ * handler; sceDeci2ReqSend arms a send; Deci2Poll drives the manager, which
+ * calls handler(DECI2_WRITE=3, 0, opt) so the handler feeds data via
+ * sceDeci2ExSend (Deci2Call -0x6, args {sock, addr, len}, returns bytes
+ * taken), then handler(DECI2_WRITEDONE=4, 0, opt), which clears the
+ * library's busy flag. The sent DECI2 packet is a 12-byte header + text;
+ * the text is logged as guest TTY output. */
+
+struct Deci2Sock {
+    bool open = false;
+    uint32_t proto = 0, opt = 0, handler = 0, gp = 0;
+    bool send_pending = false;
+};
+constexpr uint32_t kMaxDeci2Socks = 8;
+Deci2Sock g_deci2[kMaxDeci2Socks]; /* index == socket id, 0 unused */
+
+/* Dedicated context + guest stack for kernel-invoked guest callbacks (the
+ * DECI2 handler). Separate from the interrupt context/stack: a nested
+ * rt_intc_deliver at the callback's own syscall boundaries may clobber the
+ * interrupt context. Stack sits in the kernel-reserved low RAM below the
+ * interrupt stack (0xE0000). */
+constexpr uint32_t kKcallStackTop = 0x000D0000u;
+R5900Context g_kcall_ctx;
+
+uint32_t kcall_guest3(uint32_t vram, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t gp) {
+    if (vram < RECOMP_TEXT_BASE || vram >= RECOMP_TEXT_LIMIT || !g_functab[RECOMP_FUNC_IDX(vram)]) {
+        rt_fatal("syscall", nullptr, "guest callback vram 0x%08x has no translation", vram);
     }
-    return 1;
+    std::memset(&g_kcall_ctx, 0, sizeof(g_kcall_ctx));
+    g_kcall_ctx.r[4].u64x[0] = a0;
+    g_kcall_ctx.r[5].u64x[0] = a1;
+    g_kcall_ctx.r[6].u64x[0] = a2;
+    g_kcall_ctx.r[28].u64x[0] = gp;
+    g_kcall_ctx.r[29].u64x[0] = kKcallStackTop;
+    g_kcall_ctx.r[31].u64x[0] = RT_CLEAN_EXIT_VRAM;
+    g_functab[RECOMP_FUNC_IDX(vram)](&g_kcall_ctx);
+    return (uint32_t)g_kcall_ctx.r[2].u64x[0];
+}
+
+void deci2_log_text(const uint8_t* data, uint32_t len) {
+    /* Split on newlines; drop CR; print printable text via the tty tag. */
+    static char line[512];
+    static size_t fill = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        char c = (char)data[i];
+        if (c == '\r') continue;
+        if (c == '\n' || fill >= sizeof(line) - 1) {
+            line[fill] = 0;
+            if (fill) rt_log("tty", "%s", line);
+            fill = 0;
+            if (c != '\n' && fill < sizeof(line) - 1) line[fill++] = c;
+            continue;
+        }
+        line[fill++] = c;
+    }
+}
+
+int64_t h_Deci2Call(const Args& a) {
+    int32_t cmd = (int32_t)a.a0;
+    switch (cmd) {
+        case 0x01: { /* sceDeci2Open(proto, opt, handler): a1 -> args block */
+            uint32_t proto = rt_gread32(a.a1 + 0);
+            uint32_t opt = rt_gread32(a.a1 + 4);
+            uint32_t handler = rt_gread32(a.a1 + 8);
+            for (uint32_t i = 1; i < kMaxDeci2Socks; ++i) {
+                if (!g_deci2[i].open) {
+                    g_deci2[i] = Deci2Sock{true, proto, opt, handler,
+                                           (uint32_t)a.ctx->r[28].u64x[0], false};
+                    rt_log("syscall", "Deci2Open: sock=%u proto=0x%x opt=0x%08x handler=0x%08x",
+                        i, proto, opt, handler);
+                    return (int64_t)i;
+                }
+            }
+            return -1;
+        }
+        case 0x02: { /* sceDeci2Close(sock) */
+            uint32_t s = rt_gread32(a.a1 + 0);
+            if (s < kMaxDeci2Socks) g_deci2[s].open = false;
+            return 0;
+        }
+        case 0x03: { /* sceDeci2ReqSend(sock, dest): arm; poll drives it */
+            uint32_t s = rt_gread32(a.a1 + 0);
+            if (s < kMaxDeci2Socks && g_deci2[s].open) {
+                g_deci2[s].send_pending = true;
+                return 0;
+            }
+            return -1;
+        }
+        case 0x04: { /* sceDeci2Poll(sock): run the manager for this socket */
+            uint32_t s = rt_gread32(a.a1 + 0);
+            if (s < kMaxDeci2Socks && g_deci2[s].open && g_deci2[s].send_pending) {
+                Deci2Sock& d = g_deci2[s];
+                d.send_pending = false;
+                kcall_guest3(d.handler, 3 /* DECI2_WRITE */, 0, d.opt, d.gp);
+                kcall_guest3(d.handler, 4 /* DECI2_WRITEDONE */, 0, d.opt, d.gp);
+            }
+            return 0;
+        }
+        case -0x06: case 0x06: { /* sceDeci2ExSend(sock, addr, len) */
+            uint32_t addr = rt_gread32(a.a1 + 4);
+            uint32_t len = rt_gread32(a.a1 + 8) & 0xFFFF;
+            if (len && rt_gptr(addr)) {
+                const uint8_t* p = rt_gptr(addr);
+                uint32_t skip = 0;
+                /* First chunk of a packet carries the 12-byte DECI2 header
+                 * (u16 total length first); strip it from the TTY log. */
+                if (len > 12) {
+                    uint16_t hdr_len;
+                    std::memcpy(&hdr_len, p, 2);
+                    if (hdr_len == len) skip = 12;
+                }
+                deci2_log_text(p + skip, len - skip);
+            }
+            return (int64_t)len; /* everything taken */
+        }
+        case -0x05: case 0x05: /* sceDeci2ExRecv: no inbound DECI2 traffic */
+            return -1;
+        default: {
+            static bool warned = false;
+            if (!warned) {
+                rt_log("syscall", "WARNING: Deci2Call(cmd=0x%x) NOT MODELED, returning 0", cmd);
+                warned = true;
+            }
+            return 0;
+        }
+    }
 }
 
 int64_t h_MachineType(const Args&) { return 0; }

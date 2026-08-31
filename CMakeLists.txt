@@ -38,6 +38,9 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/ee/intc.cpp
     src/runtime/ee/timers.cpp
     src/runtime/sif/sif.cpp
+    src/runtime/sif/rpc.cpp
+    src/runtime/sif/cdvd.cpp
+    src/runtime/iso/iso9660.cpp
 )
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})

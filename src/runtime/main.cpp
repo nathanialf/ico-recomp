@@ -74,6 +74,7 @@ void crash_handler(int sig) {
  * interactive interrupt of a parked or spinning run is diagnosable. */
 void sigint_handler(int) {
     std::fprintf(stderr, "\n[icorecomp][main] SIGINT\n");
+    if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     rt_sched_dump_inventory("SIGINT");
     _exit(130);
 }

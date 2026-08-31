@@ -3,6 +3,7 @@
 /gen/
 
 # user-supplied game data
+/config/local.toml
 *.iso
 *.bin
 *.cue

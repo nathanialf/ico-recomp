@@ -8,8 +8,12 @@
  *                reference)
  *   intc.cpp     INTC/DMAC handler registries + delivery, GS CSR/IMR shadow
  *   timers.cpp   EE timers T0-T3 driven by the virtual clock
- *   ../sif/sif.cpp SIF register file, SifSetDma recording, minimal
- *                instantly-ready-IOP handshake
+ *   ../sif/sif.cpp SIF register file, SifSetDma recording, entry into the
+ *                RPC layer
+ *   ../sif/rpc.cpp sifrpc protocol HLE (virtual IOP RAM, service registry,
+ *                deferred response delivery)
+ *   ../sif/cdvd.cpp cdvdman services, iopheap, loadfile, padman, boot stubs
+ *   ../iso/iso9660.cpp disc image backend
  *
  * This is runtime-internal, NOT part of the ABI contract (include/recomp_*.h).
  */
