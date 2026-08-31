@@ -31,6 +31,21 @@ constexpr uint32_t RT_CLEAN_EXIT_VRAM = 0xE0000000u;
 
 /* ---- logging (log.cpp) -------------------------------------------------- */
 
+/* Opens this run's log file and points file descriptor 2 at it, so the log
+ * survives the console window dying with the process. Path comes from
+ * ICORECOMP_LOG; unset it defaults to <dir>/icorecomp.log on Windows and to
+ * no file (console only) elsewhere. ICORECOMP_LOG=- opts out. Call before
+ * anything else logs. */
+void rt_log_init(const char* dir);
+
+/* Path of the open log file, or null when logging is console only. */
+const char* rt_log_path();
+
+/* On Windows, when this process owns its console (a double-clicked run),
+ * names the log file and waits for Enter so the failure stays readable.
+ * No-op everywhere else and for runs launched from an existing shell. */
+void rt_log_hold_console();
+
 void rt_log(const char* component, const char* fmt, ...);
 void rt_vlog(const char* component, const char* fmt, va_list ap);
 

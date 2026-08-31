@@ -1,11 +1,15 @@
 /* main.cpp: boot entry point.
  *
- * Sequence: set FPU FTZ/DAZ -> allocate guest memory + page table -> read
- * config/recomp.toml -> SHA-1-check and load the boot ELF -> wire up
- * generated code (if linked) -> initialize the P2 kernel HLE (scheduler,
- * INTC, timers, SIF) -> create guest thread 1 running the translated entry
- * point and enter the scheduler loop, under a crash handler that dumps the
- * current guest context.
+ * Sequence: open the log sink and install the crash handlers -> set FPU
+ * FTZ/DAZ -> allocate guest memory + page table -> read
+ * config/recomp.toml -> SHA-1-check and load the boot ELF (mounting the
+ * disc image if that is where it comes from) -> wire up generated code (if
+ * linked) -> bring up the GS backend and its window -> initialize the P2
+ * kernel HLE (scheduler, INTC, timers, SIF) -> create guest thread 1
+ * running the translated entry point and enter the scheduler loop, under a
+ * crash handler that dumps the current guest context.
+ *
+ * The window comes up late on purpose; see the rt_hw_init() call below.
  *
  * Builds in two modes, selected at CMake configure time by whether
  * generated/ee exists (see CMakeLists.txt, -DICORECOMP_HAVE_GENERATED):
@@ -47,6 +51,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #define ICORECOMP_X86 1
@@ -87,23 +96,79 @@ void crash_handler(int sig) {
 #endif
         default: break;
     }
-    std::fprintf(stderr, "[icorecomp][crash] FATAL: caught %s while running guest code (thread %d)\n",
+    rt_log("crash", "FATAL: caught %s while running guest code (thread %d)",
         name, rt_thread_current_id());
     if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     std::fflush(stderr);
+    rt_log_hold_console();
     std::_Exit(1);
 }
+
+/* Last resort for a failure that never reaches the signal handlers: an
+ * uncaught C++ exception (the Vulkan and swapchain paths in the GS library
+ * throw) unwinds through std::terminate instead. Without this the process
+ * dies through the CRT's own abort message, which on a double-clicked
+ * Windows run is exactly the output that disappears with the console. */
+[[noreturn]] void terminate_handler() {
+    const char* what = "unknown";
+    if (std::exception_ptr e = std::current_exception()) {
+        try {
+            std::rethrow_exception(e);
+        } catch (const std::exception& ex) {
+            what = ex.what();
+        } catch (...) {
+            what = "non-std exception";
+        }
+    }
+    rt_log("crash", "FATAL: std::terminate: %s", what);
+    if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
+    std::fflush(stderr);
+    rt_log_hold_console();
+    std::_Exit(1);
+}
+
+#ifdef _WIN32
+/* Structured exceptions raised on a minicoro stack, or inside the GS DLL,
+ * do not reliably reach the CRT's SIGSEGV mapping. This filter runs for any
+ * unhandled one in the process, including a stack overflow. */
+LONG WINAPI seh_filter(EXCEPTION_POINTERS* info) {
+    DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    const void* addr = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+    const char* name = "exception";
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:      name = "ACCESS_VIOLATION"; break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION:   name = "ILLEGAL_INSTRUCTION"; break;
+        case EXCEPTION_STACK_OVERFLOW:        name = "STACK_OVERFLOW"; break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:    name = "INT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:    name = "FLT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_IN_PAGE_ERROR:         name = "IN_PAGE_ERROR"; break;
+        case EXCEPTION_PRIV_INSTRUCTION:      name = "PRIV_INSTRUCTION"; break;
+        default: break;
+    }
+    rt_log("crash", "FATAL: unhandled %s (code 0x%08lx) at host address %p (thread %d)",
+        name, (unsigned long)code, addr, rt_thread_current_id());
+    if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
+    std::fflush(stderr);
+    rt_log_hold_console();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
 
 /* SIGINT: dump the thread/semaphore inventory before dying so an
  * interactive interrupt of a parked or spinning run is diagnosable. */
 void sigint_handler(int) {
-    std::fprintf(stderr, "\n[icorecomp][main] SIGINT\n");
+    rt_log("main", "SIGINT");
     if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     rt_sched_dump_inventory("SIGINT");
+    std::fflush(stderr);
     std::_Exit(130);
 }
 
 void install_crash_handler() {
+    std::set_terminate(terminate_handler);
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(seh_filter);
+#endif
     std::signal(SIGSEGV, crash_handler);
     std::signal(SIGFPE, crash_handler);
     std::signal(SIGILL, crash_handler);
@@ -132,6 +197,12 @@ void print_usage(const char* argv0) {
 } // namespace
 
 int main(int argc, char** argv) {
+    rt_log_init(rt_base_dir());
+    /* Installed before anything that can fault, which now includes the
+     * Vulkan device and window setup in rt_hw_init: a crash there used to
+     * die with no dump at all. */
+    install_crash_handler();
+
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
         if (std::strcmp(arg, "--disc") == 0 && i + 1 < argc) {
@@ -142,19 +213,15 @@ int main(int argc, char** argv) {
             print_usage(argv[0]);
             return 0;
         } else {
-            std::fprintf(stderr, "unknown argument: %s\n", arg);
+            std::fprintf(stdout, "unknown argument: %s\n", arg);
             print_usage(argv[0]);
+            rt_log_hold_console();
             return 2;
         }
     }
 
     set_fpu_ftz_daz();
     rt_mem_init();
-    /* Creates the GS backend (ICORECOMP_GS selects dump / parallel / both;
-     * see gs/gs_select.cpp) on the main thread stack. For the live backend
-     * this brings up the Vulkan device and, when a display is available,
-     * the window + swapchain, before any guest code exists. */
-    rt_hw_init();
 
     LoaderConfig cfg;
     if (!rt_load_config(&cfg)) {
@@ -183,12 +250,24 @@ int main(int argc, char** argv) {
         rt_log("main", "FATAL: no generated code linked (stub build); entry function at vram 0x%08x cannot be"
                         " resolved. Configure with generated/ee present (or -DGENERATED_DIR=...) to run the game.", cfg.entry);
 #endif
+        rt_log_hold_console();
         return 1;
     }
 
     (void)entry_fn; /* thread 1's trampoline looks it up again via g_functab */
 
-    install_crash_handler();
+    /* Creates the GS backend (ICORECOMP_GS selects dump / parallel / both;
+     * see gs/gs_select.cpp) on the main thread stack. For the live backend
+     * this brings up the Vulkan device and, when a display is available,
+     * the window + swapchain, before any guest code exists.
+     *
+     * Deliberately last: everything above can fail cheaply and often does
+     * on a fresh install (no disc image, wrong disc, SHA-1 pin mismatch,
+     * no generated code). Opening the window first turned each of those
+     * into a black window that vanished, which reads as a crash rather
+     * than the specific error it is. */
+    rt_hw_init();
+
     rt_sched_init();
 
     rt_log("main", "booting scheduler: thread 1 entry vram=0x%08x sp=0x%08x gp=0x%08x",

@@ -268,23 +268,27 @@ void rt_iso_mount() {
         }
     }
     {
+        /* Dev checkout only: the sibling decomp tree's baserom. A packaged
+         * run has no decomp_root, and probing one there would just put a
+         * meaningless path in the "tried:" list below. */
         LoaderConfig cfg;
-        std::string root = "../ico";
-        if (rt_load_config(&cfg) && cfg.decomp_root[0]) root = cfg.decomp_root;
-        std::string base = std::string(rt_base_dir()) + "/" + root + "/baserom/Ico_USA";
-        if (try_open(base + ".bin", "decomp baserom bin/cue")) goto mounted;
-        tried += base + ".bin ";
-        if (try_open(base + ".iso", "decomp baserom iso")) goto mounted;
-        tried += base + ".iso ";
+        if (rt_load_config(&cfg) && cfg.decomp_root[0]) {
+            std::string base = std::string(rt_base_dir()) + "/" + cfg.decomp_root + "/baserom/Ico_USA";
+            if (try_open(base + ".bin", "decomp baserom bin/cue")) goto mounted;
+            tried += base + ".bin ";
+            if (try_open(base + ".iso", "decomp baserom iso")) goto mounted;
+            tried += base + ".iso ";
+        }
     }
     {
-        /* Packaged-zip convention: the disc sits next to the exe (which is
-         * the working directory when launched by double click or from its
-         * own folder). */
+        /* Packaged convention: the disc sits in the same folder as the
+         * executable. rt_base_dir() is that folder for a packaged run, so
+         * this holds however the exe was launched. */
         static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_USA.iso", "Ico_USA.bin" };
         for (const char* name : kLocal) {
-            if (try_open(name, "working directory")) goto mounted;
-            tried += std::string(name) + " ";
+            std::string p = std::string(rt_base_dir()) + "/" + name;
+            if (try_open(p, "next to the executable")) goto mounted;
+            tried += p + " ";
         }
     }
     rt_fatal("iso", nullptr, "no disc image found (tried: %s). Pass --disc <path>, set [disc] path "

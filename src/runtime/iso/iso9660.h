@@ -29,9 +29,10 @@ void rt_iso_set_path(const char* path);
  *   1. rt_iso_set_path (--disc), fatal when unusable
  *   2. config/local.toml [disc] path (untracked, gitignored; relative to
  *      rt_base_dir())
- *   3. <decomp root>/baserom/Ico_USA.bin, then .iso
- *   4. ico.iso / ico.bin / Ico_USA.iso / Ico_USA.bin in the working
- *      directory (the packaged-zip convention: disc next to the exe)
+ *   3. <decomp root>/baserom/Ico_USA.bin, then .iso; dev checkouts only,
+ *      skipped when the config named no decomp root
+ *   4. ico.iso / ico.bin / Ico_USA.iso / Ico_USA.bin next to the
+ *      executable (the packaged convention: disc beside the exe)
  * Fatal if nothing usable is found (loud failure per CLAUDE.md). Verifies
  * the mount by locating SCUS_971.13 and DFDATAS/DATA.DF. */
 void rt_iso_mount();

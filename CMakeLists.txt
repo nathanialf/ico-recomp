@@ -14,6 +14,21 @@
 cmake_minimum_required(VERSION 3.20)
 project(icorecomp LANGUAGES C CXX)
 
+# MSVC C runtime, chosen here so every scope agrees. paraLLEl-GS's own
+# CMakeLists picks the static CRT when this is unset, and it does so inside
+# add_subdirectory, so its archives came out /MT while our targets in this
+# scope stayed on the default /MD: every paraLLEl-GS and Granite object then
+# failed to link with LNK2038. Dynamic is the right side to settle on. The
+# executable, icorecomp-parallel-gs.dll and SDL3.dll pass CRT state across
+# the module boundary (the log sink's fd 2 redirect, the environment block
+# the ICORECOMP_* toggles are read from), and that only works when they
+# share one CRT instance. Has no effect on gcc, clang or the mingw cross
+# build. CMP0091 is NEW at this cmake_minimum_required, so the value is
+# honored per target rather than through CMAKE_CXX_FLAGS.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
@@ -339,3 +354,69 @@ if(ICORECOMP_PARALLEL_GS)
 else()
     message(STATUS "icorecomp: paraLLEl-GS backend disabled; ICORECOMP_GS=parallel will fail loudly")
 endif()
+
+# ---- packaging -------------------------------------------------------------
+#
+# `cmake --install <build> --prefix <dir>` lays down a self-contained,
+# runnable folder: the executable, the two shared libraries it loads, and a
+# README. Nothing else. The runtime resolves its config, saves, log and disc
+# probe against the executable's own directory (rt_base_dir in
+# src/runtime/loader.cpp), so the folder works wherever it is unzipped and
+# however it is launched, and the user's disc image is the only thing they
+# add to it.
+#
+# No config/ is installed on purpose: a packaged run falls back to the
+# compiled-in pins (loader.cpp) and creates saves/mc0 on first use.
+
+if(WIN32)
+    set(ICORECOMP_PACKAGE_PLATFORM "for Windows (x86_64)")
+    set(ICORECOMP_PACKAGE_EXE "icorecomp-runtime.exe")
+else()
+    set(ICORECOMP_PACKAGE_PLATFORM "for Linux (x86_64)")
+    set(ICORECOMP_PACKAGE_EXE "icorecomp-runtime")
+endif()
+
+if(NOT WIN32)
+    # Flat layout: the installed executable finds its libraries beside
+    # itself. Windows already searches the exe's own directory first.
+    set_target_properties(icorecomp-runtime PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH FALSE)
+endif()
+
+install(TARGETS icorecomp-runtime RUNTIME DESTINATION .)
+
+if(ICORECOMP_PARALLEL_GS)
+    # RUNTIME catches the Windows DLL, LIBRARY the Linux .so.
+    install(TARGETS icorecomp-parallel-gs RUNTIME DESTINATION . LIBRARY DESTINATION .)
+    set(ICORECOMP_PACKAGE_GSLIB "$<TARGET_FILE_NAME:icorecomp-parallel-gs>")
+    set(ICORECOMP_PACKAGE_LIBS "    ${ICORECOMP_PACKAGE_GSLIB}")
+    if(ICORECOMP_PGS_HAVE_SDL)
+        # SDL3 comes from an EXCLUDE_FROM_ALL subdirectory, so install its
+        # file rather than its target. PROGRAMS, not FILES: FILES installs
+        # 644, and a DLL without the execute bit fails to load with
+        # STATUS_ACCESS_DENIED (0xC0000022) whenever the mode bits survive
+        # the trip to the target machine, which they do over a share or a
+        # permission-preserving unzip. On ELF platforms the soname symlink
+        # has to come along too, since that is the name the exe links.
+        install(PROGRAMS $<TARGET_FILE:SDL3-shared> DESTINATION .)
+        if(NOT WIN32)
+            install(FILES $<TARGET_SONAME_FILE:SDL3-shared> DESTINATION .)
+        endif()
+        string(APPEND ICORECOMP_PACKAGE_LIBS "\n    $<TARGET_FILE_NAME:SDL3-shared>")
+    endif()
+else()
+    set(ICORECOMP_PACKAGE_GSLIB "no renderer (this build has none)")
+    set(ICORECOMP_PACKAGE_LIBS "    (no shared libraries in this build)")
+endif()
+
+# Rendered at install time because the library file names are generator
+# expressions; configure_file alone cannot resolve them.
+install(CODE "
+    set(ICORECOMP_PACKAGE_PLATFORM \"${ICORECOMP_PACKAGE_PLATFORM}\")
+    set(ICORECOMP_PACKAGE_EXE \"${ICORECOMP_PACKAGE_EXE}\")
+    set(ICORECOMP_PACKAGE_GSLIB \"${ICORECOMP_PACKAGE_GSLIB}\")
+    set(ICORECOMP_PACKAGE_LIBS \"${ICORECOMP_PACKAGE_LIBS}\")
+    configure_file(\"${CMAKE_SOURCE_DIR}/packaging/README.txt.in\"
+                   \"\${CMAKE_INSTALL_PREFIX}/README.txt\" @ONLY)
+")

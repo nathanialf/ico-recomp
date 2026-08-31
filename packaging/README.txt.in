@@ -1,0 +1,90 @@
+icorecomp @ICORECOMP_PACKAGE_PLATFORM@
+======================================
+
+A native PC port of ICO (PlayStation 2, retail US), produced by static
+recompilation. No game data ships with this build. You supply your own
+disc image, dumped from your own copy.
+
+
+Getting it running
+------------------
+
+1. Put your ICO (USA) disc image in this folder, named ico.iso.
+   A raw bin/cue dump works too: name it ico.bin. The .cue file is not
+   needed.
+
+2. Run @ICORECOMP_PACKAGE_EXE@.
+
+That is the whole install. Nothing is written outside this folder, and
+nothing needs to be configured first.
+
+If you would rather keep the image somewhere else, pass it on the command
+line instead of step 1:
+
+    @ICORECOMP_PACKAGE_EXE@ --disc "path/to/Ico (USA).iso"
+
+The image is checked against the SHA-1 of the retail US boot ELF. A
+mismatch is reported and the run stops, rather than failing strangely
+later.
+
+
+What this folder holds
+----------------------
+
+    @ICORECOMP_PACKAGE_EXE@
+@ICORECOMP_PACKAGE_LIBS@
+    README.txt
+
+The two libraries are the renderer (paraLLEl-GS) and SDL3, which provides
+the window, controller input and audio. Both must stay next to the
+executable.
+
+After the first run you will also see icorecomp.log, the last run's log,
+and saves/mc0, the virtual memory card.
+
+
+Controls
+--------
+
+Any SDL3-supported controller (Xbox, DualSense, DualShock 4) is picked up
+automatically. On the keyboard:
+
+    arrows          d-pad
+    WASD / IJKL     left / right stick
+    X C Z V         cross / circle / square / triangle
+    Q E 1 3         L1 / R1 / L2 / R2
+    Enter           start
+    Backspace       select
+
+
+When something goes wrong
+-------------------------
+
+Every run writes icorecomp.log in this folder, replacing the previous
+one. It holds the full log for that run, including the renderer and the
+Vulkan driver, and it survives the window closing. If the port fails,
+that file says why on one of its last few lines. Send it along with any
+bug report.
+
+Requirements: a GPU and driver with Vulkan 1.1 or newer. The renderer
+names the device it selected in the log.
+
+
+Environment variables
+---------------------
+
+    ICORECOMP_LOG=path        write the log somewhere else ("-" disables)
+    ICORECOMP_GS=dump         headless, no window
+    ICORECOMP_MAX_VBLANKS=N   stop after N fields
+    ICORECOMP_SAVES_DIR=path  memory card location
+    ICORECOMP_WAV_CAPTURE=out.wav
+                              record the audio mix
+
+
+License
+-------
+
+The port is MIT. It loads @ICORECOMP_PACKAGE_GSLIB@, which is paraLLEl-GS
+under LGPLv3+, and SDL3 under the zlib license, both as separate shared
+libraries. Source and the corresponding build instructions:
+https://github.com/nathanialf/ico-recomp

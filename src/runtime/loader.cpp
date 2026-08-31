@@ -16,6 +16,7 @@
  */
 #include "runtime.h"
 
+#include "host/portable.h"
 #include "iso/iso9660.h"
 
 #include <algorithm>
@@ -130,13 +131,22 @@ const char* rt_base_dir() {
         std::ifstream probe(root + "/config/recomp.toml");
         if (probe) return root;
         /* Packaged runtime: the build machine's source tree is not here.
-         * Resolve everything against the working directory instead. */
-        return std::string(".");
+         * Resolve everything against the executable's own directory, not
+         * the working directory, so the package stays self-contained no
+         * matter what launched it (a shortcut with its own "Start in"
+         * folder, a shell somewhere else, a file manager). Everything a
+         * packaged run touches goes through here: the log, config/,
+         * saves/, and the disc probe. */
+        return rt_exe_dir();
     }();
     return base.c_str();
 }
 
-bool rt_load_config(LoaderConfig* out) {
+namespace {
+
+/* Parses config/recomp.toml (or fills in the compiled-in pins when there is
+ * none). Reached only through rt_load_config, which memoizes it. */
+bool load_config_uncached(LoaderConfig* out) {
     std::string path = std::string(rt_base_dir()) + "/config/recomp.toml";
     std::ifstream f(path);
     if (!f) {
@@ -185,6 +195,19 @@ bool rt_load_config(LoaderConfig* out) {
     rt_log("loader", "config: decomp.root=%s decomp.elf=%s pins.elf_sha1=%s target.entry=0x%08x target.vram_base=0x%08x target.gp=0x%08x",
         out->decomp_root, out->decomp_elf, out->elf_sha1, out->entry, out->vram_base, out->gp);
     return true;
+}
+
+} // namespace
+
+bool rt_load_config(LoaderConfig* out) {
+    /* Parsed and logged exactly once. rt_iso_mount calls this again to find
+     * the decomp root, and sif/cdvd.cpp plus the ipu selftest reach it the
+     * same way; without the cache every repeat re-read the file and printed
+     * the notice again. */
+    static LoaderConfig cached;
+    static const bool ok = load_config_uncached(&cached);
+    *out = cached;
+    return ok;
 }
 
 void rt_resolve_elf_path(const LoaderConfig& cfg, char* buf, size_t buf_size) {

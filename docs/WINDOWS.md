@@ -44,7 +44,25 @@ Steps, from a VS x64 developer prompt in the repo root:
    ELF straight out of the disc image (SHA-1 checked against the pin), so a
    built exe plus a disc image is self-contained.
 
-4. Run:
+4. Package it. This is the step that produces something distributable:
+
+       cmake --install build --config Release --prefix dist\windows
+
+   `dist\windows` then holds four files and nothing else:
+
+       icorecomp-runtime.exe
+       libicorecomp-parallel-gs.dll     (icorecomp-parallel-gs.dll on MSVC)
+       SDL3.dll
+       README.txt
+
+   Drop your disc image in beside them as `ico.iso` (or `ico.bin` for a raw
+   bin/cue dump) and the folder is self-contained: no config files to
+   author, no install step. The runtime resolves its config, saves, log and
+   disc probe against the executable's own directory, so it works wherever
+   the folder is unzipped and however it is launched. `saves\mc0` and
+   `icorecomp.log` are created on first run.
+
+5. Run:
 
        build\Release\icorecomp-runtime.exe
 
@@ -62,5 +80,23 @@ keyboard (arrows d-pad, WASD/IJKL sticks, X/C/Z/V cross/circle/square/
 triangle, Q/E/1/3 shoulders, Enter start, Backspace select; see
 `src/runtime/host/input.h`).
 
+## Logs
+
+Every Windows run writes `icorecomp.log` next to the executable, replacing
+the previous run's. The redirect is at the file-descriptor level, so the
+runtime, the GS shared library, SDL and the Vulkan loader all land in the
+same file, and it survives the console window closing when the process
+dies. The runtime's own messages still echo to the console while it is
+alive.
+
+- `ICORECOMP_LOG=C:\path\to\run.log` writes somewhere else. The same
+  variable turns the sink on for Linux runs, where it is off by default.
+- `ICORECOMP_LOG=-` turns the sink off: console only.
+
+When a run started from Explorer fails, the console stays open with a
+"Press Enter to close" prompt and the log path, instead of vanishing with
+the failure. A run started from an existing `cmd` or PowerShell prompt
+never blocks, so scripts and CI are unaffected.
+
 Status: the Windows build is cross-compile-verified and CI-built; if you hit
-anything on a real machine, capture the console output and file it.
+anything on a real machine, file `icorecomp.log`.

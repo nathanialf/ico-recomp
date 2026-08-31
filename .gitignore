@@ -16,6 +16,7 @@ saves/
 # build trees
 /build/
 /out/
+/dist/
 target/
 CMakeUserPresets.json
 
