@@ -14,6 +14,8 @@
  */
 #include "runtime.h"
 
+#include "ee/kernel.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <unordered_map>
@@ -108,42 +110,81 @@ void log_access(const char* dir, uint32_t addr, int size_bits, uint64_t value, s
     }
 }
 
+/* Physical address for kseg0/kseg1 accesses to hardware registers. */
+uint32_t hw_norm(uint32_t addr) {
+    return addr >= 0x80000000u ? (addr & 0x1FFFFFFFu) : addr;
+}
+
+/* P2 hardware model dispatch (ee/intc.cpp, ee/timers.cpp, sif/sif.cpp).
+ * Returns true when a module owns the register; unmatched addresses fall
+ * back to the P1 log-and-return-0 behavior. */
+bool hw_read(uint32_t addr, uint64_t* out) {
+    addr = hw_norm(addr);
+    uint32_t v32;
+    if (rt_timers_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_intc_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_sif_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_gs_mmio_read(addr, out)) return true;
+    return false;
+}
+
+bool hw_write(uint32_t addr, uint64_t v) {
+    addr = hw_norm(addr);
+    if (rt_timers_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_intc_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_sif_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_gs_mmio_write(addr, v)) return true;
+    return false;
+}
+
+uint64_t mmio_read_common(uint32_t addr, int bits) {
+    /* Advance the virtual clock and deliver due interrupts first, so poll
+     * loops on CSR/COUNT/I_STAT make forward progress toward vblank. */
+    rt_kernel_mmio_tick();
+    uint64_t v = 0;
+    hw_read(addr, &v); /* v stays 0 for unmodeled registers */
+    log_access("read", addr, bits, v, g_read_stats);
+    return v;
+}
+
+void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
+    hw_write(addr, v);
+    log_access("write", addr, bits, v, g_write_stats);
+    rt_kernel_mmio_tick();
+}
+
 } // namespace
 
 uint8_t rt_mmio_read8(uint32_t addr) {
-    log_access("read", addr, 8, 0, g_read_stats);
-    return 0;
+    return (uint8_t)mmio_read_common(addr, 8);
 }
 uint16_t rt_mmio_read16(uint32_t addr) {
-    log_access("read", addr, 16, 0, g_read_stats);
-    return 0;
+    return (uint16_t)mmio_read_common(addr, 16);
 }
 uint32_t rt_mmio_read32(uint32_t addr) {
-    log_access("read", addr, 32, 0, g_read_stats);
-    return 0;
+    return (uint32_t)mmio_read_common(addr, 32);
 }
 uint64_t rt_mmio_read64(uint32_t addr) {
-    log_access("read", addr, 64, 0, g_read_stats);
-    return 0;
+    return mmio_read_common(addr, 64);
 }
 rc_u128 rt_mmio_read128(uint32_t addr) {
-    log_access("read", addr, 128, 0, g_read_stats);
     rc_u128 v{};
+    v.u64x[0] = mmio_read_common(addr, 128);
     return v;
 }
 
 void rt_mmio_write8(uint32_t addr, uint8_t v) {
-    log_access("write", addr, 8, v, g_write_stats);
+    mmio_write_common(addr, 8, v);
 }
 void rt_mmio_write16(uint32_t addr, uint16_t v) {
-    log_access("write", addr, 16, v, g_write_stats);
+    mmio_write_common(addr, 16, v);
 }
 void rt_mmio_write32(uint32_t addr, uint32_t v) {
-    log_access("write", addr, 32, v, g_write_stats);
+    mmio_write_common(addr, 32, v);
 }
 void rt_mmio_write64(uint32_t addr, uint64_t v) {
-    log_access("write", addr, 64, v, g_write_stats);
+    mmio_write_common(addr, 64, v);
 }
 void rt_mmio_write128(uint32_t addr, rc_u128 v) {
-    log_access("write", addr, 128, v.u64x[0], g_write_stats);
+    mmio_write_common(addr, 128, v.u64x[0]);
 }

@@ -1,8 +1,13 @@
 /* hooks.cpp: privileged/control hooks called by generated code and the
- * reference interpreter (see recomp_api.h). P1 policy: log everything,
+ * reference interpreter (see recomp_api.h). Policy: log everything,
  * prefer loud failure over silent wrongness, per CLAUDE.md.
+ *
+ * rt_syscall lives in ee/syscalls.cpp (P2 kernel HLE); ei/di and the COP0
+ * Status/Count reads route into ee/intc.cpp and the virtual clock.
  */
 #include "runtime.h"
+
+#include "ee/kernel.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -32,33 +37,29 @@ bool g_di_logged = false;
 
 } // namespace
 
-void rt_syscall(R5900Context* ctx) {
-    int32_t num = ctx->r[3].s32x[0];
-    if (num == 4) {
-        /* Exit */
-        rt_log("syscall", "Exit (number=4) -- terminating");
-        rt_dump_registers(ctx);
-        std::exit(0);
-    }
-    rt_log("syscall", "number=%d (0x%x), a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx",
-        num, (uint32_t)num,
-        (unsigned long long)ctx->r[4].u64x[0], (unsigned long long)ctx->r[5].u64x[0],
-        (unsigned long long)ctx->r[6].u64x[0], (unsigned long long)ctx->r[7].u64x[0]);
-    ctx->r[2].u64x[0] = 0; /* v0 = 0 */
-    ctx->r[2].u64x[1] = 0;
-}
-
 void rt_break(R5900Context* ctx, uint32_t code) {
     rt_fatal("break", ctx, "BREAK code=0x%x (%u)", code, code);
 }
 
 uint32_t rt_cop0_read(R5900Context* ctx, int reg) {
+    uint32_t value = 0;
+    switch (reg) {
+        case 9:  /* Count: CPU clock is 2x BUSCLK */
+            value = (uint32_t)(rt_clock_now() * 2);
+            break;
+        case 12: /* Status: EIE/IE per intc state */
+            value = rt_cop0_status_word();
+            break;
+        default:
+            break;
+    }
     uint64_t& n = g_cop0_read_counts[uint32_t(reg)];
     ++n;
     if (is_pow2(n)) {
-        rt_log("cop0", "read $%d -> 0 [access #%llu] pc_hint=0x%08x", reg, (unsigned long long)n, ctx->pc_hint);
+        rt_log("cop0", "read $%d -> 0x%08x [access #%llu] pc_hint=0x%08x",
+            reg, value, (unsigned long long)n, ctx->pc_hint);
     }
-    return 0;
+    return value;
 }
 
 void rt_cop0_write(R5900Context* ctx, int reg, uint32_t v) {
@@ -75,6 +76,7 @@ void rt_ei(void) {
         rt_log("intc", "EI (interrupts enabled) -- further EI calls not logged");
         g_ei_logged = true;
     }
+    rt_intc_set_eie(true); /* delivers any pending interrupts */
 }
 
 void rt_di(void) {
@@ -82,6 +84,7 @@ void rt_di(void) {
         rt_log("intc", "DI (interrupts disabled) -- further DI calls not logged");
         g_di_logged = true;
     }
+    rt_intc_set_eie(false);
 }
 
 uint32_t rt_vu0_cfc(R5900Context* ctx, int creg) {

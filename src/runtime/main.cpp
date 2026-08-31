@@ -1,9 +1,11 @@
-/* main.cpp: P1 boot skeleton entry point.
+/* main.cpp: boot entry point.
  *
  * Sequence: set FPU FTZ/DAZ -> allocate guest memory + page table -> read
  * config/recomp.toml -> SHA-1-check and load the boot ELF -> wire up
- * generated code (if linked) -> build an initial R5900Context -> call the
- * translated entry point under a crash handler that dumps registers.
+ * generated code (if linked) -> initialize the P2 kernel HLE (scheduler,
+ * INTC, timers, SIF) -> create guest thread 1 running the translated entry
+ * point and enter the scheduler loop, under a crash handler that dumps the
+ * current guest context.
  *
  * Builds in two modes, selected at CMake configure time by whether
  * generated/ee exists (see CMakeLists.txt, -DICORECOMP_HAVE_GENERATED):
@@ -16,6 +18,8 @@
  *     it traps into rt_syscall / rt_mmio_.. / rt_bad_indirect / etc.
  */
 #include "runtime.h"
+
+#include "ee/kernel.h"
 
 #include <csignal>
 #include <cstdio>
@@ -50,8 +54,6 @@ void set_fpu_ftz_daz() {
  * are reachable transitively via rt_log elsewhere, though not from here).
  * Acceptable for a debug boot skeleton: goal is a readable dump on the way
  * down, not signal-handler purity. */
-R5900Context* g_crash_ctx = nullptr;
-
 void crash_handler(int sig) {
     const char* name = "signal";
     switch (sig) {
@@ -61,10 +63,19 @@ void crash_handler(int sig) {
         case SIGBUS:  name = "SIGBUS"; break;
         default: break;
     }
-    std::fprintf(stderr, "[icorecomp][crash] FATAL: caught %s while running guest code\n", name);
-    if (g_crash_ctx) rt_dump_registers(g_crash_ctx);
+    std::fprintf(stderr, "[icorecomp][crash] FATAL: caught %s while running guest code (thread %d)\n",
+        name, rt_thread_current_id());
+    if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     std::fflush(stderr);
     _exit(1);
+}
+
+/* SIGINT: dump the thread/semaphore inventory before dying so an
+ * interactive interrupt of a parked or spinning run is diagnosable. */
+void sigint_handler(int) {
+    std::fprintf(stderr, "\n[icorecomp][main] SIGINT\n");
+    rt_sched_dump_inventory("SIGINT");
+    _exit(130);
 }
 
 void install_crash_handler() {
@@ -72,6 +83,7 @@ void install_crash_handler() {
     std::signal(SIGFPE, crash_handler);
     std::signal(SIGILL, crash_handler);
     std::signal(SIGBUS, crash_handler);
+    std::signal(SIGINT, sigint_handler);
 }
 
 } // namespace
@@ -110,23 +122,17 @@ int main() {
         return 1;
     }
 
-    R5900Context ctx{};
-    ctx.r[29].u64x[0] = uint64_t(RT_RAM_SIZE - 0x10000); /* $sp: top of RAM minus 64 KB; crt0 relocates it */
-    ctx.r[28].u64x[0] = uint64_t(cfg.gp);                /* $gp, from config [target].gp */
-    ctx.r[31].u64x[0] = uint64_t(RT_CLEAN_EXIT_VRAM);    /* $ra: sentinel, see rt_call_indirect */
+    (void)entry_fn; /* thread 1's trampoline looks it up again via g_functab */
 
     install_crash_handler();
-    g_crash_ctx = &ctx;
+    rt_sched_init();
 
-    rt_log("main", "calling entry: vram=0x%08x sp=0x%08x gp=0x%08x ra(sentinel)=0x%08x",
-        cfg.entry, uint32_t(ctx.r[29].u64x[0]), uint32_t(ctx.r[28].u64x[0]), RT_CLEAN_EXIT_VRAM);
+    rt_log("main", "booting scheduler: thread 1 entry vram=0x%08x sp=0x%08x gp=0x%08x",
+        cfg.entry, uint32_t(RT_RAM_SIZE - 0x10000), cfg.gp);
 
-    entry_fn(&ctx);
-
-    /* Only reached if the entry function returned via plain C `return`
-     * rather than a jr $ra translated through rt_call_indirect (which exits
-     * the process itself on the RT_CLEAN_EXIT_VRAM sentinel -- see mem.cpp). */
-    rt_log("main", "entry function returned directly (not via the rt_call_indirect sentinel)");
-    rt_dump_registers(&ctx);
-    return 0;
+    /* Creates guest thread 1 at priority 0 running the translated entry and
+     * never returns: the process ends via the Exit syscall, a fatal, or the
+     * clean-exit sentinel. Initial $sp matches P1 (top of RAM minus 64 KB;
+     * crt0's RFU060 declares the real stack). */
+    rt_sched_boot(cfg.entry, cfg.gp, RT_RAM_SIZE - 0x10000);
 }

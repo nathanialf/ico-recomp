@@ -42,6 +42,8 @@
  */
 #include "runtime.h"
 
+#include "ee/kernel.h"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -140,6 +142,10 @@ void rt_call_indirect(R5900Context* ctx, uint32_t target, uint32_t caller_vram) 
     uint32_t idx = RECOMP_FUNC_IDX(target);
     recomp_fn_t fn = g_functab[idx];
     if (!fn) {
+        /* Untranslated target: give the SIF HLE a chance to claim it (the
+         * sifcmd system handlers are data-referenced sub-entries inside a
+         * handwritten libkernel blob; see sif/sif.cpp). */
+        if (rt_sif_try_resolve_indirect(ctx, target, caller_vram)) return;
         rt_bad_indirect(target, caller_vram);
         return;
     }

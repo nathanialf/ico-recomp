@@ -33,6 +33,11 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/log.cpp
     src/runtime/sha1.cpp
     src/runtime/main.cpp
+    src/runtime/ee/sched.cpp
+    src/runtime/ee/syscalls.cpp
+    src/runtime/ee/intc.cpp
+    src/runtime/ee/timers.cpp
+    src/runtime/sif/sif.cpp
 )
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
@@ -40,6 +45,7 @@ add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
 target_include_directories(icorecomp-runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/runtime
+    ${CMAKE_SOURCE_DIR}/third_party/minicoro
 )
 
 target_compile_definitions(icorecomp-runtime PRIVATE
