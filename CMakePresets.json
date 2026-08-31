@@ -23,10 +23,22 @@
                 "CMAKE_C_COMPILER": "gcc",
                 "CMAKE_CXX_COMPILER": "g++"
             }
+        },
+        {
+            "name": "windows-mingw-cross",
+            "displayName": "Windows x86_64 cross (mingw-w64), no paraLLEl-GS",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/windows-mingw-cross",
+            "toolchainFile": "${sourceDir}/cmake/mingw-w64.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "ICORECOMP_PARALLEL_GS": "OFF"
+            }
         }
     ],
     "buildPresets": [
         { "name": "linux-gcc-debug", "configurePreset": "linux-gcc-debug" },
-        { "name": "linux-gcc-release", "configurePreset": "linux-gcc-release" }
+        { "name": "linux-gcc-release", "configurePreset": "linux-gcc-release" },
+        { "name": "windows-mingw-cross", "configurePreset": "windows-mingw-cross" }
     ]
 }

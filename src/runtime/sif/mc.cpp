@@ -56,6 +56,8 @@
  */
 #include "rpc.h"
 
+#include "../host/portable.h"
+
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -220,7 +222,7 @@ McTime time_from_host(const std::string& hpath) {
     McTime t;
     if (::stat(hpath.c_str(), &st) == 0) {
         struct tm tmv {};
-        localtime_r(&st.st_mtime, &tmv);
+        rt_localtime(st.st_mtime, &tmv);
         t.y = tmv.tm_year + 1900; t.mo = tmv.tm_mon + 1; t.d = tmv.tm_mday;
         t.h = tmv.tm_hour; t.mi = tmv.tm_min; t.s = tmv.tm_sec;
     }
@@ -230,7 +232,7 @@ McTime time_from_host(const std::string& hpath) {
 McTime time_now() {
     std::time_t now = std::time(nullptr);
     struct tm tmv {};
-    localtime_r(&now, &tmv);
+    rt_localtime(now, &tmv);
     McTime t;
     t.y = tmv.tm_year + 1900; t.mo = tmv.tm_mon + 1; t.d = tmv.tm_mday;
     t.h = tmv.tm_hour; t.mi = tmv.tm_min; t.s = tmv.tm_sec;

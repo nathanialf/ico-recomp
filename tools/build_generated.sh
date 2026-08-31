@@ -5,6 +5,12 @@
 # warnings are errors so the gate stays mechanical.
 #
 # Usage: tools/build_generated.sh [-jN]
+#
+# Linux/bash only. On Windows this gate is not needed: the CMake build
+# compiles the same generated TUs through the `generated` / `generated_vu1`
+# object libraries (see CMakeLists.txt), with per-compiler flags handled
+# there. A python equivalent can replace this script if a native Windows
+# gate is ever wanted.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

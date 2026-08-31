@@ -157,7 +157,13 @@ public:
         if (!env_is_1("ICORECOMP_VVL")) {
             /* Granite auto-enables the validation layer when installed;
              * keep runs reproducible unless explicitly requested. */
+#ifdef _WIN32
+            if (!std::getenv("GRANITE_VULKAN_NO_VALIDATION")) {
+                _putenv_s("GRANITE_VULKAN_NO_VALIDATION", "1");
+            }
+#else
             setenv("GRANITE_VULKAN_NO_VALIDATION", "1", 0);
+#endif
         } else {
             rt_log("gs", "paraLLEl-GS: ICORECOMP_VVL=1, Vulkan validation enabled if the layer is installed");
         }

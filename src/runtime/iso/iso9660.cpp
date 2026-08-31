@@ -22,6 +22,7 @@
  */
 #include "iso9660.h"
 
+#include "../host/portable.h"
 #include "../runtime.h"
 
 #include <cctype>
@@ -76,7 +77,7 @@ std::string toml_lookup(const char* path, const char* section, const char* key) 
 bool read_raw_sector(uint32_t lsn, uint8_t out[2048]) {
     if (!g_disc || lsn >= g_total_sectors) return false;
     long long pos = (long long)lsn * g_sector_size + g_data_offset;
-    if (std::fseek(g_disc, (long)pos, SEEK_SET) != 0) return false;
+    if (rt_fseek64(g_disc, pos, SEEK_SET) != 0) return false;
     return std::fread(out, 1, 2048, g_disc) == 2048;
 }
 
@@ -95,7 +96,7 @@ bool probe_layout(long long file_size) {
     for (const Layout& c : candidates) {
         long long pos = 16ll * c.ss + c.off;
         if (pos + 6 > file_size) continue;
-        if (std::fseek(g_disc, (long)pos, SEEK_SET) != 0) continue;
+        if (rt_fseek64(g_disc, pos, SEEK_SET) != 0) continue;
         if (std::fread(buf, 1, 6, g_disc) != 6) continue;
         if (buf[0] == 0x01 && std::memcmp(buf + 1, "CD001", 5) == 0) {
             g_sector_size = c.ss;
@@ -166,8 +167,8 @@ bool scan_dir(uint32_t dir_lba, uint32_t dir_size, const char* component,
 bool try_open(const std::string& path, const char* how) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
-    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return false; }
-    long long size = std::ftell(f);
+    if (rt_fseek64(f, 0, SEEK_END) != 0) { std::fclose(f); return false; }
+    long long size = rt_ftell64(f);
     g_disc = f;
     if (!probe_layout(size)) {
         rt_log("iso", "'%s' (%s): no ISO9660 PVD found at any known sector layout; skipping",

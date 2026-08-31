@@ -1,6 +1,8 @@
 /* host/audio.cpp: host audio output (SDL3 stream + WAV capture). See audio.h. */
 #include "audio.h"
 
+#include "portable.h"
+
 #include "../runtime.h"
 
 #include <cinttypes>
@@ -42,10 +44,10 @@ void wav_write_header() {
     std::memcpy(h + 34, &bits, 2);
     std::memcpy(h + 36, "data", 4);
     std::memcpy(h + 40, &data_bytes32, 4);
-    long pos = std::ftell(g_wav);
-    std::fseek(g_wav, 0, SEEK_SET);
+    int64_t pos = rt_ftell64(g_wav);
+    rt_fseek64(g_wav, 0, SEEK_SET);
     std::fwrite(h, 1, sizeof(h), g_wav);
-    if (pos > (long)sizeof(h)) std::fseek(g_wav, pos, SEEK_SET);
+    if (pos > (int64_t)sizeof(h)) rt_fseek64(g_wav, pos, SEEK_SET);
 }
 
 void wav_open() {

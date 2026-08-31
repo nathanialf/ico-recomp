@@ -45,7 +45,9 @@
 //! ---------------------------------------------------------------------
 
 use std::fmt::Write as _;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_void};
+#[cfg(unix)]
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -723,13 +725,51 @@ fn cop2_misc_cases(cases: &mut Vec<Case>) {
 
 // ---- snippet .so ---------------------------------------------------------
 
+#[cfg(unix)]
 extern "C" {
     fn dlopen(path: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(h: *mut c_void, name: *const c_char) -> *mut c_void;
     fn dlerror() -> *mut c_char;
 }
 
+#[cfg(unix)]
 const RTLD_NOW: c_int = 2;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(path: *const c_char) -> *mut c_void;
+    fn GetProcAddress(h: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+fn dso_open(path: &Path) -> *mut c_void {
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        let h = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW) };
+        if h.is_null() {
+            let err = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
+            panic!("dlopen failed: {}", err.to_string_lossy());
+        }
+        h
+    }
+    #[cfg(windows)]
+    {
+        let h = unsafe { LoadLibraryA(cpath.as_ptr()) };
+        assert!(!h.is_null(), "LoadLibraryA failed for {}", path.display());
+        h
+    }
+}
+
+fn dso_sym(h: *mut c_void, name: &str) -> *mut c_void {
+    let cname = std::ffi::CString::new(name).unwrap();
+    #[cfg(unix)]
+    let p = unsafe { dlsym(h, cname.as_ptr()) };
+    #[cfg(windows)]
+    let p = unsafe { GetProcAddress(h, cname.as_ptr()) };
+    assert!(!p.is_null(), "resolving symbol {name} failed");
+    p
+}
 
 fn repo_include() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -769,13 +809,18 @@ fn build_so(cases: &[Case]) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("icorecomp-threeway-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let c_path = dir.join("snippets.c");
-    let so_path = dir.join("snippets.so");
+    // A mingw gcc on PATH is expected on Windows (what CI's runners have);
+    // -fPIC stays unix-only because mingw warns it away under -Werror.
+    let so_path = dir.join(if cfg!(windows) { "snippets.dll" } else { "snippets.so" });
     std::fs::write(&c_path, src).unwrap();
-    let status = Command::new("gcc")
+    let mut cmd = Command::new("gcc");
+    if cfg!(unix) {
+        cmd.arg("-fPIC");
+    }
+    let status = cmd
         .args([
             "-std=c11",
             "-O1",
-            "-fPIC",
             "-shared",
             "-fno-strict-aliasing",
             "-ffp-contract=off",
@@ -801,18 +846,8 @@ struct Snippets {
 }
 
 fn load_so(path: &Path, n: usize) -> Snippets {
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let h = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW) };
-    if h.is_null() {
-        let err = unsafe { std::ffi::CStr::from_ptr(dlerror()) };
-        panic!("dlopen failed: {}", err.to_string_lossy());
-    }
-    let sym = |name: &str| -> *mut c_void {
-        let cname = std::ffi::CString::new(name).unwrap();
-        let p = unsafe { dlsym(h, cname.as_ptr()) };
-        assert!(!p.is_null(), "dlsym {name} failed");
-        p
-    };
+    let h = dso_open(path);
+    let sym = |name: &str| -> *mut c_void { dso_sym(h, name) };
     let set_page =
         unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u8)>(sym("so_set_page")) };
     let funcs = (0..n)

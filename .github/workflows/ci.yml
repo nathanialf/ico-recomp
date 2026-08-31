@@ -44,10 +44,33 @@ jobs:
       - name: translator tests
         working-directory: tools/recomp
         run: cargo test --release
-      - name: configure and build runtime (stub mode, no GS backend)
+      - name: configure and build runtime (stub mode, dump backend, no paraLLEl-GS)
+        # The GS dump backend (gs_dumpwriter.cpp) is unconditional; only the
+        # paraLLEl-GS live backend is optional and stays off here.
         run: |
           cmake -B build -DICORECOMP_PARALLEL_GS=OFF
           cmake --build build --config Release
+
+  runtime-pgs-windows:
+    # Optional/informational: the paraLLEl-GS live backend on MSVC. Needs
+    # the submodule tree and the Vulkan SDK; failures here never block.
+    continue-on-error: true
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: install Vulkan SDK
+        run: choco install vulkan-sdk --no-progress -y
+      - name: locate Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          echo "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: configure and build runtime (paraLLEl-GS live backend)
+        run: |
+          cmake -B build-pgs -DICORECOMP_PARALLEL_GS=ON
+          cmake --build build-pgs --config Release
 # verify-decode and the ground-truth tests need the sibling ico decomp
 # checkout and the user's ELF; they run locally, not in CI. Tests that
 # depend on ../ico skip with a notice when it is absent.

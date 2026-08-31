@@ -1,10 +1,11 @@
 //! Compiles the C shim (csrc/shim.c) that exposes the recomp_ops.h helpers
-//! to the Rust interpreter. gcc is invoked directly so the build carries no
-//! extra crate dependencies; the flags mirror tools/build_generated.sh plus
-//! -ffp-contract=off, which the shared float helpers require.
+//! to the Rust interpreter. Uses the cc crate so the shim builds with the
+//! right compiler for the target (gcc/clang on unix, cl.exe for msvc
+//! targets, the mingw cross gcc for *-pc-windows-gnu). The flags mirror
+//! tools/build_generated.sh plus -ffp-contract=off, which the shared float
+//! helpers require: multiply and add must round separately, no FMA.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -16,42 +17,30 @@ fn main() {
         .to_path_buf();
     let include = repo_root.join("include");
     let shim = manifest.join("csrc/shim.c");
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let obj = out.join("shim.o");
-    let lib = out.join("libeeshim.a");
 
-    let status = Command::new("gcc")
-        .args([
-            "-std=c11",
-            "-O1",
-            "-fPIC",
-            "-fno-strict-aliasing",
-            "-ffp-contract=off",
-            "-Wall",
-            "-Werror",
-            "-c",
-        ])
-        .arg("-I")
-        .arg(&include)
-        .arg(&shim)
-        .arg("-o")
-        .arg(&obj)
-        .status()
-        .expect("running gcc");
-    assert!(status.success(), "gcc failed on {}", shim.display());
+    let mut build = cc::Build::new();
+    build
+        .file(&shim)
+        .include(&include)
+        .std("c11")
+        .opt_level(1)
+        .warnings(true);
+    if build.get_compiler().is_like_msvc() {
+        // /fp:precise alone still permits contraction on recent MSVC;
+        // /fp:contract- (VS2022 17.0+) turns it off explicitly.
+        build.flag("/fp:precise");
+        build.flag_if_supported("/fp:contract-");
+    } else {
+        build
+            .flag("-fno-strict-aliasing")
+            .flag("-ffp-contract=off")
+            .flag("-Werror");
+    }
+    build.compile("eeshim");
 
-    let status = Command::new("ar")
-        .arg("crs")
-        .arg(&lib)
-        .arg(&obj)
-        .status()
-        .expect("running ar");
-    assert!(status.success(), "ar failed");
-
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=eeshim");
-    // MSVC has no separate libm; the CRT provides the math symbols.
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+    // The shim calls libm functions; on unix libm is separate. Windows
+    // CRTs (msvc and mingw) provide the math symbols without it.
+    if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("unix") {
         println!("cargo:rustc-link-lib=dylib=m");
     }
     println!("cargo:rerun-if-changed=csrc/shim.c");

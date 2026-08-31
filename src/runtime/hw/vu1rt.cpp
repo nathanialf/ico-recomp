@@ -55,6 +55,8 @@
 #include <cstring>
 #include <vector>
 
+#include "../host/portable.h"
+
 #ifdef ICORECOMP_HAVE_VU1_GENERATED
 extern "C" void rt_vu1_register_all(void);
 #endif
@@ -96,9 +98,8 @@ uint8_t* rt_vu1_window_page() {
         /* Room for the 64 KB window at raw+12 plus the Vu1State tail
          * padding (4 bytes past the window end). */
         const size_t raw_size = 0x10020;
-        void* raw = std::aligned_alloc(16, raw_size);
-        if (!raw) rt_fatal("vu1", nullptr, "aligned_alloc(%zu) for VU window failed", raw_size);
-        std::memset(raw, 0, raw_size);
+        void* raw = rt_aligned_zalloc(16, raw_size);
+        if (!raw) rt_fatal("vu1", nullptr, "rt_aligned_zalloc(%zu) for VU window failed", raw_size);
         g_window = static_cast<uint8_t*>(raw) + kWindowSkew;
         uint8_t* state_base = g_window + 0xC000 - offsetof(Vu1State, mem);
         if ((reinterpret_cast<uintptr_t>(state_base) & 15) != 0) {

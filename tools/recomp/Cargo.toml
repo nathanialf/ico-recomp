@@ -24,3 +24,4 @@ object = "0.36"
 clap = { version = "4", features = ["derive"] }
 sha1 = "0.10"
 rayon = "1"
+cc = "1"

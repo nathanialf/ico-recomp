@@ -181,6 +181,10 @@ if(EXISTS "${GENERATED_VU1_DIR}")
         target_include_directories(generated_vu1 PRIVATE ${CMAKE_SOURCE_DIR}/include)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
             target_compile_options(generated_vu1 PRIVATE -fno-strict-aliasing -ffp-contract=off)
+        elseif(MSVC)
+            # /fp:precise still permits FMA contraction on recent MSVC;
+            # /fp:contract- (VS2022+) forbids it, matching -ffp-contract=off.
+            target_compile_options(generated_vu1 PRIVATE /fp:precise /fp:contract-)
         endif()
 
         target_link_libraries(icorecomp-runtime PRIVATE generated_vu1)

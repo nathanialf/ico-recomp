@@ -39,6 +39,7 @@
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "host/portable.h"
 #include "hw/hw.h"
 
 #include <cstdlib>
@@ -60,10 +61,8 @@ uint8_t* g_ram = nullptr;
 uint8_t* g_scratchpad = nullptr;
 
 uint8_t* aligned_zalloc(size_t align, size_t size) {
-    /* size must already be a multiple of align for aligned_alloc. */
-    void* p = std::aligned_alloc(align, size);
-    if (!p) rt_fatal("mem", nullptr, "aligned_alloc(align=%zu, size=%zu) failed", align, size);
-    std::memset(p, 0, size);
+    void* p = rt_aligned_zalloc(align, size);
+    if (!p) rt_fatal("mem", nullptr, "rt_aligned_zalloc(align=%zu, size=%zu) failed", align, size);
     return static_cast<uint8_t*>(p);
 }
 

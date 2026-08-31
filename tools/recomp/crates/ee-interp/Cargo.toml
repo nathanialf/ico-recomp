@@ -8,3 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 r5900-decode = { path = "../r5900-decode" }
 ee-emit = { path = "../ee-emit" }
+
+[build-dependencies]
+cc.workspace = true

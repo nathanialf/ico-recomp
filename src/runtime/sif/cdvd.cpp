@@ -22,6 +22,7 @@
  */
 #include "rpc.h"
 
+#include "../host/portable.h"
 #include "../iso/iso9660.h"
 
 #include <cinttypes>
@@ -60,7 +61,7 @@ void svc_scmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
         case 0x01: { /* sceCdReadClock: recv {result, sceCdCLOCK(8)} */
             std::time_t now = std::time(nullptr);
             std::tm tmv {};
-            localtime_r(&now, &tmv);
+            rt_localtime(now, &tmv);
             unsigned year = tmv.tm_year + 1900;
             unsigned y2k = year >= 2000 ? year - 2000 : 0;
             if (recv_size >= 16) {

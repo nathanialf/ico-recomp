@@ -81,14 +81,16 @@ void crash_handler(int sig) {
         case SIGSEGV: name = "SIGSEGV"; break;
         case SIGFPE:  name = "SIGFPE"; break;
         case SIGILL:  name = "SIGILL"; break;
+#ifdef SIGBUS
         case SIGBUS:  name = "SIGBUS"; break;
+#endif
         default: break;
     }
     std::fprintf(stderr, "[icorecomp][crash] FATAL: caught %s while running guest code (thread %d)\n",
         name, rt_thread_current_id());
     if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     std::fflush(stderr);
-    _exit(1);
+    std::_Exit(1);
 }
 
 /* SIGINT: dump the thread/semaphore inventory before dying so an
@@ -97,14 +99,17 @@ void sigint_handler(int) {
     std::fprintf(stderr, "\n[icorecomp][main] SIGINT\n");
     if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     rt_sched_dump_inventory("SIGINT");
-    _exit(130);
+    std::_Exit(130);
 }
 
 void install_crash_handler() {
     std::signal(SIGSEGV, crash_handler);
     std::signal(SIGFPE, crash_handler);
     std::signal(SIGILL, crash_handler);
+#ifdef SIGBUS
+    /* Not a thing on Windows; faults arrive as SIGSEGV there. */
     std::signal(SIGBUS, crash_handler);
+#endif
     std::signal(SIGINT, sigint_handler);
 }
 
