@@ -9,3 +9,9 @@ name = "icorecomp"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+serde.workspace = true
+toml.workspace = true
+r5900-decode = { path = "../r5900-decode" }

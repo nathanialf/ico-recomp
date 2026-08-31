@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  no-rom-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no game data committed
+        run: bash tools/check_no_rom.sh --all
+
+  translator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: unit tests
+        working-directory: tools/recomp
+        run: cargo test --release
+      - name: lint
+        working-directory: tools/recomp
+        run: cargo clippy --all-targets -- -D warnings
+# verify-decode and the ground-truth tests need the sibling ico decomp
+# checkout and the user's ELF; they run locally, not in CI. Tests that
+# depend on ../ico skip with a notice when it is absent.
