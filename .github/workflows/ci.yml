@@ -23,6 +23,31 @@ jobs:
       - name: lint
         working-directory: tools/recomp
         run: cargo clippy --all-targets -- -D warnings
+
+  runtime-stub-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure and build (stub mode, no GS backend)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build -j4
+
+  runtime-stub-windows:
+    # Informational until the Windows port lands: failures here are
+    # portability debt to burn down, not merge blockers.
+    continue-on-error: true
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: translator tests
+        working-directory: tools/recomp
+        run: cargo test --release
+      - name: configure and build runtime (stub mode, no GS backend)
+        run: |
+          cmake -B build -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build --config Release
 # verify-decode and the ground-truth tests need the sibling ico decomp
 # checkout and the user's ELF; they run locally, not in CI. Tests that
 # depend on ../ico skip with a notice when it is absent.
