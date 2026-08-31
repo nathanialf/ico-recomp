@@ -5,3 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+r5900-decode = { path = "../r5900-decode" }
+ee-emit = { path = "../ee-emit" }

@@ -201,6 +201,11 @@ dependencies = [
 [[package]]
 name = "ee-interp"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ee-emit",
+ "r5900-decode",
+]
 
 [[package]]
 name = "either"

@@ -2,15 +2,18 @@
 //! statement (possibly a braced block). Control-flow instructions never
 //! reach this module; `body.rs` handles them.
 //!
-//! Coverage policy: the match below implements exactly the integer mnemonic
-//! set measured in this one binary (see `census`). COP1 and COP2 mnemonics
-//! are routed to `rt_unimplemented`. Anything else is a translation-time
-//! hard error.
+//! Coverage policy: the match below implements exactly the mnemonic set
+//! measured in this one binary (see `census`): the integer set, the 16
+//! censused COP1 ops, and the censused COP2 macro set (via `cop2::parse`).
+//! Anything else is a translation-time hard error. Only the privileged
+//! kernel-context ops (eret/tlb*) stay routed to `rt_unimplemented`.
 
 use std::collections::BTreeMap;
 
 use anyhow::Result;
 use r5900_decode::{Insn, Operand};
+
+use crate::cop2::{self, AccFmac, Cop2, Fmac, Sel};
 
 /// Per-emission-run statistics owned by the caller.
 #[derive(Debug, Default, Clone)]
@@ -73,6 +76,13 @@ fn cop0(ops: &[Operand]) -> u8 {
         }
     }
     panic!("expected Cop0 operand");
+}
+
+fn fpr(ops: &[Operand], i: usize) -> u8 {
+    match ops.get(i) {
+        Some(Operand::Fpr(n)) => *n,
+        other => panic!("expected Fpr operand, got {other:?}"),
+    }
 }
 
 // ---- register access expressions ---------------------------------------
@@ -202,15 +212,14 @@ pub fn emit_stmt(insn: &Insn, st: &mut OpStats) -> Result<String> {
     let ops = insn.operands();
 
     // COP2 macro ops all start with 'v'; no integer mnemonic does.
-    if m.starts_with('v')
-        || m.starts_with("qmfc2")
-        || m.starts_with("qmtc2")
-        || m.starts_with("cfc2")
-        || m.starts_with("ctc2")
-        || m == "lqc2"
-        || m == "sqc2"
-    {
-        return Ok(unimpl(m, vram, st));
+    if cop2::is_cop2(m) {
+        return Ok(match cop2::parse(insn) {
+            Ok(op) => emit_cop2(&op),
+            Err(_) => {
+                *st.unknown.entry(m.to_string()).or_insert(0) += 1;
+                format!("#error \"unknown mnemonic {m}\"")
+            }
+        });
     }
 
     let s = match m {
@@ -653,10 +662,61 @@ pub fn emit_stmt(insn: &Insn, st: &mut OpStats) -> Result<String> {
         // kernel; trap loudly if ever hit.
         "eret" | "tlbr" | "tlbwi" | "tlbp" | "tlbwr" => unimpl(m, vram, st),
 
-        // ---- COP1 (P1: unimplemented except bc1* branches) ----------------
-        "lwc1" | "swc1" | "mfc1" | "mtc1" | "add.s" | "sub.s" | "mul.s" | "div.s" | "abs.s"
-        | "neg.s" | "mov.s" | "sqrt.s" | "cvt.s.w" | "cvt.w.s" | "c.eq.s" | "c.lt.s"
-        | "c.le.s" | "c.f.s" => unimpl(m, vram, st),
+        // ---- COP1 (FPU tier 0) --------------------------------------------
+        "lwc1" => {
+            let f = fpr(ops, 0);
+            let (off, base) = mem(ops);
+            format!("ctx->f[{f}] = rc_bits2f(rc_read32({}));", addr(base, off))
+        }
+        "swc1" => {
+            let f = fpr(ops, 0);
+            let (off, base) = mem(ops);
+            format!("rc_write32({}, rc_f2bits(ctx->f[{f}]));", addr(base, off))
+        }
+        "mfc1" => {
+            let (rt, fs) = (gpr(ops, 0), fpr(ops, 1));
+            w64(rt, &se32(&format!("rc_f2bits(ctx->f[{fs}])")))
+        }
+        "mtc1" => {
+            let (rt, fs) = (gpr(ops, 0), fpr(ops, 1));
+            format!("ctx->f[{fs}] = rc_bits2f({});", ru32(rt))
+        }
+        "mov.s" | "neg.s" | "abs.s" => {
+            let (fd, fs) = (fpr(ops, 0), fpr(ops, 1));
+            let h = match m {
+                "mov.s" => "rc_fmov",
+                "neg.s" => "rc_fneg",
+                _ => "rc_fabs_",
+            };
+            format!("ctx->f[{fd}] = {h}(ctx->f[{fs}]);")
+        }
+        "add.s" | "sub.s" | "mul.s" | "div.s" => {
+            let (fd, fs, ft) = (fpr(ops, 0), fpr(ops, 1), fpr(ops, 2));
+            let h = match m {
+                "add.s" => "rc_fadd",
+                "sub.s" => "rc_fsub",
+                "mul.s" => "rc_fmul",
+                _ => "rc_fdiv",
+            };
+            format!("ctx->f[{fd}] = {h}(ctx->f[{fs}], ctx->f[{ft}]);")
+        }
+        "cvt.s.w" => {
+            let (fd, fs) = (fpr(ops, 0), fpr(ops, 1));
+            format!("ctx->f[{fd}] = rc_cvtsw((int32_t)rc_f2bits(ctx->f[{fs}]));")
+        }
+        "cvt.w.s" => {
+            let (fd, fs) = (fpr(ops, 0), fpr(ops, 1));
+            format!("ctx->f[{fd}] = rc_bits2f((uint32_t)rc_cvtws(ctx->f[{fs}]));")
+        }
+        "c.eq.s" | "c.lt.s" | "c.le.s" => {
+            let (fs, ft) = (fpr(ops, 0), fpr(ops, 1));
+            let h = match m {
+                "c.eq.s" => "rc_fc_eq",
+                "c.lt.s" => "rc_fc_lt",
+                _ => "rc_fc_le",
+            };
+            format!("rc_fcr31_cond(&ctx->fcr31, {h}(ctx->f[{fs}], ctx->f[{ft}]));")
+        }
 
         other => {
             // Collected across the whole run; lib.rs hard-errors after the
@@ -666,4 +726,92 @@ pub fn emit_stmt(insn: &Insn, st: &mut OpStats) -> Result<String> {
         }
     };
     Ok(s)
+}
+
+/// Format the third-operand selector for the rc_vu_* helpers.
+fn sel_c(sel: Sel) -> String {
+    match sel {
+        Sel::Lane(l) => format!("{l}"),
+        Sel::Vec => "RC_VU_SRC_VEC".into(),
+        Sel::Q => "RC_VU_SRC_Q".into(),
+    }
+}
+
+/// Emit one classified COP2 macro instruction as a helper call.
+fn emit_cop2(op: &Cop2) -> String {
+    let vu = "&ctx->vu0";
+    match *op {
+        Cop2::Lqc2 { ft, offset, base } => {
+            format!("rc_vu_lqc2({vu}, {ft}, {});", addr(base, offset))
+        }
+        Cop2::Sqc2 { fs, offset, base } => {
+            format!("rc_vu_sqc2({vu}, {fs}, {});", addr(base, offset))
+        }
+        Cop2::Qmfc2 { rt, fs } => {
+            if rt == 0 {
+                String::new()
+            } else {
+                format!("ctx->r[{rt}] = rc_vu_qmfc({vu}, {fs});")
+            }
+        }
+        Cop2::Qmtc2 { rt, fd } => format!("rc_vu_qmtc({vu}, {fd}, {});", q128(rt)),
+        Cop2::Cfc2 { rt, creg } => {
+            if rt == 0 {
+                // Keep the read so an unknown control register still hits
+                // the loud runtime hook.
+                format!("(void)rc_vu_cfc(ctx, {creg});")
+            } else {
+                w64(rt, &se32(&format!("rc_vu_cfc(ctx, {creg})")))
+            }
+        }
+        Cop2::Ctc2 { rt, creg } => format!("rc_vu_ctc(ctx, {creg}, {});", ru32(rt)),
+        Cop2::Fmac { family, fd, fs, ft, sel, mask } => {
+            let h = match family {
+                Fmac::Add => "rc_vu_add",
+                Fmac::Sub => "rc_vu_sub",
+                Fmac::Mul => "rc_vu_mul",
+                Fmac::Madd => "rc_vu_madd",
+                Fmac::Msub => "rc_vu_msub",
+                Fmac::Max => "rc_vu_max",
+                Fmac::Mini => "rc_vu_mini",
+            };
+            format!("{h}({vu}, {fd}, {fs}, {ft}, {}, 0x{mask:X});", sel_c(sel))
+        }
+        Cop2::FmacAcc { family, fs, ft, sel, mask } => {
+            let h = match family {
+                AccFmac::Adda => "rc_vu_adda",
+                AccFmac::Mula => "rc_vu_mula",
+                AccFmac::Madda => "rc_vu_madda",
+            };
+            format!("{h}({vu}, {fs}, {ft}, {}, 0x{mask:X});", sel_c(sel))
+        }
+        Cop2::Opmula { fs, ft } => format!("rc_vu_opmula({vu}, {fs}, {ft});"),
+        Cop2::Opmsub { fd, fs, ft } => format!("rc_vu_opmsub({vu}, {fd}, {fs}, {ft});"),
+        Cop2::Ftoi { shift, ft, fs, mask } => {
+            format!("rc_vu_ftoi({vu}, {shift}, {ft}, {fs}, 0x{mask:X});")
+        }
+        Cop2::Itof { shift, ft, fs, mask } => {
+            format!("rc_vu_itof({vu}, {shift}, {ft}, {fs}, 0x{mask:X});")
+        }
+        Cop2::Move { ft, fs, mask } => format!("rc_vu_move({vu}, {ft}, {fs}, 0x{mask:X});"),
+        Cop2::Mr32 { ft, fs, mask } => format!("rc_vu_mr32({vu}, {ft}, {fs}, 0x{mask:X});"),
+        Cop2::Div { fs, fsf, ft, ftf } => {
+            format!("rc_vu_div({vu}, {fs}, {fsf}, {ft}, {ftf});")
+        }
+        Cop2::Sqrt { ft, ftf } => format!("rc_vu_sqrt({vu}, {ft}, {ftf});"),
+        Cop2::Rsqrt { fs, fsf, ft, ftf } => {
+            format!("rc_vu_rsqrt({vu}, {fs}, {fsf}, {ft}, {ftf});")
+        }
+        Cop2::Clipw { fs, ft } => format!("rc_vu_clipw({vu}, {fs}, {ft});"),
+        Cop2::Lqi { ft, is, mask } => format!("rc_vu_lqi({vu}, {ft}, {is}, 0x{mask:X});"),
+        Cop2::Lqd { ft, is, mask } => format!("rc_vu_lqd({vu}, {ft}, {is}, 0x{mask:X});"),
+        Cop2::Sqi { fs, it, mask } => format!("rc_vu_sqi({vu}, {fs}, {it}, 0x{mask:X});"),
+        Cop2::Iaddi { it, is, imm } => format!("rc_vu_iaddi({vu}, {it}, {is}, {imm});"),
+        Cop2::Rnext { ft, mask } => format!("rc_vu_rnext({vu}, {ft}, 0x{mask:X});"),
+        Cop2::Rinit { fs, fsf } => format!("rc_vu_rinit({vu}, {fs}, {fsf});"),
+        Cop2::Rxor { fs, fsf } => format!("rc_vu_rxor({vu}, {fs}, {fsf});"),
+        // vwaitq: macro-mode Q results commit immediately, so the wait is
+        // a no-op. vnop is architectural.
+        Cop2::Waitq | Cop2::Nop => String::new(),
+    }
 }

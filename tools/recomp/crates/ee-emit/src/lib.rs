@@ -8,6 +8,7 @@
 
 mod body;
 mod census;
+pub mod cop2;
 mod flow;
 mod names;
 mod ops;
@@ -24,6 +25,24 @@ use ingest::{ElfImage, ProgramDb};
 use r5900_decode::{decode, Insn};
 
 pub use census::census;
+
+/// Emit the C statement for one straight-line instruction. Test support for
+/// the three-way harness in `ee-interp`; errors if the instruction is
+/// outside the measured coverage or is only routed (`rt_unimplemented`).
+pub fn emit_insn(insn: &Insn) -> Result<String> {
+    let mut st = ops::OpStats::default();
+    let s = ops::emit_stmt(insn, &mut st)?;
+    if let Some((m, _)) = st.unknown.iter().next() {
+        bail!("mnemonic {m} outside the measured coverage");
+    }
+    if let Some((m, _)) = st.unimplemented.iter().next() {
+        bail!("mnemonic {m} is routed to rt_unimplemented, not translated");
+    }
+    if st.invalid_words != 0 {
+        bail!("invalid instruction word");
+    }
+    Ok(s)
+}
 
 use body::{Group, GroupStats, Member, Resolver};
 use flow::{classify, Flow};
