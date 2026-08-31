@@ -235,8 +235,8 @@ pub fn emit_all(db: &ProgramDb, image: &ElfImage, out_dir: &Path) -> Result<Emit
     }
 
     let mut group_members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for i in 0..nfuncs {
-        if in_text[i] {
+    for (i, &in_t) in in_text.iter().enumerate().take(nfuncs) {
+        if in_t {
             group_members.entry(uf.find(i)).or_default().push(i);
         }
     }
