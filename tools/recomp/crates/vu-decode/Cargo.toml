@@ -4,4 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
+[dev-dependencies]
+sha1.workspace = true
+toml.workspace = true
