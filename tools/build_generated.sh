@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Gate B for the EE translator: every generated TU must compile as C11.
-# Compiles all of generated/ee/*.c to objects under build/generated/ee and
-# reports wall time. -Wall is on for the whole tree; warnings are errors so
-# the gate stays mechanical.
+# Gate B for the translators: every generated TU must compile as C11.
+# Compiles generated/ee/*.c and generated/vu1/*.c to objects under
+# build/generated/ and reports wall time. -Wall is on for the whole tree;
+# warnings are errors so the gate stays mechanical.
 #
 # Usage: tools/build_generated.sh [-jN]
 set -euo pipefail
@@ -12,25 +12,36 @@ cd "$(dirname "$0")/.."
 jobs="${1:--j$(nproc)}"
 jobs="${jobs#-j}"
 
-gen="generated/ee"
-out="build/generated/ee"
+CFLAGS=(-std=c11 -O1 -fno-strict-aliasing -ffp-contract=off -Wall -Werror -c -I include -I generated)
 
-if [[ ! -d "$gen" ]]; then
-    echo "build_generated: $gen not found; run 'icorecomp ee' first" >&2
+compile_tree() {
+    local gen="$1" out="$2"
+    mkdir -p "$out"
+    find "$gen" -maxdepth 1 -name '*.c' -print0 \
+        | xargs -0 -P "$jobs" -I{} bash -c '
+            src="$1"; shift
+            obj="'"$out"'/$(basename "${src%.c}").o"
+            gcc '"${CFLAGS[*]}"' "$src" -o "$obj"
+        ' _ {}
+    local count
+    count=$(find "$gen" -maxdepth 1 -name '*.c' | wc -l)
+    echo "build_generated: $gen: $count TUs compiled clean (-Wall -Werror)"
+}
+
+found=0
+if [[ -d generated/ee ]]; then
+    found=1
+    SECONDS=0
+    compile_tree generated/ee build/generated/ee
+    echo "build_generated: generated/ee done in ${SECONDS}s with -j$jobs"
+fi
+if [[ -d generated/vu1 ]]; then
+    found=1
+    SECONDS=0
+    compile_tree generated/vu1 build/generated/vu1
+    echo "build_generated: generated/vu1 done in ${SECONDS}s with -j$jobs"
+fi
+if (( ! found )); then
+    echo "build_generated: no generated/ee or generated/vu1 found; run 'icorecomp ee' / 'icorecomp vu1' first" >&2
     exit 1
 fi
-
-mkdir -p "$out"
-
-CFLAGS=(-std=c11 -O1 -fno-strict-aliasing -Wall -Werror -c -I include -I generated)
-
-SECONDS=0
-find "$gen" -maxdepth 1 -name '*.c' -print0 \
-    | xargs -0 -P "$jobs" -I{} bash -c '
-        src="$1"; shift
-        obj="'"$out"'/$(basename "${src%.c}").o"
-        gcc '"${CFLAGS[*]}"' "$src" -o "$obj"
-    ' _ {}
-
-count=$(find "$gen" -maxdepth 1 -name '*.c' | wc -l)
-echo "build_generated: $count TUs compiled clean (-Wall -Werror) in ${SECONDS}s with -j$jobs"

@@ -17,3 +17,4 @@ toml.workspace = true
 r5900-decode = { path = "../r5900-decode" }
 ingest = { path = "../ingest" }
 ee-emit = { path = "../ee-emit" }
+vu-emit = { path = "../vu-emit" }

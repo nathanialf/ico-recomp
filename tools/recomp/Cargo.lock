@@ -380,6 +380,7 @@ dependencies = [
  "rayon",
  "serde",
  "toml",
+ "vu-emit",
 ]
 
 [[package]]
@@ -594,6 +595,11 @@ dependencies = [
 [[package]]
 name = "vu-emit"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ingest",
+ "vu-decode",
+]
 
 [[package]]
 name = "windows-link"

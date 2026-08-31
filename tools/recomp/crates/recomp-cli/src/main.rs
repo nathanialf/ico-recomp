@@ -1,5 +1,6 @@
 mod ee;
 mod verify_decode;
+mod vu1;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +37,16 @@ enum Cmd {
         #[arg(long)]
         census: bool,
     },
+    /// Translate the five VU1 microprograms in .vutext to C11 under
+    /// generated/vu1/ and print the latency audit.
+    Vu1 {
+        /// Path to recomp.toml.
+        #[arg(long, default_value = "config/recomp.toml")]
+        config: PathBuf,
+        /// Output directory. Must live under a gitignored generated/ tree.
+        #[arg(long, default_value = "generated/vu1")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -47,6 +58,7 @@ fn main() -> ExitCode {
             out,
             census,
         } => ee::run(&config, &out, census),
+        Cmd::Vu1 { config, out } => vu1::run(&config, &out),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,

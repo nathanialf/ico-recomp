@@ -711,6 +711,308 @@ RC_INLINE void rc_vu_ctc(R5900Context* ctx, int creg, uint32_t v) {
     }
 }
 
+/* ---- VU1 microprograms (static recompilation) ---------------------------
+ * Helpers for the C that vu-emit generates from the five .vutext
+ * microprograms. Vu1State is a distinct struct from Vu0State (own data
+ * memory, pipelined Q), so these are parallel entry points; the lane-level
+ * primitives (rc_vu_in, rc_vu_flagres, rc_vu_maxbits/minbits, rc_vu_ftoi1)
+ * are shared with macro mode so FMAC arithmetic and flag semantics stay
+ * identical across VU0 and VU1.
+ *
+ * Same-cycle model: generated code computes the upper (FMAC) half of a
+ * bundle into locals with the *_calc helpers, executes the lower half, then
+ * commits the upper result. Both halves therefore read pre-bundle state,
+ * matching the hardware's simultaneous issue (upper and lower source reads
+ * happen in the same cycle; writes land afterwards).
+ *
+ * Q pipeline model: div/rsqrt write pending_q and set q_pending; the value
+ * moves to q at rc_vu1_q_commit, which generated code invokes at waitq, at
+ * the issue of the next div-unit op, and at Q-read sites where the static
+ * latency audit proved the hardware pipeline (7 cycles div, 13 rsqrt) has
+ * completed. Q reads inside the latency window thus see the old Q, as on
+ * hardware. The I/D status bits are set at issue time, not at completion;
+ * the audit reports the status-read sites where that could differ.
+ */
+
+/* Canonical upload hash: FNV-1a 32-bit over the raw uploaded instruction
+ * bytes (the concatenation of the embedded VIF MPG payloads; the DMA chain
+ * tags, VIF codes, and quadword-pad NOPs in .vutext are upload framing and
+ * are not part of micro memory). The state is seeded with the byte length
+ * so prefixes of a longer upload cannot collide with it. The translator
+ * (registration constants in generated/vu1/vu1_table.c, via its Rust
+ * mirror in vu-emit) and the runtime's VIF1 MPG path (src/runtime/hw/
+ * vu1rt.cpp) must both use exactly this function. */
+RC_INLINE uint32_t rc_vu1_hash(const uint8_t* bytes, uint32_t len) {
+    uint32_t h = 0x811C9DC5u ^ len;
+    uint32_t i;
+    for (i = 0; i < len; i++) {
+        h ^= bytes[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+/* Third-operand selector: 0..3 broadcast lane, RC_VU_SRC_VEC, RC_VU_SRC_Q,
+ * or the VU1-only I-register form. */
+#define RC_VU1_SRC_I 6
+
+RC_INLINE rc_u128 rc_vu1_vf(const Vu1State* vu, int n) {
+    if (n != 0) return vu->vf[n];
+    rc_u128 v;
+    v.u32x[0] = 0;
+    v.u32x[1] = 0;
+    v.u32x[2] = 0;
+    v.u32x[3] = 0x3F800000u; /* 1.0f */
+    return v;
+}
+
+RC_INLINE uint32_t rc_vu1_vi(const Vu1State* vu, int n) {
+    return n != 0 ? vu->vi[n & 15] : 0;
+}
+
+/* Masked vi write; vi00 stays 0 (writes suppressed). */
+RC_INLINE void rc_vu1_viset(Vu1State* vu, int n, uint32_t v) {
+    if (n != 0) vu->vi[n & 15] = (uint16_t)v;
+}
+
+RC_INLINE rc_u128 rc_vu1_src(const Vu1State* vu, int ft, int sel) {
+    if (sel == RC_VU_SRC_VEC) return rc_vu1_vf(vu, ft);
+    float f;
+    if (sel == RC_VU_SRC_Q) f = vu->q;
+    else if (sel == RC_VU1_SRC_I) f = vu->i;
+    else f = rc_vu1_vf(vu, ft).f32x[sel & 3];
+    rc_u128 s;
+    s.f32x[0] = f;
+    s.f32x[1] = f;
+    s.f32x[2] = f;
+    s.f32x[3] = f;
+    return s;
+}
+
+RC_INLINE void rc_vu1_write(Vu1State* vu, int fd, int mask, rc_u128 v) {
+    if (fd == 0) return;
+    int i;
+    for (i = 0; i < 4; i++)
+        if (mask & (8 >> i)) vu->vf[fd].u32x[i] = v.u32x[i];
+}
+
+RC_INLINE void rc_vu1_flags_commit(Vu1State* vu, uint32_t mac) {
+    uint32_t st = vu->status & 0xFF0u;
+    vu->mac = mac & 0xFFFFu;
+    if (mac & 0x000Fu) st |= 0x001u;
+    if (mac & 0x00F0u) st |= 0x002u;
+    if (mac & 0x0F00u) st |= 0x004u;
+    if (mac & 0xF000u) st |= 0x008u;
+    st |= (st & 0x00Fu) << 6;
+    vu->status = st;
+}
+
+/* FMAC compute without state writes. kind: 0 add, 1 sub, 2 mul, 3 madd,
+ * 4 msub. The caller commits via rc_vu1_commit_vf/rc_vu1_commit_acc after
+ * the bundle's lower half has executed. */
+RC_INLINE rc_u128 rc_vu1_fmac_calc(const Vu1State* vu, int kind, int fs,
+                                   int ft, int sel, int mask, uint32_t* mac) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 b = rc_vu1_src(vu, ft, sel);
+    rc_u128 r;
+    r.u32x[0] = 0;
+    r.u32x[1] = 0;
+    r.u32x[2] = 0;
+    r.u32x[3] = 0;
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (!(mask & (8 >> i))) continue;
+        float x = rc_vu_in(a.f32x[i]);
+        float y = rc_vu_in(b.f32x[i]);
+        float v;
+        switch (kind) {
+        case 0: v = x + y; break;
+        case 1: v = x - y; break;
+        case 2: v = x * y; break;
+        case 3: v = rc_vu_in(vu->acc.f32x[i]) + x * y; break;
+        default: v = rc_vu_in(vu->acc.f32x[i]) - x * y; break;
+        }
+        r.f32x[i] = rc_vu_flagres(mac, i, v);
+    }
+    return r;
+}
+
+RC_INLINE void rc_vu1_commit_vf(Vu1State* vu, int fd, int mask, rc_u128 r,
+                                uint32_t mac) {
+    rc_vu1_flags_commit(vu, mac);
+    rc_vu1_write(vu, fd, mask, r);
+}
+
+RC_INLINE void rc_vu1_commit_acc(Vu1State* vu, int mask, rc_u128 r,
+                                 uint32_t mac) {
+    rc_vu1_flags_commit(vu, mac);
+    int i;
+    for (i = 0; i < 4; i++)
+        if (mask & (8 >> i)) vu->acc.u32x[i] = r.u32x[i];
+}
+
+/* vmax/vmini family: no flags. Committed with rc_vu1_write. */
+RC_INLINE rc_u128 rc_vu1_maxmin_calc(const Vu1State* vu, int is_min, int fs,
+                                     int ft, int sel) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 b = rc_vu1_src(vu, ft, sel);
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++)
+        r.u32x[i] = is_min ? rc_vu_minbits(a.u32x[i], b.u32x[i])
+                           : rc_vu_maxbits(a.u32x[i], b.u32x[i]);
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_abs_calc(const Vu1State* vu, int fs) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++) r.u32x[i] = a.u32x[i] & 0x7FFFFFFFu;
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_ftoi_calc(const Vu1State* vu, int shift, int fs) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++) r.s32x[i] = rc_vu_ftoi1(a.f32x[i], shift);
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_itof_calc(const Vu1State* vu, int shift, int fs) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++)
+        r.f32x[i] = (float)a.s32x[i] / (float)(1 << shift);
+    return r;
+}
+
+/* CLIPw.xyz judgment; the caller stores the result into vu->clip when the
+ * bundle commits. */
+RC_INLINE uint32_t rc_vu1_clip_calc(const Vu1State* vu, int fs, int ft) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    float w = fabsf(rc_vu_in(rc_vu1_vf(vu, ft).f32x[3]));
+    uint32_t j = 0;
+    int i;
+    for (i = 0; i < 3; i++) {
+        float v = rc_vu_in(a.f32x[i]);
+        if (v > w) j |= 1u << (2 * i);
+        if (v < -w) j |= 1u << (2 * i + 1);
+    }
+    return ((vu->clip << 6) | j) & 0xFFFFFFu;
+}
+
+/* Q pipeline. See the model note at the top of this section. */
+RC_INLINE void rc_vu1_q_commit(Vu1State* vu) {
+    if (vu->q_pending) {
+        vu->q = vu->pending_q;
+        vu->q_pending = 0;
+    }
+}
+
+RC_INLINE void rc_vu1_qflags(Vu1State* vu, uint32_t idbits) {
+    vu->status = (vu->status & ~0x030u) | idbits | (idbits << 6);
+}
+
+RC_INLINE void rc_vu1_div(Vu1State* vu, int fs, int fsf, int ft, int ftf) {
+    rc_vu1_q_commit(vu); /* a new issue retires the previous result */
+    uint32_t ab = rc_f2bits(rc_vu_in(rc_vu1_vf(vu, fs).f32x[fsf]));
+    uint32_t bb = rc_f2bits(rc_vu_in(rc_vu1_vf(vu, ft).f32x[ftf]));
+    if ((bb & 0x7FFFFFFFu) == 0) {
+        rc_vu1_qflags(vu, (ab & 0x7FFFFFFFu) == 0 ? 0x10u : 0x20u);
+        vu->pending_q = rc_bits2f(((ab ^ bb) & 0x80000000u) | RC_PS2_FMAX_BITS);
+    } else {
+        rc_vu1_qflags(vu, 0);
+        vu->pending_q = rc_vu_fclamp(rc_bits2f(ab) / rc_bits2f(bb));
+    }
+    vu->q_pending = 1;
+}
+
+RC_INLINE void rc_vu1_rsqrt(Vu1State* vu, int fs, int fsf, int ft, int ftf) {
+    rc_vu1_q_commit(vu);
+    uint32_t ab = rc_f2bits(rc_vu_in(rc_vu1_vf(vu, fs).f32x[fsf]));
+    float b = rc_vu_in(rc_vu1_vf(vu, ft).f32x[ftf]);
+    uint32_t bb = rc_f2bits(b);
+    uint32_t fl = b < 0.0f ? 0x10u : 0u;
+    if ((bb & 0x7FFFFFFFu) == 0) {
+        fl |= (ab & 0x7FFFFFFFu) == 0 ? 0x10u : 0x20u;
+        rc_vu1_qflags(vu, fl);
+        vu->pending_q = rc_bits2f(((ab ^ bb) & 0x80000000u) | RC_PS2_FMAX_BITS);
+    } else {
+        rc_vu1_qflags(vu, fl);
+        vu->pending_q = rc_vu_fclamp(rc_bits2f(ab) / sqrtf(fabsf(b)));
+    }
+    vu->q_pending = 1;
+}
+
+/* VU1 data memory: 16 KB, 1024 quadwords, wrapping. Addresses are quadword
+ * indices as the hardware presents them to LQ/SQ/ILW/ISW/XGKICK. */
+RC_INLINE uint32_t rc_vu1_qwaddr(uint32_t qw) { return (qw & 0x3FFu) << 4; }
+
+RC_INLINE rc_u128 rc_vu1_lq(const Vu1State* vu, uint32_t qw) {
+    rc_u128 v;
+    memcpy(&v, vu->mem + rc_vu1_qwaddr(qw), 16);
+    return v;
+}
+
+RC_INLINE void rc_vu1_sq(Vu1State* vu, int fs, int mask, uint32_t qw) {
+    uint32_t a = rc_vu1_qwaddr(qw);
+    rc_u128 v = rc_vu1_vf(vu, fs);
+    int i;
+    for (i = 0; i < 4; i++)
+        if (mask & (8 >> i)) memcpy(vu->mem + a + 4u * (uint32_t)i, &v.u32x[i], 4);
+}
+
+/* ILW/ILWR: one word lane selected by the (single-bit) dest mask; the vi
+ * register receives the low 16 bits. */
+RC_INLINE uint32_t rc_vu1_ilw(const Vu1State* vu, uint32_t qw, int lane) {
+    uint32_t v;
+    memcpy(&v, vu->mem + rc_vu1_qwaddr(qw) + 4u * (uint32_t)lane, 4);
+    return v & 0xFFFFu;
+}
+
+/* ISW/ISWR: the 16-bit vi value zero-extended to 32, stored to every lane
+ * selected by the dest mask. */
+RC_INLINE void rc_vu1_isw(Vu1State* vu, uint32_t qw, int mask, uint32_t v) {
+    uint32_t a = rc_vu1_qwaddr(qw);
+    uint32_t w = v & 0xFFFFu;
+    int i;
+    for (i = 0; i < 4; i++)
+        if (mask & (8 >> i)) memcpy(vu->mem + a + 4u * (uint32_t)i, &w, 4);
+}
+
+RC_INLINE void rc_vu1_mfir(Vu1State* vu, int ft, int mask, uint32_t vi_val) {
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++) r.s32x[i] = (int32_t)(int16_t)vi_val;
+    rc_vu1_write(vu, ft, mask, r);
+}
+
+RC_INLINE void rc_vu1_move(Vu1State* vu, int ft, int fs, int mask) {
+    rc_vu1_write(vu, ft, mask, rc_vu1_vf(vu, fs));
+}
+
+RC_INLINE void rc_vu1_mr32(Vu1State* vu, int ft, int fs, int mask) {
+    rc_u128 a = rc_vu1_vf(vu, fs);
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++) r.u32x[i] = a.u32x[(i + 1) & 3];
+    rc_vu1_write(vu, ft, mask, r);
+}
+
+RC_INLINE void rc_vu1_rinit(Vu1State* vu, uint32_t bits) {
+    vu->r = 0x3F800000u | (bits & 0x007FFFFFu);
+}
+
+RC_INLINE void rc_vu1_rget(Vu1State* vu, int ft, int mask) {
+    rc_u128 r;
+    int i;
+    for (i = 0; i < 4; i++) r.u32x[i] = vu->r;
+    rc_vu1_write(vu, ft, mask, r);
+}
+
 #ifdef __cplusplus
 }
 #endif
