@@ -20,6 +20,8 @@
  */
 #include "kernel.h"
 
+#include "../hw/hw.h"
+
 #include <cinttypes>
 #include <cstdio>
 
@@ -248,8 +250,8 @@ bool rt_intc_mmio_read(uint32_t addr, uint32_t* out) {
         case 0x1000F000: *out = g_istat; return true;
         case 0x1000F010: *out = g_imask; return true;
         case 0x1000E010: *out = g_dstat | (g_dmask << 16); return true; /* D_STAT */
-        case 0x1000E000: *out = 1; return true;                        /* D_CTRL: DMA enabled */
-        case 0x1000E120: *out = 0; return true;                        /* D_ENABLER: not suspended */
+        /* D_CTRL/D_ENABLER and the rest of the DMAC block moved to
+         * hw/dmac.cpp; only interrupt status/mask stays here. */
         default: return false;
     }
 }
@@ -262,8 +264,6 @@ bool rt_intc_mmio_write(uint32_t addr, uint32_t v) {
             g_dstat &= ~(v & 0xFFFF);
             g_dmask ^= (v >> 16) & 0x3FF;
             return true;
-        case 0x1000E000: return true;                       /* D_CTRL: accept */
-        case 0x1000E100: return true;                       /* D_ENABLEW: accept */
         default: return false;
     }
 }
@@ -273,6 +273,9 @@ bool rt_intc_mmio_write(uint32_t addr, uint32_t v) {
 void rt_gs_vblank_start(unsigned field) {
     g_gs_field = field;
     g_csr_flags |= 0x8u; /* VSINT */
+    /* Backend vsync: snapshots priv registers and emits the dump Vsync
+     * packet (hw/gspriv.cpp). */
+    rt_gs_vsync_hook(field);
 }
 
 void rt_gs_vblank_end() {

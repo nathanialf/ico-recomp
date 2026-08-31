@@ -26,23 +26,20 @@
  *   mirror because it keeps every scratchpad access a flat load/store with
  *   no extra masking on the hot path.
  *
- * Deviation / documented tradeoff -- VU memory window:
+ * VU memory window:
  *   Real VU0/VU1 instruction and data memories are separate small regions
  *   (4 KB micro0 + 4 KB data0 + 16 KB micro1 + 16 KB data1 = 40 KB) that the
- *   EE bus maps into one 0x11000000 64 KB page at fixed offsets. For P1 we
- *   back that page with a single dedicated 64 KB block purely so the page
- *   table entry exists and stray EE loads/stores into that window behave
- *   like flat memory instead of faulting into MMIO logging. This block is
- *   NOT yet the same storage the VU1 execution model uses (Vu1State::mem in
- *   recomp_context.h) -- VU1 microprograms in this P1 skeleton are not
- *   invoked (rt_xgkick/rt_vu1_register are stubs), so nothing has run that
- *   would need the two views of VU1 memory to agree. Unifying them (e.g. by
- *   having Vu1State live at a fixed offset into this same block) is left to
- *   the milestone that actually executes VU1 microprograms.
+ *   EE bus maps into one 0x11000000 64 KB page at fixed offsets. Since P3
+ *   this page is owned by hw/vu1rt.cpp: the window's data1 region
+ *   (+0xC000..+0xFFFF) is Vu1State::mem itself, so the VIF1 UNPACK HLE,
+ *   recompiled VU1 microprograms and direct EE window accesses all see the
+ *   same bytes. See the overlay note in hw/vu1rt.cpp for alignment and the
+ *   micro1 caveat.
  */
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "hw/hw.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -58,11 +55,9 @@ namespace {
 constexpr size_t kPageSize = 0x10000;
 constexpr size_t kRamSize = RT_RAM_SIZE;
 constexpr size_t kScratchpadBlockSize = kPageSize; /* see tradeoff comment above */
-constexpr size_t kVuWindowBlockSize = kPageSize;   /* see tradeoff comment above */
 
 uint8_t* g_ram = nullptr;
 uint8_t* g_scratchpad = nullptr;
-uint8_t* g_vu_window = nullptr;
 
 uint8_t* aligned_zalloc(size_t align, size_t size) {
     /* size must already be a multiple of align for aligned_alloc. */
@@ -85,7 +80,6 @@ void rt_mem_init() {
     static_assert(kRamSize % 16 == 0, "RAM size must be 16-byte aligned");
     g_ram = aligned_zalloc(16, kRamSize);
     g_scratchpad = aligned_zalloc(16, kScratchpadBlockSize);
-    g_vu_window = aligned_zalloc(16, kVuWindowBlockSize);
 
     std::memset(g_pages, 0, sizeof(g_pages));
 
@@ -97,7 +91,7 @@ void rt_mem_init() {
     map_ram_prefix(0xA0000000u, ram_pages);
 
     g_pages[0x70000000u >> 16] = g_scratchpad;
-    g_pages[0x11000000u >> 16] = g_vu_window;
+    g_pages[0x11000000u >> 16] = rt_vu1_window_page();
 
     /* MMIO ranges (0x10xxxxxx device regs, 0x12xxxxxx GS privileged) are left
      * NULL by the memset above; the rc_read.. / rc_write.. helpers in
@@ -107,8 +101,8 @@ void rt_mem_init() {
         kRamSize, static_cast<void*>(g_ram));
     rt_log("mem", "scratchpad: %zu-byte page at host %p, guest 0x70000000 (16 KB architectural, see mem.cpp comment)",
         kScratchpadBlockSize, static_cast<void*>(g_scratchpad));
-    rt_log("mem", "VU mem window: %zu-byte page at host %p, guest 0x11000000 (micro0@+0x0 data0@+0x4000 micro1@+0x8000 data1@+0xC000)",
-        kVuWindowBlockSize, static_cast<void*>(g_vu_window));
+    rt_log("mem", "VU mem window: page at host %p, guest 0x11000000 (micro0@+0x0 data0@+0x4000 micro1@+0x8000 data1@+0xC000 = Vu1State::mem)",
+        static_cast<void*>(g_pages[0x11000000u >> 16]));
 }
 
 /* ---- function dispatch --------------------------------------------------- */

@@ -41,6 +41,12 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/sif/rpc.cpp
     src/runtime/sif/cdvd.cpp
     src/runtime/iso/iso9660.cpp
+    src/runtime/hw/dmac.cpp
+    src/runtime/hw/vif1.cpp
+    src/runtime/hw/gif.cpp
+    src/runtime/hw/vu1rt.cpp
+    src/runtime/hw/gspriv.cpp
+    src/runtime/gs/gs_dumpwriter.cpp
 )
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
@@ -95,4 +101,37 @@ if(EXISTS "${GENERATED_DIR}")
     endif()
 else()
     message(STATUS "icorecomp-runtime: ${GENERATED_DIR} not found; building in stub mode (see src/runtime/main.cpp)")
+endif()
+
+# ---- optional generated/vu1 link -----------------------------------------
+#
+# Recompiled VU1 microprograms (icorecomp vu1 --out generated/vu1). The
+# runtime's VIF1 MSCAL path resolves uploads against the registry these
+# files fill via rt_vu1_register_all(). -ffp-contract=off: the VU1 FMAC
+# model requires separately rounded multiply and add.
+if(NOT DEFINED GENERATED_VU1_DIR)
+    set(GENERATED_VU1_DIR "${CMAKE_SOURCE_DIR}/generated/vu1")
+endif()
+
+if(EXISTS "${GENERATED_VU1_DIR}")
+    file(GLOB GENERATED_VU1_SOURCES CONFIGURE_DEPENDS "${GENERATED_VU1_DIR}/*.c")
+    if(GENERATED_VU1_SOURCES)
+        add_library(generated_vu1 OBJECT ${GENERATED_VU1_SOURCES})
+        set_target_properties(generated_vu1 PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED ON
+        )
+        target_include_directories(generated_vu1 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(generated_vu1 PRIVATE -fno-strict-aliasing -ffp-contract=off)
+        endif()
+
+        target_link_libraries(icorecomp-runtime PRIVATE generated_vu1)
+        target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_HAVE_VU1_GENERATED)
+        message(STATUS "icorecomp-runtime: linking generated VU1 code from ${GENERATED_VU1_DIR}")
+    else()
+        message(STATUS "icorecomp-runtime: ${GENERATED_VU1_DIR} exists but has no .c files; MSCAL will loud-skip")
+    endif()
+else()
+    message(STATUS "icorecomp-runtime: ${GENERATED_VU1_DIR} not found; MSCAL will loud-skip")
 endif()

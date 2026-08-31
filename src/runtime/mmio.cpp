@@ -15,6 +15,7 @@
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "hw/hw.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -115,41 +116,57 @@ uint32_t hw_norm(uint32_t addr) {
     return addr >= 0x80000000u ? (addr & 0x1FFFFFFFu) : addr;
 }
 
-/* P2 hardware model dispatch (ee/intc.cpp, ee/timers.cpp, sif/sif.cpp).
- * Returns true when a module owns the register; unmatched addresses fall
- * back to the P1 log-and-return-0 behavior. */
+/* P2/P3 hardware model dispatch (hw/dmac.cpp, hw/vif1.cpp, hw/gif.cpp,
+ * hw/gspriv.cpp, ee/intc.cpp, ee/timers.cpp, sif/sif.cpp). Returns true
+ * when a module owns the register; unmatched addresses fall back to the P1
+ * log-and-return-0 behavior. */
 bool hw_read(uint32_t addr, uint64_t* out) {
     addr = hw_norm(addr);
     uint32_t v32;
+    if (rt_dmac_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_vif_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_gif_mmio_read(addr, &v32)) { *out = v32; return true; }
     if (rt_timers_mmio_read(addr, &v32)) { *out = v32; return true; }
     if (rt_intc_mmio_read(addr, &v32)) { *out = v32; return true; }
     if (rt_sif_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_gs_mmio_read(addr, out)) return true;
+    if (rt_gspriv_mmio_read(addr, out)) return true;
     return false;
 }
 
 bool hw_write(uint32_t addr, uint64_t v) {
     addr = hw_norm(addr);
+    if (rt_dmac_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_vif_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_gif_mmio_write(addr, (uint32_t)v)) return true;
     if (rt_timers_mmio_write(addr, (uint32_t)v)) return true;
     if (rt_intc_mmio_write(addr, (uint32_t)v)) return true;
     if (rt_sif_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_gs_mmio_write(addr, v)) return true;
+    if (rt_gspriv_mmio_write(addr, v)) return true;
     return false;
 }
 
 uint64_t mmio_read_common(uint32_t addr, int bits) {
-    /* Advance the virtual clock and deliver due interrupts first, so poll
-     * loops on CSR/COUNT/I_STAT make forward progress toward vblank. */
-    rt_kernel_mmio_tick();
+    /* Ordering matters for guest poll loops: advance the virtual clock and
+     * raise due status bits FIRST, then sample the register, then deliver
+     * pending interrupts. This models the real interrupt latency window in
+     * which a polling load can observe a freshly raised I_STAT/D_STAT bit
+     * before the kernel dispatcher acks it. The retail vsync wait (clear
+     * VB_ON, spin on I_STAT bit 2) depends on that window; delivering
+     * before the sample starves it forever. */
+    rt_clock_tick(512);
     uint64_t v = 0;
     hw_read(addr, &v); /* v stays 0 for unmodeled registers */
     log_access("read", addr, bits, v, g_read_stats);
+    rt_intc_deliver();
     return v;
 }
 
 void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
     hw_write(addr, v);
     log_access("write", addr, bits, v, g_write_stats);
+    /* CHCR-triggered DMA completions raised their D_STAT bits inside
+     * hw_write; delivery happens here, after the store completed, via the
+     * standard deferred path. */
     rt_kernel_mmio_tick();
 }
 
@@ -186,5 +203,14 @@ void rt_mmio_write64(uint32_t addr, uint64_t v) {
     mmio_write_common(addr, 64, v);
 }
 void rt_mmio_write128(uint32_t addr, rc_u128 v) {
+    /* FIFO windows (VIF0/VIF1/GIF) consume the full quadword; everything
+     * else keeps the P1 behavior (low 64 bits, registers are at most 64
+     * bits wide). */
+    uint32_t naddr = hw_norm(addr);
+    if (rt_hw_fifo_write128(naddr, &v)) {
+        log_access("write", naddr, 128, v.u64x[0], g_write_stats);
+        rt_kernel_mmio_tick();
+        return;
+    }
     mmio_write_common(addr, 128, v.u64x[0]);
 }

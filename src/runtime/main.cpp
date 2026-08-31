@@ -20,6 +20,7 @@
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "hw/hw.h"
 
 #include <csignal>
 #include <cstdio>
@@ -92,6 +93,7 @@ void install_crash_handler() {
 int main() {
     set_fpu_ftz_daz();
     rt_mem_init();
+    rt_hw_init();
 
     LoaderConfig cfg;
     if (!rt_load_config(&cfg)) {

@@ -136,10 +136,5 @@ void rt_bad_indirect(uint32_t target, uint32_t caller_vram) {
     std::exit(1);
 }
 
-void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
-    rt_log("vu1", "xgkick stub: vu=%p qw_addr=0x%x (GIF packet not parsed in P1)", (void*)vu, qw_addr);
-}
-
-void rt_vu1_register(uint32_t hash, uint32_t size_bytes, void (*entry)(Vu1State* vu)) {
-    rt_log("vu1", "register stub: hash=0x%08x size=%u entry=%p (not dispatched in P1)", hash, size_bytes, (void*)entry);
-}
+/* rt_xgkick and rt_vu1_register moved to hw/vu1rt.cpp (P3): they now parse
+ * GIF packets onto PATH1 and feed the microprogram registry. */
