@@ -426,7 +426,7 @@ bool rt_dmac_mmio_read(uint32_t addr, uint32_t* out) {
         case 0x1000E040: *out = g_rbsr; return true;
         case 0x1000E050: *out = g_rbor; return true;
         case 0x1000E060: *out = g_stadr; return true;
-        case 0x1000E120: *out = g_enable; return true; /* D_ENABLER */
+        case 0x1000F520: *out = g_enable; return true; /* D_ENABLER */
         default: return false;
     }
 }
@@ -471,7 +471,7 @@ bool rt_dmac_mmio_write(uint32_t addr, uint32_t v) {
             g_stadr = v;
             if (v) rt_log("dmac", "D_STADR = 0x%08x written; stall control is not modeled (loud stub)", v);
             return true;
-        case 0x1000E100: g_enable = v; return true; /* D_ENABLEW */
+        case 0x1000F590: g_enable = v; return true; /* D_ENABLEW */
         default: return false;
     }
 }

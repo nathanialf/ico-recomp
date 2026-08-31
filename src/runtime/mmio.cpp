@@ -61,7 +61,7 @@ constexpr NamedReg kNamedRegs[] = {
     /* DMAC global */
     {0x1000E000, "D_CTRL"}, {0x1000E010, "D_STAT"}, {0x1000E020, "D_PCR"},
     {0x1000E030, "D_SQWC"}, {0x1000E040, "D_RBSR"}, {0x1000E050, "D_RBOR"}, {0x1000E060, "D_STADR"},
-    {0x1000E100, "D_ENABLEW"}, {0x1000E120, "D_ENABLER"},
+    {0x1000F590, "D_ENABLEW"}, {0x1000F520, "D_ENABLER"},
     /* INTC */
     {0x1000F000, "I_STAT"}, {0x1000F010, "I_MASK"},
     /* SIF */
