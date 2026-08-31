@@ -36,7 +36,6 @@
 
 #include <cinttypes>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -118,7 +117,7 @@ public:
         return presented;
     }
 
-    void dump_stats() const {
+    void report_stats() override {
         rt_log("gs", "---- GS backend stats ----");
         rt_log("gs", "  packets: PATH1=%" PRIu64 " (%" PRIu64 " qw)  PATH2=%" PRIu64 " (%" PRIu64 " qw)  PATH3=%" PRIu64 " (%" PRIu64 " qw)",
             m_packets[0], m_qwords[0], m_packets[1], m_qwords[1], m_packets[2], m_qwords[2]);
@@ -144,18 +143,8 @@ private:
     bool m_transfer_since_vsync = false;
 };
 
-DumpBackend* g_backend = nullptr;
-
-void backend_atexit() {
-    if (g_backend) g_backend->dump_stats();
-}
-
 } // namespace
 
-GsBackend* rt_gs_backend() {
-    if (!g_backend) {
-        g_backend = new DumpBackend(std::getenv("ICORECOMP_GS_DUMP"));
-        std::atexit(backend_atexit);
-    }
-    return g_backend;
+GsBackend* rt_gs_make_dump_backend(const char* dump_path) {
+    return new DumpBackend(dump_path);
 }

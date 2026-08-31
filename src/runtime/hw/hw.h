@@ -87,5 +87,10 @@ bool rt_gspriv_mmio_write(uint32_t addr, uint64_t v);
 /* Called from ee/intc.cpp at vblank start: snapshots CSR into the backend
  * shadow and emits the backend vsync (dump Vsync packet). */
 void rt_gs_vsync_hook(unsigned field);
+/* Called from the SetGsCrt syscall HLE: programs SMODE1/SMODE2 in the
+ * backend priv shadow the way the real kernel does. Without SMODE1 (games
+ * never write it directly) the GS cannot deduce the video mode and refuses
+ * to scan out. Fatal on modes outside NTSC/PAL (not used by this binary). */
+void rt_gs_program_crt(uint32_t interlace, uint32_t mode, uint32_t ffmd);
 
 #endif /* ICORECOMP_HW_H */

@@ -64,6 +64,12 @@ void rt_vu0_ctc(R5900Context* ctx, int creg, uint32_t v);
 void rt_unimplemented(const char* what, uint32_t vram);
 void rt_bad_indirect(uint32_t target, uint32_t caller_vram);
 
+/* Called by generated code on taken backward branches (target vram <= branch
+ * vram), counter-gated cheap. Gives RAM-only spin loops a periodic runtime
+ * trap point: every Nth call advances the virtual clock and runs the same
+ * pending-delivery path MMIO reads use. */
+void rt_backedge(void);
+
 /* ---- VU1 --------------------------------------------------------------- */
 
 /* XGKICK: qw_addr is a quadword address into vu->mem; the runtime parses the

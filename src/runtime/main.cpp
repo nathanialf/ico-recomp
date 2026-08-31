@@ -16,6 +16,26 @@
  *   - full mode: generated/ee's funcs_table.c is linked in and its
  *     g_functab_init() populates g_functab; we then actually run crt0 until
  *     it traps into rt_syscall / rt_mmio_.. / rt_bad_indirect / etc.
+ *
+ * Presentation loop (ICORECOMP_GS=parallel|both): the EE scheduler already
+ * owns the only loop in the process (ee/sched.cpp sched_loop; rt_sched_boot
+ * never returns), and its virtual-clock timeline calls the GS backend's
+ * vsync() at every field boundary via rt_gs_vsync_hook. The live backend
+ * (gs/gs_parallel.cpp) renders and presents to the window swapchain inside
+ * that vsync() call, so the per-field cadence is exactly "run guest to the
+ * field boundary, then render + present", just with the loop inverted:
+ * presentation runs inside the scheduler rather than the scheduler inside a
+ * main-owned frame loop. Everything stays on the main OS thread (guest
+ * threads are minicoro coroutines), which keeps SDL/WSI happy. main's part
+ * of the contract is creating the backend on the main stack, before any
+ * guest code runs, via rt_hw_init() below: Vulkan device and window setup
+ * must not first happen lazily under a 2 MB coroutine stack mid-frame.
+ * With ICORECOMP_GS=dump or unset the behavior is byte-identical to the
+ * dump-only runtime: same calls, same order, no window, no Vulkan.
+ * (Wish, if main ever needs to own the loop, e.g. for a GUI event pump
+ * that must run between fields: a resumable scheduler entry point like
+ * "rt_sched_run_until_field_boundary()" returning control to main once per
+ * field. Not needed for the current inversion.)
  */
 #include "runtime.h"
 
@@ -93,6 +113,10 @@ void install_crash_handler() {
 int main() {
     set_fpu_ftz_daz();
     rt_mem_init();
+    /* Creates the GS backend (ICORECOMP_GS selects dump / parallel / both;
+     * see gs/gs_select.cpp) on the main thread stack. For the live backend
+     * this brings up the Vulkan device and, when a display is available,
+     * the window + swapchain, before any guest code exists. */
     rt_hw_init();
 
     LoaderConfig cfg;

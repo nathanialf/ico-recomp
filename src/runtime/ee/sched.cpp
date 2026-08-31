@@ -308,6 +308,27 @@ void rt_kernel_mmio_tick() {
     rt_intc_deliver();
 }
 
+/* rt_backedge: liveness for RAM-only spin loops. Generated code calls this
+ * on every taken backward branch. A loop that touches neither MMIO nor a
+ * syscall (e.g. the sndn2 library spinning on an IOP-updated counter in EE
+ * RAM) would otherwise never reach a delivery point and livelock the whole
+ * process. The fast path is one increment and one mask test; every
+ * kBackedgeInterval-th call bills the elapsed iterations to the virtual
+ * clock (kBackedgeCycles bus cycles per iteration, ~2 CPU cycles per loop
+ * instruction pair) and runs the same delivery path MMIO reads use (due
+ * timeline events, then INTC/DMAC handler dispatch + preemption check). */
+namespace {
+constexpr uint64_t kBackedgeInterval = 4096; /* power of two */
+constexpr uint64_t kBackedgeCycles = 2;      /* bus cycles billed per backedge */
+uint64_t g_backedges = 0;
+} // namespace
+
+extern "C" void rt_backedge(void) {
+    if ((++g_backedges & (kBackedgeInterval - 1)) != 0) return;
+    rt_clock_tick(kBackedgeInterval * kBackedgeCycles);
+    rt_intc_deliver();
+}
+
 /* ---- scheduler core ------------------------------------------------------ */
 
 void rt_sched_init() {

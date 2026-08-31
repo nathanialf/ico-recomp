@@ -16,6 +16,8 @@
  */
 #include "kernel.h"
 
+#include "../hw/hw.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
@@ -51,6 +53,9 @@ int64_t h_SetGsCrt(const Args& a) {
     g_kern.gscrt_ffmd = a.a2;
     g_kern.gscrt_set = true;
     rt_log("syscall", "SetGsCrt(interlace=%u, mode=0x%x, ffmd=%u) recorded", a.a0, a.a1, a.a2);
+    /* The real kernel programs SMODE1/SMODE2 here; games never write SMODE1
+     * themselves, and the GS needs it to know the video mode. */
+    rt_gs_program_crt(a.a0, a.a1, a.a2);
     return 0;
 }
 

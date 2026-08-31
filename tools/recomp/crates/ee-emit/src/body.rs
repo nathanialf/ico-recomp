@@ -259,6 +259,9 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
                     push_slot(&mut out);
                     match resolve(target)? {
                         Dest::Local(t) => {
+                            if t <= vram {
+                                let _ = writeln!(out, "rt_backedge();");
+                            }
                             let _ = writeln!(out, "goto L_{t:08X};");
                         }
                         Dest::Tail(fi) => {
@@ -278,7 +281,10 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
                     }
                     let c = temp;
                     temp += 1;
+                    // Taken backward branches call rt_backedge (liveness for
+                    // RAM-only spin loops); forward branches and calls do not.
                     let arm = match resolve(target)? {
+                        Dest::Local(t) if t <= vram => format!("rt_backedge(); goto L_{t:08X};"),
                         Dest::Local(t) => format!("goto L_{t:08X};"),
                         Dest::Tail(fi) => {
                             st.tail_calls += 1;

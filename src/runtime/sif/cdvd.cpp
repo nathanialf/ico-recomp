@@ -340,7 +340,10 @@ void svc_padman(uint32_t fno, const uint8_t* send, uint32_t send_size,
  * SifSetDma and later asks IOP-side services to consume them. Protocol per
  * ps2sdk ee/kernel/src/iopheap.c: fno 1 alloc {u32 size}->{u32 addr},
  * fno 2 free {u32 addr}->{u32 result}. */
-constexpr uint32_t kIopHeapBase = 0x00200000u; /* above the minted RPC buffers */
+/* Above the minted RPC staging buffers (rpc.cpp kBufBase 0x1C0000 + up to 32
+ * services * 0x4000 = 0x240000). 0x200000 overlapped the sndn2 service's
+ * staging buffer with the game's first sound-bank iopheap allocation. */
+constexpr uint32_t kIopHeapBase = 0x00240000u;
 constexpr uint32_t kIopHeapEnd = RT_IOP_RAM_SIZE - 0x10000u;
 uint32_t g_iop_heap_ptr = kIopHeapBase;
 
@@ -452,6 +455,7 @@ void rt_cdvd_register_services() {
     rt_rpc_register_service(0x80000400, "mcserv(stub)", nullptr);
     rt_rpc_register_service(0x80000701, "sdrdrv(stub)", nullptr);
     /* The game's own sound driver module (cdrom0:\SNDN2DRV.IRX, loaded via
-     * the loadfile HLE above) registers its RPC server as ASCII "sndn". */
-    rt_rpc_register_service(0x736e646e, "sndn2drv(stub)", nullptr);
+     * the loadfile HLE above) registers its RPC server as ASCII "sndn".
+     * Modeled in sndn2.cpp (ack protocol; no audio). */
+    rt_sndn2_register_service();
 }

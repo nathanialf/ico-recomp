@@ -49,6 +49,30 @@ bool rt_gspriv_mmio_write(uint32_t addr, uint64_t v) {
     return true;
 }
 
+void rt_gs_program_crt(uint32_t interlace, uint32_t mode, uint32_t ffmd) {
+    /* SMODE1 field layout (public hardware facts, ps2tek "GS privileged
+     * registers"): RC bits 0-2, LC bits 3-9, T1248 10-11, SLCK 12,
+     * CMOD 13-14. CMOD: 2 = NTSC, 3 = PAL. LC 32 = analog video clock.
+     * Only CMOD and LC select the video mode downstream; the PLL fields do
+     * not matter to an emulated CRTC, so they stay zero. */
+    uint64_t cmod;
+    switch (mode) {
+        case 0x02: cmod = 2; break; /* GS_MODE_NTSC */
+        case 0x03: cmod = 3; break; /* GS_MODE_PAL */
+        default:
+            rt_fatal("gs", rt_sched_current_ctx(),
+                     "SetGsCrt mode 0x%02x is not NTSC/PAL; DTV/VESA modes are not modeled", mode);
+    }
+    const uint64_t smode1 = (cmod << 13) | (32ull << 3);
+    const uint64_t smode2 = (interlace & 1u) | ((ffmd & 1u) << 1);
+    GsBackend* be = rt_gs_backend();
+    be->write_priv(0x0010, smode1);
+    be->write_priv(0x0020, smode2);
+    rt_log("gs", "SetGsCrt: SMODE1=0x%08llx SMODE2=0x%llx programmed (%s, %s, ffmd=%u)",
+        (unsigned long long)smode1, (unsigned long long)smode2,
+        cmod == 2 ? "NTSC" : "PAL", interlace ? "interlaced" : "progressive", ffmd);
+}
+
 void rt_gs_vsync_hook(unsigned field) {
     GsBackend* be = rt_gs_backend();
     uint64_t csr = 0;
