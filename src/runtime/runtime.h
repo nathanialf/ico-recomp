@@ -50,6 +50,7 @@ struct Sha1Digest {
 };
 
 Sha1Digest rt_sha1_file(const char* path, bool* ok);
+Sha1Digest rt_sha1_buffer(const uint8_t* data, size_t len);
 /* Lowercase hex, no separators; buf must hold at least 41 bytes. */
 void rt_sha1_to_hex(const Sha1Digest& d, char* buf);
 /* Case-insensitive compare against a 40-hex-char string. */
@@ -69,9 +70,19 @@ struct LoaderConfig {
     uint32_t gp = 0;
 };
 
-/* Reads config/recomp.toml (path relative to ICORECOMP_SOURCE_ROOT). Returns
- * false and logs a fatal-quality message (does not exit) on any parse
- * failure so callers can decide how to fail. */
+/* Base directory for config files and relative paths (config/recomp.toml,
+ * config/local.toml, saves/). ICORECOMP_SOURCE_ROOT when its
+ * config/recomp.toml exists (a dev checkout); otherwise "." so a packaged
+ * binary resolves everything against the directory it is run from. */
+const char* rt_base_dir();
+
+/* Reads <base>/config/recomp.toml (see rt_base_dir). When the file does not
+ * exist (packaged runtime, no dev tree) the committed [pins]/[target]
+ * values are filled in as compiled-in defaults and the boot ELF comes from
+ * the disc instead (see rt_load_elf); that path still returns true. Returns
+ * false and logs a fatal-quality message (does not exit) only when a
+ * present config is missing required keys, so callers can decide how to
+ * fail. */
 bool rt_load_config(LoaderConfig* out);
 
 /* Resolves decomp_root/decomp_elf into an absolute path. buf must hold at
@@ -79,8 +90,10 @@ bool rt_load_config(LoaderConfig* out);
 void rt_resolve_elf_path(const LoaderConfig& cfg, char* buf, size_t buf_size);
 
 /* Verifies the SHA-1 pin, then loads the single PT_LOAD segment into guest
- * RAM (via g_pages) at its vaddr and zeroes bss (memsz - filesz). Fatal on
- * any failure. */
+ * RAM (via g_pages) at its vaddr and zeroes bss (memsz - filesz). The ELF
+ * bytes come from the decomp checkout when the config names one and the
+ * file exists, otherwise from SCUS_971.13 on the mounted disc image (same
+ * bytes, same pin). Fatal on any failure. */
 void rt_load_elf(const LoaderConfig& cfg);
 
 #endif /* ICORECOMP_RUNTIME_H */

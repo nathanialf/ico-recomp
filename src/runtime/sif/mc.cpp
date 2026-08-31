@@ -120,7 +120,7 @@ size_t g_listing_pos = 0;
 
 std::string toml_lookup_saves() {
     /* Same minimal line-based lookup as iso9660.cpp/loader.cpp. */
-    std::string path = std::string(ICORECOMP_SOURCE_ROOT) + "/config/local.toml";
+    std::string path = std::string(rt_base_dir()) + "/config/local.toml";
     std::FILE* f = std::fopen(path.c_str(), "r");
     if (!f) return "";
     char line[512];
@@ -162,8 +162,9 @@ void mc_init_backing() {
     if (env && env[0]) dir = env;
     if (dir.empty()) dir = toml_lookup_saves();
     if (dir.empty()) dir = "saves/mc0";
-    if (dir[0] == '/') g_base = dir;
-    else g_base = std::string(ICORECOMP_SOURCE_ROOT) + "/" + dir;
+    const bool absolute = dir[0] == '/' || dir[0] == '\\' || (dir.size() >= 2 && dir[1] == ':');
+    if (absolute) g_base = dir;
+    else g_base = std::string(rt_base_dir()) + "/" + dir;
     std::error_code ec;
     fs::create_directories(g_base, ec);
     if (ec) {

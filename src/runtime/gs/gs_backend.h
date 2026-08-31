@@ -5,9 +5,10 @@
  *   gs_dumpwriter.cpp  records the GIF/priv-register traffic in the
  *                      paraLLEl-GS raw stream format (and acts as the
  *                      register shadow when no dump path is configured).
- *   gs_parallel.cpp    paraLLEl-GS itself (third_party/parallel-gs, linked
- *                      as libicorecomp-parallel-gs.so), rendering live on a
- *                      Vulkan device and presenting per field.
+ *   gs_parallel.cpp    adapter over libicorecomp-parallel-gs's C ABI
+ *                      (gs_parallel_api.h); paraLLEl-GS itself renders live
+ *                      on a Vulkan device inside that shared library and
+ *                      presents per field.
  *   gs_select.cpp      rt_gs_backend() singleton: picks an implementation
  *                      from ICORECOMP_GS=dump|parallel|both ("both" tees
  *                      every call to the live backend and the dump writer).

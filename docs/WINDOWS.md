@@ -28,7 +28,11 @@ Steps, from a VS x64 developer prompt in the repo root:
        cmake -B build -DICORECOMP_PARALLEL_GS=ON
        cmake --build build --config Release
 
-3. Point the runtime at your disc image: create `config\local.toml`:
+3. Point the runtime at your disc image, either per run:
+
+       build\Release\icorecomp-runtime.exe --disc "C:\path\to\Ico (USA).iso"
+
+   or once, in `config\local.toml`:
 
        [disc]
        path = "C:/path/to/Ico (USA).iso"   # .bin/.cue also works
@@ -36,11 +40,17 @@ Steps, from a VS x64 developer prompt in the repo root:
        [saves]
        dir = "saves/mc0"
 
+   Without a dev checkout next to the exe the runtime also reads the boot
+   ELF straight out of the disc image (SHA-1 checked against the pin), so a
+   built exe plus a disc image is self-contained.
+
 4. Run:
 
        build\Release\icorecomp-runtime.exe
 
-   A window should open via Vulkan. Useful environment variables:
+   A window should open via Vulkan (on Windows builds with the live
+   backend, an unset `ICORECOMP_GS` defaults to it). Useful environment
+   variables:
    - `ICORECOMP_GS=dump` for headless runs (no window)
    - `ICORECOMP_INPUT_SCRIPT=docs\scripts\newgame.pad` to auto-navigate to
      New Game

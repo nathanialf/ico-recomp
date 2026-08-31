@@ -205,12 +205,15 @@ endif()
 #                                the .so is complete. This is the LGPL
 #                                boundary; the runtime and tools link it
 #                                dynamically and contain no LGPL objects.
-#   icorecomp-runtime            gains gs/gs_parallel.cpp (ours, MIT), the
-#                                GsBackend implementation on GSInterface,
-#                                selected at runtime by ICORECOMP_GS.
+#   icorecomp-runtime            gains gs/gs_parallel.cpp (ours, MIT), a thin
+#                                GsBackend adapter over the shared library's
+#                                C ABI (gs/gs_parallel_api.h), selected at
+#                                runtime by ICORECOMP_GS. The real backend
+#                                lives inside the library
+#                                (gs/gs_parallel_lib.cpp).
 #   icorecomp-gs-replay          small headless tool (ours) that feeds a raw
 #                                dump through paraLLEl-GS's own GSDumpParser
-#                                and GSInterface; validates the dump writer
+#                                via the same C ABI; validates the dump writer
 #                                against the real consumer without a display.
 #
 # Requires CMake >= 3.25 for add_subdirectory(SYSTEM) and
@@ -240,47 +243,27 @@ if(ICORECOMP_PARALLEL_GS)
     # (slangmosh) shaders, no runtime shader compiler, no Granite app
     # framework or renderer. GRANITE_PLATFORM=null; we do WSI ourselves.
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
-    add_subdirectory("${ICORECOMP_PGS_DIR}" EXCLUDE_FROM_ALL SYSTEM)
-
-    # The shared library. Whole-archive the LGPL libs (parallel-gs,
-    # parallel-gs-dump) and granite-vulkan (the API surface our backend
-    # calls: Context/Device/WSI). Remaining granite static deps resolve
-    # symbol-by-symbol into the .so via the normal transitive link.
-    add_library(icorecomp-parallel-gs SHARED src/runtime/gs/gs_parallel_lib.cpp)
-    target_link_libraries(icorecomp-parallel-gs PRIVATE
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,parallel-gs>"
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,parallel-gs-dump>"
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,granite-vulkan>"
-    )
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_link_options(icorecomp-parallel-gs PRIVATE -Wl,--no-undefined)
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        # mingw cross build: Granite's DXGI-interop presenter (wsi_dxgi.cpp)
+        # targets the MSVC SDK headers; the plain Vulkan swapchain path is
+        # used instead. Everything is loaded dynamically either way.
+        set(GRANITE_VULKAN_DXGI_INTEROP OFF CACHE BOOL "" FORCE)
     endif()
-
-    # Header closure for consumers of the .so, marked SYSTEM so our -Wall
-    # -Wextra gate stays about our code. PUBLIC-link closure of
-    # parallel-gs/parallel-gs-dump per the Granite CMake files:
-    #   parallel-gs      -> granite-vulkan granite-math
-    #   granite-vulkan   -> granite-util granite-volk-headers
-    #   granite-util     -> granite-application-global-interface
-    #   granite-volk-headers -> Vulkan::Headers
-    set(ICORECOMP_PGS_HEADER_TARGETS
-        parallel-gs parallel-gs-dump granite-vulkan granite-math
-        granite-util granite-volk-headers granite-application-global-interface
-        Vulkan::Headers)
-    foreach(tgt IN LISTS ICORECOMP_PGS_HEADER_TARGETS)
-        target_include_directories(icorecomp-parallel-gs SYSTEM INTERFACE
-            "$<TARGET_PROPERTY:${tgt},INTERFACE_INCLUDE_DIRECTORIES>")
-        target_compile_definitions(icorecomp-parallel-gs INTERFACE
-            "$<TARGET_PROPERTY:${tgt},INTERFACE_COMPILE_DEFINITIONS>")
-    endforeach()
+    add_subdirectory("${ICORECOMP_PGS_DIR}" EXCLUDE_FROM_ALL SYSTEM)
 
     # Optional SDL3 window presentation. Standalone parallel-gs does not
     # build Granite's vendored SDL3, so configure it here the same way
     # Granite's third_party/CMakeLists.txt does for its SDL platform.
+    # SDL is a SHARED library on purpose: the window/WSI lives inside
+    # libicorecomp-parallel-gs (gs_parallel_lib.cpp) while keyboard/gamepad
+    # polling and audio live in the runtime executable (host/input.cpp,
+    # host/audio.cpp), and both must talk to the SAME SDL instance. Two
+    # static copies would give the exe a keyboard-state view of an SDL that
+    # owns no window.
     set(ICORECOMP_PGS_HAVE_SDL OFF)
     if(ICORECOMP_GS_WINDOW AND EXISTS "${ICORECOMP_PGS_DIR}/Granite/third_party/sdl3/CMakeLists.txt")
-        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_SHARED ON CACHE BOOL "" FORCE)
+        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
         set(SDL_TIMERS ON CACHE BOOL "" FORCE)
         set(SDL_LIBC ON CACHE BOOL "" FORCE)
         set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -309,18 +292,44 @@ if(ICORECOMP_PARALLEL_GS)
         set(ICORECOMP_PGS_HAVE_SDL ON)
     endif()
 
-    # Runtime: the live backend implementation (ours).
+    # The shared library. Whole-archive the LGPL libs (parallel-gs,
+    # parallel-gs-dump) and granite-vulkan (Context/Device/WSI, which the
+    # library-internal backend uses). Remaining granite static deps resolve
+    # symbol-by-symbol via the normal transitive link. The executables see
+    # only the C ABI in gs_parallel_api.h (RT_GS_API exports; explicit
+    # exports also make MSVC emit the import library). gs_parallel_lib.cpp
+    # is ours (MIT) but compiles into the library, so it alone may use the
+    # Granite/paraLLEl-GS C++ interfaces.
+    add_library(icorecomp-parallel-gs SHARED src/runtime/gs/gs_parallel_lib.cpp)
+    target_compile_definitions(icorecomp-parallel-gs PRIVATE ICORECOMP_PGS_BUILD_DLL)
+    target_include_directories(icorecomp-parallel-gs PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+    target_link_libraries(icorecomp-parallel-gs PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,parallel-gs>"
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,parallel-gs-dump>"
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,granite-vulkan>"
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(icorecomp-parallel-gs PRIVATE -Wall -Wextra -fno-strict-aliasing)
+        target_link_options(icorecomp-parallel-gs PRIVATE -Wl,--no-undefined)
+    endif()
+    if(ICORECOMP_PGS_HAVE_SDL)
+        target_compile_definitions(icorecomp-parallel-gs PRIVATE ICORECOMP_PGS_SDL)
+        target_link_libraries(icorecomp-parallel-gs PRIVATE SDL3::SDL3)
+    endif()
+
+    # Runtime: the thin GsBackend adapter over the C ABI (ours).
     target_sources(icorecomp-runtime PRIVATE src/runtime/gs/gs_parallel.cpp)
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_HAVE_PARALLEL_GS)
     target_link_libraries(icorecomp-runtime PRIVATE icorecomp-parallel-gs)
     if(ICORECOMP_PGS_HAVE_SDL)
         target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_PGS_SDL ICORECOMP_SND_SDL)
-        target_link_libraries(icorecomp-runtime PRIVATE SDL3-static)
+        target_link_libraries(icorecomp-runtime PRIVATE SDL3::SDL3)
     endif()
 
     # Headless raw-dump replay tool (ours): the CI-able consumer-side check
-    # of the dump writer format.
+    # of the dump writer format. Only the C ABI; no Granite headers.
     add_executable(icorecomp-gs-replay src/runtime/gs/gs_replay_main.cpp)
+    target_include_directories(icorecomp-gs-replay PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
     target_link_libraries(icorecomp-gs-replay PRIVATE icorecomp-parallel-gs)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(icorecomp-gs-replay PRIVATE -Wall -Wextra -fno-strict-aliasing)

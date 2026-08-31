@@ -49,6 +49,10 @@ void rt_fatal(const char* component, const R5900Context*, const char* fmt, ...) 
 
 R5900Context* rt_sched_current_ctx() { return nullptr; }
 
+/* mc.cpp resolves config/local.toml and a relative saves dir against this;
+ * the selftest always runs against the source tree. */
+const char* rt_base_dir() { return ICORECOMP_SOURCE_ROOT; }
+
 void rt_gread_bytes(uint32_t addr, void* dst, uint32_t n) {
     std::memcpy(dst, &g_fake_ram[addr % sizeof(g_fake_ram)], n);
 }

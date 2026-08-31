@@ -26,13 +26,13 @@
         },
         {
             "name": "windows-mingw-cross",
-            "displayName": "Windows x86_64 cross (mingw-w64), no paraLLEl-GS",
+            "displayName": "Windows x86_64 cross (mingw-w64), paraLLEl-GS live backend",
             "generator": "Unix Makefiles",
             "binaryDir": "${sourceDir}/build/windows-mingw-cross",
             "toolchainFile": "${sourceDir}/cmake/mingw-w64.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "ICORECOMP_PARALLEL_GS": "OFF"
+                "ICORECOMP_PARALLEL_GS": "ON"
             }
         }
     ],

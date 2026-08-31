@@ -16,6 +16,8 @@
  */
 #include "runtime.h"
 
+#include "iso/iso9660.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -106,17 +108,46 @@ void zero_guest_bytes(uint32_t vaddr, size_t len) {
     }
 }
 
+/* Packaged-run defaults, mirroring the committed config/recomp.toml
+ * ([pins].elf_sha1 is one of the two approved SHA-1 pins; the [target]
+ * values are committed config facts, not ROM data). In this mode there is
+ * no decomp checkout: the boot ELF is read out of the user's disc image
+ * (SCUS_971.13, byte-identical to the pinned ELF) by rt_load_elf. */
+constexpr char kPinElfSha1[] = "a4d8fc1948fb2da2395f3863a94a3b93de55de14";
+constexpr uint32_t kTargetEntry = 0x00100008;
+constexpr uint32_t kTargetVramBase = 0x00100000;
+constexpr uint32_t kTargetGp = 0x006388F0;
+
 } // namespace
 
-bool rt_load_config(LoaderConfig* out) {
 #ifndef ICORECOMP_SOURCE_ROOT
 #error "ICORECOMP_SOURCE_ROOT must be defined by the build (see CMakeLists.txt)"
 #endif
-    std::string path = std::string(ICORECOMP_SOURCE_ROOT) + "/config/recomp.toml";
+
+const char* rt_base_dir() {
+    static const std::string base = [] {
+        std::string root = ICORECOMP_SOURCE_ROOT;
+        std::ifstream probe(root + "/config/recomp.toml");
+        if (probe) return root;
+        /* Packaged runtime: the build machine's source tree is not here.
+         * Resolve everything against the working directory instead. */
+        return std::string(".");
+    }();
+    return base.c_str();
+}
+
+bool rt_load_config(LoaderConfig* out) {
+    std::string path = std::string(rt_base_dir()) + "/config/recomp.toml";
     std::ifstream f(path);
     if (!f) {
-        rt_log("loader", "failed to open config: %s", path.c_str());
-        return false;
+        std::snprintf(out->elf_sha1, sizeof(out->elf_sha1), "%s", kPinElfSha1);
+        out->entry = kTargetEntry;
+        out->vram_base = kTargetVramBase;
+        out->gp = kTargetGp;
+        rt_log("loader", "no config/recomp.toml (packaged run): using compiled-in pins/target "
+            "(elf_sha1=%s entry=0x%08x gp=0x%08x); boot ELF will come from the disc image",
+            out->elf_sha1, out->entry, out->gp);
+        return true;
     }
 
     std::string section;
@@ -157,50 +188,105 @@ bool rt_load_config(LoaderConfig* out) {
 }
 
 void rt_resolve_elf_path(const LoaderConfig& cfg, char* buf, size_t buf_size) {
-    std::snprintf(buf, buf_size, "%s/%s/%s", ICORECOMP_SOURCE_ROOT, cfg.decomp_root, cfg.decomp_elf);
+    std::snprintf(buf, buf_size, "%s/%s/%s", rt_base_dir(), cfg.decomp_root, cfg.decomp_elf);
 }
 
-void rt_load_elf(const LoaderConfig& cfg) {
-    char elf_path[1536]; /* comfortably covers ICORECOMP_SOURCE_ROOT + two 512-byte config fields + separators */
-    rt_resolve_elf_path(cfg, elf_path, sizeof(elf_path));
-    rt_log("loader", "ELF path: %s", elf_path);
+namespace {
 
-    bool sha_ok = false;
-    Sha1Digest digest = rt_sha1_file(elf_path, &sha_ok);
-    if (!sha_ok) {
-        rt_fatal("loader", nullptr, "failed to open/read '%s' for the SHA-1 pin check", elf_path);
+/* Reads a whole file. Returns false (out untouched) when it cannot be
+ * opened; fatal on a short read after a successful open. */
+bool read_whole_file(const char* path, std::vector<uint8_t>* out) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    if (size < 0) {
+        std::fclose(f);
+        rt_fatal("loader", nullptr, "ftell('%s') failed", path);
     }
+    std::fseek(f, 0, SEEK_SET);
+    out->resize(size_t(size));
+    if (size > 0 && std::fread(out->data(), 1, size_t(size), f) != size_t(size)) {
+        std::fclose(f);
+        rt_fatal("loader", nullptr, "short read on '%s'", path);
+    }
+    std::fclose(f);
+    return true;
+}
+
+/* Reads SCUS_971.13 out of the mounted disc image (mounting it first; the
+ * mount is fatal when no image is found, and already verifies the file
+ * exists on the disc). */
+void read_elf_from_disc(std::vector<uint8_t>* out) {
+    rt_iso_mount();
+    RtIsoFile f;
+    if (!rt_iso_search("\\SCUS_971.13;1", &f)) {
+        rt_fatal("loader", nullptr, "mounted disc has no SCUS_971.13 (wrong image?)");
+    }
+    out->resize(f.size);
+    uint8_t sec[2048];
+    uint32_t remaining = f.size;
+    for (uint32_t i = 0; remaining > 0; ++i) {
+        if (!rt_iso_read_sector(f.lsn + i, sec)) {
+            rt_fatal("loader", nullptr, "disc read failed at LBA %u while extracting SCUS_971.13", f.lsn + i);
+        }
+        uint32_t chunk = remaining < 2048 ? remaining : 2048;
+        std::memcpy(out->data() + (size_t(i) * 2048), sec, chunk);
+        remaining -= chunk;
+    }
+    rt_log("loader", "boot ELF read from disc: SCUS_971.13, LBA %u, %u bytes", f.lsn, f.size);
+}
+
+/* Bounds-checked read out of the in-memory ELF image. */
+void image_read(const std::vector<uint8_t>& img, size_t off, void* dst, size_t len,
+                const char* what, const char* src) {
+    if (off + len > img.size() || off + len < off) {
+        rt_fatal("loader", nullptr, "short read on %s of '%s' (offset %zu + %zu > %zu bytes)",
+            what, src, off, len, img.size());
+    }
+    std::memcpy(dst, img.data() + off, len);
+}
+
+} // namespace
+
+void rt_load_elf(const LoaderConfig& cfg) {
+    std::vector<uint8_t> elf;
+    char elf_src[1536]; /* comfortably covers the base dir + two 512-byte config fields + separators */
+
+    if (cfg.decomp_root[0] && cfg.decomp_elf[0]) {
+        rt_resolve_elf_path(cfg, elf_src, sizeof(elf_src));
+        rt_log("loader", "ELF path: %s", elf_src);
+        if (!read_whole_file(elf_src, &elf)) {
+            rt_log("loader", "'%s' not readable; falling back to the disc image's SCUS_971.13", elf_src);
+        }
+    }
+    if (elf.empty()) {
+        read_elf_from_disc(&elf);
+        std::snprintf(elf_src, sizeof(elf_src), "SCUS_971.13 (from the mounted disc image)");
+    }
+
+    Sha1Digest digest = rt_sha1_buffer(elf.data(), elf.size());
     char hex[41];
     rt_sha1_to_hex(digest, hex);
     if (!rt_sha1_equals_hex(digest, cfg.elf_sha1)) {
-        rt_fatal("loader", nullptr, "SHA-1 mismatch for '%s': got %s, expected %s (config/recomp.toml [pins].elf_sha1)",
-            elf_path, hex, cfg.elf_sha1);
+        rt_fatal("loader", nullptr, "SHA-1 mismatch for '%s': got %s, expected %s ([pins].elf_sha1)",
+            elf_src, hex, cfg.elf_sha1);
     }
     rt_log("loader", "SHA-1 pin OK: %s", hex);
 
-    std::FILE* f = std::fopen(elf_path, "rb");
-    if (!f) rt_fatal("loader", nullptr, "fopen('%s') failed after the SHA-1 check succeeded", elf_path);
-
     Elf32Ehdr eh;
-    if (std::fread(&eh, 1, sizeof(eh), f) != sizeof(eh)) {
-        std::fclose(f);
-        rt_fatal("loader", nullptr, "short read on ELF header of '%s'", elf_path);
-    }
+    image_read(elf, 0, &eh, sizeof(eh), "ELF header", elf_src);
     if (std::memcmp(eh.e_ident, "\x7f""ELF", 4) != 0) {
-        std::fclose(f);
-        rt_fatal("loader", nullptr, "'%s' is not an ELF file (bad magic)", elf_path);
+        rt_fatal("loader", nullptr, "'%s' is not an ELF file (bad magic)", elf_src);
     }
     if (eh.e_ident[4] != 1 /* ELFCLASS32 */ || eh.e_ident[5] != 1 /* ELFDATA2LSB */) {
-        std::fclose(f);
-        rt_fatal("loader", nullptr, "'%s' is not a 32-bit little-endian ELF (class=%u data=%u)", elf_path, eh.e_ident[4], eh.e_ident[5]);
+        rt_fatal("loader", nullptr, "'%s' is not a 32-bit little-endian ELF (class=%u data=%u)", elf_src, eh.e_ident[4], eh.e_ident[5]);
     }
     if (eh.e_type != kEtExec) {
-        std::fclose(f);
-        rt_fatal("loader", nullptr, "'%s' e_type=%u, expected ET_EXEC (2)", elf_path, eh.e_type);
+        rt_fatal("loader", nullptr, "'%s' e_type=%u, expected ET_EXEC (2)", elf_src, eh.e_type);
     }
     if (eh.e_phnum == 0) {
-        std::fclose(f);
-        rt_fatal("loader", nullptr, "'%s' has no program headers", elf_path);
+        rt_fatal("loader", nullptr, "'%s' has no program headers", elf_src);
     }
 
     rt_log("loader", "ELF header: entry=0x%08x phoff=%u phentsize=%u phnum=%u",
@@ -212,32 +298,20 @@ void rt_load_elf(const LoaderConfig& cfg) {
 
     uint32_t load_count = 0;
     for (uint16_t i = 0; i < eh.e_phnum; ++i) {
-        if (std::fseek(f, long(eh.e_phoff) + long(i) * eh.e_phentsize, SEEK_SET) != 0) {
-            std::fclose(f);
-            rt_fatal("loader", nullptr, "seek to program header %u failed", i);
-        }
         Elf32Phdr ph;
-        if (std::fread(&ph, 1, sizeof(ph), f) != sizeof(ph)) {
-            std::fclose(f);
-            rt_fatal("loader", nullptr, "short read on program header %u", i);
-        }
+        image_read(elf, size_t(eh.e_phoff) + size_t(i) * eh.e_phentsize, &ph, sizeof(ph),
+            "program header", elf_src);
         if (ph.p_type != kPtLoad) continue;
 
         rt_log("loader", "PT_LOAD[%u]: vaddr=0x%08x offset=0x%x filesz=0x%x memsz=0x%x flags=0x%x",
             load_count, ph.p_vaddr, ph.p_offset, ph.p_filesz, ph.p_memsz, ph.p_flags);
 
-        std::vector<uint8_t> buf(ph.p_filesz);
         if (ph.p_filesz > 0) {
-            if (std::fseek(f, long(ph.p_offset), SEEK_SET) != 0) {
-                std::fclose(f);
-                rt_fatal("loader", nullptr, "seek to segment %u data failed", load_count);
+            if (size_t(ph.p_offset) + ph.p_filesz > elf.size()) {
+                rt_fatal("loader", nullptr, "segment %u data runs past the end of '%s'", load_count, elf_src);
             }
-            if (std::fread(buf.data(), 1, ph.p_filesz, f) != ph.p_filesz) {
-                std::fclose(f);
-                rt_fatal("loader", nullptr, "short read on segment %u data", load_count);
-            }
+            write_guest_bytes(ph.p_vaddr, elf.data() + ph.p_offset, ph.p_filesz);
         }
-        write_guest_bytes(ph.p_vaddr, buf.data(), ph.p_filesz);
         if (ph.p_memsz > ph.p_filesz) {
             uint32_t bss_len = ph.p_memsz - ph.p_filesz;
             zero_guest_bytes(ph.p_vaddr + ph.p_filesz, bss_len);
@@ -246,9 +320,8 @@ void rt_load_elf(const LoaderConfig& cfg) {
         }
         ++load_count;
     }
-    std::fclose(f);
 
-    if (load_count == 0) rt_fatal("loader", nullptr, "no PT_LOAD segment found in '%s'", elf_path);
+    if (load_count == 0) rt_fatal("loader", nullptr, "no PT_LOAD segment found in '%s'", elf_src);
     if (load_count > 1) {
         rt_log("loader", "note: %u PT_LOAD segments found; CLAUDE.md/plan assumed exactly one (ICO's boot ELF has one)", load_count);
     }

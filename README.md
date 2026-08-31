@@ -27,6 +27,16 @@ sources) come from a sibling checkout of the ICO matching-decomp project,
 consumed read-only. Paths are configured in `config/recomp.toml`. Nothing from
 that checkout is copied into this repository.
 
+## Building
+
+You need your own ICO (USA) disc image and a sibling checkout of the ICO
+decomp project (`../ico`) with its base ELF extracted. Then:
+
+    ./setup.sh /path/to/Ico_USA.iso
+
+builds the translator, translates the game locally, builds the runtime, and
+prints how to run. Windows: see `docs/WINDOWS.md`.
+
 ## Layout
 
 - `include/`: ABI contract between generated code, the reference interpreter,

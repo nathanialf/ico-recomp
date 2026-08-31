@@ -41,6 +41,7 @@
 
 #include "ee/kernel.h"
 #include "hw/hw.h"
+#include "iso/iso9660.h"
 
 #include <csignal>
 #include <cstdio>
@@ -113,9 +114,40 @@ void install_crash_handler() {
     std::signal(SIGINT, sigint_handler);
 }
 
+void print_usage(const char* argv0) {
+    std::printf(
+        "usage: %s [--disc <path>]\n"
+        "\n"
+        "  --disc <path>   ICO (US) disc image to mount (.iso, or the .bin of a\n"
+        "                  bin/cue rip). Without it the runtime looks for a disc\n"
+        "                  per the order in src/runtime/iso/iso9660.h (config,\n"
+        "                  decomp checkout, then ico.iso next to the exe).\n"
+        "\n"
+        "Behavior toggles are environment variables (ICORECOMP_GS, ICORECOMP_MAX_VBLANKS,\n"
+        "ICORECOMP_INPUT_SCRIPT, ICORECOMP_SAVES_DIR, ...); see the runtime sources or\n"
+        "the packaged README.txt.\n",
+        argv0);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (std::strcmp(arg, "--disc") == 0 && i + 1 < argc) {
+            rt_iso_set_path(argv[++i]);
+        } else if (std::strncmp(arg, "--disc=", 7) == 0) {
+            rt_iso_set_path(arg + 7);
+        } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n", arg);
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
     set_fpu_ftz_daz();
     rt_mem_init();
     /* Creates the GS backend (ICORECOMP_GS selects dump / parallel / both;

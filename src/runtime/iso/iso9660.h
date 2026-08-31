@@ -20,10 +20,18 @@ struct RtIsoFile {
     uint8_t date[8] = {0};
 };
 
+/* Explicit disc image path (the runtime's --disc flag). Takes precedence
+ * over every probed location; a path set here that does not mount is fatal
+ * (the user asked for that file specifically). Call before rt_iso_mount. */
+void rt_iso_set_path(const char* path);
+
 /* Mounts the disc image. Path resolution order:
- *   1. config/local.toml [disc] path (untracked, gitignored)
- *   2. <decomp root>/baserom/Ico_USA.bin
- *   3. <decomp root>/baserom/Ico_USA.iso
+ *   1. rt_iso_set_path (--disc), fatal when unusable
+ *   2. config/local.toml [disc] path (untracked, gitignored; relative to
+ *      rt_base_dir())
+ *   3. <decomp root>/baserom/Ico_USA.bin, then .iso
+ *   4. ico.iso / ico.bin / Ico_USA.iso / Ico_USA.bin in the working
+ *      directory (the packaged-zip convention: disc next to the exe)
  * Fatal if nothing usable is found (loud failure per CLAUDE.md). Verifies
  * the mount by locating SCUS_971.13 and DFDATAS/DATA.DF. */
 void rt_iso_mount();

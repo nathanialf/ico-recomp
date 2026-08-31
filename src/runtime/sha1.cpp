@@ -103,6 +103,12 @@ Sha1Digest rt_sha1_file(const char* path, bool* ok) {
     return digest;
 }
 
+Sha1Digest rt_sha1_buffer(const uint8_t* data, size_t len) {
+    Sha1State state;
+    sha1_update(state, data, len);
+    return sha1_final(state);
+}
+
 void rt_sha1_to_hex(const Sha1Digest& d, char* buf) {
     static const char* hex = "0123456789abcdef";
     for (int i = 0; i < 20; ++i) {

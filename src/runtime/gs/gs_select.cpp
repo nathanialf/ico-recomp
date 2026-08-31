@@ -3,6 +3,8 @@
  * ICORECOMP_GS picks the implementation behind rt_gs_backend():
  *   dump (or unset)  gs_dumpwriter.cpp; writes a raw stream when
  *                    ICORECOMP_GS_DUMP=path is set, otherwise shadow+stats.
+ *                    On Windows builds with the live backend, unset means
+ *                    parallel instead: a packaged exe must open a window.
  *   parallel         gs_parallel.cpp, live paraLLEl-GS rendering.
  *   both             live rendering, with every call teed into the dump
  *                    writer as well, so a run can be replayed offline while
@@ -76,7 +78,20 @@ void backend_atexit() {
 }
 
 GsBackend* make_backend(const char* mode, const char* dump_path) {
-    if (!mode || !*mode || std::strcmp(mode, "dump") == 0) {
+    if (!mode || !*mode) {
+#if defined(_WIN32) && defined(ICORECOMP_HAVE_PARALLEL_GS)
+        /* Packaged Windows builds are double-clicked: an unset ICORECOMP_GS
+         * must mean "play in a window", not a silent headless dump run.
+         * Linux keeps the dump default; dev tooling there sets the variable
+         * explicitly. */
+        rt_log("gs", "ICORECOMP_GS unset: defaulting to the live paraLLEl-GS backend "
+                     "(set ICORECOMP_GS=dump for the headless dump backend)");
+        return rt_gs_make_parallel_backend();
+#else
+        return rt_gs_make_dump_backend(dump_path);
+#endif
+    }
+    if (std::strcmp(mode, "dump") == 0) {
         return rt_gs_make_dump_backend(dump_path);
     }
 #ifdef ICORECOMP_HAVE_PARALLEL_GS

@@ -34,6 +34,7 @@
 namespace {
 
 std::FILE* g_disc = nullptr;
+std::string g_forced_path; /* rt_iso_set_path (--disc) */
 uint32_t g_sector_size = 0;
 uint32_t g_data_offset = 0;
 uint32_t g_total_sectors = 0;
@@ -164,6 +165,14 @@ bool scan_dir(uint32_t dir_lba, uint32_t dir_size, const char* component,
     return false;
 }
 
+/* Absolute on either OS: leading '/' or '\' (POSIX, UNC/rooted) or a drive
+ * letter ("C:..."). */
+bool path_is_absolute(const std::string& p) {
+    if (p.empty()) return false;
+    if (p[0] == '/' || p[0] == '\\') return true;
+    return p.size() >= 2 && p[1] == ':';
+}
+
 bool try_open(const std::string& path, const char* how) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -235,29 +244,51 @@ bool rt_iso_search(const char* path, RtIsoFile* out) {
     return true;
 }
 
+void rt_iso_set_path(const char* path) {
+    g_forced_path = path ? path : "";
+}
+
 void rt_iso_mount() {
     if (g_disc) return;
 
     std::string tried;
-    std::string local = std::string(ICORECOMP_SOURCE_ROOT) + "/config/local.toml";
-    std::string cfg_path = toml_lookup(local.c_str(), "disc", "path");
-    if (!cfg_path.empty()) {
-        std::string p = cfg_path[0] == '/' ? cfg_path
-            : std::string(ICORECOMP_SOURCE_ROOT) + "/" + cfg_path;
-        if (try_open(p, "config/local.toml [disc].path")) goto mounted;
-        tried += p + " ";
+    if (!g_forced_path.empty()) {
+        if (try_open(g_forced_path, "--disc")) goto mounted;
+        rt_fatal("iso", nullptr, "--disc %s: not readable or no ISO9660 filesystem found",
+            g_forced_path.c_str());
+    }
+    {
+        std::string local = std::string(rt_base_dir()) + "/config/local.toml";
+        std::string cfg_path = toml_lookup(local.c_str(), "disc", "path");
+        if (!cfg_path.empty()) {
+            std::string p = path_is_absolute(cfg_path) ? cfg_path
+                : std::string(rt_base_dir()) + "/" + cfg_path;
+            if (try_open(p, "config/local.toml [disc].path")) goto mounted;
+            tried += p + " ";
+        }
     }
     {
         LoaderConfig cfg;
         std::string root = "../ico";
-        if (rt_load_config(&cfg)) root = cfg.decomp_root;
-        std::string base = std::string(ICORECOMP_SOURCE_ROOT) + "/" + root + "/baserom/Ico_USA";
+        if (rt_load_config(&cfg) && cfg.decomp_root[0]) root = cfg.decomp_root;
+        std::string base = std::string(rt_base_dir()) + "/" + root + "/baserom/Ico_USA";
         if (try_open(base + ".bin", "decomp baserom bin/cue")) goto mounted;
         tried += base + ".bin ";
         if (try_open(base + ".iso", "decomp baserom iso")) goto mounted;
-        tried += base + ".iso";
+        tried += base + ".iso ";
     }
-    rt_fatal("iso", nullptr, "no disc image found (tried: %s). Set [disc] path in config/local.toml.",
+    {
+        /* Packaged-zip convention: the disc sits next to the exe (which is
+         * the working directory when launched by double click or from its
+         * own folder). */
+        static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_USA.iso", "Ico_USA.bin" };
+        for (const char* name : kLocal) {
+            if (try_open(name, "working directory")) goto mounted;
+            tried += std::string(name) + " ";
+        }
+    }
+    rt_fatal("iso", nullptr, "no disc image found (tried: %s). Pass --disc <path>, set [disc] path "
+        "in config/local.toml, or put the image next to the exe as ico.iso.",
         tried.c_str());
 
 mounted:
