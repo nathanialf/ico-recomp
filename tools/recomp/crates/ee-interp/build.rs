@@ -50,7 +50,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=eeshim");
-    println!("cargo:rustc-link-lib=dylib=m");
+    // MSVC has no separate libm; the CRT provides the math symbols.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        println!("cargo:rustc-link-lib=dylib=m");
+    }
     println!("cargo:rerun-if-changed=csrc/shim.c");
     for h in ["recomp_ops.h", "recomp_api.h", "recomp_context.h"] {
         println!("cargo:rerun-if-changed={}", include.join(h).display());
