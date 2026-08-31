@@ -13,7 +13,11 @@
  *   ch1 VIF1     normal + source chain (CNT/NEXT/REF/REFS/CALL/RET/END/
  *                REFE), 2-deep ASR stack, TTE tag words 2-3 to VIF1
  *   ch2 GIF      normal + source chain, payload to GIF PATH3
- *   ch3/ch4 IPU  loud logging stubs (transfer dropped, completion raised)
+ *   ch3/ch4 IPU  forwarded to hw/ipu.cpp (rt_ipu_dma_kick), which owns
+ *                execution and completion for both channels: ch4 (toIPU)
+ *                is a pull source for the IPU bitstream (normal + source
+ *                chain), ch3 (fromIPU) drains the IPU output queue and can
+ *                stay pending (STR set) until a command produces data
  *   ch5/6/7 SIF  register file only; kicks are loud stubs (SIF DMA is
  *                HLE'd at the SifSetDma syscall layer, sif/sif.cpp)
  *   ch8 fromSPR  normal + interleave (SADR wraps in the 16 KB scratchpad)
@@ -344,10 +348,13 @@ void kick(int ch, Channel& c) {
             }
             run_normal(ch, c);
             break;
-        case 3: case 4: /* IPU: loud stub */
-            rt_log("dmac", "ch%d (%s) IPU DMA kicked (madr=0x%08x qwc=%u): STUB, transfer dropped [kick #%" PRIu64 "]",
-                ch, kDesc[ch].name, c.madr, c.qwc, c.kicks);
-            break;
+        case 3: case 4: /* ---- IPU section: hw/ipu.cpp owns these ---- */
+            /* The IPU model executes and completes ch3/ch4 itself (STR
+             * clear + rt_dmac_raise), possibly deferred until a command
+             * produces or consumes data, so the standard completion tail
+             * below must not run. */
+            rt_ipu_dma_kick(ch);
+            return;
         case 0: /* VIF0: loud stub */
             rt_log("dmac", "ch0 (VIF0) kicked (madr=0x%08x qwc=%u): STUB, transfer dropped [kick #%" PRIu64 "]",
                 c.madr, c.qwc, c.kicks);
@@ -366,6 +373,18 @@ void kick(int ch, Channel& c) {
 }
 
 } // namespace
+
+/* ---- IPU section: register-file access for hw/ipu.cpp ------------------- */
+
+uint32_t* rt_dmac_ipu_reg(int ch, int which) {
+    Channel& c = g_ch[ch];
+    switch (which) {
+        case 0: return &c.chcr;
+        case 1: return &c.madr;
+        case 2: return &c.qwc;
+        default: return &c.tadr;
+    }
+}
 
 bool rt_dmac_mmio_read(uint32_t addr, uint32_t* out) {
     uint32_t off;

@@ -120,9 +120,16 @@ int rt_sif_dma_stat(uint32_t id) {
     return -1;
 }
 
-uint64_t rt_sif_next_event() { return rt_rpc_next_event(); }
+uint64_t rt_sif_next_event() {
+    uint64_t t = rt_rpc_next_event();
+    uint64_t p = rt_pad_next_event();
+    return p < t ? p : t;
+}
 
-void rt_sif_run_due() { rt_rpc_run_due(); }
+void rt_sif_run_due() {
+    rt_rpc_run_due();
+    rt_pad_run_due();
+}
 
 bool rt_sif_mmio_read(uint32_t addr, uint32_t* out) {
     switch (addr) {

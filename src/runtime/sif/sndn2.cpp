@@ -1,10 +1,11 @@
 /* sif/sndn2.cpp: HLE of the game's own IOP sound server (SNDN2DRV.IRX,
- * RPC server id 0x736e646e, ASCII "sndn"). No audio is produced; this
- * models exactly the wire behavior the EE-side library needs to get past
- * its synchronization points. Protocol facts were reverse engineered from
- * the retail EE-side vendor sound library in the user's own game copy
+ * RPC server id 0x736e646e, ASCII "sndn"). This file owns the wire
+ * behavior (record unpacking + the seq-tag ack the EE's sync spins on) and
+ * forwards every decoded command to the native sound engine (snd/engine.cpp),
+ * which produces the actual audio. Protocol facts were reverse engineered
+ * from the retail EE-side vendor sound library in the user's own game copy
  * (disassembly at decomp-repo asm/nonmatchings/src/cod/vendor_258CC0 and
- * one boot's RPC traffic); see SNDN2_NOTES.md next to this file.
+ * boot RPC traffic); see SNDN2_NOTES.md next to this file.
  *
  * Wire summary:
  *   fno 0x65 (sync call, 64-byte send/recv): remote init. Send word 0 is
@@ -28,6 +29,8 @@
  */
 #include "rpc.h"
 
+#include "../snd/snd.h"
+
 #include <cinttypes>
 #include <cstring>
 
@@ -44,14 +47,34 @@ uint64_t g_batches = 0;
 uint64_t g_commands = 0;
 
 const char* cmd_name(uint32_t cmd) {
-    /* Names inferred from EE-side call sites; unknown ids keep "?" until a
-     * call site is identified (SNDN2_NOTES.md tracks the evidence). */
+    /* Names from EE-side call sites (SNDN2_NOTES.md tracks the evidence). */
     switch (cmd) {
-        case 0x0A: return "tick-level-A";     /* flush path, from status+0x20 */
-        case 0x0B: return "tick-level-B";     /* flush path, from status+0x28 */
-        case 0x0C: return "tick-level-C";     /* flush path, from status+0x00/0x08 */
-        case 0x0D: return "tick-level-D";     /* flush path, from status+0x10/0x18 */
+        case 0x01: return "voice-volume";
+        case 0x02: return "voice-adsr";
+        case 0x03: return "voice-addr";
+        case 0x04: return "voice-note";
+        case 0x0A: return "key-on-mask";
+        case 0x0B: return "key-off-mask";
+        case 0x0C: return "rev-send-mask";
+        case 0x0D: return "mode-mask";
+        case 0x14: return "reverb-endaddr";
+        case 0x15: return "reverb-type";
+        case 0x16: return "reverb-depth";
+        case 0x17: return "reverb-delay";
+        case 0x18: return "reverb-feedback";
+        case 0x1F: return "quit";
         case 0x20: return "bank-transfer";    /* retail func_0025C680: iop_addr, offset, size */
+        case 0x21: return "dma-read";
+        case 0x28: return "master-vol";
+        case 0x32: return "param";
+        case 0x3C: return "st-adpcm-init";
+        case 0x3D: return "st-adpcm-quit";
+        case 0x3E: return "st-adpcm-open";
+        case 0x3F: return "st-adpcm-close";
+        case 0x40: return "st-adpcm-volume";
+        case 0x41: return "st-adpcm-pitch";
+        case 0x42: return "st-adpcm-play";
+        case 0x43: return "st-adpcm-stop";
         default: return "?";
     }
 }
@@ -64,6 +87,7 @@ void handle_init(const uint8_t* send, uint32_t send_size) {
     if (w0 != 0x1E) {
         rt_log("sndn2", "WARNING init w0=0x%x, expected 0x1E (voice count?); protocol drift?", w0);
     }
+    rt_snd_engine_init(w0);
 }
 
 void handle_batch(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t recv_size) {
@@ -80,15 +104,40 @@ void handle_batch(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32
         uint32_t a2 = ((w2 & 0xFFFF) << 8) | (w3 >> 24);
         uint32_t a3 = w3 & 0xFFFFFF;
         ++g_commands;
-        if (tag) g_ack_tag = tag;
-        rt_log("sndn2", "cmd 0x%02x (%s) tag=%u a1=0x%06x a2=0x%06x a3=0x%06x [command #%" PRIu64 "]",
-            w0, cmd_name(w0), tag, a1, a2, a3, g_commands);
-        /* bank-transfer (0x20): the payload was already staged into virtual
-         * IOP RAM by the raw EE->IOP SifSetDma the game issued beforehand
-         * (a1 selects the destination inside the iopheap allocation); with
-         * no SPU model the ack below is the entire required behavior. */
+        if (w0 == 0x20 || w0 == 0x21) {
+            /* DMA commands are the only records packed by retail
+             * func_0025C6D8 (24-bit operands + the seq tag the EE's sync
+             * spins on); everything else is stored raw by func_002591F0. */
+            g_ack_tag = tag;
+            rt_log("sndn2", "cmd 0x%02x (%s) tag=%u a1=0x%06x a2=0x%06x a3=0x%06x [command #%" PRIu64 "]",
+                w0, cmd_name(w0), tag, a1, a2, a3, g_commands);
+            if (w0 == 0x20) {
+                /* bank-transfer: the payload was already staged into
+                 * virtual IOP RAM by the raw EE->IOP SifSetDma the game
+                 * issued beforehand (a1 = source inside the iopheap
+                 * allocation, a2 = SPU RAM byte destination, a3 = byte
+                 * length). Consume it now: the EE reuses the staging
+                 * buffer for the next chunk. */
+                if (a1 + a3 > RT_IOP_RAM_SIZE) {
+                    rt_fatal("sndn2", nullptr, "bank transfer source out of IOP RAM: src=0x%06x len=0x%06x", a1, a3);
+                }
+                rt_spu_upload(rt_iop_ptr(a1), a2, a3);
+            } else {
+                rt_log("sndn2", "WARNING cmd 0x21 (SgDmaRead) NOT MODELED: SPU->IOP readback ignored");
+            }
+        } else {
+            rt_log("sndn2", "cmd 0x%02x (%s) w1=0x%08x w2=0x%08x w3=0x%08x [command #%" PRIu64 "]",
+                w0, cmd_name(w0), w1, w2, w3, g_commands);
+            rt_snd_command(w0, w1, w2, w3);
+        }
     }
+    /* The EE library flushes once per vblank field; render that field's
+     * audio now (also covers empty batches, which are the common case). */
+    rt_snd_flush_tick();
     if (recv_size >= kAckOffset + 4) {
+        /* Stream read cursors at +0xC0 (read by SgSetAdpcmIopReadAddr,
+         * retail func_0025DFB0), then the DMA ack word. */
+        rt_snd_fill_status(recv, recv_size);
         wr32(recv, kAckOffset, g_ack_tag);
     } else if (recv_size) {
         rt_log("sndn2", "WARNING batch recv_size=%u < 0x%x: ack word not delivered", recv_size, kAckOffset + 4);

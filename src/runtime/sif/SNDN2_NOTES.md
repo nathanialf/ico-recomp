@@ -57,36 +57,110 @@ Retail `func_0025C2F8` (aug6 `SgSndn2RemoteInit`):
    The 64-byte receive lands in the same stack buffer and is never read.
 4. Sets `+0x44` = 1, `+0x48` = 0, `+0x40` = 0, `+0x3A` = 0x3C.
 
-## Command records (16 bytes, packed by retail func_0025C6D8)
+## Command records (16 bytes, two layouts)
 
-```
-w0 = command id
-w1 = (seq_tag << 8) | a1[23:16]
-w2 = (a1[15:0] << 16) | a2[23:8]
-w3 = (a2[7:0] << 24) | a3[23:0]
-```
+There are two enqueue functions on the EE side, and they pack differently:
 
-`seq_tag` is the post-increment value of the issued-command counter
-(`D_0071C640+0x48`), truncated to 24 bits on the wire. Commands queued
-directly by the flush path (ids 0xA-0xD) carry `seq_tag` = 0 and do not
-advance the counter. a1/a2/a3 are 24-bit operands.
+1. Tagged (retail `func_0025C6D8`), used ONLY by the DMA commands 0x20
+   (`SgDmaWrite`, retail `func_0025C680`) and 0x21 (`SgDmaRead`, retail
+   `func_0025C6B0`):
 
-Command ids with an identified EE call site:
-- `0x20` (retail `func_0025C680`, tagged): bank data transfer.
-  a1 = source address inside the IOP heap buffer, a2 = destination (SPU RAM
-  byte address, monotonically increasing across a bank load), a3 = byte
-  length. Issued by `soundDataOpenSync` after each raw EE-to-IOP copy chunk.
-- `0x21` (retail `func_0025C6B0`, tagged): same packing, transfer variant
-  (not observed during boot; direction or target differs).
-- `0x16` (retail `func_0025CCE0(ch, l, r)`): master volume per output port.
-- `0x28` (retail `func_0025CE78(ch, l, r)`): second volume pair per port
-  (observed at boot with 0x3FFF/0x3FFF).
-- `0x0A/0x0B/0x0C/0x0D`: untagged per-tick level updates from the control
-  block fields listed above.
-- Observed at boot without a traced call site: `0x32`, `0x14`, `0x15`,
-  `0x3C` (one-time setup batch) and `0x01`-`0x04` (per-voice key/pitch/
-  volume traffic from the voice state machine, retail `func_00258D10` and
-  its jump-table helpers).
+   ```
+   w0 = command id
+   w1 = (seq_tag << 8) | a1[23:16]
+   w2 = (a1[15:0] << 16) | a2[23:8]
+   w3 = (a2[7:0] << 24) | a3[23:0]
+   ```
+
+   `seq_tag` is the post-increment value of the issued-command counter
+   (`D_0071C640+0x48`), truncated to 24 bits; a1/a2/a3 are 24-bit operands.
+   For 0x20: a1 = IOP heap source, a2 = SPU RAM byte destination, a3 = byte
+   length.
+
+2. Raw (retail `func_002591F0`), used by every other command: w1..w3 are
+   the caller's 32-bit arguments stored verbatim, no tag. Since w1 is
+   always a voice/port number (or a packed field whose high byte is a
+   voice), `w1 >> 8` can look nonzero; discriminate layouts by command id
+   (only 0x20/0x21 are tagged), not by the tag byte.
+
+## Command vocabulary (raw layout, w1/w2/w3 = enqueue args)
+
+Voice commands (w1 = SPU2 voice number, 0..0x2F):
+- `0x01` volume: w2 = VOLL, w3 = VOLR. 0..0x3FFF linear; bit 15 selects the
+  SPU2 sweep-mode word `(mode << 8) | (vol >> 7)` (emitter retail
+  `func_0025AC60`; sweep taken when the tone's sweep byte +0x0A is set).
+  The emitter computes the value as the product chain chanVol x expression
+  x toneVol x velocity x progVol x masterVol x pan x seqVol.
+- `0x02` ADSR: w2 = ADSR1, w3 = ADSR2, the raw SPU2 register words straight
+  from the bank's tone record (+0x06/+0x08). `SgSeStopNoRelease`-class
+  stops send (0,0) then key-off: release shift 0 = instant cut.
+- `0x03` start address: w2 = VAG start, SPU RAM byte address (bank slot
+  base + tone's VAG offset << bank shift, computed on the EE).
+- `0x04` note params (emitter retail `func_0025AC18`):
+  w2 = tone[+2] << 24 | note << 16 | fine << 8 | bend_center,
+  w3 = moddepth << 24 | pitch_scale[23:0] (12.12 fixed, 0x1000 = x1.0).
+  No absolute pitch is sent; the IOP derives the pitch register from these.
+  Observed boot SEs: center 0x58-0x5C, note 0x4A-0x4F, fine small negative,
+  scale 0x1000.
+
+Per-tick masks from the flush path (w1 = 0, w2 = voices 0..23, w3 = voices
+24..47, both 24-bit halves, level-triggered from control block +0x00..0x28):
+- `0x0A` KEY ON (control block +0x20)
+- `0x0B` KEY OFF (+0x28)
+- `0x0C` effect (reverb) send enable mask (+0x00/+0x08 pair)
+- `0x0D` second mode mask (+0x10/+0x18; noise/pmon class, unresolved)
+
+Reverb and output (w1 = core 0/1):
+- `0x14` `SgSetReverbEndAddr(core, addr)`: boot sends 0x1FFFFF / 0x1DFFFF.
+- `0x15` `SgSetReverbType(core, type)`: boot sends type 4 (studio-large in
+  the SPU2 numbering).
+- `0x16` `SgSetReverbDepth(core, dL, dR)`: boot sends 0xCCC/0xCCC.
+- `0x17` `SgSetReverbDelaytime`, `0x18` `SgSetReverbFeedback` (types 7/8).
+- `0x28` `SgSetMasterVol(core, L, R)`: 0..0x3FFF; boot ends at full scale.
+- `0x32` parameter write: w1 = 0x0A digital output mode (boot: 0x80);
+  w1 = 0x08 observed as a per-voice attribute elsewhere.
+- `0x1F` `SgQuit` terminator.
+
+ADPCM streaming (SgStAdpcm*, retail func_0025DCF0..func_0025DFB0):
+- `0x3C` Init, `0x3D` Quit (no args).
+- `0x3E` Open (retail `func_0025DD20`): w1 = voice << 24 | nch << 16 |
+  (blocksize >> 8) << 8 | spu_addr[23:16], w2 = spu_addr[15:0] << 16 |
+  ring_size[23:8], w3 = ring_size[7:0] << 24 | iop_buf[23:0].
+  Boot ambience: two voices (0 and 1), nch = 2, blocksize 0x4000,
+  spu 0x1E0000/0x1E4000, ring 0x5C000, iop 0x2B8000/0x2B8400. The ring
+  interleaves the channels in 0x800/nch chunks (stride 0x800).
+- `0x3F` Close(voice) (w1 = voice number, not a handle).
+- `0x40` ChannelVolume(handle, L, R): w1|w2<<24 = 48-bit voice mask handle,
+  w3 = L << 16 | R, each < 0x4000.
+- `0x41` ChannelPitch(handle, rate): w3 = playback rate in Hz, capped at
+  0x2EE00 = 192000 = 4 x 48000 (the SPU2 4x pitch ceiling). The boot
+  ambience runs at 0xAC44 = 44100.
+- `0x42` Play(handle), `0x43` Stop(handle).
+- `0x46`..`0x4F` `SgStPcm*` family (PCM streaming; not observed).
+
+## Pitch unit
+
+The SPU2 pitch register convention (0x1000 = one input sample per 48 kHz
+output tick, i.e. 0x1000 plays a 48 kHz encoding at native speed) is
+confirmed by `SgStAdpcmChannelPitch`: it passes a raw rate in Hz with an
+EE-side cap of 0x2EE00 = 192000 Hz = exactly the hardware's 4x ceiling
+(pitch register max 0x3FFF is 4x 0x1000), so the IOP computes
+pitch = rate * 0x1000 / 48000. Sequenced voices never receive an absolute
+pitch; cmd 0x04 sends note/fine/center plus a 12.12 scale and the IOP does
+the note math. The runtime uses the convention note == center => 0x1000
+(2^(1/12) per semitone, fine in 1/16 semitone); the boot SEs land at
+~0.45x = ~21.5 kHz, consistent with 22.05 kHz source encodings.
+
+## Bank format facts (EE side; nothing IOP-visible)
+
+The .hd header is parsed entirely on the EE (retail bank open rebases table
+pointers at header +0x10/+0x18/+0x1C/+0x20/+0x24 into absolute pointers at
++0x30..+0x44). Only the .bd VAG bodies are uploaded to SPU RAM (seven 0x20
+transfers for the SE bank, 0x5010..0x1B7250). Note-ons then carry explicit
+SPU addresses/ADSR/note data, so this HLE never parses a bank header: the
+16-byte tone records (+0x02 center?, +0x03 fine, +0x04 VAG offset in
+shifted units, +0x06 ADSR1, +0x08 ADSR2, +0x0A sweep, +0x0D used by the
+voice state machine, +0x0F bit 7 reverb flag) stay an EE-side concern.
 
 ## Flush (fno 0x64)
 
@@ -115,10 +189,12 @@ path when `+0x44` is set (`func_0025C638`):
   widen the tag; the counter never gets near 2^24 in practice and this HLE
   echoes the 24-bit value (documented limitation in sndn2.cpp).
 
-Other status-block fields observed to be read by the EE (`+0x10` as a
-pointer in voice states 0xB0/0xF0) are not needed during boot and stay zero
-in this HLE; the loud per-command log will surface any state that starts
-depending on them.
+Beyond the ack, the EE reads the per-voice STREAM READ CURSORS from the
+status block: `+0xC0 + (voice % 24) * 4 + (voice / 24) * 0x60` (retail
+`func_0025DFB0`, aug6 `SgStAdpcmIopReadAddr`) holds the absolute IOP RAM
+address the driver will consume next for that stream voice. The game's
+adpcm tick uses the per-tick delta to schedule ring refills, so the HLE
+fills these words every flush (engine.cpp `rt_snd_fill_status`).
 
 ## Boot behavior after the fix
 
@@ -127,3 +203,31 @@ each preceded by a raw EE-to-IOP copy and followed by a mode-1 sync; then
 regular per-field fno 0x64 flushes continue (mostly empty, occasionally
 voice commands when the game plays SEs). See the endpoint log excerpt in the
 task report / commit message.
+
+## Native engine (src/runtime/snd, src/runtime/host/audio.*)
+
+sndn2.cpp forwards every record to the engine and renders one field of
+48 kHz stereo audio per fno 0x64 flush (48000 * 1001 / 60000 = 800.8
+frames, fraction carried). Implementation notes and known deviations:
+
+- VAG decode is the public Sony spec, verified bit-exact against the decomp
+  repo's tools/decode_vag.py via `ICORECOMP_SND_SELFTEST=prefix` (dumps the
+  first keyed-on VAG and its decode; compare with
+  snd/tests/vag_compare.py). Dumps are ROM-derived: keep them in /tmp.
+- ADSR follows the public SPU2 envelope spec (shift/step/exponential
+  flags), clocked at 48 kHz.
+- cmd 0x01 sweep-mode volume words are flattened to their 7-bit level (no
+  ramp yet). The boot SEs arrive with volume (0,0) from the EE's own
+  factor chain, so a faithful boot render is silent SE-wise;
+  `ICORECOMP_SND_UNITY_VOL=1` overrides voice/master volumes for pipeline
+  verification.
+- Reverb is a Schroeder/Moorer send bus keyed off the type/depth commands
+  (0x15/0x16) and the 0x0C send-enable mask, not an SPU2 DSP model.
+- Streams decode straight out of the virtual-IOP ring (interleave
+  de-chunking as above), report their cursors, and play whatever the ring
+  holds; refill DMA from the EE side is the pending piece (ring observed
+  all-zero during boot).
+- Output: host/audio.cpp, SDL3 audio stream at 48 kHz stereo f32 when a
+  playback device exists, plus `ICORECOMP_WAV_CAPTURE=path` (48 kHz stereo
+  s16, header kept valid incrementally). snd/tests/wav_stats.py prints
+  per-second RMS and a distinct-event count for headless checks.

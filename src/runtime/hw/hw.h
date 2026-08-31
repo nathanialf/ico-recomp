@@ -52,6 +52,26 @@ void rt_vif1_feed(const uint32_t* words, uint32_t count);
  * 64 bits are not lost. Returns true when the address is a FIFO. */
 bool rt_hw_fifo_write128(uint32_t addr, const rc_u128* v);
 
+/* ---- IPU (ipu.cpp) ------------------------------------------------------ */
+
+/* IPU registers 0x10002000-0x10002030 and the FIFO windows at 0x10007000/
+ * 0x10007010. IPU_CMD/IPU_TOP reads are 64-bit (busy flag in bit 63). */
+bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out);
+bool rt_ipu_mmio_write(uint32_t addr, uint64_t v);
+/* dmac.cpp forwards ch3 (fromIPU) / ch4 (toIPU) CHCR.STR kicks here; the
+ * IPU owns transfer execution and completion for those channels (clears
+ * STR and raises D_STAT itself, possibly later, when a command produces or
+ * consumes the data). */
+void rt_ipu_dma_kick(int ch);
+/* dmac.cpp: pointers into the ch3/ch4 register file for the IPU module.
+ * which: 0=CHCR 1=MADR 2=QWC 3=TADR. */
+uint32_t* rt_dmac_ipu_reg(int ch, int which);
+/* Selftest hooks (hw/ipu_selftest.cpp): direct feed into the input queue
+ * and reads from the output queue, bypassing the DMA bridge. */
+void rt_ipu_test_feed(const uint8_t* data, size_t len);
+size_t rt_ipu_test_out_avail();
+size_t rt_ipu_test_read_out(uint8_t* dst, size_t maxlen);
+
 /* ---- GIF (gif.cpp) ------------------------------------------------------ */
 
 /* path: 0 = PATH1 (XGKICK), 1 = PATH2 (VIF1 DIRECT), 2 = PATH3 (GIF DMA).

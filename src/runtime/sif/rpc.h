@@ -71,4 +71,14 @@ void rt_cdvd_register_services();
 /* sndn2.cpp: the game's own IOP sound server (SNDN2DRV.IRX). */
 void rt_sndn2_register_service();
 
+/* pad.cpp: the padman servers (old wire protocol) plus the per-field pad
+ * data delivery timeline (aggregated into rt_sif_next_event/run_due). */
+void rt_pad_register_services();
+uint64_t rt_pad_next_event();
+void rt_pad_run_due();
+
+/* mc.cpp: the mcserv server (old MCSERV wire protocol), backed by
+ * config/local.toml [saves] dir on the host disk. */
+void rt_mc_register_service();
+
 #endif /* ICORECOMP_SIF_RPC_H */

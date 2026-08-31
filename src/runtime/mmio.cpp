@@ -129,6 +129,7 @@ bool hw_read(uint32_t addr, uint64_t* out) {
     if (rt_timers_mmio_read(addr, &v32)) { *out = v32; return true; }
     if (rt_intc_mmio_read(addr, &v32)) { *out = v32; return true; }
     if (rt_sif_mmio_read(addr, &v32)) { *out = v32; return true; }
+    if (rt_ipu_mmio_read(addr, out)) return true; /* IPU regs are 64-bit reads */
     if (rt_gspriv_mmio_read(addr, out)) return true;
     return false;
 }
@@ -141,6 +142,7 @@ bool hw_write(uint32_t addr, uint64_t v) {
     if (rt_timers_mmio_write(addr, (uint32_t)v)) return true;
     if (rt_intc_mmio_write(addr, (uint32_t)v)) return true;
     if (rt_sif_mmio_write(addr, (uint32_t)v)) return true;
+    if (rt_ipu_mmio_write(addr, v)) return true;
     if (rt_gspriv_mmio_write(addr, v)) return true;
     return false;
 }

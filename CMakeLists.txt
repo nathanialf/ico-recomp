@@ -44,8 +44,16 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/sif/rpc.cpp
     src/runtime/sif/cdvd.cpp
     src/runtime/sif/sndn2.cpp
+    src/runtime/sif/pad.cpp
+    src/runtime/sif/mc.cpp
+    src/runtime/host/input.cpp
+    src/runtime/snd/spu.cpp
+    src/runtime/snd/engine.cpp
+    src/runtime/snd/reverb.cpp
+    src/runtime/host/audio.cpp
     src/runtime/iso/iso9660.cpp
     src/runtime/hw/dmac.cpp
+    src/runtime/hw/ipu.cpp
     src/runtime/hw/vif1.cpp
     src/runtime/hw/gif.cpp
     src/runtime/hw/vu1rt.cpp
@@ -55,6 +63,23 @@ set(ICORECOMP_RUNTIME_SOURCES
 )
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
+
+# Standalone mcserv protocol exercise (sif/mc_selftest.cpp): links mc.cpp
+# against stubbed runtime services; run with ICORECOMP_SAVES_DIR set.
+add_executable(icorecomp-mc-selftest
+    src/runtime/sif/mc.cpp
+    src/runtime/sif/mc_selftest.cpp
+)
+target_include_directories(icorecomp-mc-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-mc-selftest PRIVATE
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-mc-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
 
 target_include_directories(icorecomp-runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -68,6 +93,33 @@ target_compile_definitions(icorecomp-runtime PRIVATE
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-runtime PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# ---- IPU selftest ---------------------------------------------------------
+#
+# Standalone check of the IPU model (hw/ipu.cpp) against the real FMV
+# bitstream: mounts the disc image, demuxes the video elementary stream
+# EE-side (as the game does), drives the IPU over its MMIO interface
+# (SETIQ/SETTH/BCLR/FDEC/VDEC/BDEC/CSC), and writes the decoded first I
+# frame to an untracked BMP for eyeball verification. See
+# src/runtime/hw/ipu_selftest.cpp.
+add_executable(icorecomp-ipu-selftest
+    src/runtime/hw/ipu.cpp
+    src/runtime/hw/ipu_selftest.cpp
+    src/runtime/iso/iso9660.cpp
+    src/runtime/loader.cpp
+    src/runtime/log.cpp
+    src/runtime/sha1.cpp
+)
+target_include_directories(icorecomp-ipu-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-ipu-selftest PRIVATE
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-ipu-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
 # ---- optional generated/ee link ------------------------------------------
@@ -230,7 +282,10 @@ if(ICORECOMP_PARALLEL_GS)
         set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
         set(SDL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
         set(SDL_ATOMIC OFF CACHE BOOL "" FORCE)
-        set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
+        # Audio ON: host/audio.cpp plays the sound engine's mix through an
+        # SDL3 audio stream when a playback device exists (falls back to
+        # silent/WAV-capture operation otherwise).
+        set(SDL_AUDIO ON CACHE BOOL "" FORCE)
         set(SDL_RENDER OFF CACHE BOOL "" FORCE)
         set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
         set(SDL_POWER OFF CACHE BOOL "" FORCE)
@@ -255,7 +310,7 @@ if(ICORECOMP_PARALLEL_GS)
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_HAVE_PARALLEL_GS)
     target_link_libraries(icorecomp-runtime PRIVATE icorecomp-parallel-gs)
     if(ICORECOMP_PGS_HAVE_SDL)
-        target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_PGS_SDL)
+        target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_PGS_SDL ICORECOMP_SND_SDL)
         target_link_libraries(icorecomp-runtime PRIVATE SDL3-static)
     endif()
 

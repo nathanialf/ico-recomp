@@ -15,9 +15,10 @@
  * (so the EE-side unaligned-read fixup callback gets all-zero sizes and
  * copies nothing).
  *
- * Boot stubs (documented, loud): padman, mcserv and the sound RPC servers
- * accept BIND and answer every CALL with a zeroed receive buffer so boot can
- * proceed to the next subsystem; every stub call is logged.
+ * Also registers the non-cdvd IOP services: iopheap and loadfile (here),
+ * padman (sif/pad.cpp), mcserv (sif/mc.cpp), the game's own sound server
+ * (sif/sndn2.cpp), and one documented loud stub (sdrdrv) that answers every
+ * CALL with a zeroed receive buffer, logged.
  */
 #include "rpc.h"
 
@@ -282,57 +283,6 @@ void svc_diskready(uint32_t fno, const uint8_t* send, uint32_t send_size,
     rt_log("cdvd", "diskready fno=%u sceCdDiskReady(mode=%u) -> SCECdComplete", fno, mode);
 }
 
-/* ---- 0x80000100: padman ------------------------------------------------- */
-
-void svc_padman(uint32_t fno, const uint8_t* send, uint32_t send_size,
-                uint8_t* recv, uint32_t recv_size) {
-    /* Old padman wire protocol (ps2sdk iop/input/padman rpcserver.c +
-     * include/xpadman.h, clean-room structural reference): every request is
-     * a 128-byte block whose word 0 is the command; the server echoes the
-     * block back with result words written in place. fno is ignored. */
-    uint32_t cmd = send_size >= 4 ? rd32(send, 0) : 0;
-    uint32_t n = send_size < recv_size ? send_size : recv_size;
-    if (n) std::memcpy(recv, send, n);
-    switch (cmd) {
-        case 0x01: /* PAD_RPCCMD_OPEN: data[3] = result, data[4] = EE pad area */
-            wr32(recv, 12, 1);
-            rt_log("pad", "padPortOpen(port=%u slot=%u pad_area=0x%08x) -> 1 "
-                "(virtual pad: area stays zeroed = no controller data)",
-                rd32(send, 4), rd32(send, 8), rd32(send, 16));
-            break;
-        case 0x02: /* PAD_RPCCMD_END / close: data[3] = result */
-            wr32(recv, 12, 1);
-            rt_log("pad", "pad end/close -> 1");
-            break;
-        case 0x06: /* PAD_RPCCMD_SET_MMODE: data[5] = result */
-            wr32(recv, 20, 1);
-            rt_log("pad", "padSetMainMode(port=%u slot=%u mode=%u lock=%u) -> 1",
-                rd32(send, 4), rd32(send, 8), rd32(send, 12), rd32(send, 16));
-            break;
-        case 0x03: case 0x04: case 0x05: /* INFO_ACT / INFO_COMB / INFO_MODE */
-            wr32(recv, 20, 0); /* nothing connected: no modes/actuators */
-            rt_log("pad", "padInfo cmd=0x%02x(port=%u slot=%u) -> 0 (no controller)",
-                cmd, rd32(send, 4), rd32(send, 8));
-            break;
-        case 0x07: case 0x08: /* SET_ACTDIR / SET_ACTALIGN: data[5] = result */
-            wr32(recv, 20, 1);
-            rt_log("pad", "padSetAct cmd=0x%02x -> 1", cmd);
-            break;
-        case 0x10: /* PAD_RPCCMD_INIT: data[3] = result, data[4] = EE area */
-            wr32(recv, 12, 1);
-            rt_log("pad", "padInit(ee_area=0x%08x) -> 1", rd32(send, 16));
-            break;
-        case 0x12: /* PAD_RPCCMD_GET_MODVER: data[3] = module version */
-            wr32(recv, 12, 0x0400); /* 4.0: what this game's libpad 4.0 requires */
-            rt_log("pad", "padGetModVersion -> 4.0");
-            break;
-        default:
-            rt_log("pad", "WARNING padman cmd=0x%02x NOT MODELED (fno=%u send_size=%u "
-                "recv_size=%u): echoed request back unchanged", cmd, fno, send_size, recv_size);
-            break;
-    }
-}
-
 /* ---- 0x80000003: iopheap ------------------------------------------------- */
 
 /* Bump allocator over a reserved span of the virtual IOP RAM. Real
@@ -446,13 +396,16 @@ void rt_cdvd_register_services() {
     rt_rpc_register_service(0x80000599, "cdvd:0599(stub)", nullptr);
     rt_rpc_register_service(0x8000059C, "cdvd:diskready2(stub)", nullptr);
 
-    /* Documented loud stubs (nullptr handler): BIND succeeds, CALLs are
+    /* Peripheral services with real models: padman (sif/pad.cpp, old wire
+     * protocol + per-field pad data delivery) and mcserv (sif/mc.cpp, old
+     * MCSERV protocol backed by the [saves] dir). */
+    rt_pad_register_services();
+    rt_mc_register_service();
+
+    /* Documented loud stub (nullptr handler): BIND succeeds, CALLs are
      * logged and answered with zeroed receive data, so boot can progress
      * past subsystems that tolerate a dead peripheral. Server ids are
      * public SDK facts (ps2sdk iop module sources). */
-    rt_rpc_register_service(0x80000100, "padman", svc_padman);
-    rt_rpc_register_service(0x80000101, "padman-ext(stub)", nullptr);
-    rt_rpc_register_service(0x80000400, "mcserv(stub)", nullptr);
     rt_rpc_register_service(0x80000701, "sdrdrv(stub)", nullptr);
     /* The game's own sound driver module (cdrom0:\SNDN2DRV.IRX, loaded via
      * the loadfile HLE above) registers its RPC server as ASCII "sndn".
