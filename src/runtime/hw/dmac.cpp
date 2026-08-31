@@ -146,10 +146,26 @@ void run_source_chain(int ch, Channel& c) {
     /* ASP field of CHCR (bits 4-5) is the live stack depth. */
     uint32_t asp = (c.chcr >> 4) & 3;
 
+    /* Runaway guard. A full in-game display list is a long balanced
+     * CALL/CNT/RET + REF walk (the START menu transition walks >4096 tags
+     * legitimately, main list monotonically increasing, shared subroutine
+     * packets re-CALLed many times), so the cap must be far above any real
+     * frame. 1M tags at 16 bytes each is 16 MB, half of EE RAM: past that
+     * the chain cannot be real data. On trip, dump the last 32 tags walked
+     * so a genuine loop is visible in the log. */
+    constexpr uint32_t kTagCap = 1u << 20;
+    struct TagRec { uint32_t tadr, id, qwc, taddr; };
+    static TagRec last_tags[32];
+
     for (;;) {
-        if (++tags > 4096) {
-            rt_fatal("dmac", nullptr, "ch%d (%s) source chain exceeded 4096 tags; runaway TADR=0x%08x",
-                ch, kDesc[ch].name, c.tadr);
+        if (++tags > kTagCap) {
+            for (uint32_t i = 0; i < 32; ++i) {
+                const TagRec& t = last_tags[(tags - 1 - 32 + i) % 32];
+                rt_log("dmac", "runaway last[%u]: @0x%08x %s qwc=%u addr=0x%08x",
+                    i, t.tadr, tag_id_name(t.id), t.qwc, t.taddr);
+            }
+            rt_fatal("dmac", nullptr, "ch%d (%s) source chain exceeded %u tags; runaway TADR=0x%08x STADR=0x%08x D_CTRL=0x%08x",
+                ch, kDesc[ch].name, kTagCap, c.tadr, g_stadr, g_dctrl);
         }
         bool tadr_spr = (c.tadr & 0x80000000u) != 0;
         uint8_t tagbuf[16];
@@ -162,6 +178,7 @@ void run_source_chain(int ch, Channel& c) {
         uint32_t taddr = (uint32_t)((lo >> 32) & 0x7FFFFFF0u);
         bool tspr = (lo >> 63) & 1;
         c.chcr = (c.chcr & 0xFFFFu) | ((uint32_t)(lo >> 16) & 0xFFFF0000u); /* CHCR.TAG mirrors tag bits 16-31 */
+        last_tags[(tags - 1) % 32] = {c.tadr, id, qwc, taddr};
 
         if (rt_trace()) {
             rt_log("dmac", "ch%d tag #%u @0x%08x: %s qwc=%u addr=0x%08x%s irq=%d",

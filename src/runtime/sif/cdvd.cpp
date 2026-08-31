@@ -124,10 +124,21 @@ void svc_scmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
 
 uint32_t g_stream_lsn = 0;
 
-void do_read(const uint8_t* send, uint32_t send_size) {
+/* Shared by ncmd fno 0x01 (sceCdRead, destination in EE RAM) and fno 0x0D
+ * (this library vintage's read into IOP memory, used by the streaming
+ * loader: the destinations observed are the IOP ring buffers the game's
+ * sound driver opened). Both carry the same 0x18-byte request block:
+ * {lbn, sectors, buf, sceCdRMode bytes at +0xC..+0xE, unaligned-fixup block
+ * address at +0x10, read-position word address at +0x14}; the two writeback
+ * addresses are EE-side library statics in both cases. Layout confirmed
+ * against the vendor libcdvd read entry points in the decomp repo's
+ * disassembly (behavioral reference; the fno assignments predate the
+ * ps2sdk table, where 0x0C is readiopmem and 0x0D is diskready). */
+void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     if (send_size < 24) {
         rt_fatal("cdvd", rt_sched_current_ctx(), "ncmd read with short send (%u bytes)", send_size);
     }
+    const bool to_iop = fno == 0x0D;
     uint32_t lbn = rd32(send, 0);
     uint32_t sectors = rd32(send, 4);
     uint32_t buf = rd32(send, 8) & 0x1FFFFFFFu;
@@ -135,8 +146,12 @@ void do_read(const uint8_t* send, uint32_t send_size) {
     uint32_t intr_addr = rd32(send, 16) & 0x1FFFFFFFu;
     uint32_t pos_addr = rd32(send, 20) & 0x1FFFFFFFu;
     uint32_t datapattern = (mode >> 16) & 0xFF;
-    rt_log("cdvd", "ncmd fno=0x01 sceCdRead(lbn=%u sectors=%u buf=0x%08x mode=0x%06x) intr=0x%08x pos=0x%08x",
-        lbn, sectors, buf, mode, intr_addr, pos_addr);
+    rt_log("cdvd", "ncmd fno=0x%02x sceCdRead%s(lbn=%u sectors=%u buf=0x%08x mode=0x%06x) intr=0x%08x pos=0x%08x",
+        fno, to_iop ? "IOPm" : "", lbn, sectors, buf, mode, intr_addr, pos_addr);
+    if (to_iop && (uint64_t)buf + (uint64_t)sectors * 2048 > RT_IOP_RAM_SIZE) {
+        rt_fatal("cdvd", rt_sched_current_ctx(),
+            "ncmd fno=0x0d read overruns IOP RAM: buf=0x%08x + %u sectors", buf, sectors);
+    }
     if (datapattern != 0) { /* SCECdSecS2048 only; ICO is a DVD title */
         rt_fatal("cdvd", rt_sched_current_ctx(),
             "sceCdRead datapattern 0x%02x not modeled (only 2048-byte sectors)", datapattern);
@@ -147,7 +162,11 @@ void do_read(const uint8_t* send, uint32_t send_size) {
             rt_fatal("cdvd", rt_sched_current_ctx(),
                 "sceCdRead past end of disc: LSN %u (disc has %u sectors)", lbn + i, rt_iso_total_sectors());
         }
-        rt_gwrite_bytes(buf + i * 2048, sec, 2048);
+        if (to_iop) {
+            std::memcpy(rt_iop_ptr(buf + i * 2048), sec, 2048);
+        } else {
+            rt_gwrite_bytes(buf + i * 2048, sec, 2048);
+        }
     }
     /* Unaligned-fixup info for the EE end-callback: all zero = the whole
      * transfer already landed in place, copy nothing. Covers both the
@@ -204,7 +223,7 @@ void svc_ncmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
               uint8_t* recv, uint32_t recv_size) {
     switch (fno) {
         case 0x01: /* sceCdRead */
-            do_read(send, send_size);
+            do_read(fno, send, send_size);
             break;
         case 0x05: /* sceCdSeek: async success, callback only */
             rt_log("cdvd", "ncmd fno=0x05 sceCdSeek(lbn=%u) -> ok", send_size >= 4 ? rd32(send, 0) : 0);
@@ -218,9 +237,35 @@ void svc_ncmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
         case 0x09: /* sceCdStream */
             do_stream(send, send_size, recv, recv_size);
             break;
-        case 0x0D: /* sceCdNCmdDiskReady */
-            if (recv_size >= 4) wr32(recv, 0, SCECdComplete);
-            rt_log("cdvd", "ncmd fno=0x0d sceCdNCmdDiskReady -> SCECdComplete");
+        case 0x0D:
+            /* In this library vintage 0x0D is the read into IOP memory, not
+             * diskready: the vendor read entry point sends the standard
+             * 0x18-byte read block (async, no recv; completion is the RPC
+             * END packet, whose EE-side end callback clears the library's
+             * busy flags). A 0x0D with no read block is not a shape this
+             * library emits. */
+            if (send_size >= 24) {
+                do_read(fno, send, send_size);
+            } else {
+                rt_fatal("cdvd", rt_sched_current_ctx(),
+                    "ncmd fno=0x0d with send_size=%u (expected the 0x18-byte read block)", send_size);
+            }
+            break;
+        case 0x0E:
+            /* Drive status poll (sync, 4-byte recv). The library's read
+             * entry points call this before issuing a read and refuse to
+             * start while it returns SCECdStatRead (0x06). Reads complete
+             * synchronously inside the RPC call here, so the virtual drive
+             * is never mid-read: always paused. */
+            if (recv_size >= 4) wr32(recv, 0, SCECdStatPause);
+            {
+                static uint64_t polls = 0;
+                ++polls;
+                if (rt_trace() || (polls & (polls - 1)) == 0) {
+                    rt_log("cdvd", "ncmd fno=0x0e drive status poll -> SCECdStatPause (0x%02x) [#%" PRIu64 "]",
+                        SCECdStatPause, polls);
+                }
+            }
             break;
         default:
             if (recv_size >= 4) wr32(recv, 0, 1);
