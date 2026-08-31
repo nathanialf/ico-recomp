@@ -71,15 +71,16 @@ if(EXISTS "${GENERATED_DIR}")
         target_include_directories(generated PRIVATE
             ${CMAKE_SOURCE_DIR}/include
             ${GENERATED_DIR}
+            ${GENERATED_DIR}/..
         )
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
             target_compile_options(generated PRIVATE -fno-strict-aliasing)
         endif()
 
         target_link_libraries(icorecomp-runtime PRIVATE generated)
-        target_include_directories(icorecomp-runtime PRIVATE ${GENERATED_DIR})
+        target_include_directories(icorecomp-runtime PRIVATE ${GENERATED_DIR} ${GENERATED_DIR}/..)
         target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_HAVE_GENERATED)
-        message(STATUS "icorecomp-runtime: linking generated code from ${GENERATED_DIR} (${GENERATED_SOURCES})")
+        message(STATUS "icorecomp-runtime: linking generated code from ${GENERATED_DIR} (${GENERATED_DIR})")
     else()
         message(STATUS "icorecomp-runtime: ${GENERATED_DIR} exists but has no .c files; building in stub mode")
     endif()

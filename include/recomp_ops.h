@@ -5,7 +5,8 @@
  *
  * Conventions:
  *  - 32-bit results are sign-extended to 64 per MIPS64 (RC_SE32).
- *  - Guest loads/stores go through rc_read*/rc_write* below; lq/sq mask the
+ *  - Guest loads/stores go through the rc_readN/rc_writeN helpers below;
+ *    lq/sq mask the
  *    address to 16-byte alignment (hardware behavior).
  *  - FPU tier 0: host float + clamp. No NaN/Inf ever exists in guest state:
  *    results that would be Inf/NaN clamp to +/-FMAX with the IEEE result's
@@ -92,6 +93,126 @@ RC_INLINE void rc_write64(uint32_t a, uint64_t v) {
 RC_INLINE void rc_write128(uint32_t a, rc_u128 v) {
     uint8_t* p = rc_page(a);
     if (p) memcpy(p + (a & 0xFFF0), &v, 16); else rt_mmio_write128(a, v);
+}
+
+/* ---- multiply / divide -------------------------------------------------
+ * Shared by generated code and the interpreter so LO/HI results match
+ * bit-exactly. lo/hi point at the selected pipeline's 64-bit slot:
+ * pipeline 0 is lo.u64x[0]/hi.u64x[0], pipeline 1 (mult1/div1/madd1) is
+ * lo.u64x[1]/hi.u64x[1]. 32-bit halves are sign-extended per MIPS64. */
+
+RC_INLINE void rc_mult(uint64_t* lo, uint64_t* hi, int32_t a, int32_t b) {
+    int64_t p = (int64_t)a * (int64_t)b;
+    *lo = (uint64_t)RC_SE32((int32_t)p);
+    *hi = (uint64_t)RC_SE32((int32_t)(p >> 32));
+}
+RC_INLINE void rc_multu(uint64_t* lo, uint64_t* hi, uint32_t a, uint32_t b) {
+    uint64_t p = (uint64_t)a * (uint64_t)b;
+    *lo = (uint64_t)RC_SE32((int32_t)p);
+    *hi = (uint64_t)RC_SE32((int32_t)(p >> 32));
+}
+/* div by zero: lo = (a >= 0 ? -1 : 1), hi = a. INT_MIN / -1: lo = INT_MIN,
+ * hi = 0. Matches the R5900 (no exception is raised). */
+RC_INLINE void rc_div(uint64_t* lo, uint64_t* hi, int32_t a, int32_t b) {
+    if (b == 0) {
+        *lo = (uint64_t)RC_SE32(a >= 0 ? -1 : 1);
+        *hi = (uint64_t)RC_SE32(a);
+    } else if (a == (int32_t)0x80000000 && b == -1) {
+        *lo = (uint64_t)RC_SE32((int32_t)0x80000000);
+        *hi = 0;
+    } else {
+        *lo = (uint64_t)RC_SE32(a / b);
+        *hi = (uint64_t)RC_SE32(a % b);
+    }
+}
+RC_INLINE void rc_divu(uint64_t* lo, uint64_t* hi, uint32_t a, uint32_t b) {
+    if (b == 0) {
+        *lo = (uint64_t)RC_SE32(-1);
+        *hi = (uint64_t)RC_SE32((int32_t)a);
+    } else {
+        *lo = (uint64_t)RC_SE32((int32_t)(a / b));
+        *hi = (uint64_t)RC_SE32((int32_t)(a % b));
+    }
+}
+/* madd: {hi[31:0], lo[31:0]} + a*b, results written back sign-extended. */
+RC_INLINE void rc_madd(uint64_t* lo, uint64_t* hi, int32_t a, int32_t b) {
+    int64_t acc = (int64_t)(((uint64_t)(uint32_t)*hi << 32) | (uint32_t)*lo);
+    int64_t p = acc + (int64_t)a * (int64_t)b;
+    *lo = (uint64_t)RC_SE32((int32_t)p);
+    *hi = (uint64_t)RC_SE32((int32_t)(p >> 32));
+}
+
+/* ---- unaligned loads / stores (little-endian R5900) --------------------
+ * cur is the destination register's current 64-bit value; the return value
+ * is the merged register result. lwl sign-extends the merged 32-bit value
+ * (it always writes the sign byte); lwr sign-extends only in the aligned
+ * case (equivalent to lw) and otherwise preserves cur's upper 32 bits,
+ * relying on the paired lwl for the final sign extension. */
+
+RC_INLINE uint64_t rc_lwl(uint32_t a, uint64_t cur) {
+    uint32_t b = a & 3;
+    uint32_t w = rc_read32(a);
+    uint32_t m = 0x00FFFFFFu >> (b * 8);
+    return (uint64_t)RC_SE32((int32_t)(((uint32_t)cur & m) | (w << (24 - b * 8))));
+}
+RC_INLINE uint64_t rc_lwr(uint32_t a, uint64_t cur) {
+    uint32_t b = a & 3;
+    uint32_t w = rc_read32(a);
+    if (b == 0) return (uint64_t)RC_SE32((int32_t)w);
+    uint32_t m = ~(0xFFFFFFFFu >> (b * 8));
+    uint32_t r = ((uint32_t)cur & m) | (w >> (b * 8));
+    return (cur & 0xFFFFFFFF00000000ull) | r;
+}
+RC_INLINE uint64_t rc_ldl(uint32_t a, uint64_t cur) {
+    uint32_t b = a & 7;
+    uint64_t d = rc_read64(a);
+    uint64_t m = 0x00FFFFFFFFFFFFFFull >> (b * 8);
+    return (cur & m) | (d << (56 - b * 8));
+}
+RC_INLINE uint64_t rc_ldr(uint32_t a, uint64_t cur) {
+    uint32_t b = a & 7;
+    uint64_t d = rc_read64(a);
+    if (b == 0) return d;
+    uint64_t m = ~(0xFFFFFFFFFFFFFFFFull >> (b * 8));
+    return (cur & m) | (d >> (b * 8));
+}
+RC_INLINE void rc_swl(uint32_t a, uint32_t v) {
+    uint32_t b = a & 3;
+    uint32_t w = rc_read32(a);
+    uint32_t m = 0xFFFFFF00u << (b * 8);
+    rc_write32(a, (w & m) | (v >> (24 - b * 8)));
+}
+RC_INLINE void rc_swr(uint32_t a, uint32_t v) {
+    uint32_t b = a & 3;
+    uint32_t w = rc_read32(a);
+    uint32_t m = ~(0xFFFFFFFFu << (b * 8));
+    rc_write32(a, (w & m) | (v << (b * 8)));
+}
+RC_INLINE void rc_sdl(uint32_t a, uint64_t v) {
+    uint32_t b = a & 7;
+    uint64_t d = rc_read64(a);
+    uint64_t m = 0xFFFFFFFFFFFFFF00ull << (b * 8);
+    rc_write64(a, (d & m) | (v >> (56 - b * 8)));
+}
+RC_INLINE void rc_sdr(uint32_t a, uint64_t v) {
+    uint32_t b = a & 7;
+    uint64_t d = rc_read64(a);
+    uint64_t m = ~(0xFFFFFFFFFFFFFFFFull << (b * 8));
+    rc_write64(a, (d & m) | (v << (b * 8)));
+}
+
+/* ---- qfsrv -------------------------------------------------------------
+ * Funnel shift right of the 256-bit {rs || rt} by ctx->sa bytes (sa is
+ * byte-granular per recomp_context.h). Byte positions past the funnel
+ * read as zero (sa is masked to 0..31). */
+RC_INLINE rc_u128 rc_qfsrv(rc_u128 rs, rc_u128 rt, uint32_t sa_bytes) {
+    rc_u128 d;
+    uint32_t s = sa_bytes & 0x1F;
+    for (int i = 0; i < 16; i++) {
+        uint32_t j = (uint32_t)i + s;
+        d.u8x[i] = j < 16 ? rt.u8x[j] : (j < 32 ? rs.u8x[j - 16] : 0);
+    }
+    return d;
 }
 
 /* ---- FPU tier 0 -------------------------------------------------------- */
