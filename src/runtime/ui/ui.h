@@ -54,6 +54,23 @@ void rt_ui_tick();
 bool rt_ui_visible();
 void rt_ui_set_visible(bool visible);
 
+/* The launcher: its own frame loop, run from main() before the config and
+ * ELF are loaded, when main's launcher gate passes (see the sequence comment
+ * in main.cpp). Shows launcher.rml, pumps events, applies pending settings,
+ * ticks the UI and presents through rt_pgs_present_ui until the user starts
+ * or quits.
+ *
+ * Returns true when the boot precheck passed and Start was pressed: the disc
+ * is mounted and the boot ELF is already read and pin-checked, so the
+ * rt_load_elf that follows reuses it. Returns false when the user chose Quit
+ * or closed the window, and main then exits 0 without booting anything.
+ *
+ * Returns true immediately, with a log, when there is nothing to draw into
+ * (no live window) or the launcher document failed to load: the launcher is
+ * a front end, never a gate on running the game. No-op requirement on the
+ * caller: rt_ui_init() must have run first. */
+bool rt_launcher_run();
+
 /* True while the menu owns input, which is exactly while it is visible.
  * host/input.cpp's SDL provider reports a centered pad with no buttons
  * instead of sampling the devices while this is true, so a keypress aimed at
@@ -75,6 +92,9 @@ inline bool rt_ui_init() { return false; }
 inline void rt_ui_tick() {}
 inline bool rt_ui_visible() { return false; }
 inline void rt_ui_set_visible(bool) {}
+/* No UI means no launcher: main's gate tests ICORECOMP_UI first and never
+ * reaches this, but the stub keeps the call site free of its own #ifdef. */
+inline bool rt_launcher_run() { return true; }
 inline bool rt_ui_wants_input() { return false; }
 #ifdef ICORECOMP_PGS_SDL
 inline bool rt_ui_handle_sdl_event(const SDL_Event&) { return false; }

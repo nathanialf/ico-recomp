@@ -60,6 +60,19 @@ void backend_set_frame(const RtPgsOverlayFrame* frame) {
     if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_overlay_set_frame(pgs, frame);
 }
 
+uint32_t backend_present_ui() {
+    RtPgs* pgs = rt_gs_parallel_handle();
+    return pgs ? rt_pgs_present_ui(pgs) : 0;
+}
+
+void backend_set_present_mode(uint32_t mode) {
+    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_set_present_mode(pgs, mode);
+}
+
+uint32_t backend_present_mode() {
+    return rt_gs_parallel_present_mode();
+}
+
 #else /* !ICORECOMP_HAVE_PARALLEL_GS */
 
 /* No library to call: this build has no live backend at all (the CI gate
@@ -72,6 +85,12 @@ void backend_surface_size(uint32_t* width, uint32_t* height) { *width = 0; *heig
 uint32_t backend_texture_create(const uint8_t*, uint32_t, uint32_t) { return 0; }
 void backend_texture_destroy(uint32_t) {}
 void backend_set_frame(const RtPgsOverlayFrame*) {}
+/* 0 is "nothing presented and the window did not close" (no RT_PGS_VSYNC_*
+ * bit set), which is what rt_pgs_present_ui itself returns headless. The
+ * launcher never spins on it: it refuses to run without a live window. */
+uint32_t backend_present_ui() { return 0; }
+void backend_set_present_mode(uint32_t) {}
+uint32_t backend_present_mode() { return 0; }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */
 
@@ -193,6 +212,11 @@ bool rt_ui_init() {
         rt_log("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
     }
 
+    /* The launcher's model and its two documents. A failure here costs the
+     * launcher and the credits, not the settings menu, so it is logged
+     * inside and not checked for here. */
+    launcher_init(g_ui.context, ui_dir);
+
     g_ui.visible = false;
     g_ui.initialized = true;
 
@@ -249,10 +273,11 @@ void rt_ui_tick() {
         rt_settings_flush_save();
     }
 
-    /* The tick renders whenever any document is up. The menu is one of them;
-     * the fps readout is the other, and it is shown on display.show_fps with
-     * the menu closed. */
-    if (!g_ui.visible && !g_ui.fps_visible) {
+    /* The tick renders whenever any document is up: the launcher (which owns
+     * the whole window while it is, and draws over an empty backbuffer), the
+     * menu, or the fps readout, which is shown on display.show_fps with
+     * neither of the other two up. */
+    if (!g_ui.visible && !g_ui.fps_visible && !g_ui.launcher_visible) {
         /* Exactly one clear on the way down, keyed on whether anything was
          * drawn last time; never a set_frame call while nothing is up. */
         if (g_ui.frame_posted) {
@@ -316,7 +341,10 @@ void rt_ui_set_visible(bool visible) {
 }
 
 bool rt_ui_wants_input() {
-    return rt_ui_visible();
+    /* The launcher counts even though no guest code is running yet to read
+     * a pad: host/input.cpp's contract is "the UI owns input while this is
+     * true", and the launcher owns it for the whole of rt_launcher_run(). */
+    return rt_ui_visible() || rtui::g_ui.launcher_visible;
 }
 
 #endif /* ICORECOMP_UI */

@@ -324,10 +324,21 @@ if(ICORECOMP_PARALLEL_GS)
         set(SDL_POWER OFF CACHE BOOL "" FORCE)
         set(SDL_FILE OFF CACHE BOOL "" FORCE)
         set(SDL_CPUINFO OFF CACHE BOOL "" FORCE)
-        set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
         set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
         set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
-        set(SDL_MISC OFF CACHE BOOL "" FORCE)
+        # The launcher's disc picker (src/runtime/ui/ui_launcher.cpp) needs
+        # SDL_ShowOpenFileDialog, and its credits link needs SDL_OpenURL.
+        # Only SDL_DIALOG is an option in this SDL revision (its CMakeLists
+        # declares the Dialog subsystem through define_sdl_subsystem, default
+        # ON); it is set here so a future default flip cannot quietly remove
+        # the file dialog. SDL_FILESYSTEM and SDL_MISC are not options at all
+        # any more: those two are selected per platform (HAVE_SDL_FILESYSTEM /
+        # HAVE_SDL_MISC), so the lines below document the requirement and
+        # would take effect again if upstream reintroduced the options. The
+        # OFF values they replaced never disabled anything.
+        set(SDL_DIALOG ON CACHE BOOL "" FORCE)
+        set(SDL_FILESYSTEM ON CACHE BOOL "" FORCE)
+        set(SDL_MISC ON CACHE BOOL "" FORCE)
         # Headless build hosts (no X11/Wayland dev headers) may still build
         # SDL; window creation then fails at runtime and the backend falls
         # back to headless rendering. Video drivers are still auto-detected
@@ -462,6 +473,7 @@ if(ICORECOMP_UI)
         src/runtime/ui/ui_events.cpp
         src/runtime/ui/ui_rebind.cpp
         src/runtime/ui/ui_settings_model.cpp
+        src/runtime/ui/ui_launcher.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)
     # RmlUi::Core only. The debugger is a separate target that nothing here

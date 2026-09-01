@@ -199,6 +199,10 @@ void window_to_surface(float x, float y, int* out_x, int* out_y) {
 }
 
 bool toggle_menu() {
+    /* The launcher owns the window while it is up: it has its own Settings
+     * button, and the menu shows on top of it. The hotkey is still consumed
+     * here so it reaches neither RmlUi nor the pad, it just does nothing. */
+    if (g_ui.launcher_visible) return true;
     rt_ui_set_visible(!rt_ui_visible());
     return true;
 }
@@ -214,6 +218,10 @@ bool text_input_focused() {
 }
 
 bool close_menu() {
+    /* Nothing to close: the launcher is up on its own. Escape does nothing
+     * there on purpose, so a stray press cannot quit out of it. Returning
+     * false lets the key reach RmlUi, where it is only a focus-level key. */
+    if (!g_ui.visible) return false;
     if (text_input_focused()) return false;
     rt_ui_set_visible(false);
     return true;
@@ -309,8 +317,10 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
         break;
     }
 
-    /* While hidden the UI looks at nothing else: the game owns the input. */
-    if (!g_ui.visible) return false;
+    /* While nothing is up the UI looks at nothing else: the game owns the
+     * input. The launcher counts as up, and while it is, the events below
+     * drive it exactly as they drive the menu. */
+    if (!g_ui.visible && !g_ui.launcher_visible) return false;
 
     Rml::Context* context = g_ui.context;
     switch (e.type) {

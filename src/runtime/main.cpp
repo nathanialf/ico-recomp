@@ -9,7 +9,9 @@
  * running the translated entry point and enter the scheduler loop, under a
  * crash handler that dumps the current guest context.
  *
- * The window comes up late on purpose; see the rt_hw_init() call below.
+ * Two orderings, chosen by the launcher gate below: without the launcher
+ * the window comes up late on purpose, and with it the window comes up
+ * first. See the gate and the rt_hw_init() call for why both are right.
  *
  * Builds in two modes, selected at CMake configure time by whether
  * generated/ee exists (see CMakeLists.txt, -DICORECOMP_HAVE_GENERATED):
@@ -45,10 +47,15 @@
 
 #include "ee/kernel.h"
 #include "host/settings.h"
+#include "host/window.h"
 #include "hw/hw.h"
 #include "iso/iso9660.h"
 #include "prof.h"
 #include "ui/ui.h"
+
+#ifdef ICORECOMP_HAVE_PARALLEL_GS
+#include "gs/gs_parallel_api.h"
+#endif
 
 #include <csignal>
 #include <cstdio>
@@ -189,6 +196,19 @@ void install_crash_handler() {
  * (see rt_no_launcher_flag). */
 bool g_no_launcher = false;
 
+/* The launcher's last gate condition: the backend rt_hw_init() created is
+ * the live one and it actually opened a window. A dump-only run, a headless
+ * live run and a build with no paraLLEl-GS at all have nothing to draw a
+ * launcher into, and take the boot-first ordering. */
+bool live_windowed_backend() {
+#ifdef ICORECOMP_HAVE_PARALLEL_GS
+    RtPgs* pgs = rt_gs_parallel_handle();
+    return pgs && rt_pgs_window_handle(pgs) != nullptr;
+#else
+    return false;
+#endif
+}
+
 void print_usage(const char* argv0) {
     std::printf(
         "usage: %s [--disc <path>] [--no-launcher]\n"
@@ -253,7 +273,68 @@ int main(int argc, char** argv) {
         rt_log_set_verbose(rt_settings().debug.verbose.c_str());
     }
 
-    rt_mem_init();
+    /* ---- launcher gate ---------------------------------------------------
+     *
+     * Which of the two orderings below this run uses. Every condition is a
+     * reason the launcher would be wrong, not merely unnecessary:
+     *   - no UI in this build: there is nothing to show.
+     *   - ICORECOMP_INPUT_SCRIPT: a scripted run drives the pad from a file
+     *     and must stay reproducible; a window waiting for a click is not.
+     *   - ICORECOMP_MAX_VBLANKS: a bounded diagnostic run, expected to boot
+     *     and exit on its own.
+     *   - --no-launcher, and launcher.show_at_startup: the user said so.
+     *   - no live windowed backend: a dump-only or headless run has nothing
+     *     to draw the launcher into. That one can only be answered after
+     *     rt_hw_init(), so the two init calls it needs happen first and the
+     *     rest of the sequence below skips them.
+     */
+    bool launcher = false;
+    const char* launcher_reason = "UI built in, live window, no bypass, launcher.show_at_startup";
+#ifdef ICORECOMP_UI
+    if (std::getenv("ICORECOMP_INPUT_SCRIPT")) {
+        launcher_reason = "ICORECOMP_INPUT_SCRIPT is set";
+    } else if (std::getenv("ICORECOMP_MAX_VBLANKS")) {
+        launcher_reason = "ICORECOMP_MAX_VBLANKS is set";
+    } else if (rt_no_launcher_flag()) {
+        launcher_reason = "--no-launcher";
+    } else if (!rt_settings().launcher.show_at_startup) {
+        launcher_reason = "launcher.show_at_startup is false";
+    } else {
+        launcher = true;
+    }
+#else
+    launcher_reason = "this build has no UI (ICORECOMP_UI=OFF)";
+#endif
+
+    bool mem_ready = false, hw_ready = false, ui_ready = false;
+    if (launcher) {
+        rt_mem_init();
+        mem_ready = true;
+        rt_hw_init();
+        hw_ready = true;
+        if (!live_windowed_backend()) {
+            launcher = false;
+            launcher_reason = "no live windowed backend in this run";
+        }
+    }
+    rt_log("main", "launcher gate: %s (%s)",
+        launcher ? "launcher first" : "boot straight into the game", launcher_reason);
+
+    if (launcher) {
+        rt_ui_init();
+        ui_ready = true;
+        /* Returns only when the boot precheck passed and Start was pressed:
+         * the disc is mounted and the boot ELF is already read and
+         * pin-checked, so the rt_load_elf below reuses it. Quit and window
+         * close leave the process here, with nothing loaded. */
+        if (!rt_launcher_run()) {
+            rt_log("main", "launcher exited without starting the game");
+            rt_log_hold_console();
+            return 0;
+        }
+    }
+
+    if (!mem_ready) rt_mem_init();
 
     LoaderConfig cfg;
     if (!rt_load_config(&cfg)) {
@@ -293,18 +374,27 @@ int main(int argc, char** argv) {
      * this brings up the Vulkan device and, when a display is available,
      * the window + swapchain, before any guest code exists.
      *
-     * Deliberately last: everything above can fail cheaply and often does
-     * on a fresh install (no disc image, wrong disc, SHA-1 pin mismatch,
-     * no generated code). Opening the window first turned each of those
-     * into a black window that vanished, which reads as a crash rather
-     * than the specific error it is. */
-    rt_hw_init();
+     * Deliberately last on this path: everything above can fail cheaply and
+     * often does on a fresh install (no disc image, wrong disc, SHA-1 pin
+     * mismatch, no generated code). Opening the window first turned each of
+     * those into a black window that vanished, which reads as a crash
+     * rather than the specific error it is. That is the failure ordering
+     * for a run with no launcher, and it is why the calls above come first
+     * here.
+     *
+     * The launcher path inverts it deliberately: it opens the window before
+     * any of them, because rt_boot_precheck (loader.cpp) runs exactly those
+     * same steps and reports each failure inside the window, by name,
+     * instead of on a console the user may never see. Nothing is lost, the
+     * failures just arrive somewhere the user is already looking. Both
+     * calls are skipped here when the launcher path already made them. */
+    if (!hw_ready) rt_hw_init();
 
     /* The UI needs the window (and its surface size) to exist, so it comes
      * up right after the backend. A scripted run bypasses the UI entirely
      * (settings plan): ICORECOMP_INPUT_SCRIPT drives the pad from a file and
      * must stay reproducible, which a menu that eats input would break. */
-    if (!std::getenv("ICORECOMP_INPUT_SCRIPT")) rt_ui_init();
+    if (!ui_ready && !std::getenv("ICORECOMP_INPUT_SCRIPT")) rt_ui_init();
 
     rt_sched_init();
 

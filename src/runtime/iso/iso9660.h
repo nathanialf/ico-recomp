@@ -26,6 +26,12 @@ struct RtIsoFile {
  * (the user asked for that file specifically). Call before rt_iso_mount. */
 void rt_iso_set_path(const char* path);
 
+/* The path rt_iso_set_path stored, or "" when --disc was not given. The
+ * launcher asks so it can disable its disc picker: a run started with an
+ * explicit --disc must boot that image or report why it cannot, never a
+ * different one chosen in the window. */
+const char* rt_iso_forced_path();
+
 /* Mounts the disc image. Path resolution order:
  *   1. rt_iso_set_path (--disc), fatal when unusable
  *   2. rt_settings().launcher.disc_path, when non-empty (relative to

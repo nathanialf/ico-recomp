@@ -159,6 +159,12 @@ void host_pump_events() {
  * the LGPL boundary. */
 RtPgs* g_live_pgs = nullptr;
 
+/* The present mode resolve_create_options() settled on, kept for
+ * rt_gs_parallel_present_mode(). The launcher forces FIFO while it is up
+ * and restores this at hand-off; deriving it a second time there would mean
+ * a second copy of the env-vs-settings precedence below. */
+uint32_t g_create_present_mode = RT_PGS_PRESENT_MAILBOX;
+
 /* Startup options for rt_pgs_create: env resolution plus settings.json.
  * Called from rt_hw_init() (see main.cpp), which runs after
  * rt_settings_init(), so rt_settings() already reflects the loaded file. */
@@ -213,6 +219,7 @@ RtPgsCreateOptions resolve_create_options() {
      * compiled-in default and simply honors a user's saved size otherwise. */
     opts.window_width = (uint32_t)s.display.window_width;
     opts.window_height = (uint32_t)s.display.window_height;
+    g_create_present_mode = opts.present_mode;
     return opts;
 }
 
@@ -289,6 +296,13 @@ GsBackend* rt_gs_make_parallel_backend() {
  * the one currently selected by ICORECOMP_GS. */
 RtPgs* rt_gs_parallel_handle() {
     return g_live_pgs;
+}
+
+/* See window.h. Valid once resolve_create_options() has run, which is
+ * inside the one ParallelBackend constructor; before that (and in a run
+ * that never creates the live backend) it is the shim's own default. */
+uint32_t rt_gs_parallel_present_mode() {
+    return g_create_present_mode;
 }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */

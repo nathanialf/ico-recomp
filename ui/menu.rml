@@ -275,7 +275,21 @@
 					<span class="section-number">05</span>
 					<span class="section-title">About</span>
 				</div>
-				<div class="note">Credits land with the launcher</div>
+				<!--
+					The same credits the launcher shows (ui/credits.rml). The
+					link is not a data binding: ui_launcher.cpp attaches a
+					plain click listener to this id, because the "settings"
+					model has no business holding a URL.
+				-->
+				<div class="credits-line">Developed by Nathanial Fine</div>
+				<div class="credits-url" id="about-url">https://defnf.com</div>
+
+				<div class="control-label credits-heading">Built with</div>
+				<div class="credits-item">paraLLEl-GS, Arntzen Software, LGPLv3+, loaded as a separate shared library</div>
+				<div class="credits-item">SDL3, zlib license</div>
+				<div class="credits-item">RmlUi, MIT</div>
+				<div class="credits-item">FreeType, FreeType License</div>
+				<div class="credits-item">Playfair Display, SIL Open Font License; the notice ships in ui/fonts/OFL.txt</div>
 			</div>
 		</div>
 	</div>

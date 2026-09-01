@@ -1,0 +1,64 @@
+<rml>
+<head>
+	<title>ICO</title>
+	<link type="text/rcss" href="style/base.rcss"/>
+</head>
+<!--
+	The launcher, shown before the game boots (src/runtime/ui/ui_launcher.cpp
+	and the sequence comment in main.cpp). Its controls are bound to the
+	"launcher" data model, which is separate from "settings": everything here
+	except the startup checkbox is the state of this run's disc and of the
+	boot precheck, not a setting.
+
+	Every callback below only queues work; the launcher's own frame loop does
+	it at the next iteration, for the same reason the settings menu queues
+	its changes (see ui_settings_model.cpp's file comment).
+-->
+<body class="launcher" data-model="launcher">
+	<div class="launcher-shell">
+		<div class="title-block">
+			<div class="title-name">ICO</div>
+			<div class="title-tagline">PlayStation 2 static recompilation</div>
+		</div>
+
+		<div class="disc-panel">
+			<div class="control-label">Disc image</div>
+			<div class="disc-path">{{disc_path}}</div>
+			<div class="disc-source">{{disc_source}}</div>
+
+			<div class="disc-actions" data-if="!disc_locked">
+				<div class="button" data-if="browse_available" data-event-click="browse()">Browse</div>
+				<div class="button" data-event-click="clear_disc()">Clear</div>
+			</div>
+
+			<!--
+				The text field is the fallback when no file dialog can be
+				shown (no portal and no zenity, or a build with no SDL). It
+				is always available so a path can be typed even where the
+				dialog works.
+			-->
+			<div class="path-row" data-if="!disc_locked">
+				<input type="text" data-value="path_entry"/>
+				<div class="button" data-event-click="use_path()">Use path</div>
+			</div>
+
+			<div class="status-line" data-if="has_status">{{status}}</div>
+			<div class="error-line" data-if="has_precheck_error">{{precheck_error}}</div>
+		</div>
+
+		<div class="launcher-actions">
+			<div class="button start-button" data-class-disabled="!can_start" data-event-click="start()">Start</div>
+			<div class="button" data-event-click="open_settings()">Settings</div>
+			<div class="button" data-event-click="open_credits()">Credits</div>
+			<div class="button" data-event-click="quit()">Quit</div>
+		</div>
+
+		<div class="check-row startup-row">
+			<input type="checkbox" data-checked="show_at_startup" data-event-change="startup_changed()"/>
+			<span class="check-label">Show this launcher at startup</span>
+		</div>
+	</div>
+
+	<div class="launcher-footer">{{version_line}}</div>
+</body>
+</rml>

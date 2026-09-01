@@ -578,3 +578,211 @@ body.fps {
 	color: #a3a3a3;
 	text-align: right;
 }
+
+/* ---- launcher (launcher.rml) ---------------------------------------------
+ *
+ * The launcher draws over an empty backbuffer: there is no scanout behind
+ * it, so its body is opaque #0a0a0a rather than the menu's translucent
+ * panel. Everything else is the same restricted set of boxes and text. */
+
+body.launcher {
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	padding: 18dp 22dp;
+	display: flex;
+	flex-direction: column;
+	background-color: #0a0a0a;
+}
+
+.launcher-shell {
+	display: block;
+	flex-grow: 1;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.title-block {
+	display: block;
+	margin-bottom: 16dp;
+	padding-bottom: 8dp;
+	border-bottom: 1dp #262626;
+}
+
+.title-name {
+	display: block;
+	font-weight: 700;
+	font-size: 34dp;
+	letter-spacing: 0.12em;
+	color: #f9fafb;
+	line-height: 1.1;
+}
+
+.title-tagline {
+	display: block;
+	margin-top: 4dp;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: #737373;
+}
+
+.disc-panel {
+	display: block;
+	padding: 10dp 12dp;
+	background-color: #0d0d0d;
+	border: 1dp #262626;
+	margin-bottom: 14dp;
+}
+
+.disc-path {
+	display: block;
+	font-size: 11dp;
+	color: #e5e5e5;
+	/* A disc path has no spaces to break at; without this a long one runs
+	 * off the panel. */
+	word-break: break-all;
+}
+
+.disc-source {
+	display: block;
+	margin-top: 3dp;
+	font-size: 8dp;
+	color: #525252;
+	word-break: break-all;
+}
+
+.disc-actions {
+	display: flex;
+	flex-direction: row;
+	margin-top: 8dp;
+}
+
+.path-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	margin-top: 6dp;
+}
+
+.path-row input.text {
+	width: auto;
+	flex-grow: 1;
+	min-width: 0;
+	margin-right: 8dp;
+}
+
+/* What the last action did. Not a failure, so it stays in the quiet type
+ * scale; .error-line below is the one that shouts. */
+.status-line {
+	display: block;
+	margin-top: 8dp;
+	font-size: 8dp;
+	color: #737373;
+}
+
+/* The boot precheck's message: the same treatment as .override and
+ * .bind-status, which are the other two lines in this UI the user has to
+ * read before anything works. */
+.error-line {
+	display: block;
+	margin-top: 8dp;
+	padding: 4dp 5dp;
+	font-size: 8dp;
+	color: #d4a000;
+	background-color: #2d2000;
+	border: 1dp #4d3800;
+}
+
+.launcher-actions {
+	display: flex;
+	flex-direction: row;
+	margin-bottom: 12dp;
+}
+
+.start-button {
+	color: #d4d4d4;
+	border-color: #404040;
+}
+
+/* Start with a precheck that has not passed. Still clickable: pressing it
+ * re-runs the precheck and reports what is wrong, which is more use than a
+ * button that ignores the click. */
+.button.disabled,
+.button.disabled:hover,
+.button.disabled:focus {
+	color: #333333;
+	border-color: #1a1a1a;
+}
+
+.startup-row {
+	margin-bottom: 4dp;
+}
+
+.launcher-footer {
+	display: block;
+	flex-shrink: 0;
+	margin-top: 10dp;
+	padding-top: 8dp;
+	border-top: 1dp #262626;
+	font-size: 8dp;
+	color: #333333;
+}
+
+/* ---- credits (credits.rml, and the menu's About pane) -------------------- */
+
+body.credits {
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	padding: 18dp 22dp;
+	display: flex;
+	flex-direction: column;
+	background-color: #0a0a0a;
+}
+
+.credits-shell {
+	display: block;
+	flex-grow: 1;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.credits-line {
+	display: block;
+	font-size: 11dp;
+	color: #d4d4d4;
+}
+
+/* Clickable: ui_launcher.cpp hands it to SDL_OpenURL. Focusable too, so a
+ * gamepad can reach it. */
+.credits-url {
+	display: block;
+	margin-top: 3dp;
+	font-size: 10dp;
+	color: #a3a3a3;
+	tab-index: auto;
+	nav: auto;
+}
+
+.credits-url:hover,
+.credits-url:focus {
+	color: #bfff00;
+}
+
+.credits-heading {
+	margin-top: 14dp;
+}
+
+.credits-item {
+	display: block;
+	font-size: 9dp;
+	color: #737373;
+	line-height: 1.5;
+}
+
+.credits-actions {
+	display: flex;
+	flex-direction: row;
+	margin-top: 14dp;
+}

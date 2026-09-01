@@ -37,6 +37,10 @@
  * needing the ICORECOMP_HAVE_PARALLEL_GS guard. Exactly one of this stub or
  * gs_parallel.cpp's real definition exists in any given build. */
 RtPgs* rt_gs_parallel_handle() { return nullptr; }
+/* Same reason, same pair: RT_PGS_PRESENT_MAILBOX is 0 (gs_parallel_api.h),
+ * and no caller in such a build ever hands it to a library that is not
+ * there. */
+uint32_t rt_gs_parallel_present_mode() { return 0; }
 #endif
 
 #ifdef ICORECOMP_PGS_SDL

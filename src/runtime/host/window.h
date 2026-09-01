@@ -17,6 +17,8 @@
 
 #include "settings.h"
 
+#include <cstdint>
+
 /* Opaque handle to the live backend, defined in gs_parallel_api.h (the
  * MIT/LGPL C ABI boundary). Forward-declared here rather than pulling that
  * header in for every window.h includer; window.cpp includes it for the
@@ -30,6 +32,13 @@ struct RtPgs;
  * settings_apply.cpp never need the ICORECOMP_HAVE_PARALLEL_GS guard
  * themselves. */
 RtPgs* rt_gs_parallel_handle();
+
+/* The RT_PGS_PRESENT_* value resolve_create_options() settled on at startup
+ * (ICORECOMP_GS_PRESENT if set, otherwise display.present). The launcher
+ * forces FIFO while it is up and puts this value back at hand-off, rather
+ * than deriving the mapping a second time. RT_PGS_PRESENT_MAILBOX (0) in a
+ * build with no paraLLEl-GS backend, where nothing consumes it. */
+uint32_t rt_gs_parallel_present_mode();
 
 /* The process's one and only SDL_PollEvent loop. Routes SDL_EVENT_QUIT to
  * rt_pgs_notify_quit and the two resize events to rt_pgs_notify_resize (plus

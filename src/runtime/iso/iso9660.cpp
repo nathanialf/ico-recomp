@@ -494,6 +494,8 @@ void rt_iso_set_path(const char* path) {
     g_forced_path = path ? path : "";
 }
 
+const char* rt_iso_forced_path() { return g_forced_path.c_str(); }
+
 /* Thin wrapper over the shared probe: same candidate order, same source
  * labels, same log lines and same fatal messages as before this function was
  * factored out. */

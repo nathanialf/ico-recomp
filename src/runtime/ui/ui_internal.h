@@ -46,6 +46,13 @@ namespace rtui {
  */
 bool backend_window_live();
 void backend_surface_size(uint32_t* width, uint32_t* height);
+/* The launcher's three: one presented frame with no guest scanout, and the
+ * present-mode pair it uses to force FIFO while it is up and put the user's
+ * mode back at hand-off. Between-frames-only like the rest, which for these
+ * means the launcher's own loop (ui_launcher.cpp), never the event pump. */
+uint32_t backend_present_ui();
+void backend_set_present_mode(uint32_t mode);
+uint32_t backend_present_mode();
 uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height);
 void backend_texture_destroy(uint32_t texture);
 void backend_set_frame(const RtPgsOverlayFrame* frame);
@@ -149,6 +156,12 @@ struct UiState {
      * anything at all is on screen before it decides to render. The fps
      * document is shown and hidden by settings_model_refresh(). */
     bool fps_visible = false;
+    /* True for the whole of rt_launcher_run(), from the Show() of
+     * launcher.rml to the Hide() that hands off to the game. Like the two
+     * flags above it makes the tick render; unlike them it also makes
+     * rt_ui_wants_input() true and takes the menu hotkey out of service
+     * (ui_events.cpp), because the launcher owns the window while it is up. */
+    bool launcher_visible = false;
     /* Set by rt_ui_set_visible(false), consumed by the next rt_ui_tick: the
      * menu closes from inside the event pump, and the settings file write
      * belongs at the field boundary. */
@@ -161,6 +174,11 @@ struct UiState {
     Rml::Context* context = nullptr;
     Rml::ElementDocument* menu = nullptr;
     Rml::ElementDocument* fps = nullptr;
+    /* Both loaded once at init and shown/hidden from ui_launcher.cpp; the
+     * credits document is reachable from the launcher, and the same text is
+     * inline in the menu's About pane. */
+    Rml::ElementDocument* launcher = nullptr;
+    Rml::ElementDocument* credits = nullptr;
     UiRenderInterface* render = nullptr;
     UiSystemInterface* system = nullptr;
 };
@@ -206,6 +224,20 @@ const char* bind_slot_label(bool gamepad, int slot);
  * back from the settings. `status` is shown as-is and may be empty. Called
  * only from ui_rebind.cpp. */
 void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::string& status);
+
+/* ---- launcher (ui_launcher.cpp) -----------------------------------------
+ *
+ * The "launcher" data model (separate from "settings": it holds the disc
+ * state and the precheck result, none of which is a setting) plus the two
+ * documents that read it. Called from rt_ui_init: the model has to exist
+ * before launcher.rml is parsed, and both documents load whether or not the
+ * launcher gate in main.cpp passed, because the credits are reachable from
+ * the in-game menu as well.
+ *
+ * Returns false, having logged, when the model or launcher.rml could not be
+ * created. That disables the launcher (rt_launcher_run then returns true
+ * straight away) without disabling the settings menu. */
+bool launcher_init(Rml::Context* context, const std::string& ui_dir);
 
 #ifdef ICORECOMP_PGS_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
