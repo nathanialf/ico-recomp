@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <new>
@@ -214,6 +215,33 @@ inline std::string rt_exe_dir() {
     std::string path(buf);
     size_t cut = path.find_last_of('/');
     return cut == std::string::npos ? std::string(".") : path.substr(0, cut);
+#endif
+}
+
+/* Per-user state directory, the first fallback when the executable's own
+ * folder cannot be written. */
+inline std::string rt_user_state_dir() {
+#ifdef _WIN32
+    if (const char* p = std::getenv("LOCALAPPDATA")) return std::string(p) + "/icorecomp";
+    return std::string();
+#else
+    if (const char* p = std::getenv("XDG_STATE_HOME")) return std::string(p) + "/icorecomp";
+    if (const char* p = std::getenv("HOME")) return std::string(p) + "/.local/state/icorecomp";
+    return std::string();
+#endif
+}
+
+/* Per-user configuration directory. On Linux this is XDG_CONFIG_HOME or
+ * ~/.config; Windows has no config/state split, so both land in
+ * %LOCALAPPDATA%/icorecomp. Empty when no base env var exists. */
+inline std::string rt_user_config_dir() {
+#ifdef _WIN32
+    if (const char* p = std::getenv("LOCALAPPDATA")) return std::string(p) + "/icorecomp";
+    return std::string();
+#else
+    if (const char* p = std::getenv("XDG_CONFIG_HOME")) return std::string(p) + "/icorecomp";
+    if (const char* p = std::getenv("HOME")) return std::string(p) + "/.config/icorecomp";
+    return std::string();
 #endif
 }
 

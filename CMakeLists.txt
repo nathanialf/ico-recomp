@@ -62,6 +62,8 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/sif/pad.cpp
     src/runtime/sif/mc.cpp
     src/runtime/host/input.cpp
+    src/runtime/host/json.cpp
+    src/runtime/host/settings.cpp
     src/runtime/snd/spu.cpp
     src/runtime/snd/engine.cpp
     src/runtime/snd/reverb.cpp
@@ -95,6 +97,27 @@ target_compile_definitions(icorecomp-mc-selftest PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-mc-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# Standalone exercise of the JSON DOM (host/json.cpp) and the typed settings
+# model (host/settings.cpp): host/settings_selftest.cpp against stub
+# rt_log/rt_base_dir (settings.cpp's only two runtime.h externs), not
+# against log.cpp, so this never pulls in the log sink or the rest of the
+# runtime. Run with ICORECOMP_SETTINGS_SELFTEST_DIR set to a scratch dir.
+add_executable(icorecomp-settings-selftest
+    src/runtime/host/json.cpp
+    src/runtime/host/settings.cpp
+    src/runtime/host/settings_selftest.cpp
+)
+target_include_directories(icorecomp-settings-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-settings-selftest PRIVATE
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-settings-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
 target_include_directories(icorecomp-runtime PRIVATE

@@ -367,19 +367,6 @@ std::FILE* try_open(const std::string& path, std::string* why) {
     return f;
 }
 
-/* Per-user state directory, the first fallback when the executable's own
- * folder cannot be written. */
-std::string user_state_dir() {
-#ifdef _WIN32
-    if (const char* p = std::getenv("LOCALAPPDATA")) return std::string(p) + "/icorecomp";
-    return std::string();
-#else
-    if (const char* p = std::getenv("XDG_STATE_HOME")) return std::string(p) + "/icorecomp";
-    if (const char* p = std::getenv("HOME")) return std::string(p) + "/.local/state/icorecomp";
-    return std::string();
-#endif
-}
-
 std::string temp_dir() {
 #ifdef _WIN32
     if (const char* p = std::getenv("TEMP")) return p;
@@ -446,7 +433,7 @@ void rt_log_init(const char* dir) {
         if (!verbose) return;
         candidates.push_back(base + "/icorecomp.log");
 #endif
-        if (std::string d = user_state_dir(); !d.empty()) candidates.push_back(d + "/icorecomp.log");
+        if (std::string d = rt_user_state_dir(); !d.empty()) candidates.push_back(d + "/icorecomp.log");
         if (std::string d = temp_dir(); !d.empty()) candidates.push_back(d + "/icorecomp.log");
     }
 

@@ -33,6 +33,17 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
           cmake --build build -j4
 
+  settings-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure and build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build --target icorecomp-settings-selftest -j4
+      - name: run
+        run: ICORECOMP_SETTINGS_SELFTEST_DIR=$(mktemp -d) ./build/icorecomp-settings-selftest
+
   runtime-stub-windows:
     # Informational until the Windows port lands: failures here are
     # portability debt to burn down, not merge blockers.
