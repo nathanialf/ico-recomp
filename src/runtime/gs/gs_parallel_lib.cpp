@@ -572,6 +572,16 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
 
 RtPgs::~RtPgs() {
     if (m_device) m_device->wait_idle();
+    /* The overlay's images are declared after the device members and would
+     * be destroyed after them by the member order alone, but m_wsi.reset()
+     * / m_headless_device.reset() below destroy the device first, and an
+     * ImageHandle released against a dead device is a leak report from
+     * Granite's allocator followed by a fault at exit. Release them here,
+     * after the idle wait, while the device is still up. The program is
+     * owned by the device's cache; only the pointer is dropped. */
+    m_overlay_textures.clear();
+    m_overlay_white.reset();
+    m_overlay_program = nullptr;
     m_iface.reset();
 #ifdef ICORECOMP_PGS_SDL
     m_wsi.reset();
@@ -1237,6 +1247,14 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
 
     cmd.set_program(m_overlay_program);
     cmd.set_depth_test(false, false);
+    /* Granite's request_command_buffer starts every command buffer in
+     * set_opaque_state: back-face culling with counter-clockwise front
+     * faces. Overlay geometry is authored in a y-down pixel space and
+     * projected without a flip, so its triangles are clockwise in
+     * framebuffer terms and that default culls every one of them (the
+     * symptom is a cleared backbuffer with no UI on it). A 2D overlay has
+     * no back faces: draw both windings. */
+    cmd.set_cull_mode(VK_CULL_MODE_NONE);
     cmd.set_blend_enable(true);
     cmd.set_blend_op(VK_BLEND_OP_ADD);
 
