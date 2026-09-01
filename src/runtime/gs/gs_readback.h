@@ -9,6 +9,12 @@
  *
  * PPM output of game scanout is ROM-derived data; paths must stay outside
  * the repository (check_no_rom is the mechanical gate for the repo side).
+ *
+ * The pixels are the scanout as the GS produced it, with no aspect ratio
+ * correction: PS2 pixels are not square, so the image's width:height is not
+ * its shape on screen. That is the point, it keeps the file a function of the
+ * GS output alone. Presentation applies the display aspect separately; see
+ * scanout_display_aspect in gs_parallel_lib.cpp.
  */
 #ifndef ICORECOMP_GS_READBACK_H
 #define ICORECOMP_GS_READBACK_H
