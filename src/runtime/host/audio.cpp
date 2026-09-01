@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #ifdef ICORECOMP_SND_SDL
 #include <SDL3/SDL.h>
@@ -51,9 +52,12 @@ void wav_write_header() {
 }
 
 void wav_open() {
+    /* Opt in: ICORECOMP_WAV_CAPTURE=path captures the mixer's output before
+     * the device sees it, which is what separates a bad mix from a bad
+     * handoff. 192 KB per second of run. */
     const char* path = std::getenv("ICORECOMP_WAV_CAPTURE");
     if (!path || !path[0]) return;
-    g_wav = std::fopen(path, "wb");
+    g_wav = rt_fopen_utf8(path, "wb");
     if (!g_wav) {
         rt_log("audio", "WARNING: ICORECOMP_WAV_CAPTURE=%s: fopen failed; capture disabled", path);
         return;
@@ -119,14 +123,40 @@ void sdl_open() {
         rt_log("audio", "SDL_OpenAudioDeviceStream failed (%s); playback disabled", SDL_GetError());
         return;
     }
+    /* Prime with a few fields of silence. The device starts consuming the
+     * moment it is resumed, and the first mix does not arrive until the
+     * game issues its first sndn2 flush; without a cushion that gap is an
+     * immediate underrun, and every later hitch has nothing to absorb it. */
+    {
+        constexpr uint32_t kPrimeFrames = RT_AUDIO_RATE / 20; /* 50 ms */
+        static float silence[kPrimeFrames * 2] = {0.0f};
+        SDL_PutAudioStreamData(g_sdl_stream, silence, (int)sizeof silence);
+    }
     SDL_ResumeAudioStreamDevice(g_sdl_stream);
-    rt_log("audio", "SDL3 audio stream open (driver=%s, 48000 Hz stereo f32)",
-        SDL_GetCurrentAudioDriver());
+    rt_log("audio", "SDL3 audio stream open (driver=%s, 48000 Hz stereo f32, "
+                    "50 ms primed)", SDL_GetCurrentAudioDriver());
 }
+
+/* Queue-depth telemetry. The sink previously reported only the overrun
+ * case, so a starving queue (the audible one: the device runs out and the
+ * gap is a click) was invisible. */
+uint32_t g_q_min = UINT32_MAX;
+uint32_t g_q_max = 0;
+uint64_t g_q_sum = 0;
+uint64_t g_q_n = 0;
+uint64_t g_underruns = 0;
 
 void sdl_submit(const float* lr, uint32_t frames) {
     if (!g_sdl_stream) return;
     int queued = SDL_GetAudioStreamQueued(g_sdl_stream);
+    if (queued >= 0) {
+        uint32_t q = (uint32_t)queued;
+        if (q < g_q_min) g_q_min = q;
+        if (q > g_q_max) g_q_max = q;
+        g_q_sum += q;
+        ++g_q_n;
+        if (q == 0) ++g_underruns;
+    }
     if (queued >= 0 && (uint32_t)queued > kMaxQueuedBytes) {
         g_sdl_dropped += frames;
         if ((g_sdl_dropped & (g_sdl_dropped - 1)) == 0) { /* power-of-two repeats */
@@ -142,6 +172,44 @@ void sdl_submit(const float* lr, uint32_t frames) {
 uint64_t g_total_frames = 0;
 
 } // namespace
+
+uint64_t g_window_frames_submitted = 0;
+
+uint64_t rt_audio_window_frames() {
+    uint64_t v = g_window_frames_submitted;
+    g_window_frames_submitted = 0;
+    return v;
+}
+
+int rt_audio_queued_frames() {
+#ifdef ICORECOMP_SND_SDL
+    if (!g_sdl_stream) return -1;
+    int queued = SDL_GetAudioStreamQueued(g_sdl_stream);
+    if (queued < 0) return -1;
+    return queued / (int)(2 * sizeof(float));
+#else
+    return -1;
+#endif
+}
+
+void rt_audio_queue_stats(uint32_t* min_f, uint32_t* mean_f, uint32_t* max_f,
+                          uint64_t* underruns) {
+#ifdef ICORECOMP_SND_SDL
+    const uint32_t bpf = 2 * (uint32_t)sizeof(float);
+    *min_f = g_q_min == UINT32_MAX ? 0 : g_q_min / bpf;
+    *max_f = g_q_max / bpf;
+    *mean_f = g_q_n ? (uint32_t)(g_q_sum / g_q_n) / bpf : 0;
+    *underruns = g_underruns;
+    g_q_min = UINT32_MAX;
+    g_q_max = 0;
+    g_q_sum = 0;
+    g_q_n = 0;
+    g_underruns = 0;
+#else
+    *min_f = *mean_f = *max_f = 0;
+    *underruns = 0;
+#endif
+}
 
 void rt_audio_init() {
     if (g_inited) return;
@@ -159,6 +227,7 @@ void rt_audio_init() {
 void rt_audio_submit(const float* lr, uint32_t frames) {
     if (!g_inited || frames == 0) return;
     g_total_frames += frames;
+    g_window_frames_submitted += frames;
     wav_submit(lr, frames);
 #ifdef ICORECOMP_SND_SDL
     sdl_submit(lr, frames);

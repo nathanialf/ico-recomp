@@ -21,6 +21,8 @@
 #include "snd.h"
 
 #include "../host/audio.h"
+#include "../host/portable.h"
+#include "../prof.h"
 #include "../runtime.h"
 #include "../sif/rpc.h" /* rt_iop_ptr: streams decode out of the IOP ring */
 
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -392,6 +395,41 @@ float mix_voice(Voice& v, float* out_l, float* out_r, float* out_rev) {
     return sample;
 }
 
+/* One-shot dump of a stream ring once it has been filled, so the channel
+ * interleave can be recovered offline instead of inferred. Opt in with
+ * ICORECOMP_RING_DUMP=path: the contents are ROM-derived, so this must
+ * never write without being asked, and never inside the repository. */
+void maybe_dump_ring(const Voice& v) {
+    static bool done = false;
+    if (done || !v.st_ring) return;
+    const char* e = std::getenv("ICORECOMP_RING_DUMP");
+    if (!e || !*e) { done = true; return; }
+    if (v.st_pos < 0x8000) return; /* let the ring hold real data first */
+    done = true;
+    /* Dump the whole streaming allocation, not just one ring's worth. The
+     * iopheap alloc for streaming is 755712 = 0x800 + 2 * 0x5c000, which is
+     * two rings plus a 0x800 header, so the layout has to be checked across
+     * the entire region rather than assumed from the voice pointers. */
+    uint32_t base = g_voices[0].st_iop_buf & ~0xFFFu;
+    /* st_iop_buf comes straight from the guest, so it may be out of range;
+     * clamp with unsigned arithmetic that cannot wrap. */
+    if (base >= RT_IOP_RAM_SIZE) {
+        rt_log("snd", "ring dump skipped: stream buffer 0x%06x is outside IOP RAM", base);
+        return;
+    }
+    uint64_t len = (uint64_t)0x800 + 2ull * v.st_ring;
+    if (len > RT_IOP_RAM_SIZE - base) len = RT_IOP_RAM_SIZE - base;
+    std::string path = e;
+    if (std::FILE* f = rt_fopen_utf8(path.c_str(), "wb")) {
+        std::fwrite(rt_iop_ptr(base), 1, (size_t)len, f);
+        std::fclose(f);
+        rt_log("snd", "ring dump -> %s (base=0x%06x len=0x%x, ring=0x%x, voice "
+                      "bases 0x%06x/0x%06x)",
+            path.c_str(), base, (unsigned)len, v.st_ring, g_voices[0].st_iop_buf,
+            g_voices[1].st_iop_buf);
+    }
+}
+
 void render(uint32_t frames) {
     /* Render in small stack chunks. */
     float buf[256 * 2];
@@ -450,6 +488,7 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
 }
 
 void rt_snd_flush_tick() {
+    RT_PROF_ZONE(RT_PROF_AUDIO);
     /* One vblank field of audio: 48000 / 59.94 = 800.80 frames. 16.16
      * fixed-point accumulator carries the fraction. */
     constexpr uint64_t kStep = ((uint64_t)RT_AUDIO_RATE << 16) * 1001 / 60000; /* 59.94 Hz */
@@ -457,6 +496,7 @@ void rt_snd_flush_tick() {
     uint32_t frames = g_frame_frac >> 16;
     g_frame_frac &= 0xFFFF;
     render(frames);
+
 
     /* Once per ~10 s: stream ring health (fill state is otherwise invisible
      * because raw SIF DMA logging is deduplicated). */
@@ -468,8 +508,19 @@ void rt_snd_flush_tick() {
             const uint8_t* p = rt_iop_ptr(v.st_iop_buf & ~(v.st_stride - 1));
             uint32_t nonzero = 0;
             for (uint32_t b = 0; b < 0x1000; ++b) nonzero += p[b] != 0;
-            rt_log("snd", "stream voice %d: pos=0x%x cursor=0x%06x ring nonzero bytes (first 4K)=%u",
-                i, v.st_pos, stream_addr(v, v.st_pos), nonzero);
+            /* pitch is the whole ballgame for a stream: 0x1000 means the
+             * voice is stepping one 48 kHz sample per output sample, so
+             * 44.1 kHz source material plays 8.8% fast and outruns the
+             * ring. Report it with the rate it implies. */
+            static uint32_t last_pos[kNumVoices] = {0};
+            uint32_t advanced = v.st_pos - last_pos[i];
+            last_pos[i] = v.st_pos;
+            maybe_dump_ring(v);
+            rt_log("snd", "stream voice %d: pitch=0x%04x (%.0f Hz) pos=0x%x "
+                          "(+%u bytes/s = %.0f Hz effective) cursor=0x%06x nonzero=%u",
+                i, v.pitch, (double)v.pitch * RT_AUDIO_RATE / 4096.0, v.st_pos,
+                advanced, (double)advanced * 28.0 / 16.0,
+                stream_addr(v, v.st_pos), nonzero);
         }
     }
 }
@@ -501,6 +552,7 @@ void for_mask(uint32_t w2, uint32_t w3, Fn fn) {
 }
 
 void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
+    RT_PROF_ZONE(RT_PROF_AUDIO);
     /* Semantics per SNDN2_NOTES.md (EE emitters in the retail vendor
      * library; aug6 names in parentheses). */
     uint32_t voice = w1 & 0xFF;

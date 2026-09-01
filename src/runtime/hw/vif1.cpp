@@ -27,6 +27,7 @@
 #include "hw.h"
 
 #include "../ee/kernel.h"
+#include "../prof.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -299,7 +300,13 @@ void exec_command(Vif1& v) {
             std::memcpy(rt_vu1_micro() + dst, v.payload.data(), bytes);
             rt_vu1_micro_written(dst, bytes);
             ++v.mpgs;
-            rt_log("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x", v.mpgs, num, dst);
+            /* Sampled like DIRECT below. ICO re-uploads its five microprograms
+             * around 35 times per field, so logging every one costs more
+             * frame time than the rest of the runtime's logging together,
+             * and says nothing the sampled line does not. */
+            if (rt_trace() || is_pow2(v.mpgs)) {
+                rt_log("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x", v.mpgs, num, dst);
+            }
             break;
         }
         case 0x50: case 0x51: { /* DIRECT / DIRECTHL */
@@ -340,6 +347,7 @@ uint32_t words_needed(const Vif1& v, uint32_t code) {
 } // namespace
 
 void rt_vif1_feed(const uint32_t* words, uint32_t count) {
+    RT_PROF_ZONE(RT_PROF_VIF1);
     Vif1& v = g_vif;
     for (uint32_t i = 0; i < count; ++i) {
         if (!v.pending) {

@@ -20,6 +20,10 @@
  *   gspriv.cpp GS privileged MMIO (0x12000000): routes to the backend's
  *              write_priv/read_priv shadow. CSR/IMR semantics stay owned
  *              by ee/intc.cpp (see the ownership note in gspriv.cpp).
+ *   geomcheck.cpp
+ *              ICORECOMP_VERBOSE=geom vertex validation of the GIF
+ *              stream, attributed to the VU1 program that produced it.
+ *              Read-only; it never changes a submission.
  *
  * This is runtime-internal, NOT part of the ABI contract.
  */
@@ -82,6 +86,20 @@ size_t rt_ipu_test_read_out(uint8_t* dst, size_t maxlen);
 /* path: 0 = PATH1 (XGKICK), 1 = PATH2 (VIF1 DIRECT), 2 = PATH3 (GIF DMA).
  * data must be a contiguous host buffer of qwords*16 bytes. */
 void rt_gif_submit(int path, const uint8_t* data, uint32_t qwords);
+
+/* ---- geometry diagnostics (geomcheck.cpp) -------------------------------- */
+
+/* Validates one submitted packet. `vu1_hash` attributes PATH1 traffic to
+ * the bound microprogram and is ignored for the other paths. Called from
+ * rt_gif_submit only when ICORECOMP_VERBOSE names "geom". */
+void rt_geom_scan(int path, const uint8_t* data, uint32_t qwords, uint32_t vu1_hash);
+/* Records the CLIP judgment register at XGKICK time, which says whether a
+ * microprogram's clip-cull path is running at all. */
+void rt_geom_note_clip(uint32_t clip, uint32_t vu1_hash);
+/* Emits the per-field summary and resets the field counters. */
+void rt_geom_field(unsigned field);
+/* Whole-run totals, for the end-of-run stats block. */
+void rt_geom_report();
 bool rt_gif_mmio_read(uint32_t addr, uint32_t* out);
 bool rt_gif_mmio_write(uint32_t addr, uint32_t v);
 
@@ -104,6 +122,9 @@ void rt_vu1_micro_written(uint32_t offset, uint32_t bytes);
  * current upload against the registry, run the program if registered,
  * loud-log and skip if not. */
 void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* how);
+/* Upload hash of the microprogram currently bound, 0 before the first
+ * MSCAL. Used to attribute GIF traffic back to the program that built it. */
+uint32_t rt_vu1_bound_hash();
 
 /* ---- GS privileged registers (gspriv.cpp) ------------------------------- */
 

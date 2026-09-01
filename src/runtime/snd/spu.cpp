@@ -13,6 +13,7 @@
  */
 #include "snd.h"
 
+#include "../prof.h"
 #include "../runtime.h"
 
 #include <cstdlib>
@@ -35,6 +36,7 @@ uint8_t* rt_spu_ram() {
 }
 
 void rt_spu_upload(const uint8_t* src, uint32_t spu_addr, uint32_t len) {
+    RT_PROF_ZONE(RT_PROF_AUDIO);
     uint8_t* ram = rt_spu_ram();
     if (spu_addr >= RT_SPU_RAM_SIZE || len > RT_SPU_RAM_SIZE - spu_addr) {
         rt_fatal("snd", nullptr,

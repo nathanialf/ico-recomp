@@ -46,6 +46,7 @@
 #include "ee/kernel.h"
 #include "hw/hw.h"
 #include "iso/iso9660.h"
+#include "prof.h"
 
 #include <csignal>
 #include <cstdio>
@@ -161,6 +162,9 @@ void sigint_handler(int) {
     if (rt_sched_current_ctx()) rt_dump_registers(rt_sched_current_ctx());
     rt_sched_dump_inventory("SIGINT");
     std::fflush(stderr);
+    /* Logging is asynchronous and _Exit runs no atexit, so drain before
+     * leaving or the inventory dump above never reaches the file. */
+    rt_log_drain();
     std::_Exit(130);
 }
 
@@ -198,6 +202,7 @@ void print_usage(const char* argv0) {
 
 int main(int argc, char** argv) {
     rt_log_init(rt_base_dir());
+    rt_prof_init();
     /* Installed before anything that can fault, which now includes the
      * Vulkan device and window setup in rt_hw_init: a crash there used to
      * die with no dump at all. */

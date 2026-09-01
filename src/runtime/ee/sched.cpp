@@ -20,6 +20,8 @@
  */
 #include "kernel.h"
 
+#include "prof.h"
+
 #define MINICORO_IMPL
 #include "minicoro.h"
 
@@ -262,6 +264,21 @@ static uint64_t clock_next_event() {
     return nxt;
 }
 
+/* Where virtual time comes from. A field is RT_CYCLES_PER_FIELD cycles;
+ * whether those cycles are billed by a spinning guest (backedge/mmio) or
+ * skipped over while every thread sleeps (idle) is the difference between
+ * a wait that costs host time and one that costs none. */
+uint64_t g_cyc_backedge = 0;
+uint64_t g_cyc_mmio = 0;
+uint64_t g_cyc_idle = 0;
+
+extern "C" void rt_clock_sources(uint64_t* backedge, uint64_t* mmio, uint64_t* idle) {
+    *backedge = g_cyc_backedge;
+    *mmio = g_cyc_mmio;
+    *idle = g_cyc_idle;
+    g_cyc_backedge = g_cyc_mmio = g_cyc_idle = 0;
+}
+
 void rt_clock_tick(uint64_t cycles) {
     uint64_t target = g_vclk + cycles;
     /* Step event by event so ordering stays exact. */
@@ -304,6 +321,7 @@ void rt_clock_tick(uint64_t cycles) {
 void rt_kernel_mmio_tick() {
     /* ~3.5 us per polled MMIO access: a tight guest poll loop crosses a
      * 16.7 ms field boundary in a few thousand iterations. */
+    g_cyc_mmio += 512;
     rt_clock_tick(512);
     rt_intc_deliver();
 }
@@ -319,13 +337,24 @@ void rt_kernel_mmio_tick() {
  * timeline events, then INTC/DMAC handler dispatch + preemption check). */
 namespace {
 constexpr uint64_t kBackedgeInterval = 4096; /* power of two */
-constexpr uint64_t kBackedgeCycles = 2;      /* bus cycles billed per backedge */
+/* Bus cycles billed per taken backward branch. This is the only thing that
+ * sets the emulated EE speed relative to the video and audio clocks: fields
+ * are a fixed number of virtual cycles, so billing too few cycles per loop
+ * iteration lets the guest do more work per field than a real EE could.
+ * The game's sound tick then runs too often per field and over-refills the
+ * stream ring, overwriting audio that has not been played yet.
+ *
+ * 2 assumes a loop iteration costs 2 bus cycles. A real spin-loop body is
+ * 8-12 EE instructions, so ~5 bus cycles is closer. Tunable by ear:
+ * ICORECOMP_EE_LOOP_CYCLES=n. */
+uint64_t g_backedge_cycles = 2;
 uint64_t g_backedges = 0;
 } // namespace
 
 extern "C" void rt_backedge(void) {
     if ((++g_backedges & (kBackedgeInterval - 1)) != 0) return;
-    rt_clock_tick(kBackedgeInterval * kBackedgeCycles);
+    g_cyc_backedge += kBackedgeInterval * g_backedge_cycles;
+    rt_clock_tick(kBackedgeInterval * g_backedge_cycles);
     rt_intc_deliver();
 }
 
@@ -334,6 +363,14 @@ extern "C" void rt_backedge(void) {
 void rt_sched_init() {
     const char* e = std::getenv("ICORECOMP_MAX_VBLANKS");
     if (e) g_max_vblanks = std::strtoull(e, nullptr, 10);
+    if (const char* c = std::getenv("ICORECOMP_EE_LOOP_CYCLES")) {
+        uint64_t v = std::strtoull(c, nullptr, 10);
+        if (v >= 1 && v <= 64) g_backedge_cycles = v;
+    }
+    rt_log("sched", "EE loop billing: %llu bus cycles per backedge "
+                    "(ICORECOMP_EE_LOOP_CYCLES; higher = slower emulated EE "
+                    "relative to the field clock)",
+        (unsigned long long)g_backedge_cycles);
     rt_intc_init();
     rt_timers_init();
     rt_sif_init();
@@ -373,7 +410,15 @@ void rt_sched_maybe_preempt() {
             g_current = id;
             ++t->run_count;
             ++g_resumes;
-            mco_result r = mco_resume(t->co);
+            mco_result r;
+            {
+                /* Everything the guest triggers (MMIO, syscalls, DMA,
+                 * VIF1, VU1, GIF, GS) opens its own zone underneath
+                 * this one, so the "ee" bucket ends up holding
+                 * translated EE code and nothing else. */
+                RT_PROF_ZONE(RT_PROF_EE);
+                r = mco_resume(t->co);
+            }
             g_current = 0;
             if (r != MCO_SUCCESS) {
                 rt_fatal("sched", &t->ctx, "mco_resume(thread %d) failed: %s", id, mco_result_description(r));
@@ -413,6 +458,7 @@ void rt_sched_maybe_preempt() {
             rt_sched_dump_inventory("no runnable threads and no pending timeline events");
             rt_fatal("sched", nullptr, "deadlock: nothing to run and nothing scheduled");
         }
+        g_cyc_idle += nxt - g_vclk;
         rt_clock_tick(nxt - g_vclk);
         rt_intc_deliver();
     }

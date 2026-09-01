@@ -79,6 +79,13 @@ pub struct Audit {
 }
 
 pub struct Analysis {
+    /// Bundle offset -> the flag-read sites whose visible flags must be
+    /// snapshotted at the top of that bundle. The VU flag pipeline is four
+    /// deep: a lower-slot fmand/fsand at bundle i sees the flags committed
+    /// at bundle i-4, so the snapshot is taken entering bundle i-3.
+    pub flag_save_sites: BTreeMap<u32, Vec<(u32, bool)>>,
+    /// Bundle offset of a flag read -> true if it reads MAC, false status.
+    pub flag_read_sites: BTreeMap<u32, bool>,
     pub bundles: Vec<Bundle>,
     /// MSCAL entry offsets (bytes): offset 0 plus the head branch stubs.
     pub entries: Vec<u32>,
@@ -561,6 +568,13 @@ pub fn analyze(prog: &Vu1Program) -> Result<Analysis> {
         if !uppers[i].reads_q {
             continue;
         }
+        // A waitq in this same bundle stalls the whole pair until the
+        // divider writes Q, so the upper half reads the new value. The
+        // programs pair `mulq | waitq` for exactly that reason.
+        if lowers[i].div == Some(DivKind::Waitq) {
+            q_commit_sites.insert(bundles[i].offset);
+            continue;
+        }
         for back in 1..=64usize {
             let Some(j) = i.checked_sub(back) else { break };
             match lowers[j].div {
@@ -644,9 +658,30 @@ pub fn analyze(prog: &Vu1Program) -> Result<Analysis> {
                 // lower half runs, so the model already shows the old flags
                 // here, as hardware does. Not a finding.
             } else if setter {
+                // A flag read that only lands in a vf or a stored value is
+                // a numeric difference. One whose vi feeds a branch inside
+                // the next two bundles changes control flow, which is the
+                // same shape as the Q-pipeline bug: a wrong path, not a
+                // wrong number. Call those out separately.
+                let feeds_branch = lowers[i].writes_vi.and_then(|w| {
+                    (i + 1..=(i + 2).min(n - 1)).find(|&k| {
+                        lowers[k]
+                            .branch
+                            .as_ref()
+                            .is_some_and(|(srcs, _)| srcs.contains(&w))
+                    })
+                });
+                let tail = match feeds_branch {
+                    Some(k) => format!(
+                        "; the vi it writes is the branch condition at {:#x}, so this \
+                         one selects a path",
+                        bundles[k].offset
+                    ),
+                    None => String::new(),
+                };
                 audit.flag_windows.push(format!(
                     "{}: {:?} read at {:#x} with a setter at {:#x} (-{d}); hardware \
-                     would still show the older flags, immediate model shows the new",
+                     would still show the older flags, immediate model shows the new{tail}",
                     prog.name,
                     kind,
                     bundles[i].offset,
@@ -671,7 +706,96 @@ pub fn analyze(prog: &Vu1Program) -> Result<Analysis> {
         }
     }
 
+    // Flag pipeline. A lower-slot fmand/fsand/fmeq/... at bundle i reads the
+    // MAC or status flags as they stood four bundles back, not as this
+    // bundle's FMAC just left them. Same fix shape as the integer-branch
+    // hazard: snapshot the value into a temp at the earlier bundle and read
+    // the temp at the use site.
+    let mut flag_save_sites: BTreeMap<u32, Vec<(u32, bool)>> = BTreeMap::new();
+    let mut flag_read_sites: BTreeMap<u32, bool> = BTreeMap::new();
+    for i in 0..n {
+        let Some(kind) = lowers[i].reads_flags else { continue };
+        let is_mac = match kind {
+            FlagKind::Mac => true,
+            FlagKind::Status => false,
+            // The clip register is written by vclip and read by fcand/fcor.
+            // No read in the shipped programs falls inside its window, so
+            // the immediate model is exact there; leave it alone.
+            FlagKind::Clip => continue,
+        };
+        let read_off = bundles[i].offset;
+        // Only a setter inside the window makes the immediate model wrong.
+        let mut inside = false;
+        for d in 1..=FLAG_WINDOW as usize {
+            let Some(j) = i.checked_sub(d) else { break };
+            // Both MAC and status are written by the FMAC units. Status also
+            // carries the divider's D/I bits, which the interpreter's history
+            // delays along with everything else, so a div issue inside the
+            // window has to count as a setter or the two models disagree.
+            let setter = uppers[j].sets_macstatus
+                || (!is_mac
+                    && matches!(
+                        lowers[j].div,
+                        Some(DivKind::Div) | Some(DivKind::Sqrt) | Some(DivKind::Rsqrt)
+                    ));
+            if setter {
+                inside = true;
+                break;
+            }
+        }
+        if !inside {
+            continue;
+        }
+        flag_read_sites.insert(read_off, is_mac);
+        // The snapshot goes at the top of bundle i-3, so it captures the
+        // state left by bundle i-4. Fewer than 4 bundles in means the
+        // visible flags are the ones the program was entered with, and the
+        // temp keeps its entry initialiser.
+        let Some(save_idx) = i.checked_sub(FLAG_WINDOW as usize) else {
+            audit.flag_windows.push(format!(
+                "{}: flag read at {read_off:#x} is within {} bundles of entry; \
+                 visible flags are the entry values",
+                prog.name, FLAG_WINDOW
+            ));
+            continue;
+        };
+        // The temp is written at save_idx and read at i. If anything between
+        // them can be entered from elsewhere, the temp may not hold what
+        // this path put there.
+        let mut linear = true;
+        for k in save_idx + 1..=i {
+            let off = bundles[k].offset;
+            if labels.contains(&off) || dispatch.contains(&off) {
+                linear = false;
+                break;
+            }
+        }
+        if !linear {
+            bail!(
+                "{}: flag read at {read_off:#x} needs a snapshot at {:#x}, but a \
+                 bundle between them is a jump target; the saved-temp fix assumes \
+                 linear entry",
+                prog.name,
+                bundles[save_idx].offset
+            );
+        }
+        flag_save_sites
+            .entry(bundles[save_idx].offset)
+            .or_default()
+            .push((read_off, is_mac));
+        audit.flag_windows.push(format!(
+            "{}: flag read at {read_off:#x} now uses the flags snapshotted at {:#x} \
+             ({} bundles back), matching the {}-deep flag pipeline",
+            prog.name,
+            bundles[save_idx].offset,
+            FLAG_WINDOW,
+            FLAG_WINDOW + 1
+        ));
+    }
+
     Ok(Analysis {
+        flag_save_sites,
+        flag_read_sites,
         bundles,
         entries: entries.into_iter().collect(),
         labels,

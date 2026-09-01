@@ -73,6 +73,7 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/hw/gif.cpp
     src/runtime/hw/vu1rt.cpp
     src/runtime/hw/gspriv.cpp
+    src/runtime/hw/geomcheck.cpp
     src/runtime/gs/gs_dumpwriter.cpp
     src/runtime/gs/gs_select.cpp
 )
@@ -384,7 +385,22 @@ if(NOT WIN32)
         BUILD_WITH_INSTALL_RPATH FALSE)
 endif()
 
+if(WIN32)
+    # timeBeginPeriod, for the frame limiter's sleep resolution. Outside the
+    # generated-code branch: portable.h calls it in every configuration,
+    # including stub mode.
+    target_link_libraries(icorecomp-runtime PRIVATE winmm)
+endif()
+
 install(TARGETS icorecomp-runtime RUNTIME DESTINATION .)
+
+# Fallback launcher: captures the console to a file using cmd.exe's own
+# redirect, so a run can be diagnosed even when the runtime cannot open a
+# log file of its own.
+if(WIN32)
+    install(FILES ${CMAKE_SOURCE_DIR}/packaging/run-with-log.bat DESTINATION .)
+    install(FILES ${CMAKE_SOURCE_DIR}/packaging/run-diagnostic.bat DESTINATION .)
+endif()
 
 if(ICORECOMP_PARALLEL_GS)
     # RUNTIME catches the Windows DLL, LIBRARY the Linux .so.

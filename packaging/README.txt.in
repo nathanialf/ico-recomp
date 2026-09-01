@@ -66,6 +66,19 @@ Vulkan driver, and it survives the window closing. If the port fails,
 that file says why on one of its last few lines. Send it along with any
 bug report.
 
+If this folder cannot be written (an install under Program Files, a
+read-only share), the log goes to %LOCALAPPDATA%\icorecomp instead, and
+then to the temp folder. Whichever it picks, its first line names the
+file, and the console says which locations it tried and why each failed.
+
+The log can also carry diagnostic channels, which are never printed to
+the console. They are off by default because they cost frame time.
+ICORECOMP_VERBOSE=geom turns on the graphics one: it checks every
+primitive sent to the graphics chip and reports, once per field, the ones
+projected behind the eye or stretched past the hardware guard band, along
+with which VU1 microprogram built them. If the picture is wrong, those
+lines say so in numbers.
+
 Requirements: a GPU and driver with Vulkan 1.1 or newer. The renderer
 names the device it selected in the log.
 
@@ -74,6 +87,11 @@ Environment variables
 ---------------------
 
     ICORECOMP_LOG=path        write the log somewhere else ("-" disables)
+    ICORECOMP_VERBOSE=list    extra diagnostic channels, comma separated,
+                              or "all". Off by default: "geom" re-reads
+                              every packet sent to the graphics chip, so
+                              it costs frame time and is only worth it
+                              when diagnosing the picture.
     ICORECOMP_GS=dump         headless, no window
     ICORECOMP_MAX_VBLANKS=N   stop after N fields
     ICORECOMP_SAVES_DIR=path  memory card location

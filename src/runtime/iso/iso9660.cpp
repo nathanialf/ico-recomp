@@ -22,6 +22,10 @@
  */
 #include "iso9660.h"
 
+#include "../prof.h"
+
+#include <vector>
+
 #include "../host/portable.h"
 #include "../runtime.h"
 
@@ -76,6 +80,7 @@ std::string toml_lookup(const char* path, const char* section, const char* key) 
 }
 
 bool read_raw_sector(uint32_t lsn, uint8_t out[2048]) {
+    RT_PROF_ZONE(RT_PROF_DISC);
     if (!g_disc || lsn >= g_total_sectors) return false;
     long long pos = (long long)lsn * g_sector_size + g_data_offset;
     if (rt_fseek64(g_disc, pos, SEEK_SET) != 0) return false;
@@ -198,6 +203,42 @@ uint32_t rt_iso_total_sectors() { return g_total_sectors; }
 
 bool rt_iso_read_sector(uint32_t lsn, uint8_t out[2048]) {
     return read_raw_sector(lsn, out);
+}
+
+uint32_t rt_iso_read_sectors(uint32_t lsn, uint32_t count, uint8_t* out) {
+    RT_PROF_ZONE(RT_PROF_DISC);
+    if (!g_disc || count == 0) return 0;
+    if (lsn >= g_total_sectors) return 0;
+    if (count > g_total_sectors - lsn) count = g_total_sectors - lsn;
+
+    /* A plain 2048 image stores the user data contiguously, so a run of
+     * sectors is one seek and one read. The retail streaming path asks for
+     * ~1400 sectors at a time; doing that per sector costs 1400 seek/read
+     * pairs, which is ruinous when the image sits on a network share.
+     * Raw 2352 layouts interleave headers between sectors and keep the
+     * per-sector path. */
+    if (g_sector_size == 2048 && g_data_offset == 0) {
+        long long pos = (long long)lsn * 2048;
+        if (rt_fseek64(g_disc, pos, SEEK_SET) != 0) return 0;
+        size_t got = std::fread(out, 2048, count, g_disc);
+        return (uint32_t)got;
+    }
+
+    /* Raw layouts (2352 mode 1 / mode 2 form 1) wrap each 2048-byte user
+     * area in sync, header and ECC, so the user data is strided rather than
+     * contiguous. That is still one read: pull the whole span and unpack it,
+     * instead of a seek and a read per sector. The retail streaming path
+     * asks for ~1400 sectors at a time, and doing that one sector at a time
+     * is ruinous when the image is on a network share. */
+    static std::vector<uint8_t> raw;
+    raw.resize((size_t)count * g_sector_size);
+    if (rt_fseek64(g_disc, (long long)lsn * g_sector_size, SEEK_SET) != 0) return 0;
+    size_t got = std::fread(raw.data(), g_sector_size, count, g_disc);
+    for (size_t i = 0; i < got; ++i) {
+        std::memcpy(out + i * 2048,
+            raw.data() + i * g_sector_size + g_data_offset, 2048);
+    }
+    return (uint32_t)got;
 }
 
 bool rt_iso_search(const char* path, RtIsoFile* out) {

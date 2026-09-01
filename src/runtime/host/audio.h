@@ -36,4 +36,21 @@ void rt_audio_submit(const float* lr, uint32_t frames);
  * but callable directly. Safe to call more than once. */
 void rt_audio_shutdown();
 
+/* Device queue depth in frames, or -1 when there is no device. The frame
+ * limiter uses this to lock the emulation rate to the audio clock: the two
+ * clocks are independent crystals, so pacing purely on the host wall clock
+ * drifts and eventually starves or overruns the device. */
+int rt_audio_queued_frames();
+
+/* Frames handed to the device since the last call. Divided by the window's
+ * wall time this is the true playback rate: above the device rate the sound
+ * plays fast, below it the device starves. */
+uint64_t rt_audio_window_frames();
+
+/* Window statistics for the profile report, cleared on read: minimum,
+ * mean and maximum queue depth in frames, plus the number of submits that
+ * found the queue empty. */
+void rt_audio_queue_stats(uint32_t* min_f, uint32_t* mean_f, uint32_t* max_f,
+                          uint64_t* underruns);
+
 #endif /* ICORECOMP_HOST_AUDIO_H */

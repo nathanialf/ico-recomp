@@ -34,6 +34,7 @@
 #include "hw.h"
 
 #include "../ee/kernel.h"
+#include "../prof.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -321,6 +322,10 @@ void run_normal(int ch, Channel& c) {
 }
 
 void kick(int ch, Channel& c) {
+    /* Tag walk and the gather into the scratch buffer are billed here;
+     * the VIF1, GIF, IPU and GS work the payload triggers opens its own
+     * zone and is subtracted back out. */
+    RT_PROF_ZONE(RT_PROF_DMA);
     ++c.kicks;
     uint32_t dir = c.chcr & 1;
     uint32_t mode = (c.chcr >> 2) & 3;

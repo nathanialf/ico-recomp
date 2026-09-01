@@ -48,9 +48,14 @@
 #include "hw.h"
 
 #include "../ee/kernel.h"
+#include "../prof.h"
 #include "recomp_ops.h"
 
 #include <cinttypes>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <utility>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -81,6 +86,7 @@ struct Prog {
     uint32_t size = 0;
     void (*entry)(Vu1State*) = nullptr;
     uint64_t calls = 0;
+    uint64_t binds = 0;
 };
 std::vector<Prog> g_progs;
 Prog* g_bound = nullptr;
@@ -90,6 +96,55 @@ uint64_t g_mscal_misses = 0;
 uint64_t g_xgkicks = 0;
 
 bool is_pow2(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
+
+/* ---- VU1 state capture (ICORECOMP_VU1_CAPTURE=path) --------------------- */
+
+/* Record: a fixed header then the whole Vu1State. The reader keys on
+ * (hash, pc) and needs nothing else; sizeof(Vu1State) is pinned by the ABI
+ * header, so a mismatched build is caught by the size field. */
+struct CaptureHeader {
+    uint32_t magic;   /* 'V','U','1','C' */
+    uint32_t version;
+    uint32_t state_size;
+    uint32_t reserved;
+};
+constexpr uint32_t kCaptureMagic = 0x43315556u; /* "VU1C" little-endian */
+
+std::FILE* g_capture = nullptr;
+/* Per (hash, entry pc) sample budget, so a long run does not fill a disk. */
+std::map<std::pair<uint32_t, uint32_t>, uint32_t> g_capture_counts;
+uint32_t g_capture_per_site = 8;
+
+void capture_open() {
+    /* Opt in: ICORECOMP_VU1_CAPTURE=path records the real states the VU1
+     * differential gate replays. Bounded at g_capture_per_site states per
+     * (program, entry). */
+    const char* path = std::getenv("ICORECOMP_VU1_CAPTURE");
+    if (!path || !*path) return;
+    if (const char* n = std::getenv("ICORECOMP_VU1_CAPTURE_PER_SITE")) {
+        uint32_t v = (uint32_t)std::strtoul(n, nullptr, 10);
+        if (v) g_capture_per_site = v;
+    }
+    g_capture = rt_fopen_utf8(path, "wb");
+    if (!g_capture) {
+        rt_log("vu1", "VU1 capture: could not open '%s'; capture disabled", path);
+        return;
+    }
+    CaptureHeader h{kCaptureMagic, 1, (uint32_t)sizeof(Vu1State), 0};
+    std::fwrite(&h, sizeof h, 1, g_capture);
+    rt_log("vu1", "VU1 capture: writing up to %u states per (program, entry) to %s",
+        g_capture_per_site, path);
+}
+
+void capture_state(const Vu1State* vu, uint32_t hash) {
+    auto key = std::make_pair(hash, vu->pc);
+    uint32_t& n = g_capture_counts[key];
+    if (n >= g_capture_per_site) return;
+    ++n;
+    std::fwrite(&hash, sizeof hash, 1, g_capture);
+    std::fwrite(vu, sizeof(Vu1State), 1, g_capture);
+    std::fflush(g_capture);
+}
 
 } // namespace
 
@@ -120,6 +175,7 @@ Vu1State* rt_vu1_state() {
 uint8_t* rt_vu1_micro() { return g_micro; }
 
 void rt_vu1_init() {
+    capture_open();
 #ifdef ICORECOMP_HAVE_VU1_GENERATED
     rt_vu1_register_all();
     rt_log("vu1", "generated VU1 code linked: rt_vu1_register_all() registered %zu programs", g_progs.size());
@@ -171,8 +227,14 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
                     rt_log("vu1", "upload of %u bytes matched hash 0x%08x but registry says %u bytes",
                         g_upload_len, p.hash, p.size);
                 }
-                rt_log("vu1", "upload of %u bytes bound to program hash=0x%08x entry=%p",
-                    g_upload_len, p.hash, (void*)p.entry);
+                /* The first bind of each program is the useful line: it
+                 * says the upload resolved and to what. After that the game
+                 * rebinds the same five programs every field, so sample. */
+                ++p.binds;
+                if (rt_trace() || is_pow2(p.binds)) {
+                    rt_log("vu1", "upload of %u bytes bound to program hash=0x%08x entry=%p [bind #%" PRIu64 "]",
+                        g_upload_len, p.hash, (void*)p.entry, p.binds);
+                }
                 break;
             }
         }
@@ -192,16 +254,35 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
         return;
     }
 
+    /* Seed capture for the VU1 differential harness. Writes the exact
+     * Vu1State the game hands each microprogram, which is the one input
+     * synthetic seeding cannot reproduce: these programs are stateful
+     * across MSCAL, so the deep geometry paths are only reachable from a
+     * state a previous call and a VIF1 unpack built up. Sampled per
+     * (program, entry) pair so the file stays small. The records are
+     * ROM-derived; write them outside the repository. */
+    if (g_capture) capture_state(vu, g_bound->hash);
+
     ++g_bound->calls;
     if (rt_trace() || is_pow2(g_bound->calls)) {
         rt_log("vu1", "%s pc=0x%x xtop=0x%x itop=0x%x -> program hash=0x%08x [call #%" PRIu64 "]",
             how, vu->pc, xtop, itop, g_bound->hash, g_bound->calls);
     }
-    g_bound->entry(vu);
+    {
+        /* Recompiled microprogram. rt_xgkick calls out of here open
+         * their own zones, so "vu1" is microprogram code only. */
+        RT_PROF_ZONE(RT_PROF_VU1);
+        g_bound->entry(vu);
+    }
 }
 
+uint32_t rt_vu1_bound_hash() { return g_bound_hash; }
+
 extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
+    RT_PROF_ZONE(RT_PROF_GIF);
     ++g_xgkicks;
+    static const bool geom = rt_verbose("geom");
+    if (geom) rt_geom_note_clip(vu->clip, g_bound_hash);
     uint32_t addr = qw_addr & (kVuDataQw - 1);
 
     /* Walk GIF tags to find the packet end (EOP), handling the 16 KB wrap.

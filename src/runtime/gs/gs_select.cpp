@@ -22,6 +22,8 @@
 
 #include "runtime.h"
 
+#include "../hw/hw.h"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -69,6 +71,7 @@ GsBackend* g_backend = nullptr;
 
 void backend_atexit() {
     if (g_backend) {
+        rt_geom_report();
         g_backend->report_stats();
         /* Destroy the backend so a live Vulkan device tears down cleanly
          * (wait-idle in its destructor) even on std::exit paths. */

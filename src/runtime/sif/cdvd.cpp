@@ -27,6 +27,7 @@
 
 #include <cinttypes>
 #include <cstring>
+#include <vector>
 #include <ctime>
 
 namespace {
@@ -35,6 +36,7 @@ namespace {
 constexpr uint32_t SCECdPS2DVD = 0x14;
 constexpr uint32_t SCECdComplete = 2;    /* sceCdDiskReady: ready */
 constexpr uint32_t SCECdStatPause = 0x0A;
+constexpr uint32_t SCECdStatRead = 0x06; /* drive is mid-transfer */
 constexpr uint32_t SCECdErNO = 0;
 
 uint32_t rd32(const uint8_t* p, uint32_t off) { uint32_t v; std::memcpy(&v, p + off, 4); return v; }
@@ -131,10 +133,19 @@ uint32_t g_stream_lsn = 0;
  * sound driver opened). Both carry the same 0x18-byte request block:
  * {lbn, sectors, buf, sceCdRMode bytes at +0xC..+0xE, unaligned-fixup block
  * address at +0x10, read-position word address at +0x14}; the two writeback
- * addresses are EE-side library statics in both cases. Layout confirmed
+ * addresses are EE-side library statics in both cases. Confirmed against
+ * a raw dump of the block: 3a b3 01 00 | b8 00 00 00 | 00 80 2b 00 |
+ * 02 00 00 00 | 00 1a 55 00 | c0 1a 55 00 decodes as lbn=111418
+ * sectors=184 buf=0x2b8000 mode=2, so the field layout is right and the
+ * constant destination across reads is what the game actually asks for. Layout confirmed
  * against the vendor libcdvd read entry points in the decomp repo's
  * disassembly (behavioral reference; the fno assignments predate the
  * ps2sdk table, where 0x0C is readiopmem and 0x0D is diskready). */
+/* Virtual clock value until which the drive reports itself as reading. */
+uint64_t g_drive_busy_until = 0;
+
+uint32_t iop_alloc_room(uint32_t addr);
+
 void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     if (send_size < 24) {
         rt_fatal("cdvd", rt_sched_current_ctx(), "ncmd read with short send (%u bytes)", send_size);
@@ -168,16 +179,58 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
             lbn, sectors, rt_iso_total_sectors(),
             (uint32_t)((uint64_t)lbn + sectors - (lbn < rt_iso_total_sectors() ? rt_iso_total_sectors() : lbn)));
     }
-    uint8_t sec[2048];
-    for (uint32_t i = 0; i < sectors; ++i) {
-        if (!rt_iso_read_sector(lbn + i, sec)) {
-            std::memset(sec, 0, sizeof(sec));
+    /* One bulk read, then one copy into the guest. The retail streaming
+     * path asks for ~1400 sectors at a time; a per-sector loop turns that
+     * into 1400 seek/read pairs. */
+    /* sectors is guest supplied. The IOP path has a fatal guard above; the
+     * EE path had none, so a wild count sized a multi-gigabyte vector before
+     * any I/O happened. Refuse loudly instead. */
+    if (sectors > rt_iso_total_sectors() + 4096) {
+        rt_fatal("cdvd", rt_sched_current_ctx(),
+            "sceCdRead sector count %u is larger than the disc (%u sectors)",
+            sectors, rt_iso_total_sectors());
+    }
+    static std::vector<uint8_t> disc_buf;
+    disc_buf.resize((size_t)sectors * 2048);
+    uint32_t got = rt_iso_read_sectors(lbn, sectors, disc_buf.data());
+    if (got < sectors) {
+        std::memset(disc_buf.data() + (size_t)got * 2048, 0,
+            ((size_t)sectors - got) * 2048);
+    }
+    if (to_iop) {
+        /* The retail streaming reads ask for ~1400 sectors (2.8 MB) into a
+         * 755712-byte iopheap buffer. Writing the whole request runs past
+         * the allocation and through everything the game allocated after
+         * it, which for this title is the other streams' buffers: each
+         * refill destroys the other tracks. Clamp to the allocation and say
+         * so, rather than corrupting memory quietly. */
+        size_t want = (size_t)sectors * 2048;
+        uint32_t room = iop_alloc_room(buf);
+        if (room == 0) {
+            /* Not inside any tracked allocation: either the game never got
+             * this buffer from iopheap, or the allocation table filled. Say
+             * so rather than writing an unbounded amount into it. */
+            static uint64_t untracked = 0;
+            ++untracked;
+            if (rt_trace() || (untracked & (untracked - 1)) == 0) {
+                rt_log("cdvd", "read into untracked IOP buffer 0x%06x (%zu bytes); "
+                               "extent unknown, cannot bound the write [#%" PRIu64 "]",
+                    buf, want, untracked);
+            }
         }
-        if (to_iop) {
-            std::memcpy(rt_iop_ptr(buf + i * 2048), sec, 2048);
-        } else {
-            rt_gwrite_bytes(buf + i * 2048, sec, 2048);
+        if (room && want > room) {
+            static uint64_t clamped = 0;
+            ++clamped;
+            if (rt_trace() || (clamped & (clamped - 1)) == 0) {
+                rt_log("cdvd", "read into IOP buffer 0x%06x clamped: %zu bytes requested, "
+                               "allocation has %u left [#%" PRIu64 "]",
+                    buf, want, room, clamped);
+            }
+            want = room;
         }
+        std::memcpy(rt_iop_ptr(buf), disc_buf.data(), want);
+    } else {
+        rt_gwrite_bytes(buf, disc_buf.data(), (size_t)sectors * 2048);
     }
     /* Unaligned-fixup info for the EE end-callback: all zero = the whole
      * transfer already landed in place, copy nothing. Covers both the
@@ -187,8 +240,46 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
         rt_gwrite_bytes(intr_addr, zero, sizeof(zero));
     }
     if (pos_addr) {
-        uint32_t done = sectors * 2048;
-        rt_gwrite_bytes(pos_addr, &done, 4);
+        /* The +0x14 word is the library's read-position word. Writing a byte
+         * count here made the streaming scheduler walk backwards: successive
+         * reads went lbn 112994 -> 112433 -> 111884 while the requested size
+         * crept up ~13 sectors each time, so the ring was refilled from a
+         * position that jumped around. The natural reading is the disc
+         * position the drive reached. ICORECOMP_CDVD_POS selects the
+         * semantic while this is being pinned down:
+         *   end    (default) lbn + sectors, the position after the transfer
+         *   sectors          count of sectors transferred
+         *   bytes            previous behaviour, sectors * 2048 */
+        static const int mode = [] {
+            const char* e = std::getenv("ICORECOMP_CDVD_POS");
+            if (!e) return 0;
+            if (std::strcmp(e, "sectors") == 0) return 1;
+            if (std::strcmp(e, "bytes") == 0) return 2;
+            return 0;
+        }();
+        uint32_t pos = mode == 2 ? sectors * 2048
+                     : mode == 1 ? sectors
+                                 : lbn + sectors;
+        rt_gwrite_bytes(pos_addr, &pos, 4);
+    }
+
+    /* Hold the virtual drive busy for as long as the transfer would take.
+     * The data is already in place and the RPC completes immediately, so
+     * nothing blocks; what this restores is the back pressure the library
+     * already looks for. Its read entry points poll fno 0x0E and refuse to
+     * start while the drive reports SCECdStatRead, so answering "idle"
+     * unconditionally let the streaming prefetch window slide as fast as
+     * the EE loop runs and rewrite the sound ring under the voices, which
+     * sounds like fast forward. ICORECOMP_CDVD_MBPS sets the rate, 0
+     * restores the unthrottled behaviour. */
+    static const double mbps = [] {
+        const char* e = std::getenv("ICORECOMP_CDVD_MBPS");
+        double v = e ? std::strtod(e, nullptr) : 5.4; /* PS2 DVD, about 4x */
+        return v < 0.0 ? 0.0 : v;
+    }();
+    if (mbps > 0.0) {
+        const double secs = (double)sectors * 2048.0 / (mbps * 1048576.0);
+        g_drive_busy_until = rt_clock_now() + (uint64_t)(secs * 147456000.0);
     }
 }
 
@@ -211,12 +302,10 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
             g_stream_lsn = lbn;
             break;
         case 2: { /* READ nsectors at the stream position */
-            uint8_t sec[2048];
-            uint32_t i = 0;
-            for (; i < nsectors; ++i) {
-                if (!rt_iso_read_sector(g_stream_lsn + i, sec)) break;
-                rt_gwrite_bytes(buf + i * 2048, sec, 2048);
-            }
+            static std::vector<uint8_t> stream_buf;
+            stream_buf.resize((size_t)nsectors * 2048);
+            uint32_t i = rt_iso_read_sectors(g_stream_lsn, nsectors, stream_buf.data());
+            if (i) rt_gwrite_bytes(buf, stream_buf.data(), (size_t)i * 2048);
             g_stream_lsn += i;
             result = i; /* sectors read; high half = error (0) */
             break;
@@ -268,13 +357,15 @@ void svc_ncmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
              * start while it returns SCECdStatRead (0x06). Reads complete
              * synchronously inside the RPC call here, so the virtual drive
              * is never mid-read: always paused. */
-            if (recv_size >= 4) wr32(recv, 0, SCECdStatPause);
             {
+                const bool busy = rt_clock_now() < g_drive_busy_until;
+                const uint32_t st = busy ? SCECdStatRead : SCECdStatPause;
+                if (recv_size >= 4) wr32(recv, 0, st);
                 static uint64_t polls = 0;
                 ++polls;
                 if (rt_trace() || (polls & (polls - 1)) == 0) {
-                    rt_log("cdvd", "ncmd fno=0x0e drive status poll -> SCECdStatPause (0x%02x) [#%" PRIu64 "]",
-                        SCECdStatPause, polls);
+                    rt_log("cdvd", "ncmd fno=0x0e drive status poll -> %s (0x%02x) [#%" PRIu64 "]",
+                        busy ? "SCECdStatRead" : "SCECdStatPause", st, polls);
                 }
             }
             break;
@@ -353,6 +444,25 @@ constexpr uint32_t kIopHeapBase = 0x00240000u;
 constexpr uint32_t kIopHeapEnd = RT_IOP_RAM_SIZE - 0x10000u;
 uint32_t g_iop_heap_ptr = kIopHeapBase;
 
+/* Live allocations, so a transfer aimed at one can be checked against its
+ * real extent. Without this a disc read that asks for more than the buffer
+ * holds walks straight through whatever the game allocated next. */
+struct IopAlloc { uint32_t addr, size; };
+IopAlloc g_iop_allocs[64];
+int g_iop_alloc_count = 0;
+
+/* Bytes from `addr` to the end of the allocation containing it, or 0 when
+ * `addr` is not inside a tracked allocation. */
+uint32_t iop_alloc_room(uint32_t addr) {
+    for (int i = 0; i < g_iop_alloc_count; ++i) {
+        const IopAlloc& a = g_iop_allocs[i];
+        if (addr >= a.addr && addr < a.addr + a.size) {
+            return a.addr + a.size - addr;
+        }
+    }
+    return 0;
+}
+
 void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
                  uint8_t* recv, uint32_t recv_size) {
     switch (fno) {
@@ -363,6 +473,9 @@ void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
             if (g_iop_heap_ptr + aligned <= kIopHeapEnd) {
                 addr = g_iop_heap_ptr;
                 g_iop_heap_ptr += aligned;
+            }
+            if (addr && g_iop_alloc_count < 64) {
+                g_iop_allocs[g_iop_alloc_count++] = IopAlloc{addr, size};
             }
             if (recv_size >= 4) wr32(recv, 0, addr);
             rt_log("iopheap", "alloc(%u) -> 0x%06x (%u bytes of virtual IOP heap left)",

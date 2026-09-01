@@ -21,6 +21,7 @@
 #include "kernel.h"
 
 #include "../hw/hw.h"
+#include "../prof.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -90,6 +91,10 @@ uint32_t run_guest_handler(const Handler& h, uint32_t a0) {
 }
 
 void dispatch_line(Line& line, int number, uint32_t a0, const char* kind, const char* name) {
+    /* Guest handler code runs inside this zone, so "intc" measures time in
+     * interrupt handlers, not dispatcher bookkeeping. The call count is the
+     * number of lines dispatched. */
+    RT_PROF_ZONE(RT_PROF_INTC);
     ++line.dispatches;
     bool any = false;
     for (const Handler& h : line.h) {

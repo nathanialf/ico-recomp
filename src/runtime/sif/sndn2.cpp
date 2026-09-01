@@ -109,8 +109,10 @@ void handle_batch(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32
              * func_0025C6D8 (24-bit operands + the seq tag the EE's sync
              * spins on); everything else is stored raw by func_002591F0. */
             g_ack_tag = tag;
-            rt_log("sndn2", "cmd 0x%02x (%s) tag=%u a1=0x%06x a2=0x%06x a3=0x%06x [command #%" PRIu64 "]",
-                w0, cmd_name(w0), tag, a1, a2, a3, g_commands);
+            if (rt_trace() || (g_commands & (g_commands + 1)) == 0) {
+                rt_log("sndn2", "cmd 0x%02x (%s) tag=%u a1=0x%06x a2=0x%06x a3=0x%06x [command #%" PRIu64 "]",
+                    w0, cmd_name(w0), tag, a1, a2, a3, g_commands);
+            }
             if (w0 == 0x20) {
                 /* bank-transfer: the payload was already staged into
                  * virtual IOP RAM by the raw EE->IOP SifSetDma the game
@@ -126,8 +128,13 @@ void handle_batch(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32
                 rt_log("sndn2", "WARNING cmd 0x21 (SgDmaRead) NOT MODELED: SPU->IOP readback ignored");
             }
         } else {
-            rt_log("sndn2", "cmd 0x%02x (%s) w1=0x%08x w2=0x%08x w3=0x%08x [command #%" PRIu64 "]",
-                w0, cmd_name(w0), w1, w2, w3, g_commands);
+            /* Stream control (open/close/vol/pitch/play) is rare and each
+             * one matters: never sample those away. */
+            const bool stream_ctl = (w0 >= 0x3E && w0 <= 0x42);
+            if (rt_trace() || stream_ctl || (g_commands & (g_commands + 1)) == 0) {
+                rt_log("sndn2", "cmd 0x%02x (%s) w1=0x%08x w2=0x%08x w3=0x%08x [command #%" PRIu64 "]",
+                    w0, cmd_name(w0), w1, w2, w3, g_commands);
+            }
             rt_snd_command(w0, w1, w2, w3);
         }
     }

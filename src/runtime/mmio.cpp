@@ -16,6 +16,7 @@
 
 #include "ee/kernel.h"
 #include "hw/hw.h"
+#include "prof.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -148,6 +149,7 @@ bool hw_write(uint32_t addr, uint64_t v) {
 }
 
 uint64_t mmio_read_common(uint32_t addr, int bits) {
+    RT_PROF_ZONE(RT_PROF_MMIO);
     /* Ordering matters for guest poll loops: advance the virtual clock and
      * raise due status bits FIRST, then sample the register, then deliver
      * pending interrupts. This models the real interrupt latency window in
@@ -164,6 +166,7 @@ uint64_t mmio_read_common(uint32_t addr, int bits) {
 }
 
 void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
+    RT_PROF_ZONE(RT_PROF_MMIO);
     hw_write(addr, v);
     log_access("write", addr, bits, v, g_write_stats);
     /* CHCR-triggered DMA completions raised their D_STAT bits inside
@@ -209,10 +212,13 @@ void rt_mmio_write128(uint32_t addr, rc_u128 v) {
      * else keeps the P1 behavior (low 64 bits, registers are at most 64
      * bits wide). */
     uint32_t naddr = hw_norm(addr);
-    if (rt_hw_fifo_write128(naddr, &v)) {
-        log_access("write", naddr, 128, v.u64x[0], g_write_stats);
-        rt_kernel_mmio_tick();
-        return;
+    {
+        RT_PROF_ZONE(RT_PROF_MMIO);
+        if (rt_hw_fifo_write128(naddr, &v)) {
+            log_access("write", naddr, 128, v.u64x[0], g_write_stats);
+            rt_kernel_mmio_tick();
+            return;
+        }
     }
     mmio_write_common(addr, 128, v.u64x[0]);
 }

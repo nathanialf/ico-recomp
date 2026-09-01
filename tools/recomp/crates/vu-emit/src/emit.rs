@@ -201,7 +201,22 @@ fn cond_vi(off: u32, reg: u8, old: &[u8]) -> String {
 }
 
 /// Census gate + code for the lower half.
-fn emit_lower(prog: &str, b: &Bundle, old: &[u8]) -> Result<(Vec<String>, Ctl)> {
+/// MAC or status as a lower-slot flag op sees it. When the read sits inside
+/// the flag pipeline window it reads the snapshot taken four bundles back;
+/// otherwise the committed register is already correct.
+fn flag_expr(flag_src: Option<(u32, bool)>, want_mac: bool) -> String {
+    match flag_src {
+        Some((off, is_mac)) if is_mac == want_mac => format!("fl_{off:04X}"),
+        _ => if want_mac { "vu->mac".to_string() } else { "vu->status".to_string() },
+    }
+}
+
+fn emit_lower(
+    prog: &str,
+    b: &Bundle,
+    old: &[u8],
+    flag_src: Option<(u32, bool)>,
+) -> Result<(Vec<String>, Ctl)> {
     let off = b.offset;
     let op = match b.lower {
         LowerSlot::Loi(_) => return Ok((vec![], Ctl::None)), // handled by the caller
@@ -326,12 +341,15 @@ fn emit_lower(prog: &str, b: &Bundle, old: &[u8]) -> Result<(Vec<String>, Ctl)> 
         )),
         Rget { dest, ft } => one(format!("rc_vu1_rget(vu, {}, 0x{:X});", ft.0, dest.0)),
         Fsand { it, imm12 } => one(format!(
-            "rc_vu1_viset(vu, {}, vu->status & 0x{imm12:X}u);",
-            it.0
+            "rc_vu1_viset(vu, {}, {} & 0x{imm12:X}u);",
+            it.0,
+            flag_expr(flag_src, false)
         )),
         Fmand { it, is } => one(format!(
-            "rc_vu1_viset(vu, {}, vu->mac & rc_vu1_vi(vu, {}));",
-            it.0, is.0
+            "rc_vu1_viset(vu, {}, {} & rc_vu1_vi(vu, {}));",
+            it.0,
+            flag_expr(flag_src, true),
+            is.0
         )),
         Fcand { imm24 } => one(format!(
             "rc_vu1_viset(vu, 1, (vu->clip & 0x{imm24:X}u) != 0u ? 1u : 0u);"
@@ -396,7 +414,20 @@ fn bundle_comment(b: &Bundle) -> String {
 /// All statements of one bundle in execution order (no wrapping braces).
 fn bundle_lines(fname: &str, a: &Analysis, i: usize) -> Result<(Vec<String>, Ctl)> {
     let b = &a.bundles[i];
-    let mut lines = vec![format!("/* {} */", bundle_comment(b))];
+    let mut lines = vec![
+        format!("/* {} */", bundle_comment(b)),
+        format!("RC_VU_TRACE(0x{:04X}u);", b.offset),
+    ];
+    // Snapshot flags for a read four bundles ahead: the VU flag pipeline
+    // makes them visible there, not at the FMAC that produced them.
+    if let Some(sites) = a.flag_save_sites.get(&b.offset) {
+        for &(read_off, is_mac) in sites {
+            let src = if is_mac { "vu->mac" } else { "vu->status" };
+            lines.push(format!(
+                "fl_{read_off:04X} = {src}; /* flag pipeline: visible at {read_off:#06x} */"
+            ));
+        }
+    }
     if a.q_commit_sites.contains(&b.offset) {
         lines.push("rc_vu1_q_commit(vu); /* audited: div latency has elapsed here */".to_string());
     }
@@ -414,7 +445,8 @@ fn bundle_lines(fname: &str, a: &Analysis, i: usize) -> Result<(Vec<String>, Ctl
     }
     let (calc, commit) = emit_upper(fname, b)?;
     let old: &[u8] = a.old_vi_sites.get(&b.offset).map(Vec::as_slice).unwrap_or(&[]);
-    let (lower, ctl) = emit_lower(fname, b, old)?;
+    let flag_src = a.flag_read_sites.get(&b.offset).map(|&is_mac| (b.offset, is_mac));
+    let (lower, ctl) = emit_lower(fname, b, old, flag_src)?;
     lines.extend(calc);
     lines.extend(lower);
     lines.extend(commit);
@@ -451,7 +483,17 @@ pub fn emit_program(prog: &Vu1Program, a: &Analysis) -> Result<(String, EmitStat
          * Source: .vutext fragment at vram {:#010x} ({} uploaded instructions,\n\
          * upload hash {:#010x} = rc_vu1_hash over the MPG payload bytes).\n\
          * Semantics model: see the VU1 section of include/recomp_ops.h. */\n\
-         #include \"recomp_ops.h\"\n",
+         #include \"recomp_ops.h\"\n\
+         \n\
+         /* Bundle trace hook. Compiled out unless the translation unit is\n\
+          * built with -DRC_VU_TRACE_ENABLE, which only the vu-interp\n\
+          * differential harness does. The runtime build sees no calls. */\n\
+         #ifdef RC_VU_TRACE_ENABLE\n\
+         extern void rc_vu_trace(uint32_t off, const Vu1State* vu);\n\
+         #define RC_VU_TRACE(off) rc_vu_trace(off, vu)\n\
+         #else\n\
+         #define RC_VU_TRACE(off) ((void)0)\n\
+         #endif\n",
         prog.vram,
         prog.instruction_count(),
         prog.hash()
@@ -463,6 +505,13 @@ pub fn emit_program(prog: &Vu1Program, a: &Analysis) -> Result<(String, EmitStat
         for &r in regs {
             let _ = writeln!(out, "    uint32_t ov_{off:04X}_{r} = 0;");
         }
+    }
+    // Flag pipeline temps. Initialised from the state the program was
+    // entered with, which is what a read closer than the pipeline depth to
+    // the entry point sees on hardware.
+    for (&read_off, &is_mac) in &a.flag_read_sites {
+        let src = if is_mac { "vu->mac" } else { "vu->status" };
+        let _ = writeln!(out, "    uint32_t fl_{read_off:04X} = {src};");
     }
     if has_jr {
         let _ = writeln!(out, "dispatch:");

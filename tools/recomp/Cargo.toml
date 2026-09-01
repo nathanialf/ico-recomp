@@ -7,6 +7,7 @@ members = [
     "crates/ee-emit",
     "crates/vu-emit",
     "crates/ee-interp",
+    "crates/vu-interp",
     "crates/recomp-cli",
 ]
 

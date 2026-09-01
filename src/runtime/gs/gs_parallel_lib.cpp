@@ -377,6 +377,30 @@ void RtPgs::init_windowed() {
     auto wsi = std::make_unique<Vulkan::WSI>();
     wsi->set_platform(platform.get());
     wsi->set_backbuffer_format(Vulkan::BackbufferFormat::UNORM);
+
+    /* Present pacing. Granite defaults to FIFO, which blocks each present
+     * until the display has scanned out the previous one. The guest clock
+     * here is advanced by guest execution, not by the presenter, so a
+     * blocking present does not pace the game, it only stalls the thread
+     * that is trying to run it: miss a 60 Hz deadline once and the
+     * swapchain settles at 30, and the game runs at half speed while still
+     * looking smooth. MAILBOX presents without blocking and without
+     * tearing. ICORECOMP_GS_PRESENT=vsync restores the old behavior,
+     * =tear forces IMMEDIATE. */
+    {
+        const char* pm = std::getenv("ICORECOMP_GS_PRESENT");
+        Vulkan::PresentMode mode = Vulkan::PresentMode::UnlockedNoTearing;
+        const char* what = "mailbox (non-blocking, no tearing)";
+        if (pm && (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0)) {
+            mode = Vulkan::PresentMode::SyncToVBlank;
+            what = "FIFO (blocks on the display refresh)";
+        } else if (pm && (std::strcmp(pm, "tear") == 0 || std::strcmp(pm, "immediate") == 0)) {
+            mode = Vulkan::PresentMode::UnlockedForceTearing;
+            what = "immediate (may tear)";
+        }
+        wsi->set_present_mode(mode);
+        logf("paraLLEl-GS: present mode %s (ICORECOMP_GS_PRESENT=vsync|mailbox|tear)", what);
+    }
     /* WSI owns context creation here, so the CPU-device auto-fallback in
      * gs_pgs_context.h does not apply; a windowed run on a software device
      * needs ICORECOMP_GS_NO_DESCBUF=1 by hand. */

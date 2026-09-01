@@ -19,6 +19,7 @@
 
 #include "../ee/kernel.h"
 #include "../gs/gs_backend.h"
+#include "../prof.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -94,6 +95,7 @@ void track_framing(int path, const uint8_t* data, uint32_t qwords) {
 } // namespace
 
 void rt_gif_submit(int path, const uint8_t* data, uint32_t qwords) {
+    RT_PROF_ZONE(RT_PROF_GIF);
     if (path < 0 || path > 2) {
         rt_log("gif", "submit on invalid path %d dropped", path);
         return;
@@ -101,7 +103,16 @@ void rt_gif_submit(int path, const uint8_t* data, uint32_t qwords) {
     if (qwords == 0) return;
     ++g_submits;
     track_framing(path, data, qwords);
-    rt_gs_backend()->submit_gif(path, data, qwords);
+    /* Diagnostic read of the same bytes, before they are handed on. The
+     * gate is cached because this is on every packet of every frame. */
+    static const bool geom = rt_verbose("geom");
+    if (geom) rt_geom_scan(path, data, qwords, rt_vu1_bound_hash());
+    {
+        /* Separate bucket: framing above is ours, this is the backend
+         * (dump writer, or paraLLEl-GS rasterization and present). */
+        RT_PROF_ZONE(RT_PROF_GS);
+        rt_gs_backend()->submit_gif(path, data, qwords);
+    }
 }
 
 bool rt_gif_mmio_read(uint32_t addr, uint32_t* out) {

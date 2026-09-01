@@ -45,6 +45,12 @@ bool rt_iso_search(const char* path, RtIsoFile* out);
 /* Reads one 2048-byte data sector. Returns false past end of disc. */
 bool rt_iso_read_sector(uint32_t lsn, uint8_t out[2048]);
 
+/* Reads up to `count` consecutive 2048-byte sectors into `out`, which must
+ * hold count * 2048 bytes. Returns how many were read; a short return means
+ * the end of the disc or an I/O error. One seek and one read on a plain
+ * 2048 image. */
+uint32_t rt_iso_read_sectors(uint32_t lsn, uint32_t count, uint8_t* out);
+
 uint32_t rt_iso_sector_size();  /* raw sector size of the mounted image */
 uint32_t rt_iso_total_sectors();
 

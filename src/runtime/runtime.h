@@ -33,10 +33,36 @@ constexpr uint32_t RT_CLEAN_EXIT_VRAM = 0xE0000000u;
 
 /* Opens this run's log file and points file descriptor 2 at it, so the log
  * survives the console window dying with the process. Path comes from
- * ICORECOMP_LOG; unset it defaults to <dir>/icorecomp.log on Windows and to
- * no file (console only) elsewhere. ICORECOMP_LOG=- opts out. Call before
- * anything else logs. */
+ * ICORECOMP_LOG; unset it defaults to <dir>/icorecomp.log, falling back to
+ * the per-user state directory and then the temp directory when <dir> is
+ * not writable. ICORECOMP_LOG=- opts out. On POSIX the sink stays off
+ * unless ICORECOMP_VERBOSE or ICORECOMP_LOG asks for it. Also parses
+ * ICORECOMP_VERBOSE, so call it before anything else logs. */
 void rt_log_init(const char* dir);
+
+/* True when ICORECOMP_VERBOSE named this component (or "all"). Parsing is a
+ * short list walk, so hot callers should cache the answer in a static. */
+bool rt_verbose(const char* component);
+
+/* A verbose diagnostic line. Goes to the log file only, never to the
+ * console echo, so enabling a channel does not make the console unusable.
+ * Callers gate on rt_verbose() first; this does not check again. */
+void rt_logv(const char* component, const char* fmt, ...);
+
+/* Nudges the log writer thread so a field's lines reach the file promptly.
+ * Does no I/O and never waits, so it costs the frame path nothing; the
+ * writer flushes on its own whenever it drains the queue empty. Called
+ * once per field. */
+void rt_log_flush();
+
+/* Drains everything queued to the log file and then puts logging back on
+ * the calling thread for the rest of the process. For fatal paths and
+ * state dumps: after this returns, every later log line is written and
+ * flushed before its call returns, so a handler that leaves through
+ * std::_Exit (which runs no atexit) still produces a complete log.
+ * Idempotent, and bounded: it gives up waiting rather than hanging a
+ * process that is already on its way down. */
+void rt_log_drain();
 
 /* Path of the open log file, or null when logging is console only. */
 const char* rt_log_path();

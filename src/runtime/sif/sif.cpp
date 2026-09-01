@@ -103,7 +103,13 @@ uint32_t rt_sif_set_dma(uint32_t tx_addr, uint32_t count) {
         if ((dest & 0x1FFFFFFFu) == RT_SIF_IOP_CMDBUF && size >= 16 && rt_gptr(src)) {
             cid = rt_gread32(src + 8);
         }
-        if (rt_trace() || cid || (g_dma_count & (g_dma_count + 1)) == 0) {
+        /* A transfer carrying an RPC command id is a rare, individually
+         * meaningful event: keep every one, on the verbose channel rather
+         * than the default one. Everything else stays sampled. */
+        if (cid) {
+            rt_logv("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
+                id, i + 1, count, src, dest, size, attr, cid);
+        } else if (rt_trace() || (g_dma_count & (g_dma_count + 1)) == 0) {
             rt_log("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
                 id, i + 1, count, src, dest, size, attr, cid);
         }

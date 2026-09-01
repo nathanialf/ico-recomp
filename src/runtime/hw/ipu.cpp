@@ -37,6 +37,7 @@
 #include "hw.h"
 
 #include "../ee/kernel.h"
+#include "../prof.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1158,6 +1159,7 @@ uint64_t g_busy_polls = 0;
 /* ---- DMA bridge (called from hw/dmac.cpp) -------------------------------- */
 
 void rt_ipu_dma_kick(int ch) {
+    RT_PROF_ZONE(RT_PROF_IPU);
     bind_regs();
     idct_init();
     if (ch == 4) {
@@ -1217,6 +1219,7 @@ void rt_ipu_dma_kick(int ch) {
 /* ---- MMIO ---------------------------------------------------------------- */
 
 bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
+    RT_PROF_ZONE(RT_PROF_IPU);
     switch (addr) {
         case 0x10002000: { /* IPU_CMD */
             uint32_t data = g_cmd_data;
@@ -1267,6 +1270,7 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
 }
 
 bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
+    RT_PROF_ZONE(RT_PROF_IPU);
     switch (addr) {
         case 0x10002000: /* IPU_CMD */
             bind_regs();
@@ -1301,6 +1305,7 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
 }
 
 void rt_ipu_fifo_feed(const uint8_t* qw16) {
+    RT_PROF_ZONE(RT_PROF_IPU);
     static uint64_t n = 0;
     size_t base = g_in.size();
     g_in.resize(base + 16);

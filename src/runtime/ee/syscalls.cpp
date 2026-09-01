@@ -17,6 +17,7 @@
 #include "kernel.h"
 
 #include "../hw/hw.h"
+#include "../prof.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -530,6 +531,9 @@ bool should_log(int32_t num, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
 } // namespace
 
 void rt_syscall(R5900Context* ctx) {
+    /* The one zone that can be open across a coroutine yield: WaitSema
+     * and SleepThread block here. See the caveat in prof.h. */
+    RT_PROF_ZONE(RT_PROF_SYSCALL);
     ++g_syscall_count;
     int32_t num = ctx->r[3].s32x[0];
     uint32_t key = (uint32_t)(num < 0 ? -num : num) & 0xFF;
