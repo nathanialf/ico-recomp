@@ -462,6 +462,8 @@ private:
     Vulkan::ImageHandle m_overlay_white; /* 1x1 fallback for untextured draws */
     Vulkan::Program* m_overlay_program = nullptr; /* lazily requested, see draw_overlay */
     bool m_overlay_ui_headless_logged = false; /* present_ui's once-only headless log */
+    bool m_overlay_diag_logged = false;        /* draw_overlay's once-only first-draw log */
+
 };
 
 void RtPgs::logf(const char* fmt, ...) {
@@ -1246,14 +1248,26 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
     const double scale_y = surface_h > 0.0 ? bb_h / surface_h : 1.0;
 
     cmd.set_program(m_overlay_program);
+    /* Granite's CommandBuffer constructor calls set_opaque_state() and then
+     * memsets the entire static state to zero on the very next line
+     * (Granite/vulkan/command_buffer.cpp, CommandBuffer::CommandBuffer), so a
+     * freshly requested command buffer carries an all-zero pipeline state, not
+     * the opaque preset: write_mask 0, which build_graphics_pipeline turns
+     * into colorWriteMask 0 (every channel masked off, nothing reaches the
+     * attachment), and topology 0, which is VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+     * rather than a triangle list. A pass that sets no base state draws
+     * nothing at all. Every Granite pass picks one first; paraLLEl-GS's own
+     * scanout blit calls set_opaque_sprite_state() right after
+     * begin_render_pass (gs/gs_renderer.cpp). set_opaque_state supplies the
+     * triangle-list topology and full write mask this pass needs; the depth,
+     * cull and blend calls below override the parts a 2D overlay does not
+     * want. */
+    cmd.set_opaque_state();
     cmd.set_depth_test(false, false);
-    /* Granite's request_command_buffer starts every command buffer in
-     * set_opaque_state: back-face culling with counter-clockwise front
-     * faces. Overlay geometry is authored in a y-down pixel space and
-     * projected without a flip, so its triangles are clockwise in
-     * framebuffer terms and that default culls every one of them (the
-     * symptom is a cleared backbuffer with no UI on it). A 2D overlay has
-     * no back faces: draw both windings. */
+    /* Overlay geometry is authored in a y-down pixel space and projected
+     * without a flip, so its triangles are clockwise in framebuffer terms
+     * and the opaque preset's back-face culling would drop every one of
+     * them. A 2D overlay has no back faces: draw both windings. */
     cmd.set_cull_mode(VK_CULL_MODE_NONE);
     cmd.set_blend_enable(true);
     cmd.set_blend_op(VK_BLEND_OP_ADD);
@@ -1269,6 +1283,30 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
     const VkDeviceSize idx_size = VkDeviceSize(m_overlay_indices.size()) * sizeof(uint32_t);
     void* idx = cmd.allocate_index_data(idx_size, VK_INDEX_TYPE_UINT32);
     std::memcpy(idx, m_overlay_indices.data(), size_t(idx_size));
+
+    if (!m_overlay_diag_logged) {
+        /* Once per process: what the first drawn overlay frame looked like
+         * at the point it was handed to Vulkan. Cheap insurance for a pass
+         * that can only be judged on a GPU this build machine does not
+         * have. */
+        m_overlay_diag_logged = true;
+        const RtPgsOverlayCmd& c0 = m_overlay_cmds[0];
+        const RtPgsOverlayVertex& v0 = m_overlay_vertices[size_t(c0.vertex_offset) +
+            size_t(m_overlay_indices[c0.index_offset])];
+        float mvp0[16];
+        build_overlay_mvp(mvp0, c0, bb_w, bb_h, surface_w, surface_h);
+        logf("paraLLEl-GS: overlay: first draw: %zu cmds, %zu vertices, backbuffer %ux%u, surface %ux%u;"
+             " cmd0 tex %u idx [%u +%u) voff %d flags 0x%x translate (%.1f, %.1f) scissor (%d, %d, %d, %d);"
+             " v0 (%.1f, %.1f) uv (%.3f, %.3f) rgba 0x%08x; mvp col0 (%g, %g) col1 (%g, %g) col3 (%g, %g, %g, %g)",
+             m_overlay_cmds.size(), m_overlay_vertices.size(),
+             unsigned(bb_w), unsigned(bb_h), unsigned(surface_w), unsigned(surface_h),
+             c0.texture, c0.index_offset, c0.index_count, c0.vertex_offset, c0.flags,
+             double(c0.translate_x), double(c0.translate_y),
+             c0.scissor_x, c0.scissor_y, c0.scissor_w, c0.scissor_h,
+             double(v0.x), double(v0.y), double(v0.u), double(v0.v), v0.rgba,
+             double(mvp0[0]), double(mvp0[1]), double(mvp0[4]), double(mvp0[5]),
+             double(mvp0[12]), double(mvp0[13]), double(mvp0[14]), double(mvp0[15]));
+    }
 
     for (const RtPgsOverlayCmd& c : m_overlay_cmds) {
         /* Per command, per gs_parallel_api.h: straight alpha multiplies the

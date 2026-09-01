@@ -328,8 +328,9 @@ int main(int argc, char** argv) {
          * pin-checked, so the rt_load_elf below reuses it. Quit and window
          * close leave the process here, with nothing loaded. */
         if (!rt_launcher_run()) {
+            /* A deliberate Quit or window close, not an error: no console
+             * hold, the process just ends. */
             rt_log("main", "launcher exited without starting the game");
-            rt_log_hold_console();
             return 0;
         }
     }

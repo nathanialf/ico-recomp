@@ -292,6 +292,24 @@ void rt_ui_tick() {
     g_ui.context->Render();
 
     const RtPgsOverlayFrame& frame = g_ui.render->frame(g_ui.surface_width, g_ui.surface_height);
+    /* One line for the first frame that carries geometry and one for the
+     * first that does not while a document is up: the two halves of "the UI
+     * drew nothing" (RmlUi produced no geometry, or the library drew what it
+     * got and it did not show) are told apart from the log alone. */
+    static bool logged_geometry = false, logged_empty = false;
+    if (frame.cmd_count != 0 && !logged_geometry) {
+        logged_geometry = true;
+        rt_log("ui", "first overlay frame: %u vertices, %u indices, %u cmds for a %ux%u surface"
+                     " (menu %d, fps %d, launcher %d)",
+            frame.vertex_count, frame.index_count, frame.cmd_count,
+            frame.surface_width, frame.surface_height,
+            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0);
+    } else if (frame.cmd_count == 0 && !logged_empty) {
+        logged_empty = true;
+        rt_log("ui", "a document is up but RmlUi produced no geometry this field"
+                     " (menu %d, fps %d, launcher %d)",
+            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0);
+    }
     if (frame.cmd_count != 0) {
         backend_set_frame(&frame);
         g_ui.frame_posted = true;
