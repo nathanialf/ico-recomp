@@ -524,9 +524,10 @@ endif()
 install(TARGETS icorecomp-runtime RUNTIME DESTINATION .)
 
 if(ICORECOMP_UI)
-    # The UI's documents, stylesheets and font, found at run time under
-    # rt_base_dir()/ui (src/runtime/ui/ui.cpp). The font's OFL license text
-    # ships beside it, which is what the license requires.
+    # The UI's documents, stylesheets and fonts, found at run time under
+    # rt_base_dir()/ui (src/runtime/ui/ui.cpp). Each font's OFL notice ships
+    # beside it (PlayfairDisplay-OFL.txt, JetBrainsMono-OFL.txt), which is
+    # what the license requires.
     install(DIRECTORY ui/ DESTINATION ui)
 endif()
 
@@ -560,7 +561,7 @@ endif()
 if(ICORECOMP_UI)
     set(ICORECOMP_PACKAGE_UI "\n    ui/")
     set(ICORECOMP_PACKAGE_UI_NOTE
-        "\n\nui/ holds the settings menu's documents, stylesheet and font, plus that\nfont's license. It stays next to the executable as well.")
+        "\n\nui/ holds the settings menu's documents, stylesheet and fonts, plus those\nfonts' licenses. It stays next to the executable as well.")
 else()
     set(ICORECOMP_PACKAGE_UI "")
     set(ICORECOMP_PACKAGE_UI_NOTE "")

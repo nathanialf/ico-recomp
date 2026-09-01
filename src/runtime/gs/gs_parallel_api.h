@@ -68,8 +68,10 @@ typedef struct RtPgsCreateOptions {
     uint32_t filter;         /* RT_PGS_FILTER_* */
     uint32_t render_scale;   /* 1/2/4/8/16, paraLLEl-GS SuperSampling factor */
     uint32_t hires_scanout;  /* nonzero: high resolution scanout; needs render_scale >= 4 */
-    /* Initial window size in logical pixels. 0 (either field): the historic
-     * 640x480 default (see init_windowed's comment on why 4:3). */
+    /* Initial window size in logical pixels. 0 (either field): the shim's
+     * own 640x480 fallback (see init_windowed's comment on why 4:3). That
+     * fallback is not the host's default: display.window_width/height
+     * default to 1280x960 (settings.h), and the host always passes them. */
     uint32_t window_width, window_height;
 } RtPgsCreateOptions;
 

@@ -53,8 +53,8 @@ Apply timing:
 | key | type | allowed / range | default | apply | env override |
 |---|---|---|---|---|---|
 | mode | enum | `windowed`, `fullscreen_desktop`, `fullscreen_exclusive` | `windowed` | hot | - |
-| window_width | int | [320, 16384] | 640 | hot | - |
-| window_height | int | [320, 16384] | 480 | hot | - |
+| window_width | int | [320, 16384] | 1280 | hot | - |
+| window_height | int | [320, 16384] | 960 | hot | - |
 | remember_window_size | bool | - | true | cold | - |
 | present | enum | `mailbox`, `fifo`, `immediate` | `mailbox` | warm | `ICORECOMP_GS_PRESENT` |
 | fit | enum | `letterbox`, `integer`, `stretch` | `letterbox` | hot | - |
@@ -276,6 +276,21 @@ this document, changes a value the game itself supplied. There is no
 widescreen option and no game-speed option; both are out of scope for this
 port by design.
 
+The default is 1280x960, which is 640x480 doubled. Both are 4:3, the aspect
+this backend presents at, so the window opens with no letterbox either way.
+640x480 keeps a second meaning: it is the size the menu and launcher
+documents are laid out against, and the UI's density-independent pixel ratio
+is the surface height over 480 (`src/runtime/ui/ui.cpp`), so the default
+window shows that layout at exactly 2x.
+
+The menu offers the size as a list rather than as two typed numbers: the
+integer multiples of 640x480 up to 3840x2880. A size the file holds that is
+not one of them is kept and honored, and the list grows a leading
+`custom (WIDTHxHEIGHT)` entry naming it, so the control never shows a size
+the settings do not hold. Any value in [320, 16384] is still accepted from a
+hand-edited file, and `display.remember_window_size` can still store the
+size of a window that was dragged to some other shape.
+
 ## 7. The in-game menu
 
 The menu opens and closes with a hotkey: F1 on the keyboard, Guide on a
@@ -347,11 +362,37 @@ single line the first time it is hit, naming itself
 (`RenderInterface::<Function>`), and the affected element simply draws
 without that effect.
 
-### Font
+Text that this project cannot bound (a settings path, a disc path, a
+binding name, the build identity) is clipped with an ellipsis rather than
+allowed to run out of its box. RmlUi resolves `text-overflow` against the
+element that holds the text, and only when that element's own overflow is
+not visible, so the three properties always appear together:
 
-The UI font is Playfair Display (a variable font), under
-`ui/fonts/PlayfairDisplay[wght].ttf`, licensed under the SIL Open Font
-License; the license text ships alongside it at `ui/fonts/OFL.txt`.
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+
+Everything else wraps. Column widths in `ui/style/base.rcss` are derived
+from the longest string a column can hold at the mono face's 0.6em advance,
+at a density-independent pixel ratio of 1, which is the 640x480 baseline.
+
+### Fonts
+
+The UI uses two faces, both required: a missing one disables the UI, and the
+log names the file that failed.
+
+- Playfair Display (a variable font), `ui/fonts/PlayfairDisplay[wght].ttf`,
+  for names and titles: the nav names, the section titles, the launcher
+  title and the credits byline.
+- JetBrains Mono, `ui/fonts/JetBrainsMono-Regular.ttf`, for everything a
+  value is read out of: labels, controls, values, hints, taglines, the
+  footer and the field-rate readout. Every column width in
+  `ui/style/base.rcss` is derived from this face's 0.6em advance and the
+  longest string that column can hold.
+
+Both are licensed under the SIL Open Font License. Each notice ships beside
+its font, at `ui/fonts/PlayfairDisplay-OFL.txt` and
+`ui/fonts/JetBrainsMono-OFL.txt`.
 
 ## 8. The launcher
 
@@ -445,9 +486,11 @@ About pane (`ui/credits.rml`, shown as its own document; the same text is
 inline in the About pane). It lists "Developed by Nathanial Fine", a link
 to `https://defnf.com`, and the "Built with" credits for paraLLEl-GS
 (Arntzen Software, LGPLv3+, loaded as a separate shared library), SDL3
-(zlib license), RmlUi (MIT), FreeType (FreeType License), and Playfair
-Display (SIL Open Font License, notice in `ui/fonts/OFL.txt`). The site
-link opens through `SDL_OpenURL`, the same call the About pane's link uses;
+(zlib license), RmlUi (MIT), FreeType (FreeType License), Playfair Display
+(SIL Open Font License, notice in `ui/fonts/PlayfairDisplay-OFL.txt`) and
+JetBrains Mono (SIL Open Font License, notice in
+`ui/fonts/JetBrainsMono-OFL.txt`). The site link opens through
+`SDL_OpenURL`, the same call the About pane's link uses;
 a build with no SDL, or a platform `SDL_OpenURL` cannot hand off to, logs
 why and shows that in the status line instead of doing nothing.
 

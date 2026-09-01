@@ -212,11 +212,12 @@ RtPgsCreateOptions resolve_create_options() {
     opts.filter = s.display.filter == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
     opts.render_scale = (uint32_t)s.display.render_scale;
     opts.hires_scanout = s.display.hires_scanout ? 1u : 0u;
-    /* No env twin either. 0 would mean "the shim's own 640x480 default"
-     * (see RtPgsCreateOptions in gs_parallel_api.h); display.window_width/
-     * height already defaults to that same 640x480, so passing them
-     * straight through is equivalent to 0 whenever settings are at their
-     * compiled-in default and simply honors a user's saved size otherwise. */
+    /* No env twin either. 0 would mean "the shim's own 640x480 fallback"
+     * (see RtPgsCreateOptions in gs_parallel_api.h), which is not what the
+     * settings default to: display.window_width/height are 1280x960
+     * (settings.h). These are passed through as they stand, so the window
+     * opens at the saved size, or at 1280x960 on a fresh install, and the
+     * shim's fallback is only reached by a caller that passes 0. */
     opts.window_width = (uint32_t)s.display.window_width;
     opts.window_height = (uint32_t)s.display.window_height;
     g_create_present_mode = opts.present_mode;

@@ -10,9 +10,34 @@
  * Sizes are in dp, not px. The context's density-independent pixel ratio is
  * set from the surface height against the 640x480 baseline (ui.cpp), so the
  * same document reads at the same size in a small window and a large one.
+ * 640x480 is the layout's design size, not the default window size: the
+ * default window is 1280x960, the same layout at a dp ratio of exactly 2.
+ * Every width below is derived to fit at ratio 1, so the whole layout is
+ * still readable in a window dragged down to the baseline.
  *
  * RmlUi ships no default stylesheet, so every element used by a document
  * gets its display value here.
+ *
+ * Two families, one rule: JetBrains Mono carries everything a value is read
+ * out of (labels, controls, values, hints, taglines, the footer, the fps
+ * readout), Playfair Display carries names and titles (nav names, section
+ * titles, the launcher title, the credits byline). Both are loaded in
+ * ui.cpp, which disables the UI if either is missing.
+ *
+ * Column widths are derived from the longest string each column can hold,
+ * at the mono advance of 0.6em plus that rule's letter-spacing. The three
+ * that decide a width are "Right stick right" (binding slot), "Trigger
+ * threshold" (control label) and "Fullscreen (exclusive)" (select value).
+ *
+ * Overflow: anything whose text is not bounded by this file (a settings
+ * path, a disc path, a binding name, a version string) either wraps or is
+ * clipped with an ellipsis. RmlUi resolves text-overflow against the
+ * element holding the text, and only when that element's overflow is not
+ * visible (Source/Core/ElementText.cpp ResolveTextOverflow), so the three
+ * always appear together: white-space: nowrap, overflow: hidden,
+ * text-overflow: ellipsis. All three are registered properties in RmlUi 6.3
+ * (Source/Core/StyleSheetSpecification.cpp), and the ellipsis glyph U+2026
+ * is present in both fonts.
  *
  * Palette, one place:
  *   panels    #0a0a0a  #0d0d0d  #171717
@@ -26,7 +51,7 @@
 /* ---- elements ----------------------------------------------------------- */
 
 body {
-	font-family: "Playfair Display";
+	font-family: "JetBrains Mono";
 	font-weight: 400;
 	font-style: normal;
 	font-size: 11dp;
@@ -63,12 +88,19 @@ body.menu {
 	min-height: 0;
 }
 
-/* ---- left navigation column --------------------------------------------- */
+/* ---- left navigation column ---------------------------------------------
+ *
+ * 160dp of the 612dp the body's padding leaves at the baseline: 140dp of
+ * buttons, then the 14dp bracket and its 6dp gap. A button's text box is
+ * 140dp less 9dp of padding either side and 1dp of border, so 120dp, which
+ * is 24 characters of the 8dp tagline (8 * (0.6 + 0.02) = 4.96dp each).
+ * The longest tagline in the document is 22. A longer one wraps to a
+ * second line and the button grows, which is why nothing here is nowrap. */
 
 .nav {
 	display: flex;
 	flex-direction: row;
-	width: 150dp;
+	width: 160dp;
 	flex-shrink: 0;
 }
 
@@ -100,11 +132,15 @@ body.menu {
 
 .nav-name {
 	display: block;
+	font-family: "Playfair Display";
 	font-weight: 700;
-	font-size: 11dp;
+	font-size: 12dp;
 	letter-spacing: 0.05em;
 	color: #f9fafb;
 	line-height: 1.2;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .nav-tagline {
@@ -112,6 +148,7 @@ body.menu {
 	font-size: 8dp;
 	letter-spacing: 0.02em;
 	color: #737373;
+	line-height: 1.3;
 	margin-top: 2dp;
 }
 
@@ -157,7 +194,11 @@ body.menu {
 }
 
 /* Rotated about its own center, so the pre-rotation box is centered on the
- * line with a negative margin of half its width. */
+ * line with a negative margin of half its width. 70dp holds "Settings" at
+ * 8dp mono with 0.1em of letter-spacing (8 * 0.7 = 5.6dp each, 45dp in
+ * all) with room to spare; after rotation the box is 14dp across, which is
+ * the bracket's width. Nowrap because a wrap here would rotate a second
+ * line into the nav column. */
 .bracket-label {
 	display: block;
 	width: 70dp;
@@ -169,15 +210,24 @@ body.menu {
 	letter-spacing: 0.1em;
 	font-size: 8dp;
 	color: #525252;
+	white-space: nowrap;
 	transform: rotate(-90deg);
 }
 
-/* ---- content pane ------------------------------------------------------- */
+/* ---- content pane -------------------------------------------------------
+ *
+ * Scrolls vertically and clips horizontally: every row inside it either
+ * wraps or ellipsizes, so nothing needs horizontal room, and clipping is
+ * the backstop rather than the mechanism. An open dropdown is not clipped
+ * by this: RmlUi gives the select box clip: none (WidgetDropDown.cpp), so
+ * it escapes the pane's clip region. At the baseline the pane's content is
+ * 434dp wide, less the 5dp scrollbar. */
 
 .pane {
 	display: block;
 	flex-grow: 1;
 	min-width: 0;
+	overflow-x: hidden;
 	overflow-y: auto;
 	padding-left: 14dp;
 	padding-right: 4dp;
@@ -225,11 +275,15 @@ scrollbarvertical sliderbar:hover {
 
 .section-title {
 	display: block;
-	font-size: 11dp;
+	font-family: "Playfair Display";
+	font-size: 12dp;
 	font-weight: 700;
 	text-transform: uppercase;
 	letter-spacing: 0.06em;
 	color: #d4d4d4;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .note {
@@ -239,7 +293,11 @@ scrollbarvertical sliderbar:hover {
 	line-height: 1.5;
 }
 
-/* ---- controls ----------------------------------------------------------- */
+/* ---- controls -----------------------------------------------------------
+ *
+ * A label is 9dp mono with 0.05em of letter-spacing, so 5.85dp a character:
+ * "Trigger threshold", the longest, is 100dp of the 429dp the pane leaves.
+ * Labels therefore never need to wrap, and are not told to. */
 
 .control {
 	display: block;
@@ -248,7 +306,7 @@ scrollbarvertical sliderbar:hover {
 
 .control-label {
 	display: block;
-	font-size: 8dp;
+	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
 	color: #737373;
@@ -257,15 +315,17 @@ scrollbarvertical sliderbar:hover {
 
 .hint {
 	display: block;
-	font-size: 8dp;
+	font-size: 9dp;
 	color: #525252;
+	line-height: 1.4;
 	margin-top: 3dp;
 }
 
 /* An environment variable owns this key for the life of the run. */
 .override {
 	display: block;
-	font-size: 8dp;
+	font-size: 9dp;
+	line-height: 1.4;
 	color: #d4a000;
 	background-color: #2d2000;
 	border: 1dp #4d3800;
@@ -279,11 +339,20 @@ select {
 	nav: auto;
 }
 
+/* Every text field and select gets a width in dp rather than a percentage
+ * of the pane: stretched to the pane a select puts its arrow at the far
+ * right of a very wide bar, which reads as a table row rather than as a
+ * control. 220dp is the width of the longest option string it has to hold,
+ * "Fullscreen (exclusive)": 22 characters of 10dp mono (6dp each, 132dp)
+ * plus 12dp of padding, the 16dp arrow and 2dp of border, so 162dp, with
+ * room left for a longer one. "3840 x 2880 (6x)", the widest window size,
+ * is 96dp of text. The label stays on its own line above. */
 input.text,
 select {
 	display: block;
 	box-sizing: border-box;
-	width: 100%;
+	width: 220dp;
+	max-width: 100%;
 	height: 20dp;
 	padding: 4dp 6dp;
 	font-size: 10dp;
@@ -306,6 +375,8 @@ input.range:disabled {
 	border-color: #1a1a1a;
 }
 
+/* The widget sets overflow: hidden on this element itself
+ * (WidgetDropDown.cpp), which is what lets text-overflow resolve here. */
 select selectvalue {
 	width: auto;
 	height: 20dp;
@@ -313,6 +384,8 @@ select selectvalue {
 	padding: 4dp 6dp;
 	box-sizing: border-box;
 	color: #e5e5e5;
+	white-space: nowrap;
+	text-overflow: ellipsis;
 }
 
 select selectarrow {
@@ -333,12 +406,19 @@ select selectbox {
 	border: 1dp #262626;
 }
 
+/* display: block is also what the widget sets on each option as it adopts
+ * it; stating it here means an option laid out before that still reads as
+ * a row rather than as inline text. */
 select selectbox option {
+	display: block;
 	width: auto;
 	padding: 3dp 6dp;
 	font-size: 10dp;
 	color: #a3a3a3;
 	background-color: #171717;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 select selectbox option:checked {
@@ -360,6 +440,7 @@ input.checkbox {
 	display: inline-block;
 	width: 11dp;
 	height: 11dp;
+	flex-shrink: 0;
 	margin-right: 7dp;
 	background-color: #171717;
 	border: 1dp #262626;
@@ -374,21 +455,30 @@ input.checkbox:checked {
 	border-color: #bfff00;
 }
 
+/* Wraps rather than ellipsizes: the checkbox beside it is the control, and
+ * a clipped label would hide which setting it is. */
 .check-label {
 	display: block;
+	min-width: 0;
 	font-size: 10dp;
+	line-height: 1.3;
 	color: #d4d4d4;
 }
 
+/* The same 220dp box as a select, so the controls line up down the pane:
+ * the slider takes what the reading beside it leaves. */
 .range-row {
 	display: flex;
 	flex-direction: row;
 	align-items: center;
+	width: 220dp;
+	max-width: 100%;
 }
 
 input.range {
 	display: block;
 	flex-grow: 1;
+	min-width: 0;
 	height: 14dp;
 }
 
@@ -409,14 +499,18 @@ input.range sliderbar:active {
 	background-color: #737373;
 }
 
+/* Widest reading is "100" for the volume and "0.95" for a deadzone: four
+ * characters of 10dp mono, 24dp. */
 .range-value {
 	display: block;
-	width: 34dp;
+	width: 36dp;
 	flex-shrink: 0;
 	margin-left: 8dp;
 	text-align: right;
 	font-size: 10dp;
 	color: #a3a3a3;
+	white-space: nowrap;
+	overflow: hidden;
 }
 
 /* ---- binding tables ------------------------------------------------------
@@ -424,7 +518,14 @@ input.range sliderbar:active {
  * One row per RtKeyBind / RtPadBind slot, rendered by a data-for loop in
  * menu.rml. Same construction as the controls above: hairline separators and
  * flat boxes only, nothing that reaches an unimplemented RenderInterface
- * call. */
+ * call.
+ *
+ * The row is three columns: a fixed slot name, the binding, and the button.
+ * The slot column is 104dp, which is "Right stick right" at 9dp mono with
+ * 0.05em of letter-spacing (17 characters at 5.85dp). The button is sized
+ * by its own text and never shrinks. The binding takes what is left, 264dp
+ * at the baseline, and ellipsizes: it holds device names this file cannot
+ * bound, and the capture prompt "press a button or move an axis". */
 
 .bind-table {
 	display: block;
@@ -442,20 +543,27 @@ input.range sliderbar:active {
 
 .bind-slot {
 	display: block;
-	width: 110dp;
+	width: 104dp;
 	flex-shrink: 0;
-	font-size: 8dp;
+	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
 	color: #404040;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .bind-name {
 	display: block;
 	flex-grow: 1;
+	flex-shrink: 1;
 	min-width: 0;
 	font-size: 9dp;
 	color: #737373;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* The row waiting for a key or a button. */
@@ -470,10 +578,11 @@ input.range sliderbar:active {
 	padding: 2dp 7dp;
 	background-color: transparent;
 	border: 1dp #262626;
-	font-size: 8dp;
+	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.08em;
 	color: #525252;
+	white-space: nowrap;
 	tab-index: auto;
 	nav: auto;
 }
@@ -487,6 +596,8 @@ input.range sliderbar:active {
 .bind-actions {
 	display: flex;
 	flex-direction: row;
+	flex-wrap: wrap;
+	row-gap: 6dp;
 	margin-bottom: 12dp;
 }
 
@@ -495,7 +606,8 @@ input.range sliderbar:active {
  * this menu that reports something the user has to read. */
 .bind-status {
 	display: block;
-	font-size: 8dp;
+	font-size: 9dp;
+	line-height: 1.4;
 	color: #d4a000;
 	background-color: #2d2000;
 	border: 1dp #4d3800;
@@ -503,13 +615,21 @@ input.range sliderbar:active {
 	margin-bottom: 6dp;
 }
 
-/* ---- footer ------------------------------------------------------------- */
+/* ---- footer -------------------------------------------------------------
+ *
+ * Buttons first at their own width, then the settings path taking whatever
+ * is left, then the hotkey. Only the path shrinks: it is the one item whose
+ * text this file cannot bound, so it is the one that ellipsizes. The row
+ * wraps rather than squeezing the path to nothing in a window narrower than
+ * the baseline. */
 
 .footer {
 	display: flex;
 	flex-direction: row;
+	flex-wrap: wrap;
 	align-items: center;
 	flex-shrink: 0;
+	row-gap: 6dp;
 	margin-top: 10dp;
 	padding-top: 8dp;
 	border-top: 1dp #262626;
@@ -526,6 +646,7 @@ input.range sliderbar:active {
 	text-transform: uppercase;
 	letter-spacing: 0.1em;
 	color: #525252;
+	white-space: nowrap;
 	tab-index: auto;
 	nav: auto;
 }
@@ -539,10 +660,13 @@ input.range sliderbar:active {
 .footer-path {
 	display: block;
 	flex-grow: 1;
+	flex-shrink: 1;
 	min-width: 0;
-	text-align: right;
 	font-size: 8dp;
 	color: #333333;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .footer-hotkey {
@@ -551,19 +675,25 @@ input.range sliderbar:active {
 	margin-left: 12dp;
 	font-size: 8dp;
 	color: #525252;
+	white-space: nowrap;
 }
 
 .key {
 	color: #a3a3a3;
 }
 
-/* ---- fps readout (fps.rml) ---------------------------------------------- */
+/* ---- fps readout (fps.rml) ----------------------------------------------
+ *
+ * Sized for the widest reading the model can format, "119.9 fields/s
+ * 100.0 ms": 24 characters of 9dp mono with 0.05em of letter-spacing
+ * (5.85dp each, 141dp) plus 10dp of padding and 2dp of border. The height
+ * is one 9dp line at line-height 1.2 (10.8dp) plus the same. */
 
 body.fps {
 	top: 8dp;
 	right: 8dp;
-	width: 116dp;
-	height: 16dp;
+	width: 154dp;
+	height: 18dp;
 	/* Never in the way of a click aimed at the menu underneath. */
 	pointer-events: none;
 	background-color: #0a0a0a;
@@ -577,6 +707,9 @@ body.fps {
 	letter-spacing: 0.05em;
 	color: #a3a3a3;
 	text-align: right;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* ---- launcher (launcher.rml) ---------------------------------------------
@@ -599,6 +732,7 @@ body.launcher {
 	display: block;
 	flex-grow: 1;
 	min-height: 0;
+	overflow-x: hidden;
 	overflow-y: auto;
 }
 
@@ -611,20 +745,24 @@ body.launcher {
 
 .title-name {
 	display: block;
+	font-family: "Playfair Display";
 	font-weight: 700;
 	font-size: 34dp;
 	letter-spacing: 0.12em;
 	color: #f9fafb;
 	line-height: 1.1;
+	white-space: nowrap;
+	overflow: hidden;
 }
 
 .title-tagline {
 	display: block;
 	margin-top: 4dp;
-	font-size: 8dp;
+	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
 	color: #737373;
+	line-height: 1.3;
 }
 
 .disc-panel {
@@ -637,24 +775,31 @@ body.launcher {
 
 .disc-path {
 	display: block;
-	font-size: 11dp;
+	font-size: 10dp;
+	line-height: 1.4;
 	color: #e5e5e5;
 	/* A disc path has no spaces to break at; without this a long one runs
-	 * off the panel. */
+	 * off the panel. Wrapping, not clipping: which file is mounted is the
+	 * one thing this window exists to show. */
 	word-break: break-all;
 }
 
 .disc-source {
 	display: block;
 	margin-top: 3dp;
-	font-size: 8dp;
+	font-size: 9dp;
+	line-height: 1.4;
 	color: #525252;
 	word-break: break-all;
 }
 
+/* Wraps: at the baseline the two buttons fit on one line, and a narrower
+ * window drops the second one below rather than pushing it off the panel. */
 .disc-actions {
 	display: flex;
 	flex-direction: row;
+	flex-wrap: wrap;
+	row-gap: 6dp;
 	margin-top: 8dp;
 }
 
@@ -668,6 +813,7 @@ body.launcher {
 .path-row input.text {
 	width: auto;
 	flex-grow: 1;
+	flex-shrink: 1;
 	min-width: 0;
 	margin-right: 8dp;
 }
@@ -677,8 +823,10 @@ body.launcher {
 .status-line {
 	display: block;
 	margin-top: 8dp;
-	font-size: 8dp;
+	font-size: 9dp;
+	line-height: 1.4;
 	color: #737373;
+	word-break: break-word;
 }
 
 /* The boot precheck's message: the same treatment as .override and
@@ -688,15 +836,19 @@ body.launcher {
 	display: block;
 	margin-top: 8dp;
 	padding: 4dp 5dp;
-	font-size: 8dp;
+	font-size: 9dp;
+	line-height: 1.4;
 	color: #d4a000;
 	background-color: #2d2000;
 	border: 1dp #4d3800;
+	word-break: break-word;
 }
 
 .launcher-actions {
 	display: flex;
 	flex-direction: row;
+	flex-wrap: wrap;
+	row-gap: 6dp;
 	margin-bottom: 12dp;
 }
 
@@ -719,6 +871,7 @@ body.launcher {
 	margin-bottom: 4dp;
 }
 
+/* The build identity, which this file cannot bound. */
 .launcher-footer {
 	display: block;
 	flex-shrink: 0;
@@ -727,6 +880,9 @@ body.launcher {
 	border-top: 1dp #262626;
 	font-size: 8dp;
 	color: #333333;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* ---- credits (credits.rml, and the menu's About pane) -------------------- */
@@ -745,12 +901,15 @@ body.credits {
 	display: block;
 	flex-grow: 1;
 	min-height: 0;
+	overflow-x: hidden;
 	overflow-y: auto;
 }
 
 .credits-line {
 	display: block;
-	font-size: 11dp;
+	font-family: "Playfair Display";
+	font-size: 13dp;
+	line-height: 1.3;
 	color: #d4d4d4;
 }
 
@@ -761,6 +920,7 @@ body.credits {
 	margin-top: 3dp;
 	font-size: 10dp;
 	color: #a3a3a3;
+	word-break: break-all;
 	tab-index: auto;
 	nav: auto;
 }
@@ -774,15 +934,21 @@ body.credits {
 	margin-top: 14dp;
 }
 
+/* One credit a line at the baseline, wrapping at a space when the line is
+ * longer than the pane. break-word so that the one long token in the list,
+ * a font's license file name, breaks rather than running out of the box. */
 .credits-item {
 	display: block;
 	font-size: 9dp;
 	color: #737373;
 	line-height: 1.5;
+	word-break: break-word;
 }
 
 .credits-actions {
 	display: flex;
 	flex-direction: row;
+	flex-wrap: wrap;
+	row-gap: 6dp;
 	margin-top: 14dp;
 }

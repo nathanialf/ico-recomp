@@ -25,7 +25,8 @@
 		<div class="credits-item">SDL3, zlib license</div>
 		<div class="credits-item">RmlUi, MIT</div>
 		<div class="credits-item">FreeType, FreeType License</div>
-		<div class="credits-item">Playfair Display, SIL Open Font License; the notice ships in ui/fonts/OFL.txt</div>
+		<div class="credits-item">Playfair Display, SIL Open Font License; the notice ships in ui/fonts/PlayfairDisplay-OFL.txt</div>
+		<div class="credits-item">JetBrains Mono, SIL Open Font License; the notice ships in ui/fonts/JetBrainsMono-OFL.txt</div>
 
 		<div class="credits-actions">
 			<div class="button" id="credits-back">Back</div>

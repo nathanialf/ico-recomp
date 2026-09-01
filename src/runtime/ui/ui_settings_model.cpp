@@ -30,8 +30,8 @@
  *      already put the validated value back, leaving the menu showing a
  *      value the settings do not hold. By the next tick both have run.
  *
- * Text fields (window size, verbose, profiler period, fps limit) apply on
- * Enter or blur only, not per keystroke. That falls out of the same one
+ * Text fields (verbose, profiler period, fps limit) apply on Enter or blur
+ * only, not per keystroke. That falls out of the same one
  * callback: RmlUi's text widget puts "linebreak" in its change event
  * (WidgetTextInput::DispatchChangeEvent), false for an ordinary keystroke
  * and true for Enter, and no other control sends that parameter at all. A
@@ -76,6 +76,17 @@ struct UiBindRow {
     bool capturing = false;
 };
 
+/* One entry of a select built by a data-for loop rather than by fixed
+ * <option> elements in the document. `value` is what the option's value
+ * attribute carries, which is what the bound string ends up holding;
+ * `label` is what the list shows. Only the window size select needs this:
+ * its list is fixed except for the leading "custom" entry, which exists
+ * only when the stored size is not one of the offered ones. */
+struct UiOptionRow {
+    std::string value;
+    std::string label;
+};
+
 /* ---- the mirror ---------------------------------------------------------
  *
  * Selects and text fields are strings because that is what an Rml form
@@ -88,8 +99,9 @@ struct UiBindRow {
 struct UiSettingsMirror {
     /* display */
     std::string display_mode;
-    std::string window_width;
-    std::string window_height;
+    /* "WIDTHxHEIGHT", the value of one of window_sizes below. */
+    std::string window_size;
+    std::vector<UiOptionRow> window_sizes;
     std::string present;
     std::string fit;
     std::string filter;
@@ -205,6 +217,28 @@ const char* const kKeyboardLabels[RT_KB_COUNT] = {
     "Menu key",
 };
 
+/* The window sizes the Display tab offers: the integer multiples of the
+ * 640x480 4:3 baseline up to 3840x2880, which is 4K wide. The baseline is
+ * also the size the UI documents are laid out against (ui.cpp density_for),
+ * so every entry here is a whole number of dp ratios. A size settings.json
+ * holds that is not in this table is still honored: settings.cpp validates
+ * the range, and the select grows a leading "custom" entry for it
+ * (refresh_window_sizes below), so the control never shows a size the
+ * settings do not hold. */
+struct WindowSizeOption {
+    int width, height;
+    const char* label;
+};
+
+const WindowSizeOption kWindowSizes[] = {
+    { 640, 480, "640 x 480 (1x)" },
+    { 1280, 960, "1280 x 960 (2x)" },
+    { 1920, 1440, "1920 x 1440 (3x)" },
+    { 2560, 1920, "2560 x 1920 (4x)" },
+    { 3200, 2400, "3200 x 2400 (5x)" },
+    { 3840, 2880, "3840 x 2880 (6x)" },
+};
+
 const char* const kGamepadLabels[RT_GP_COUNT] = {
     "Up", "Down", "Left", "Right",
     "Cross", "Circle", "Square", "Triangle",
@@ -269,6 +303,31 @@ bool parse_int_field(const std::string& text, const char* dotted, int* out) {
     return true;
 }
 
+/* "WIDTHxHEIGHT", whole string, both parts positive. The select can only
+ * produce a value this parses, so a failure here means the document and
+ * this file disagree; it is logged and both dimensions are kept. */
+bool parse_size_field(const std::string& text, int* width, int* height) {
+    const char* begin = skip_spaces(text.c_str());
+    char* end = nullptr;
+    const long w = std::strtol(begin, &end, 10);
+    if (end == begin || *end != 'x') {
+        rt_log("ui", "settings menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
+            text.c_str(), *width, *height);
+        return false;
+    }
+    const char* second = end + 1;
+    char* end2 = nullptr;
+    const long h = std::strtol(second, &end2, 10);
+    if (end2 == second || *skip_spaces(end2) != '\0' || w <= 0 || h <= 0) {
+        rt_log("ui", "settings menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
+            text.c_str(), *width, *height);
+        return false;
+    }
+    *width = (int)w;
+    *height = (int)h;
+    return true;
+}
+
 bool parse_double_field(const std::string& text, const char* dotted, double* out) {
     const char* begin = skip_spaces(text.c_str());
     char* end = nullptr;
@@ -290,12 +349,40 @@ void set_override(const char* dotted, bool* flag, std::string* text) {
     *text = *flag && env[0] ? std::string("overridden by ") + env : std::string();
 }
 
+/* Rebuilds the window size list for the size the settings currently hold.
+ * A size that is one of kWindowSizes gives the plain six-entry list; any
+ * other size (a hand edit, or a size remembered from a resize drag with
+ * display.remember_window_size on) gets a seventh entry at the top naming
+ * itself, whose value is that size, so selecting it is a no-op rather than
+ * a silent move to some other size. */
+void refresh_window_sizes() {
+    const RtSettings& s = rt_settings();
+    bool offered = false;
+    for (const WindowSizeOption& o : kWindowSizes) {
+        if (o.width == s.display.window_width && o.height == s.display.window_height) offered = true;
+    }
+
+    g_m.window_sizes.clear();
+    if (!offered) {
+        UiOptionRow row;
+        row.value = g_m.window_size;
+        row.label = fmt("custom (%dx%d)", s.display.window_width, s.display.window_height);
+        g_m.window_sizes.push_back(row);
+    }
+    for (const WindowSizeOption& o : kWindowSizes) {
+        UiOptionRow row;
+        row.value = fmt("%dx%d", o.width, o.height);
+        row.label = o.label;
+        g_m.window_sizes.push_back(row);
+    }
+}
+
 void settings_to_mirror() {
     const RtSettings& s = rt_settings();
 
     g_m.display_mode = name_of(kDisplayModes, (int)s.display.mode);
-    g_m.window_width = fmt("%d", s.display.window_width);
-    g_m.window_height = fmt("%d", s.display.window_height);
+    g_m.window_size = fmt("%dx%d", s.display.window_width, s.display.window_height);
+    refresh_window_sizes();
     g_m.present = name_of(kPresentModes, (int)s.display.present);
     g_m.fit = name_of(kFits, (int)s.display.fit);
     g_m.filter = name_of(kFilters, (int)s.display.filter);
@@ -357,8 +444,7 @@ void mirror_to_settings() {
     if (value_of(kFits, g_m.fit, "display.fit", &e)) s.display.fit = (RtFit)e;
     if (value_of(kFilters, g_m.filter, "display.filter", &e)) s.display.filter = (RtFilter)e;
 
-    parse_int_field(g_m.window_width, "display.window_width", &s.display.window_width);
-    parse_int_field(g_m.window_height, "display.window_height", &s.display.window_height);
+    parse_size_field(g_m.window_size, &s.display.window_width, &s.display.window_height);
     parse_int_field(g_m.render_scale, "display.render_scale", &s.display.render_scale);
     s.display.hires_scanout = g_m.hires_scanout;
     s.display.show_fps = g_m.show_fps;
@@ -467,8 +553,7 @@ bool settings_model_init(Rml::Context* context) {
     }
 
     c.Bind("display_mode", &g_m.display_mode);
-    c.Bind("window_width", &g_m.window_width);
-    c.Bind("window_height", &g_m.window_height);
+    c.Bind("window_size", &g_m.window_size);
     c.Bind("present", &g_m.present);
     c.Bind("fit", &g_m.fit);
     c.Bind("filter", &g_m.filter);
@@ -487,6 +572,22 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("right_deadzone_text", &g_m.right_deadzone_text);
     c.Bind("trigger_threshold_text", &g_m.trigger_threshold_text);
     c.Bind("rumble", &g_m.rumble);
+
+    /* Same registration order as the binding rows below: the struct, then
+     * the array of it, then the Bind. The window size select is a data-for
+     * over this array rather than fixed <option> elements because its list
+     * is not fixed: it carries a "custom" entry when the stored size is not
+     * one of the offered ones. */
+    if (Rml::StructHandle<UiOptionRow> opt = c.RegisterStruct<UiOptionRow>()) {
+        opt.RegisterMember("value", &UiOptionRow::value);
+        opt.RegisterMember("label", &UiOptionRow::label);
+    } else {
+        rt_log("ui", "RegisterStruct<UiOptionRow> failed; the window size select is disabled");
+    }
+    if (!c.RegisterArray<std::vector<UiOptionRow>>()) {
+        rt_log("ui", "RegisterArray<vector<UiOptionRow>> failed; the window size select is disabled");
+    }
+    c.Bind("window_sizes", &g_m.window_sizes);
 
     /* The struct has to be registered before the array whose value type it
      * is, and both before the Bind of a vector of them. */

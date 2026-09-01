@@ -19,7 +19,7 @@
 			<div class="nav-stack">
 				<div class="nav-button" data-class-active="active_tab == 'display'" data-event-click="active_tab = 'display'">
 					<span class="nav-name">Display</span>
-					<span class="nav-tagline">window, scaling, readout</span>
+					<span class="nav-tagline">window, scaling, rate</span>
 				</div>
 				<div class="nav-button" data-class-active="active_tab == 'audio'" data-event-click="active_tab = 'audio'">
 					<span class="nav-name">Audio</span>
@@ -27,11 +27,11 @@
 				</div>
 				<div class="nav-button" data-class-active="active_tab == 'input'" data-event-click="active_tab = 'input'">
 					<span class="nav-name">Input</span>
-					<span class="nav-tagline">sticks, triggers, rumble</span>
+					<span class="nav-tagline">sticks, rumble, binds</span>
 				</div>
 				<div class="nav-button" data-class-active="active_tab == 'debug'" data-event-click="active_tab = 'debug'">
 					<span class="nav-name">Debug</span>
-					<span class="nav-tagline">logging, pacing, profiler</span>
+					<span class="nav-tagline">logs, pacing, profiler</span>
 				</div>
 				<div class="nav-button" data-class-active="active_tab == 'about'" data-event-click="active_tab = 'about'">
 					<span class="nav-name">About</span>
@@ -63,15 +63,21 @@
 					</select>
 				</div>
 
+				<!--
+					The option list is a data-for over window_sizes rather
+					than fixed <option> elements: it carries a leading
+					"custom (WxH)" entry when the stored size is not one of
+					the offered ones, so the control never shows a size the
+					settings do not hold. The values are "WIDTHxHEIGHT",
+					parsed back by parse_size_field in
+					ui_settings_model.cpp.
+				-->
 				<div class="control">
-					<div class="control-label">Window width</div>
-					<input type="text" data-value="window_width" data-event-change="apply()" data-event-blur="apply()"/>
-					<div class="hint">applies on Enter or when the field loses focus</div>
-				</div>
-
-				<div class="control">
-					<div class="control-label">Window height</div>
-					<input type="text" data-value="window_height" data-event-change="apply()" data-event-blur="apply()"/>
+					<div class="control-label">Window size</div>
+					<select data-value="window_size" data-event-change="apply()">
+						<option data-for="opt : window_sizes" data-attr-value="opt.value">{{opt.label}}</option>
+					</select>
+					<div class="hint">windowed mode; 640 x 480 is the layout's baseline, the default is 2x that</div>
 				</div>
 
 				<div class="control">
@@ -289,7 +295,8 @@
 				<div class="credits-item">SDL3, zlib license</div>
 				<div class="credits-item">RmlUi, MIT</div>
 				<div class="credits-item">FreeType, FreeType License</div>
-				<div class="credits-item">Playfair Display, SIL Open Font License; the notice ships in ui/fonts/OFL.txt</div>
+				<div class="credits-item">Playfair Display, SIL Open Font License; the notice ships in ui/fonts/PlayfairDisplay-OFL.txt</div>
+				<div class="credits-item">JetBrains Mono, SIL Open Font License; the notice ships in ui/fonts/JetBrainsMono-OFL.txt</div>
 			</div>
 		</div>
 	</div>

@@ -219,7 +219,7 @@ int main() {
         rt_settings_init();
         const RtSettings& s = rt_settings();
         CHECK(s.audio.master_volume == 100);
-        CHECK(s.display.window_width == 640 && s.display.window_height == 480);
+        CHECK(s.display.window_width == 1280 && s.display.window_height == 960);
         CHECK(s.debug.fps_limit_hz == 59.94);
         CHECK(s.input.keyboard[RT_KB_CROSS] == "X");
         CHECK(s.input.gamepad[RT_GP_L2] == "lefttrigger+");
@@ -280,7 +280,7 @@ int main() {
         set_env("ICORECOMP_SETTINGS", path.c_str());
         rt_settings_init();
         const RtSettings& s = rt_settings();
-        CHECK(s.display.window_width == 640);
+        CHECK(s.display.window_width == 1280);
         CHECK(s.audio.master_volume == 55);
     }
     { /* 10. bad enum falls back to its default */
@@ -296,7 +296,7 @@ int main() {
         write_file(path, original);
         set_env("ICORECOMP_SETTINGS", path.c_str());
         rt_settings_init();
-        CHECK(rt_settings().display.window_width == 640);
+        CHECK(rt_settings().display.window_width == 1280);
         CHECK(!rt_settings_save());
         CHECK(read_file(path) == original);
     }
@@ -306,14 +306,14 @@ int main() {
         write_file(path, original);
         set_env("ICORECOMP_SETTINGS", path.c_str());
         rt_settings_init();
-        CHECK(rt_settings().display.window_width == 640);
+        CHECK(rt_settings().display.window_width == 1280);
         CHECK(std::filesystem::exists(path + ".bad"));
         CHECK(read_file(path + ".bad") == original);
     }
     { /* 13. ICORECOMP_SETTINGS=- : defaults only, no file, save refused */
         set_env("ICORECOMP_SETTINGS", "-");
         rt_settings_init();
-        CHECK(rt_settings().display.window_width == 640);
+        CHECK(rt_settings().display.window_width == 1280);
         CHECK(!rt_settings_save());
         CHECK(std::string(rt_settings_path()).empty());
     }

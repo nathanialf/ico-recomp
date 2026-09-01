@@ -974,9 +974,10 @@ void RtPgs::init_windowed() {
     /* 640x480: the 4:3 this backend presents at (scanout_display_aspect), so
      * the window opens with no letterbox. Not the scanout's pixel dimensions:
      * ICO scans out 512x224 in the mode domain, which is not its shape on a
-     * TV. display.window_width/height (settings.json) override this when
-     * set; 0 in either field keeps the 640x480 default (see
-     * RtPgsCreateOptions in gs_parallel_api.h). */
+     * TV. This is only the fallback for a caller that passes 0 in either
+     * field (see RtPgsCreateOptions in gs_parallel_api.h); the host always
+     * passes display.window_width/height, which default to 1280x960, the
+     * same 4:3 shape at twice the size. */
     const unsigned window_w = (m_have_opts && m_opts.window_width) ? m_opts.window_width : 640;
     const unsigned window_h = (m_have_opts && m_opts.window_height) ? m_opts.window_height : 480;
     if (!platform->init(window_w, window_h)) return;

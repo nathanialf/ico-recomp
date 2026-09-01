@@ -97,10 +97,14 @@ uint32_t backend_present_mode() { return 0; }
 namespace {
 
 /* Density-independent pixel ratio: the documents are authored in dp against
- * a 640x480 surface, the historic window size (gs_parallel_lib.cpp's
- * init_windowed). A larger window scales the menu with it rather than
- * leaving it a postage stamp in a corner. Clamped at 4x, past which the text
- * is larger than anything the layout was written for. */
+ * a 640x480 surface. That is the layout's design size, not the default
+ * window size: display.window_width/height default to 1280x960 (settings.h),
+ * which is this baseline at a dp ratio of exactly 2. Every column width and
+ * font size in ui/style/base.rcss is chosen to fit at ratio 1, so a window
+ * dragged down to the 640x480 minimum still shows the whole layout. A larger
+ * window scales the menu with it rather than leaving it a postage stamp in a
+ * corner. Clamped at 4x, past which the text is larger than anything the
+ * layout was written for. */
 float density_for(uint32_t surface_height) {
     if (surface_height == 0) return 1.0f;
     const float ratio = float(surface_height) / 480.0f;
@@ -168,13 +172,25 @@ bool rt_ui_init() {
         return false;
     }
 
-    /* One variable font, one file. RmlUi's FreeType engine walks the named
-     * instances of a variable face (FreeTypeInterface.cpp GetFaceVariations)
-     * and registers one face per weight, so "Playfair Display" at
-     * font-weight 400 and 700 both resolve out of this single file. */
-    const std::string font_path = ui_dir + "/fonts/PlayfairDisplay[wght].ttf";
-    if (!Rml::LoadFontFace(font_path)) {
-        rt_log("ui", "font %s failed to load; the settings UI is disabled", font_path.c_str());
+    /* Two faces, both required: the documents name "Playfair Display" for
+     * headings and "JetBrains Mono" for everything a value is read out of,
+     * and a missing family falls back to whatever RmlUi finds, which is
+     * nothing here. Either failure disables the UI and the log names which
+     * file it was.
+     *
+     * Playfair is one variable font in one file: RmlUi's FreeType engine
+     * walks the named instances of a variable face (FreeTypeInterface.cpp
+     * GetFaceVariations) and registers one face per weight, so font-weight
+     * 400 and 700 both resolve out of that single file. JetBrains Mono is a
+     * static regular; nothing in the documents asks it for a bold. */
+    const std::string serif_path = ui_dir + "/fonts/PlayfairDisplay[wght].ttf";
+    const std::string mono_path = ui_dir + "/fonts/JetBrainsMono-Regular.ttf";
+    if (!Rml::LoadFontFace(serif_path)) {
+        rt_log("ui", "font %s failed to load; the settings UI is disabled", serif_path.c_str());
+        return false;
+    }
+    if (!Rml::LoadFontFace(mono_path)) {
+        rt_log("ui", "font %s failed to load; the settings UI is disabled", mono_path.c_str());
         return false;
     }
 
@@ -220,8 +236,8 @@ bool rt_ui_init() {
     g_ui.visible = false;
     g_ui.initialized = true;
 
-    rt_log("ui", "RmlUi %s up: font %s, document %s, surface %ux%u, dp ratio %.2f",
-        Rml::GetVersion().c_str(), font_path.c_str(), doc_path.c_str(),
+    rt_log("ui", "RmlUi %s up: fonts %s and %s, document %s, surface %ux%u, dp ratio %.2f",
+        Rml::GetVersion().c_str(), serif_path.c_str(), mono_path.c_str(), doc_path.c_str(),
         width, height, double(density_for(height)));
 
 #ifdef ICORECOMP_PGS_SDL
@@ -335,6 +351,11 @@ void rt_ui_set_visible(bool visible) {
          * window resize, an env-overridden key) may have moved a value since
          * the menu was last up. */
         settings_model_refresh();
+        /* Over the launcher, the launcher goes away first: the menu's
+         * backdrop is translucent for the game's scanout behind it, and
+         * two documents through one another is unreadable. No-op when the
+         * launcher is not up, which is every in-game open. */
+        launcher_set_covered(true);
         g_ui.menu->Show();
     } else {
 #ifdef ICORECOMP_PGS_SDL
@@ -344,6 +365,8 @@ void rt_ui_set_visible(bool visible) {
         rebind_cancel("the menu closed");
 #endif
         g_ui.menu->Hide();
+        /* Whatever the launcher had up when the menu opened comes back. */
+        launcher_set_covered(false);
         /* Not rt_settings_flush_save() here. This function runs from the
          * event handler, which can execute from inside WSI::begin_frame; the
          * write belongs at the field boundary, so the next rt_ui_tick does

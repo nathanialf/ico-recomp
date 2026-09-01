@@ -239,6 +239,18 @@ void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::s
  * straight away) without disabling the settings menu. */
 bool launcher_init(Rml::Context* context, const std::string& ui_dir);
 
+/* Takes launcher.rml (and the credits, if they are up) down while the
+ * settings menu is open on top of them, and puts back exactly what was up
+ * when the menu closes. The menu's backdrop is translucent because the
+ * game's scanout belongs behind it; over the launcher there is no scanout,
+ * only another document, and the two read as one jumbled screen.
+ *
+ * g_ui.launcher_visible stays true throughout: it means "the launcher owns
+ * the window", which is still true with the menu over it, and both
+ * rt_launcher_run's loop and rt_ui_wants_input() depend on that meaning.
+ * Does nothing when the launcher is not up, which is the in-game case. */
+void launcher_set_covered(bool covered);
+
 #ifdef ICORECOMP_PGS_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
  * SDL scancode and gamepad button, once, at init. An unresolvable name logs

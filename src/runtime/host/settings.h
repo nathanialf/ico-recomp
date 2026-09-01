@@ -47,7 +47,12 @@ enum RtPadBind {
 struct RtSettings {
     struct {
         RtDisplayMode mode = RtDisplayMode::Windowed;
-        int window_width = 640, window_height = 480;
+        /* 1280x960: twice the 640x480 4:3 baseline the UI documents are
+         * laid out against (src/runtime/ui/ui.cpp density_for). The
+         * shim's own fallback when either field is 0 is still 640x480
+         * (gs_parallel_lib.cpp init_windowed); the two no longer
+         * coincide. */
+        int window_width = 1280, window_height = 960;
         bool remember_window_size = true;
         RtPresentMode present = RtPresentMode::Mailbox;
         RtFit fit = RtFit::Letterbox;

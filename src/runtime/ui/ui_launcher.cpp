@@ -96,6 +96,13 @@ LauncherModel g_m;
 Rml::DataModelHandle g_model;
 bool g_model_valid = false;
 
+/* True while the settings menu is up over the launcher and this document
+ * has been hidden for it (launcher_set_covered). The credits flag records
+ * what to put back: the menu is reachable from the credits screen only
+ * through the launcher behind it, but the state is restored either way. */
+bool g_covered = false;
+bool g_credits_covered = false;
+
 /* Queued by the callbacks, drained by launcher_tick(). */
 bool g_start_pending = false;
 bool g_quit_pending = false;
@@ -270,6 +277,8 @@ void on_start(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { g_st
 void on_quit(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { g_quit_pending = true; }
 
 void on_open_settings(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    /* rt_ui_set_visible() hides this document for the time the menu is up
+     * (launcher_set_covered below), so the two never overlap. */
     rt_ui_set_visible(true);
 }
 
@@ -437,6 +446,25 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     return true;
 }
 
+void launcher_set_covered(bool covered) {
+    /* Not "is the launcher document shown": the in-game menu opens with no
+     * launcher at all, and this has to be a no-op there. */
+    if (!g_ui.launcher_visible || !g_ui.launcher) return;
+    if (covered == g_covered) return;
+    g_covered = covered;
+
+    if (covered) {
+        g_credits_covered = g_ui.credits && g_ui.credits->IsVisible();
+        if (g_credits_covered) g_ui.credits->Hide();
+        g_ui.launcher->Hide();
+    } else {
+        g_ui.launcher->Show();
+        if (g_credits_covered && g_ui.credits) g_ui.credits->Show();
+        g_credits_covered = false;
+    }
+    rt_log("ui", "launcher document %s for the settings menu", covered ? "hidden" : "shown again");
+}
+
 namespace {
 
 /* ---- the field-boundary half -------------------------------------------- */
@@ -533,6 +561,8 @@ bool rt_launcher_run() {
     rt_log("launcher", "present mode forced to FIFO while the launcher is up (mode %u restored at hand-off)",
         user_present_mode);
 
+    g_covered = false;
+    g_credits_covered = false;
     g_ui.launcher_visible = true;
     g_ui.launcher->Show();
 #ifdef ICORECOMP_PGS_SDL
@@ -583,6 +613,8 @@ bool rt_launcher_run() {
 
     g_ui.launcher->Hide();
     g_ui.launcher_visible = false;
+    g_covered = false;
+    g_credits_covered = false;
     if (g_ui.credits) g_ui.credits->Hide();
 #ifdef ICORECOMP_PGS_SDL
     if (!rt_ui_visible()) menu_set_text_input(false);
