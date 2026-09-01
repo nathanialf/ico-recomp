@@ -170,7 +170,7 @@ RtPgsCreateOptions resolve_create_options() {
      * library mapped it itself before this option existed (vsync/fifo ->
      * FIFO, tear/immediate -> IMMEDIATE, anything else -> MAILBOX);
      * otherwise display.present decides. */
-    if (const char* pm = std::getenv("ICORECOMP_GS_PRESENT"); pm && *pm) {
+    if (const char* pm = std::getenv("ICORECOMP_GS_PRESENT")) {
         uint32_t mode = RT_PGS_PRESENT_MAILBOX;
         if (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0) {
             mode = RT_PGS_PRESENT_FIFO;

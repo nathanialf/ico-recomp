@@ -86,9 +86,14 @@ constexpr BindDef kGamepadBinds[RT_GP_COUNT] = {
  *
  * The environment wins over the file for every one of these so existing
  * scripts and CI invocations keep their exact behavior after this milestone
- * lands. Each consumer latches its own env var at its own read site (that
- * lands with the milestone 2 appliers); this table only powers
- * rt_settings_overridden() and the startup "overridden by" log.
+ * lands. Each consumer reads its own env var at its own read site
+ * (pace_period_seconds, rt_prof_init, resolve_create_options, sdl_open,
+ * main's verbosity setup); this table only powers rt_settings_overridden()
+ * and the startup "overridden by" log.
+ *
+ * "Set" means present in the environment, even as an empty string: that is
+ * what every consumer above tests (getenv() != NULL), so the UI's
+ * "overridden by" state and the consumer's actual behavior agree.
  */
 struct EnvTwin {
     const char* dotted_key;
@@ -483,26 +488,35 @@ void write_bad_copy(const std::string& path, const std::string& text) {
     std::fclose(f);
 }
 
+/* Opens `path` and reads its entire contents into `*out`. Returns false
+ * (leaving `*out` empty) when the file cannot be opened; a file that opens
+ * but is empty returns true with `*out` cleared. */
+bool read_whole_file(const std::string& path, std::string* out) {
+    std::FILE* f = rt_fopen_utf8(path.c_str(), "rb");
+    if (!f) return false;
+    out->clear();
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+        long sz = std::ftell(f);
+        if (sz > 0) {
+            out->resize((size_t)sz);
+            std::fseek(f, 0, SEEK_SET);
+            size_t n = std::fread(out->data(), 1, (size_t)sz, f);
+            out->resize(n);
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
 /* Reads and applies one settings file at `path`. On any failure this logs
  * why and leaves *out (already at compiled-in defaults) alone; the caller
  * has already set g_path before calling this. */
 void load_file(const std::string& path) {
-    std::FILE* f = rt_fopen_utf8(path.c_str(), "rb");
-    if (!f) {
+    std::string text;
+    if (!read_whole_file(path, &text)) {
         rt_log("settings", "settings: %s not found yet; running on defaults, will create it on first save", path.c_str());
         return;
     }
-    std::string text;
-    if (std::fseek(f, 0, SEEK_END) == 0) {
-        long sz = std::ftell(f);
-        if (sz > 0) {
-            text.resize((size_t)sz);
-            std::fseek(f, 0, SEEK_SET);
-            size_t n = std::fread(text.data(), 1, (size_t)sz, f);
-            text.resize(n);
-        }
-    }
-    std::fclose(f);
 
     RtJson parsed;
     std::string err;
@@ -670,6 +684,40 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
 
 } // namespace
 
+bool rt_settings_peek_log_file() {
+    ResolvedSource src = resolve_source();
+    std::string path;
+    switch (src.kind) {
+    case SourceKind::EnvPath:
+    case SourceKind::BaseDir:
+    case SourceKind::UserConfig:
+        path = src.path;
+        break;
+    case SourceKind::EnvDisabled:
+    case SourceKind::None:
+        return true;
+    }
+
+    std::string text;
+    if (!read_whole_file(path, &text)) return true;
+
+    RtJson parsed;
+    std::string err;
+    if (!rt_json_parse(text, &parsed, &err)) return true;
+    if (parsed.type != RtJson::Type::Object) return true;
+
+    const RtJson* ver = parsed.find("version");
+    if (!ver || ver->type != RtJson::Type::Number || ver->number != 1.0) return true;
+
+    const RtJson* dbg = parsed.find("debug");
+    if (!dbg || dbg->type != RtJson::Type::Object) return true;
+
+    const RtJson* lf = dbg->find("log_file");
+    if (!lf || lf->type != RtJson::Type::Bool) return true;
+
+    return lf->boolean;
+}
+
 void rt_settings_init() {
     apply_compiled_defaults(&g_current);
     g_dom = RtJson::make_object();
@@ -709,7 +757,7 @@ void rt_settings_init() {
 
     for (const EnvTwin& t : kEnvTwins) {
         const char* v = std::getenv(t.env_var);
-        if (v && *v) {
+        if (v) {
             rt_log("settings", "settings: %s is overridden by %s=%s", t.dotted_key, t.env_var, v);
         }
     }
@@ -773,8 +821,7 @@ const char* rt_settings_path() {
 bool rt_settings_overridden(const char* dotted_key) {
     for (const EnvTwin& t : kEnvTwins) {
         if (std::strcmp(t.dotted_key, dotted_key) == 0) {
-            const char* v = std::getenv(t.env_var);
-            return v && *v;
+            return std::getenv(t.env_var) != nullptr;
         }
     }
     return false;

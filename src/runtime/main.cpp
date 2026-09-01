@@ -202,7 +202,10 @@ void print_usage(const char* argv0) {
 } // namespace
 
 int main(int argc, char** argv) {
-    rt_log_init(rt_base_dir());
+    /* The log file has to exist before anything can log to it, including
+     * settings.json loading itself, so this peeks debug.log_file directly
+     * off disk instead of waiting for rt_settings_init() below. */
+    rt_log_init(rt_base_dir(), rt_settings_peek_log_file());
     rt_prof_init();
     /* Installed before anything that can fault, which now includes the
      * Vulkan device and window setup in rt_hw_init: a crash there used to

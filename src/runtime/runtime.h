@@ -36,9 +36,13 @@ constexpr uint32_t RT_CLEAN_EXIT_VRAM = 0xE0000000u;
  * ICORECOMP_LOG; unset it defaults to <dir>/icorecomp.log, falling back to
  * the per-user state directory and then the temp directory when <dir> is
  * not writable. ICORECOMP_LOG=- opts out. On POSIX the sink stays off
- * unless ICORECOMP_VERBOSE or ICORECOMP_LOG asks for it. Also parses
- * ICORECOMP_VERBOSE, so call it before anything else logs. */
-void rt_log_init(const char* dir);
+ * unless ICORECOMP_VERBOSE or ICORECOMP_LOG asks for it. file_allowed is
+ * debug.log_file (peeked from settings.json before settings can log; see
+ * rt_settings_peek_log_file): false behaves as ICORECOMP_LOG=- unless
+ * ICORECOMP_LOG is set, in which case the env var decides and a line logs
+ * that the settings value was ignored. Also parses ICORECOMP_VERBOSE, so
+ * call it before anything else logs. */
+void rt_log_init(const char* dir, bool file_allowed);
 
 /* True when ICORECOMP_VERBOSE named this component (or "all"). Parsing is a
  * short list walk, so hot callers should cache the answer in a static. */

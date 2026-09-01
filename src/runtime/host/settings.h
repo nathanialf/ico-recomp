@@ -71,7 +71,10 @@ struct RtSettings {
     struct {
         std::string verbose;            /* ICORECOMP_VERBOSE channel spec */
         bool log_file = true;
-        int profile_fields = 0;
+        int profile_fields = 180;       /* 0 disables; 180 is the pre-settings
+                                         * ICORECOMP_PROFILE-unset default (prof.h
+                                         * g_every), kept so an env-less run still
+                                         * produces a diagnosable log */
         double fps_limit_hz = 59.94;    /* 0 disables pacing */
     } debug;
     struct {
@@ -79,6 +82,17 @@ struct RtSettings {
         std::string disc_path;
     } launcher;
 };
+
+/* Reads only debug.log_file from the settings file that rt_settings_init
+ * would load (same source resolution: ICORECOMP_SETTINGS, then
+ * rt_base_dir()/settings.json, then rt_user_config_dir()/settings.json),
+ * without logging and without touching the settings model. Exists only
+ * because rt_log_init must decide about the log file before any logging
+ * (and so before rt_settings_init) can run. Returns true (the default)
+ * when no file is found, the file does not parse, "version" is not 1, or
+ * the key is absent or not a boolean; rt_settings_init reports all of
+ * those properly a moment later. */
+bool rt_settings_peek_log_file();
 
 /* Reloads the settings model from disk, replacing whatever is in memory.
  * Resolves the load source by precedence (ICORECOMP_SETTINGS env, then
@@ -102,11 +116,8 @@ RtSettings& rt_settings_mutable();
  * using the same ranges and allowed sets as the JSON loader. A field that
  * fails validation reverts to its previously committed value (not the
  * compiled-in default) with a log naming the dotted key, the bad value, and
- * what it was reverted to. Then saves.
- *
- * This does not yet push anything to a subsystem: subsystem appliers land
- * with the first consumers in milestone 2. For now, commit only validates
- * and saves.
+ * what it was reverted to. Then runs rt_settings_apply(before, now) with
+ * the previously committed struct and saves.
  */
 void rt_settings_commit();
 
@@ -139,9 +150,12 @@ bool rt_settings_overridden(const char* dotted_key);
  * window size, presentation fit/filter) apply immediately; warm settings
  * (present mode, render scale) queue for rt_settings_apply_pending(), which
  * rt_gs_vsync_hook (hw/gspriv.cpp) calls at the next field boundary, because
- * their subsystem entry points fatal when called mid-frame. Volume,
- * verbosity, fps cap and profiler period need no applier here: their
- * consumers already read rt_settings() fresh on every use. */
+ * their subsystem entry points fatal when called mid-frame. Verbosity is
+ * hot too, pushed through rt_log_set_verbose here (log.cpp parses the spec
+ * once, it does not poll the struct). Volume, fps cap and profiler period
+ * need no applier: their consumers read rt_settings() fresh on every use.
+ * A setting whose env twin is set (rt_settings_overridden) is never
+ * applied; the environment owns it for the life of the run. */
 void rt_settings_apply(const RtSettings& before, const RtSettings& now);
 void rt_settings_apply_pending();
 

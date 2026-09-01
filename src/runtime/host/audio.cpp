@@ -111,7 +111,7 @@ void sdl_open() {
          * settings.json and is stronger than a plain mute (the stream never
          * opens at all); it still wins over the file per the env-precedence
          * rule, so only the "value ignored" log is new here. */
-        if (*e && !rt_settings().audio.mute) {
+        if (!rt_settings().audio.mute) {
             rt_log("audio", "audio.mute: using ICORECOMP_NO_AUDIO=%s, settings.json value ignored", e);
         }
         rt_log("audio", "ICORECOMP_NO_AUDIO set: SDL audio disabled");

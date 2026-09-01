@@ -323,6 +323,36 @@ int main() {
         CHECK(!rt_settings_overridden("audio.master_volume"));
         unset_env("ICORECOMP_FPS_LIMIT");
     }
+    { /* 15. rt_settings_peek_log_file: false in the file */
+        std::string path = scratch + "/peek_false.json";
+        write_file(path, "{\"version\": 1, \"debug\": {\"log_file\": false}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        CHECK(rt_settings_peek_log_file() == false);
+    }
+    { /* 16. rt_settings_peek_log_file: true in the file, and absent */
+        std::string path = scratch + "/peek_true.json";
+        write_file(path, "{\"version\": 1, \"debug\": {\"log_file\": true}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        CHECK(rt_settings_peek_log_file() == true);
+
+        std::string path2 = scratch + "/peek_absent.json";
+        write_file(path2, "{\"version\": 1}\n");
+        set_env("ICORECOMP_SETTINGS", path2.c_str());
+        CHECK(rt_settings_peek_log_file() == true);
+    }
+    { /* 17. rt_settings_peek_log_file: malformed file falls back to true,
+       * with no .bad copy and no log line (the peek is silent). */
+        std::string path = scratch + "/peek_malformed.json";
+        std::string original = "{ nope";
+        write_file(path, original);
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        CHECK(rt_settings_peek_log_file() == true);
+        CHECK(!std::filesystem::exists(path + ".bad"));
+    }
+    { /* 18. rt_settings_peek_log_file: ICORECOMP_SETTINGS=- falls back to true */
+        set_env("ICORECOMP_SETTINGS", "-");
+        CHECK(rt_settings_peek_log_file() == true);
+    }
 
     unset_env("ICORECOMP_SETTINGS");
     std::printf("settings-selftest: all checks passed\n");

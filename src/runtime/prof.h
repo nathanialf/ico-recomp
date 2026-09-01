@@ -187,7 +187,8 @@ inline uint64_t rt_prof_zone_ns(int zone) { return rt_prof_detail::g_ns[zone]; }
  * on by default for any spelling that is not one of the "off" ones below,
  * and it wins over the settings file for the rest of the run (a mismatch
  * between the two is logged once, here). Unset: debug.profile_fields
- * decides instead (0 = off, matching the file's own documented default),
+ * decides instead (0 = off; its compiled-in default is the same 180-field
+ * interval as g_every, so a run with neither set behaves as before),
  * re-read every field by rt_prof_field rather than latched here -- see
  * g_rt_prof_env_set. Builds with no ICORECOMP_HAVE_SETTINGS keep today's
  * on-by-default behavior when the env var is unset, since there is no

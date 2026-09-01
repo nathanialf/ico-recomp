@@ -380,7 +380,7 @@ std::string temp_dir() {
 
 } // namespace
 
-void rt_log_init(const char* dir) {
+void rt_log_init(const char* dir, bool file_allowed) {
     /* This is main's first statement, so in practice nothing has logged
      * yet and no writer thread exists. It is still cheap to be certain:
      * park the writer for the whole of this function, not just up to the
@@ -407,6 +407,14 @@ void rt_log_init(const char* dir) {
     const bool verbose = g_verbose_all || !g_verbose_tags.empty();
 
     const char* env = std::getenv("ICORECOMP_LOG");
+    /* The environment always wins over debug.log_file (see settings.cpp's
+     * kEnvTwins table). When it disagrees with a false setting, say so once
+     * so a run started with the old env var doesn't look like it silently
+     * ignored a settings.json edit. */
+    if (env && *env && !file_allowed) {
+        std::fprintf(stderr, "[icorecomp][log] debug.log_file: using ICORECOMP_LOG=%s,"
+            " settings.json value ignored\n", env);
+    }
     const std::string base = (dir && *dir) ? dir : ".";
 
     /* Candidates, in the order they are tried. An explicit ICORECOMP_LOG is
@@ -424,6 +432,15 @@ void rt_log_init(const char* dir) {
         }
         candidates.push_back(env);
     } else {
+        /* debug.log_file=false, no ICORECOMP_LOG override: same opt-out as
+         * ICORECOMP_LOG=- above, just from settings.json instead of the
+         * environment. */
+        if (!file_allowed) {
+            if (verbose) {
+                std::fprintf(stderr, "[icorecomp][log] debug.log_file=false disables the log file\n");
+            }
+            return;
+        }
 #ifdef _WIN32
         candidates.push_back(base + "/icorecomp.log");
 #else

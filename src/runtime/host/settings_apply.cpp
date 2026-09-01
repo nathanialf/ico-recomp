@@ -26,10 +26,16 @@
  *                                       lands with the overlay, milestone
  *                                       5-6); no applier needed until then
  *
- * Everything outside display (audio.*, input.*, debug.*, launcher.*) needs
- * no applier in this milestone: audio/input/debug consumers already read
- * rt_settings() fresh on every use (pace_period_seconds in gspriv.cpp is the
- * existing example), and launcher.* is cold for the current run by design.
+ *   debug.verbose                hot   rt_log_set_verbose, unless
+ *                                       ICORECOMP_VERBOSE is set (log.cpp
+ *                                       parses a spec once; it does not
+ *                                       poll the struct)
+ *
+ * Everything else outside display (audio.*, input.*, the rest of debug.*,
+ * launcher.*) needs no applier: those consumers read rt_settings() fresh on
+ * every use (pace_period_seconds in gspriv.cpp, sdl_submit in audio.cpp,
+ * rt_prof_field in prof.h), and launcher.* is cold for the current run by
+ * design.
  *
  * Every rt_pgs_* call is guarded on rt_gs_parallel_handle() != nullptr: a
  * dump-only run, a headless live run, or a build with no paraLLEl-GS backend
@@ -89,6 +95,23 @@ struct PendingApply {
 } // namespace
 
 void rt_settings_apply(const RtSettings& before, const RtSettings& now) {
+    if (before.debug.verbose != now.debug.verbose) {
+        if (rt_settings_overridden("debug.verbose")) {
+            rt_log("settings", "settings: debug.verbose changed but ICORECOMP_VERBOSE overrides it"
+                               " for this run; not applied");
+        } else {
+            /* Same rule as main.cpp at startup: an empty spec means "the
+             * compiled-in default channels", which is what rt_log_init
+             * selected when the env var was unset; rt_log_set_verbose("")
+             * would instead clear every channel. */
+            if (now.debug.verbose.empty()) {
+                rt_log("settings", "settings: debug.verbose cleared; default channels return at next start");
+            } else {
+                rt_log_set_verbose(now.debug.verbose.c_str());
+            }
+        }
+    }
+
     const bool window_changed =
         before.display.mode != now.display.mode ||
         before.display.window_width != now.display.window_width ||
