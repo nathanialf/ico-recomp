@@ -21,10 +21,120 @@
 #include "../host/settings.h"
 #include "../host/window.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace {
+
+/* Packs R,G,B,A (0-255 each) into RtPgsOverlayVertex::rgba (R8G8B8A8_UNORM
+ * byte order, straight alpha; see gs_parallel_api.h). */
+uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | (uint32_t(a) << 24);
+}
+
+/* Manual GPU test for milestone 4 (overlay render path): builds and submits
+ * one static RtPgsOverlayFrame proving every mechanism the ABI added --
+ * alpha-blended overlap, a texture, a scissor rect, and a transform -- so a
+ * human with a GPU and eyes can confirm the pass actually draws. Gated by
+ * ICORECOMP_UI_TEST=1, costs nothing when unset, removed by nobody: this is
+ * the only exercise of the overlay ABI until RmlUi replaces it (milestone
+ * 5). Laid out for a 640x480 surface, the historic default window size (see
+ * init_windowed's comment in gs_parallel_lib.cpp).
+ */
+void run_overlay_ui_test(RtPgs* pgs) {
+    std::vector<RtPgsOverlayVertex> verts;
+    std::vector<uint32_t> indices;
+    std::vector<RtPgsOverlayCmd> cmds;
+
+    /* Appends one quad (4 verts, 2 triangles) and returns a cmd already
+     * pointed at it via vertex_offset/index_offset/index_count; callers set
+     * texture/flags/translate/scissor/transform and push_back it. */
+    auto add_quad = [&](float x, float y, float w, float h, uint32_t rgba) {
+        RtPgsOverlayCmd cmd = {};
+        cmd.vertex_offset = int32_t(verts.size());
+        cmd.index_offset = uint32_t(indices.size());
+        cmd.index_count = 6;
+        verts.push_back({ x,     y,     0.0f, 0.0f, rgba });
+        verts.push_back({ x + w, y,     1.0f, 0.0f, rgba });
+        verts.push_back({ x + w, y + h, 1.0f, 1.0f, rgba });
+        verts.push_back({ x,     y + h, 0.0f, 1.0f, rgba });
+        for (uint32_t i : { 0u, 1u, 2u, 0u, 2u, 3u }) indices.push_back(i);
+        return cmd;
+    };
+
+    /* (a) two overlapping 50%-alpha colored quads: proves straight-alpha
+     * blending (SRC_ALPHA/ONE_MINUS_SRC_ALPHA) and draw order. */
+    cmds.push_back(add_quad(40, 40, 120, 120, pack_rgba(255, 0, 0, 128)));
+    cmds.push_back(add_quad(100, 100, 120, 120, pack_rgba(0, 128, 255, 128)));
+
+    /* (b) one quad textured with a generated 8x8 black/white checkerboard:
+     * proves rt_pgs_overlay_texture_create and set_texture. */
+    uint8_t checker[8 * 8 * 4];
+    for (unsigned ty = 0; ty < 8; ++ty) {
+        for (unsigned tx = 0; tx < 8; ++tx) {
+            const uint8_t v = ((tx ^ ty) & 1u) ? 255 : 0;
+            uint8_t* px = &checker[(ty * 8 + tx) * 4];
+            px[0] = v; px[1] = v; px[2] = v; px[3] = 255;
+        }
+    }
+    const uint32_t checker_tex = rt_pgs_overlay_texture_create(pgs, checker, 8, 8);
+    if (!checker_tex) {
+        rt_log("gs", "ICORECOMP_UI_TEST: checkerboard texture create failed");
+    }
+    {
+        RtPgsOverlayCmd c = add_quad(300, 40, 128, 128, pack_rgba(255, 255, 255, 255));
+        c.texture = checker_tex;
+        cmds.push_back(c);
+    }
+
+    /* (c) one quad with RT_PGS_OVERLAY_SCISSOR cutting it in half: proves
+     * scissor scaling/clamping (draw_overlay). */
+    {
+        RtPgsOverlayCmd c = add_quad(40, 300, 160, 100, pack_rgba(0, 255, 0, 255));
+        c.flags |= RT_PGS_OVERLAY_SCISSOR;
+        c.scissor_x = 40;
+        c.scissor_y = 300;
+        c.scissor_w = 80; /* left half of the 160-wide quad only */
+        c.scissor_h = 100;
+        cmds.push_back(c);
+    }
+
+    /* (d) one quad with RT_PGS_OVERLAY_TRANSFORM rotating ~15 degrees about
+     * its own center, then placed on the surface via translate: proves the
+     * transform path and that translate composes with it. */
+    {
+        RtPgsOverlayCmd c = add_quad(-40, -40, 80, 80, pack_rgba(255, 200, 0, 255));
+        c.flags |= RT_PGS_OVERLAY_TRANSFORM;
+        const float angle = 15.0f * 3.14159265f / 180.0f;
+        const float cs = std::cos(angle), sn = std::sin(angle);
+        const float t[16] = {
+              cs,  sn, 0.0f, 0.0f,
+             -sn,  cs, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f,
+        };
+        std::memcpy(c.transform, t, sizeof(t));
+        c.translate_x = 460.0f;
+        c.translate_y = 400.0f;
+        cmds.push_back(c);
+    }
+
+    RtPgsOverlayFrame frame = {};
+    frame.vertices = verts.data();
+    frame.vertex_count = uint32_t(verts.size());
+    frame.indices = indices.data();
+    frame.index_count = uint32_t(indices.size());
+    frame.cmds = cmds.data();
+    frame.cmd_count = uint32_t(cmds.size());
+    frame.surface_width = 640;
+    frame.surface_height = 480;
+
+    rt_pgs_overlay_set_frame(pgs, &frame);
+    rt_log("gs", "ICORECOMP_UI_TEST=1: static overlay test frame submitted (%u cmds, texture id %u)",
+           frame.cmd_count, checker_tex);
+}
 
 void host_log(const char* component, const char* message) {
     rt_log(component, "%s", message);
@@ -113,6 +223,10 @@ public:
         RtPgsCreateOptions opts = resolve_create_options();
         m_pgs = rt_pgs_create(&host, &opts); /* fatal (never null) on setup failure */
         g_live_pgs = m_pgs;
+
+        if (const char* v = std::getenv("ICORECOMP_UI_TEST"); v && std::strcmp(v, "1") == 0) {
+            run_overlay_ui_test(m_pgs);
+        }
 
         /* init_windowed (gs_parallel_lib.cpp) already opened the window at
          * opts.window_width/height, i.e. display.window_width/height, so a

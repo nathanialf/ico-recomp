@@ -126,6 +126,62 @@ RT_GS_API void  rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filte
  * (host validates). hires_scanout below 4x logs once and stays off. */
 RT_GS_API void  rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor, uint32_t hires_scanout);
 
+/* Overlay rendering: a small textured/scissored 2D pass drawn on top of the
+ * swapchain backbuffer, used by the settings menu and (later) RmlUi. Plain
+ * POD in, no host callback needed; the library owns the Vulkan pipeline,
+ * pooled vertex/index buffers and texture images. */
+
+typedef struct RtPgsOverlayVertex {
+    float x, y;       /* pixels, origin top-left of the surface */
+    float u, v;
+    uint32_t rgba;    /* R8G8B8A8_UNORM byte order, straight (non-premultiplied) alpha */
+} RtPgsOverlayVertex;
+
+#define RT_PGS_OVERLAY_SCISSOR   1u   /* scissor_* fields are valid */
+#define RT_PGS_OVERLAY_TRANSFORM 2u   /* transform[] is not identity */
+
+typedef struct RtPgsOverlayCmd {
+    uint32_t texture;        /* id from rt_pgs_overlay_texture_create; 0 = solid white */
+    uint32_t index_offset;
+    uint32_t index_count;
+    int32_t  vertex_offset;
+    float    translate_x, translate_y;
+    int32_t  scissor_x, scissor_y, scissor_w, scissor_h;
+    uint32_t flags;
+    float    transform[16]; /* column-major, column vectors */
+} RtPgsOverlayCmd;
+
+typedef struct RtPgsOverlayFrame {
+    const RtPgsOverlayVertex* vertices; uint32_t vertex_count;
+    const uint32_t*           indices;  uint32_t index_count;
+    const RtPgsOverlayCmd*    cmds;     uint32_t cmd_count;
+    uint32_t surface_width, surface_height; /* the size the geometry was laid out for */
+} RtPgsOverlayFrame;
+
+/* Uploads an immutable RGBA8 texture and returns an id for use as
+ * RtPgsOverlayCmd::texture (0 always means "no texture, solid white").
+ * 0 on failure, logged. Between frames only: this allocates and submits
+ * GPU work, so it reuses the m_in_frame fatal guard (fatal if called from
+ * pump_events or otherwise while a frame is in flight). */
+RT_GS_API uint32_t rt_pgs_overlay_texture_create(RtPgs* pgs, const uint8_t* rgba8, uint32_t width, uint32_t height);
+/* Between frames only; same m_in_frame guard as texture_create. Destroying
+ * an id still referenced by the retained overlay frame is the caller's bug;
+ * the library does not scan for that. */
+RT_GS_API void     rt_pgs_overlay_texture_destroy(RtPgs* pgs, uint32_t texture);
+/* Deep-copies frame into retained storage; drawn by every present (both
+ * rt_pgs_vsync's windowed path and rt_pgs_present_ui) until replaced. NULL
+ * or an empty frame clears it. A malformed frame (out-of-range index/vertex
+ * ranges, an unknown texture id) is rejected whole with one loud log; the
+ * previous frame keeps drawing rather than risk out-of-bounds geometry.
+ * Between frames only; same m_in_frame guard as texture_create. */
+RT_GS_API void     rt_pgs_overlay_set_frame(RtPgs* pgs, const RtPgsOverlayFrame* frame);
+/* One presented frame with no guest scanout: clear the backbuffer, draw the
+ * retained overlay frame, present. For the launcher and any future overlay
+ * menu drawn while the guest is not producing scanout. Same RT_PGS_VSYNC_*
+ * return as rt_pgs_vsync; headless builds log once and return 0. Respects
+ * m_in_frame (fatal if called reentrantly, e.g. from pump_events). */
+RT_GS_API uint32_t rt_pgs_present_ui(RtPgs* pgs);
+
 /* Headless replay of a raw dump (gs_dumpwriter.cpp format) through
  * paraLLEl-GS's own GSDumpParser; the consumer-side check of the dump
  * writer. Progress and errors go to stderr. Returns 0 on success, nonzero
