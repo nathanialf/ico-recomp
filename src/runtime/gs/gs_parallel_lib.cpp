@@ -150,6 +150,33 @@ constexpr Vulkan::ContextCreationFlags kContextFlags =
     Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
     Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
 
+/* Shared by init_windowed (the have_opts branch) and rt_pgs_set_present_mode:
+ * RT_PGS_PRESENT_* -> the Vulkan::PresentMode Granite's WSI wants, plus the
+ * log wording used at both call sites. */
+Vulkan::PresentMode present_mode_from_rt(uint32_t rt_mode, const char** what) {
+    switch (rt_mode) {
+    case RT_PGS_PRESENT_FIFO:
+        *what = "FIFO (blocks on the display refresh)";
+        return Vulkan::PresentMode::SyncToVBlank;
+    case RT_PGS_PRESENT_IMMEDIATE:
+        *what = "immediate (may tear)";
+        return Vulkan::PresentMode::UnlockedForceTearing;
+    default: /* RT_PGS_PRESENT_MAILBOX */
+        *what = "mailbox (non-blocking, no tearing)";
+        return Vulkan::PresentMode::UnlockedNoTearing;
+    }
+}
+
+const char* present_mode_name(Vulkan::PresentMode mode) {
+    switch (mode) {
+    case Vulkan::PresentMode::SyncToVBlank: return "FIFO";
+    case Vulkan::PresentMode::UnlockedMaybeTear: return "mailbox/immediate (driver choice)";
+    case Vulkan::PresentMode::UnlockedForceTearing: return "immediate";
+    case Vulkan::PresentMode::UnlockedNoTearing: return "mailbox";
+    }
+    return "?";
+}
+
 #endif /* ICORECOMP_PGS_SDL */
 
 } // namespace
@@ -169,6 +196,15 @@ struct RtPgs {
     uint64_t read_priv(uint32_t offset);
     uint32_t vsync(unsigned field);
     void report_stats();
+
+    /* Window control / event pump inversion (shim 3); see gs_parallel_api.h. */
+    void* window_handle();
+    void notify_quit();
+    void notify_resize();
+    void surface_size(uint32_t* width, uint32_t* height);
+    void set_present_mode(uint32_t mode);
+    void set_presentation(uint32_t fit, uint32_t filter);
+    void set_render_scale(uint32_t factor, uint32_t hires_scanout);
 
 private:
     void init_headless();
@@ -230,6 +266,17 @@ private:
 
         bool alive(Vulkan::WSI&) override { return m_alive; }
 
+        /* Shared by the inline poll_input() loop below and the
+         * rt_pgs_notify_quit / rt_pgs_notify_resize entry points, so the
+         * exe-side pump (host/window.cpp) and the library's own fallback
+         * pump apply state changes identically. Public: RtPgs (the
+         * enclosing class) calls these directly, and a nested class does
+         * not automatically grant the enclosing class access to its own
+         * private members. */
+        void handle_quit() { m_alive = false; }
+        void handle_resize() { resize = true; }
+        SDL_Window* window() const { return m_window; }
+
         /* True when begin_frame() is safe to call. A minimized window makes
          * the driver report a 0x0 maxImageExtent, which Granite answers with
          * SwapchainError::NoSurface and a call to
@@ -262,16 +309,25 @@ private:
             }
         }
 
+        /* Event pump inversion: when the host supplied pump_events (the exe
+         * owns the only SDL_PollEvent loop; see gs_parallel_api.h and
+         * host/window.cpp), hand control to it instead of polling here. NULL
+         * keeps the pre-shim-3 behavior (icorecomp-gs-replay, or any host
+         * without a UI). */
         void poll_input() override {
+            if (m_owner.m_host.pump_events) {
+                m_owner.m_host.pump_events();
+                return;
+            }
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
                 switch (e.type) {
                     case SDL_EVENT_QUIT:
-                        m_alive = false;
+                        handle_quit();
                         break;
                     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                     case SDL_EVENT_WINDOW_RESIZED:
-                        resize = true;
+                        handle_resize();
                         break;
                     default:
                         break;
@@ -312,6 +368,13 @@ private:
     bool m_transfer_since_vsync = false;
     bool m_wsi_active = false;
     bool m_window_closed = false;
+    /* True from a successful m_wsi->begin_frame() until the matching
+     * end_frame(). Swapchain-touching entry points (set_present_mode,
+     * set_presentation, set_render_scale) fatal while this is set: they run
+     * from pump_events, which Granite calls from inside begin_frame, and
+     * Vulkan::WSI::set_present_mode would otherwise silently no-op mid-frame
+     * instead of taking effect. */
+    bool m_in_frame = false;
     /* Last (internal w, internal h, mode w, mode h, deinterlaced) whose aspect
      * was logged, so a mode change is visible in the log without spamming
      * every field. */
@@ -541,6 +604,119 @@ void RtPgs::report_stats() {
          (unsigned long long)m_vsyncs, m_wsi_active ? "windowed" : "headless");
 }
 
+/* ---- window control / event pump inversion (shim 3) ----------------------
+ *
+ * window_handle/notify_quit/notify_resize/surface_size are no-ops (NULL /
+ * 0x0 / dropped) when headless, matching the doc comments in
+ * gs_parallel_api.h. set_present_mode/set_presentation/set_render_scale are
+ * declared reachable "between frames only" by that same header; the
+ * m_in_frame check comes first so a caller that violates the contract gets a
+ * loud fatal, headless or not.
+ */
+
+void* RtPgs::window_handle() {
+#ifdef ICORECOMP_PGS_SDL
+    if (m_wsi_active && m_platform) return (void*)m_platform->window();
+#endif
+    return nullptr;
+}
+
+void RtPgs::notify_quit() {
+#ifdef ICORECOMP_PGS_SDL
+    if (m_platform) m_platform->handle_quit();
+#endif
+}
+
+void RtPgs::notify_resize() {
+#ifdef ICORECOMP_PGS_SDL
+    if (m_platform) m_platform->handle_resize();
+#endif
+}
+
+void RtPgs::surface_size(uint32_t* width, uint32_t* height) {
+    uint32_t w = 0, h = 0;
+#ifdef ICORECOMP_PGS_SDL
+    if (m_wsi_active && m_platform) {
+        w = m_platform->get_surface_width();
+        h = m_platform->get_surface_height();
+    }
+#endif
+    if (width) *width = w;
+    if (height) *height = h;
+}
+
+void RtPgs::set_present_mode(uint32_t mode) {
+    if (m_in_frame) {
+        fatalf("paraLLEl-GS: rt_pgs_set_present_mode called while a frame is in flight;"
+               " settings must apply at the field boundary");
+    }
+#ifdef ICORECOMP_PGS_SDL
+    if (!m_wsi_active) {
+        logf("paraLLEl-GS: rt_pgs_set_present_mode ignored (headless, no window)");
+        return;
+    }
+    const char* what = "mailbox (non-blocking, no tearing)";
+    Vulkan::PresentMode vk_mode = present_mode_from_rt(mode, &what);
+    m_opts.present_mode = mode;
+    m_wsi->set_present_mode(vk_mode);
+    /* set_present_mode only records the request; it takes effect on the
+     * swapchain that gets rebuilt at the next begin_frame. Reading
+     * get_present_mode() here reports the request just recorded, not
+     * necessarily what the driver ends up honoring -- logging requested vs
+     * what Granite is about to ask the driver for is still the useful
+     * signal for "does this driver even support mailbox". */
+    logf("paraLLEl-GS: present mode requested %s (%s, resolved by the host); "
+         "driver reports %s once the swapchain rebuilds",
+         what, present_mode_name(vk_mode), present_mode_name(m_wsi->get_present_mode()));
+#else
+    (void)mode;
+    logf("paraLLEl-GS: rt_pgs_set_present_mode ignored (built without window support)");
+#endif
+}
+
+void RtPgs::set_presentation(uint32_t fit, uint32_t filter) {
+    if (m_in_frame) {
+        fatalf("paraLLEl-GS: rt_pgs_set_presentation called while a frame is in flight;"
+               " settings must apply at the field boundary");
+    }
+    /* Only stores; present_frame reads m_opts.fit/filter fresh every field,
+     * so this takes effect at the next present with no further action. */
+    m_opts.fit = fit;
+    m_opts.filter = filter;
+}
+
+void RtPgs::set_render_scale(uint32_t factor, uint32_t hires_scanout) {
+    if (m_in_frame) {
+        fatalf("paraLLEl-GS: rt_pgs_set_render_scale called while a frame is in flight;"
+               " settings must apply at the field boundary");
+    }
+    ParallelGS::SuperSampling ss;
+    switch (factor) {
+    case 1: ss = ParallelGS::SuperSampling::X1; break;
+    case 2: ss = ParallelGS::SuperSampling::X2; break;
+    case 4: ss = ParallelGS::SuperSampling::X4; break;
+    case 8: ss = ParallelGS::SuperSampling::X8; break;
+    case 16: ss = ParallelGS::SuperSampling::X16; break;
+    default:
+        /* The host validates render_scale against settings.json's allowed
+         * set before this is ever called, so anything else is a programming
+         * error, not user input (same reasoning as the constructor). */
+        fatalf("paraLLEl-GS: rt_pgs_set_render_scale factor %u is not one of 1/2/4/8/16", factor);
+    }
+    /* ordered_super_sampling / super_sampled_textures kept at the GSOptions
+     * defaults (gs_interface.hpp): true / false. Nothing here changes them. */
+    m_iface->set_super_sampling_rate(ss, true, false);
+    m_opts.render_scale = factor;
+    if (hires_scanout && factor < 4) {
+        /* Same message as the create path (RtPgs::RtPgs); stays off rather
+         * than silently engaging below the documented minimum. */
+        logf("paraLLEl-GS: high_resolution_scanout needs render_scale >= 4; staying off");
+        m_opts.hires_scanout = 0;
+    } else {
+        m_opts.hires_scanout = hires_scanout;
+    }
+}
+
 void RtPgs::init_headless() {
     RtGsContextResult ctx = rt_gs_make_pgs_context();
     if (!ctx.context) {
@@ -566,8 +742,12 @@ void RtPgs::init_windowed() {
     /* 640x480: the 4:3 this backend presents at (scanout_display_aspect), so
      * the window opens with no letterbox. Not the scanout's pixel dimensions:
      * ICO scans out 512x224 in the mode domain, which is not its shape on a
-     * TV. */
-    if (!platform->init(640, 480)) return;
+     * TV. display.window_width/height (settings.json) override this when
+     * set; 0 in either field keeps the 640x480 default (see
+     * RtPgsCreateOptions in gs_parallel_api.h). */
+    const unsigned window_w = (m_have_opts && m_opts.window_width) ? m_opts.window_width : 640;
+    const unsigned window_h = (m_have_opts && m_opts.window_height) ? m_opts.window_height : 480;
+    if (!platform->init(window_w, window_h)) return;
 
     auto wsi = std::make_unique<Vulkan::WSI>();
     wsi->set_platform(platform.get());
@@ -588,18 +768,7 @@ void RtPgs::init_windowed() {
         if (m_have_opts) {
             /* The host already resolved settings.json vs ICORECOMP_GS_PRESENT
              * (gs_parallel.cpp); this reads only the result. */
-            switch (m_opts.present_mode) {
-            case RT_PGS_PRESENT_FIFO:
-                mode = Vulkan::PresentMode::SyncToVBlank;
-                what = "FIFO (blocks on the display refresh)";
-                break;
-            case RT_PGS_PRESENT_IMMEDIATE:
-                mode = Vulkan::PresentMode::UnlockedForceTearing;
-                what = "immediate (may tear)";
-                break;
-            default:
-                break; /* RT_PGS_PRESENT_MAILBOX, the default above */
-            }
+            mode = present_mode_from_rt(m_opts.present_mode, &what);
             logf("paraLLEl-GS: present mode %s (display.present, resolved by the host)", what);
         } else {
             /* opts == NULL: the pre-settings default path documented on
@@ -657,7 +826,16 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
         return;
     }
 
+    /* Set before the call, not after it returns: Granite's WSI::begin_frame
+     * (wsi.cpp) calls platform->poll_input() -- and so pump_events -- itself,
+     * after acquiring the swapchain image but before begin_frame() returns
+     * ("Poll after acquire as well for optimal latency"). The guard has to
+     * be armed across that reentrant call, which is exactly why
+     * pump_events may only queue events and call notify_quit/notify_resize;
+     * anything else it calls lands here fatal. */
+    m_in_frame = true;
     if (!m_wsi->begin_frame()) {
+        m_in_frame = false;
         logf("paraLLEl-GS: WSI begin_frame failed");
         return;
     }
@@ -753,6 +931,7 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
     if (!m_wsi->end_frame()) {
         logf("paraLLEl-GS: WSI end_frame failed");
     }
+    m_in_frame = false;
 }
 
 #endif /* ICORECOMP_PGS_SDL */
@@ -787,6 +966,34 @@ uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field) {
 
 void rt_pgs_report_stats(RtPgs* pgs) {
     pgs->report_stats();
+}
+
+void* rt_pgs_window_handle(RtPgs* pgs) {
+    return pgs->window_handle();
+}
+
+void rt_pgs_notify_quit(RtPgs* pgs) {
+    pgs->notify_quit();
+}
+
+void rt_pgs_notify_resize(RtPgs* pgs) {
+    pgs->notify_resize();
+}
+
+void rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height) {
+    pgs->surface_size(width, height);
+}
+
+void rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode) {
+    pgs->set_present_mode(mode);
+}
+
+void rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filter) {
+    pgs->set_presentation(fit, filter);
+}
+
+void rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor, uint32_t hires_scanout) {
+    pgs->set_render_scale(factor, hires_scanout);
 }
 
 /* Body moved intact from the pre-C-ABI gs_replay_main.cpp so the replay

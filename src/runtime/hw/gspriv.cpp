@@ -19,6 +19,7 @@
 #include "../host/audio.h"
 #include "../host/portable.h"
 #include "../host/settings.h"
+#include "../host/window.h"
 #include "../prof.h"
 #include <cstring>
 #include <cstdlib>
@@ -193,6 +194,17 @@ void pace_field() {
 } // namespace
 
 void rt_gs_vsync_hook(unsigned field) {
+    /* The event pump also runs from inside WSI::begin_frame via the
+     * pump_events callback (gs_parallel_lib.cpp's RtPgs::present_frame), but
+     * that only happens when a frame is actually presented. Running it here
+     * too guarantees events (and window-close) still drain on a skipped
+     * field -- a minimized window, or a dump/headless backend that never
+     * calls begin_frame at all. rt_settings_apply_pending() applies warm
+     * settings (present mode, render scale) here because their subsystem
+     * calls fatal if made mid-frame; this is the one place guaranteed to run
+     * between frames every field. */
+    rt_window_pump();
+    rt_settings_apply_pending();
     {
         RT_PROF_ZONE(RT_PROF_PRESENT);
         GsBackend* be = rt_gs_backend();

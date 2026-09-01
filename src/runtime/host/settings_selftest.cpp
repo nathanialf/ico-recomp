@@ -42,6 +42,17 @@ const char* rt_base_dir() {
     return g_base_dir.c_str();
 }
 
+/* rt_settings_commit() (settings.cpp) calls rt_settings_apply(before, now)
+ * after validation; the real implementation (settings_apply.cpp) pushes
+ * changes into window control and the GS backend, which this selftest
+ * deliberately does not link -- see the file comment above: JSON + the
+ * settings model only, stubbed against exactly two runtime.h externs. A
+ * stub here is simpler than linking settings_apply.cpp, which would pull in
+ * window.cpp and gs_parallel.cpp/gs_select.cpp (SDL, the GS backend, hw.h)
+ * for no benefit to what this target verifies. */
+void rt_settings_apply(const RtSettings&, const RtSettings&) {}
+void rt_settings_apply_pending() {}
+
 /* ---- test harness ---------------------------------------------------------- */
 
 namespace {

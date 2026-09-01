@@ -38,6 +38,13 @@ RT_GS_API const char* icorecomp_parallel_gs_shim_version(void);
 typedef struct RtPgsHost {
     void (*log)(const char* component, const char* message);
     void (*fatal)(const char* component, const char* message);
+    /* Pumps the host's SDL event loop. NULL: the library pumps SDL itself
+     * (the pre-shim-3 behavior; the replay tool and any host without a UI
+     * use that). Called from inside Granite's WSI::begin_frame, so a
+     * swapchain image may be acquired: the callback may only queue events
+     * and call rt_pgs_notify_quit / rt_pgs_notify_resize. Any other
+     * rt_pgs_* call from inside it is fatal (see the in-frame guard). */
+    void (*pump_events)(void);
 } RtPgsHost;
 
 /* Opaque live-backend instance (Vulkan device + optional SDL3 window +
@@ -61,6 +68,9 @@ typedef struct RtPgsCreateOptions {
     uint32_t filter;         /* RT_PGS_FILTER_* */
     uint32_t render_scale;   /* 1/2/4/8/16, paraLLEl-GS SuperSampling factor */
     uint32_t hires_scanout;  /* nonzero: high resolution scanout; needs render_scale >= 4 */
+    /* Initial window size in logical pixels. 0 (either field): the historic
+     * 640x480 default (see init_windowed's comment on why 4:3). */
+    uint32_t window_width, window_height;
 } RtPgsCreateOptions;
 
 /* Creates the live backend. Never returns NULL: unrecoverable setup errors
@@ -87,6 +97,34 @@ RT_GS_API uint64_t rt_pgs_read_priv(RtPgs* pgs, uint32_t offset);
 RT_GS_API uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field);
 
 RT_GS_API void rt_pgs_report_stats(RtPgs* pgs);
+
+/* Window control and event-pump inversion (shim 3). The exe owns the only
+ * SDL_PollEvent loop (host/window.cpp); these let it drive the window the
+ * library created without the library polling SDL itself. */
+
+/* SDL_Window* as void*, NULL when headless. Opaque on purpose: the exe must
+ * not link SDL types through this boundary, only pass the pointer to SDL
+ * calls it makes itself (see host/window.cpp). */
+RT_GS_API void* rt_pgs_window_handle(RtPgs* pgs);
+/* Reported the same way the inline SDL_EVENT_QUIT handling used to: the
+ * next vsync's RT_PGS_VSYNC_WINDOW_CLOSED reflects it. */
+RT_GS_API void  rt_pgs_notify_quit(RtPgs* pgs);
+/* Reported the same way the inline SDL_EVENT_WINDOW_RESIZED /
+ * SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED handling used to: the swapchain is
+ * rebuilt at the next presentable frame. */
+RT_GS_API void  rt_pgs_notify_resize(RtPgs* pgs);
+/* Current surface size in pixels, 0x0 when headless. */
+RT_GS_API void  rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height);
+/* Between frames only; fatal when called while a frame is in flight
+ * (including from pump_events). Same RT_PGS_PRESENT_* values as create. */
+RT_GS_API void  rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode);
+/* Presentation of the final scanout only (fit + filter); takes effect at
+ * the next present. Safe between frames; fatal from pump_events. */
+RT_GS_API void  rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filter);
+/* Retunes super-sampling in flight (dynamic_super_sampling was set at
+ * init). Between frames only; fatal mid-frame. Invalid factor is fatal
+ * (host validates). hires_scanout below 4x logs once and stays off. */
+RT_GS_API void  rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor, uint32_t hires_scanout);
 
 /* Headless replay of a raw dump (gs_dumpwriter.cpp format) through
  * paraLLEl-GS's own GSDumpParser; the consumer-side check of the dump

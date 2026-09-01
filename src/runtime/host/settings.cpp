@@ -724,11 +724,10 @@ RtSettings& rt_settings_mutable() {
 }
 
 void rt_settings_commit() {
+    RtSettings before = g_committed;
     commit_validate(&g_current, g_committed);
     g_committed = g_current;
-    /* No subsystem applier yet: rt_settings_apply(before, now) lands in
-     * settings_apply.cpp with the first consumers (milestone 2). For now
-     * commit only validates the struct and saves it. */
+    rt_settings_apply(before, g_committed);
     rt_settings_save();
 }
 

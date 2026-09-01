@@ -133,4 +133,16 @@ const char* rt_settings_path();
  * display. */
 bool rt_settings_overridden(const char* dotted_key);
 
+/* The one place a settings diff becomes subsystem calls (settings_apply.cpp).
+ * Called from rt_settings_commit(), after validation, with the previously
+ * committed struct and the newly committed one. Hot settings (fullscreen,
+ * window size, presentation fit/filter) apply immediately; warm settings
+ * (present mode, render scale) queue for rt_settings_apply_pending(), which
+ * rt_gs_vsync_hook (hw/gspriv.cpp) calls at the next field boundary, because
+ * their subsystem entry points fatal when called mid-frame. Volume,
+ * verbosity, fps cap and profiler period need no applier here: their
+ * consumers already read rt_settings() fresh on every use. */
+void rt_settings_apply(const RtSettings& before, const RtSettings& now);
+void rt_settings_apply_pending();
+
 #endif /* ICORECOMP_HOST_SETTINGS_H */

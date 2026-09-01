@@ -19,6 +19,7 @@
 #include "runtime.h"
 
 #include "../host/settings.h"
+#include "../host/window.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,21 @@ void host_log(const char* component, const char* message) {
 void host_fatal(const char* component, const char* message) {
     rt_fatal(component, nullptr, "%s", message);
 }
+
+/* Event pump inversion (shim 3): the exe owns the only SDL_PollEvent loop.
+ * Called from inside Granite's WSI::begin_frame (see gs_parallel_lib.cpp's
+ * RtPgs::present_frame); rt_window_pump honors that reentrancy contract
+ * (queue/translate events, notify_quit/notify_resize only). */
+void host_pump_events() {
+    rt_window_pump();
+}
+
+/* The live backend's RtPgs*, exposed to the exe side (host/window.cpp,
+ * host/settings_apply.cpp) via rt_gs_parallel_handle(). Set for the
+ * lifetime of the one ParallelBackend instance gs_select.cpp ever creates;
+ * RtPgs itself stays opaque here, same as everywhere else on this side of
+ * the LGPL boundary. */
+RtPgs* g_live_pgs = nullptr;
 
 /* Startup options for rt_pgs_create: env resolution plus settings.json.
  * Called from rt_hw_init() (see main.cpp), which runs after
@@ -80,18 +96,38 @@ RtPgsCreateOptions resolve_create_options() {
     opts.filter = s.display.filter == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
     opts.render_scale = (uint32_t)s.display.render_scale;
     opts.hires_scanout = s.display.hires_scanout ? 1u : 0u;
+    /* No env twin either. 0 would mean "the shim's own 640x480 default"
+     * (see RtPgsCreateOptions in gs_parallel_api.h); display.window_width/
+     * height already defaults to that same 640x480, so passing them
+     * straight through is equivalent to 0 whenever settings are at their
+     * compiled-in default and simply honors a user's saved size otherwise. */
+    opts.window_width = (uint32_t)s.display.window_width;
+    opts.window_height = (uint32_t)s.display.window_height;
     return opts;
 }
 
 class ParallelBackend final : public GsBackend {
 public:
     ParallelBackend() {
-        const RtPgsHost host = { host_log, host_fatal };
+        const RtPgsHost host = { host_log, host_fatal, host_pump_events };
         RtPgsCreateOptions opts = resolve_create_options();
         m_pgs = rt_pgs_create(&host, &opts); /* fatal (never null) on setup failure */
+        g_live_pgs = m_pgs;
+
+        /* init_windowed (gs_parallel_lib.cpp) already opened the window at
+         * opts.window_width/height, i.e. display.window_width/height, so a
+         * Windowed-mode run needs no further action here. Either fullscreen
+         * mode still needs rt_window_apply_mode to take the window from
+         * "windowed at the configured size" (what rt_pgs_create just did)
+         * to what display.mode actually asks for. */
+        const RtSettings& s = rt_settings();
+        if (s.display.mode != RtDisplayMode::Windowed) {
+            rt_window_apply_mode(s);
+        }
     }
 
     ~ParallelBackend() override {
+        g_live_pgs = nullptr;
         rt_pgs_destroy(m_pgs);
         m_pgs = nullptr;
     }
@@ -129,6 +165,16 @@ private:
 
 GsBackend* rt_gs_make_parallel_backend() {
     return new ParallelBackend();
+}
+
+/* See window.h: the exe-side accessor to the live backend's RtPgs*, used by
+ * host/window.cpp (the event pump) and host/settings_apply.cpp (warm
+ * appliers). window.cpp carries the nullptr stub for builds with no
+ * paraLLEl-GS backend at all (ICORECOMP_HAVE_PARALLEL_GS unset); this is
+ * the one definition when the backend exists, regardless of whether it is
+ * the one currently selected by ICORECOMP_GS. */
+RtPgs* rt_gs_parallel_handle() {
+    return g_live_pgs;
 }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */

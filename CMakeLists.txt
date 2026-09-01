@@ -64,6 +64,8 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/host/input.cpp
     src/runtime/host/json.cpp
     src/runtime/host/settings.cpp
+    src/runtime/host/settings_apply.cpp
+    src/runtime/host/window.cpp
     src/runtime/snd/spu.cpp
     src/runtime/snd/engine.cpp
     src/runtime/snd/reverb.cpp
