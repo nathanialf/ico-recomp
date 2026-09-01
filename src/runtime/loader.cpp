@@ -307,14 +307,31 @@ constexpr char kDiscElfSrc[] = "SCUS_971.13 (from the mounted disc image)";
 
 /* The ELF image rt_boot_precheck already read and pin-checked, kept so the
  * rt_load_elf that follows a successful precheck does not read the file (or
- * ~1 MB off the disc) a second time. Only used when the source string
- * rt_load_elf resolves to is the one the precheck cached. */
+ * ~1 MB off the disc) a second time. Only used when the key rt_load_elf
+ * resolves to is the one the precheck cached. */
 struct ElfImageCache {
     bool valid = false;
-    char src[1536] = {0};
+    std::string key;
     std::vector<uint8_t> bytes;
 };
 ElfImageCache g_elf_cache;
+
+/* Cache key for one boot ELF image.
+ *
+ * The decomp-checkout source string is the resolved path, so it names the
+ * image on its own. The disc source string is the constant kDiscElfSrc,
+ * identical for every image, so the mounted image path is appended: the
+ * launcher can mount a different image between the precheck and
+ * rt_load_elf, and keying on the label alone would hand back the previous
+ * image's bytes together with the pin result that was measured against
+ * them. An unmounted disc produces a key no mount can match, which is the
+ * wanted answer too: there are no bytes to reuse. */
+std::string elf_cache_key(const char* src) {
+    if (std::strcmp(src, kDiscElfSrc) == 0) {
+        return std::string(src) + "|" + rt_iso_mounted_path();
+    }
+    return std::string(src);
+}
 
 /* Produces the boot ELF bytes and the source string used in messages: the
  * decomp checkout's ELF when the config names one and it is readable,
@@ -332,7 +349,7 @@ bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint
     if (cfg.decomp_root[0] && cfg.decomp_elf[0]) {
         rt_resolve_elf_path(cfg, src, src_len);
         rt_log("loader", "ELF path: %s", src);
-        if (g_elf_cache.valid && std::strcmp(g_elf_cache.src, src) == 0) {
+        if (g_elf_cache.valid && g_elf_cache.key == elf_cache_key(src)) {
             *out = g_elf_cache.bytes;
             rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
             return true;
@@ -353,7 +370,7 @@ bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint
     }
 
     std::snprintf(src, src_len, "%s", kDiscElfSrc);
-    if (g_elf_cache.valid && std::strcmp(g_elf_cache.src, src) == 0) {
+    if (g_elf_cache.valid && g_elf_cache.key == elf_cache_key(src)) {
         *out = g_elf_cache.bytes;
         rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
         return true;
@@ -501,7 +518,7 @@ bool rt_boot_precheck(char* err, size_t err_len) {
 
     /* Hand the bytes to the rt_load_elf that follows, so the disc read or
      * file read happens once per run. The disc stays mounted. */
-    std::snprintf(g_elf_cache.src, sizeof(g_elf_cache.src), "%s", src);
+    g_elf_cache.key = elf_cache_key(src);
     g_elf_cache.bytes = std::move(elf);
     g_elf_cache.valid = true;
     return true;

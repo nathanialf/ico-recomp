@@ -329,50 +329,64 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
         if (button == SDL_GAMEPAD_BUTTON_EAST) return close_menu();
         const Rml::Input::KeyIdentifier key = convert_gamepad_button(button);
         if (key == Rml::Input::KI_UNKNOWN) return false;
-        bool consumed = context->ProcessKeyDown(key, 0);
+        /* Every Rml::Context::Process* below is negated. RmlUi's convention
+         * is inverted from this function's: Process* returns true when the
+         * event was NOT consumed (Include/RmlUi/Core/Context.h, the @return
+         * on each of them), while rt_ui_handle_sdl_event returns true to
+         * mean the UI took the event and the game must not see it. Passing
+         * the return value through unchanged handed the game exactly the
+         * keys and clicks the menu had just acted on. */
+        bool consumed = !context->ProcessKeyDown(key, 0);
         if (key == Rml::Input::KI_RETURN) {
             /* The keyboard path pairs Enter with a newline text input; the
-             * text widget needs both to commit a field. */
-            consumed &= context->ProcessTextInput('\n');
+             * text widget needs both to commit a field, so the call is made
+             * unconditionally rather than short-circuited away. Either half
+             * being consumed means the UI took the press. */
+            const bool text_consumed = !context->ProcessTextInput('\n');
+            consumed = consumed || text_consumed;
         }
         return consumed;
     }
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         const Rml::Input::KeyIdentifier key = convert_gamepad_button(SDL_GamepadButton(e.gbutton.button));
         if (key == Rml::Input::KI_UNKNOWN) return false;
-        return context->ProcessKeyUp(key, 0);
+        return !context->ProcessKeyUp(key, 0);
     }
     case SDL_EVENT_MOUSE_MOTION: {
         int x = 0, y = 0;
         window_to_surface(e.motion.x, e.motion.y, &x, &y);
-        return context->ProcessMouseMove(x, y, key_modifier_state());
+        return !context->ProcessMouseMove(x, y, key_modifier_state());
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN: {
-        const bool consumed = context->ProcessMouseButtonDown(convert_mouse_button(e.button.button),
-                                                              key_modifier_state());
+        const bool consumed = !context->ProcessMouseButtonDown(convert_mouse_button(e.button.button),
+                                                               key_modifier_state());
         SDL_CaptureMouse(true);
         return consumed;
     }
     case SDL_EVENT_MOUSE_BUTTON_UP: {
         SDL_CaptureMouse(false);
-        return context->ProcessMouseButtonUp(convert_mouse_button(e.button.button), key_modifier_state());
+        return !context->ProcessMouseButtonUp(convert_mouse_button(e.button.button), key_modifier_state());
     }
     case SDL_EVENT_MOUSE_WHEEL:
-        return context->ProcessMouseWheel(float(-e.wheel.y), key_modifier_state());
+        return !context->ProcessMouseWheel(float(-e.wheel.y), key_modifier_state());
     case SDL_EVENT_KEY_DOWN: {
         if (e.key.key == SDLK_ESCAPE && close_menu()) return true;
-        bool consumed = context->ProcessKeyDown(convert_key(e.key.key), key_modifier_state());
+        bool consumed = !context->ProcessKeyDown(convert_key(e.key.key), key_modifier_state());
         if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER) {
-            consumed &= context->ProcessTextInput('\n');
+            /* Unconditional, not short-circuited: the text widget needs the
+             * newline to commit the field whether or not the key down was
+             * already consumed. */
+            const bool text_consumed = !context->ProcessTextInput('\n');
+            consumed = consumed || text_consumed;
         }
         return consumed;
     }
     case SDL_EVENT_KEY_UP:
-        return context->ProcessKeyUp(convert_key(e.key.key), key_modifier_state());
+        return !context->ProcessKeyUp(convert_key(e.key.key), key_modifier_state());
     case SDL_EVENT_TEXT_INPUT:
-        return context->ProcessTextInput(Rml::String(e.text.text));
+        return !context->ProcessTextInput(Rml::String(e.text.text));
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
-        return context->ProcessMouseLeave();
+        return !context->ProcessMouseLeave();
     default:
         break;
     }

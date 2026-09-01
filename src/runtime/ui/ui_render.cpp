@@ -52,6 +52,22 @@ void log_unsupported_once(bool& logged, const char* function) {
 } // namespace
 
 void UiRenderInterface::begin_frame() {
+    /* Retire the textures released two or more ticks ago, before anything of
+     * this tick is built. ReleaseTexture explains the rule; the short form is
+     * that the newest frame the library can still be holding was built in the
+     * previous tick, so an id released during tick N is only unreferenced
+     * everywhere once tick N+2 starts. */
+    ++m_tick;
+    size_t kept = 0;
+    for (const PendingTextureDestroy& p : m_pending_destroy) {
+        if (p.tick + 2 <= m_tick) {
+            backend_texture_destroy(p.texture);
+        } else {
+            m_pending_destroy[kept++] = p;
+        }
+    }
+    m_pending_destroy.resize(kept);
+
     m_vertices.clear();
     m_indices.clear();
     m_cmds.clear();
@@ -204,11 +220,22 @@ Rml::TextureHandle UiRenderInterface::GenerateTexture(Rml::Span<const Rml::byte>
 
 void UiRenderInterface::ReleaseTexture(Rml::TextureHandle texture) {
     if (texture == 0) return;
-    /* Immediate, and safe: the tick that triggered this replaces the
-     * retained overlay frame before the next present can reference the dead
-     * id, and the library defers the image's actual destruction by frame
-     * context. */
-    backend_texture_destroy(uint32_t(texture));
+    /* Deferred, not immediate. RmlUi can release a glyph atlas in the middle
+     * of Context::Render(): a glyph that is new to a font face forces the
+     * layer to regenerate, FontFaceLayer::Generate clears textures_owned
+     * (third_party/rmlui/Source/Core/FontEngineDefault/FontFaceLayer.cpp:26)
+     * and RenderManager calls straight through to ReleaseTexture
+     * (Source/Core/RenderManager.cpp:342). Two things still name the id at
+     * that moment: the commands this tick already emitted, and the frame the
+     * library retained from the last tick. Destroying it there made
+     * rt_pgs_overlay_set_frame reject the whole frame ("references unknown
+     * texture"), or left the already-retained frame drawing white boxes.
+     *
+     * So record the id with the tick that released it and let begin_frame()
+     * destroy it once two ticks have started. An id released anywhere in
+     * tick N is unreferenced by the frame built in tick N+1, and that frame
+     * has replaced the retained one by the time tick N+2 begins. */
+    m_pending_destroy.push_back(PendingTextureDestroy{ uint32_t(texture), m_tick });
 }
 
 void UiRenderInterface::EnableScissorRegion(bool enable) {

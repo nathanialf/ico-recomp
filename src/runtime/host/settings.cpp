@@ -16,7 +16,8 @@
  * config file the user (or a hand-edit) can break in any number of ways,
  * and it should never cost them the rest of a working file:
  *   - a parse error copies the raw file to "<path>.bad" and runs on
- *     defaults; the broken original is preserved, never overwritten again;
+ *     defaults; the broken original is preserved and never overwritten
+ *     again, which means saving is off for the rest of that run;
  *   - a field with the wrong JSON type or an out-of-range value keeps the
  *     compiled-in default for that one field, logs why, and the rest of
  *     the file still loads;
@@ -97,20 +98,38 @@ constexpr BindDef kGamepadBinds[RT_GP_COUNT] = {
  * "Set" means present in the environment, even as an empty string: that is
  * what every consumer above tests (getenv() != NULL), so the UI's
  * "overridden by" state and the consumer's actual behavior agree.
+ *
+ * ICORECOMP_LOG is the one exception, and `nonempty` records it. log.cpp
+ * tests `env && *env`, because an empty log path names no file and so
+ * overrides nothing; reporting debug.log_file as overridden for an empty
+ * value would tell the user the setting was ignored when it is exactly what
+ * took effect.
  */
 struct EnvTwin {
     const char* dotted_key;
     const char* env_var;
+    bool nonempty;
 };
 
 constexpr EnvTwin kEnvTwins[] = {
-    {"display.present", "ICORECOMP_GS_PRESENT"},
-    {"debug.fps_limit_hz", "ICORECOMP_FPS_LIMIT"},
-    {"debug.verbose", "ICORECOMP_VERBOSE"},
-    {"debug.profile_fields", "ICORECOMP_PROFILE"},
-    {"debug.log_file", "ICORECOMP_LOG"},
-    {"audio.mute", "ICORECOMP_NO_AUDIO"},
+    {"display.present", "ICORECOMP_GS_PRESENT", false},
+    {"debug.fps_limit_hz", "ICORECOMP_FPS_LIMIT", false},
+    {"debug.verbose", "ICORECOMP_VERBOSE", false},
+    {"debug.profile_fields", "ICORECOMP_PROFILE", false},
+    {"debug.log_file", "ICORECOMP_LOG", true},
+    {"audio.mute", "ICORECOMP_NO_AUDIO", false},
 };
+
+/* The value this twin overrides its setting with, or null when it is not
+ * set in the sense its consumer means (see `nonempty` above). The startup
+ * log and rt_settings_overridden() both go through this so the two can
+ * never disagree. */
+const char* env_twin_value(const EnvTwin& t) {
+    const char* v = std::getenv(t.env_var);
+    if (!v) return nullptr;
+    if (t.nonempty && !*v) return nullptr;
+    return v;
+}
 
 /* ---- enum <-> JSON string tables ------------------------------------------ */
 
@@ -243,7 +262,13 @@ void load_double_range(const RtJson* v, const char* dotted, double lo, double hi
     *out = d;
 }
 
-void load_float_range(const RtJson* v, const char* dotted, float lo, float hi, bool lo_exclusive, float* out) {
+/* The bounds are doubles, and revert_float's are the same doubles, so the
+ * load path and the commit path share one predicate. Narrowing them to
+ * float would not: 0.95 as a double is above (double)0.95f, so the
+ * documented maximum would parse, widen, and fail the comparison the loader
+ * makes in double, while the commit path (which compares the stored float)
+ * accepted the very same value. */
+void load_float_range(const RtJson* v, const char* dotted, double lo, double hi, bool lo_exclusive, float* out) {
     double d = *out;
     load_double_range(v, dotted, lo, hi, lo_exclusive, &d);
     *out = (float)d;
@@ -394,9 +419,9 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             });
             map_bind_section(i->find("keyboard"), "input.keyboard", kKeyboardBinds, RT_KB_COUNT, out->input.keyboard);
             map_bind_section(i->find("gamepad"), "input.gamepad", kGamepadBinds, RT_GP_COUNT, out->input.gamepad);
-            load_float_range(i->find("left_deadzone"), "input.left_deadzone", 0.0f, 0.95f, false, &out->input.left_deadzone);
-            load_float_range(i->find("right_deadzone"), "input.right_deadzone", 0.0f, 0.95f, false, &out->input.right_deadzone);
-            load_float_range(i->find("trigger_threshold"), "input.trigger_threshold", 0.0f, 1.0f, true, &out->input.trigger_threshold);
+            load_float_range(i->find("left_deadzone"), "input.left_deadzone", 0.0, 0.95, false, &out->input.left_deadzone);
+            load_float_range(i->find("right_deadzone"), "input.right_deadzone", 0.0, 0.95, false, &out->input.right_deadzone);
+            load_float_range(i->find("trigger_threshold"), "input.trigger_threshold", 0.0, 1.0, true, &out->input.trigger_threshold);
             load_bool(i->find("rumble"), "input.rumble", &out->input.rumble);
         }
     }
@@ -505,6 +530,18 @@ void write_bad_copy(const std::string& path, const std::string& text) {
     std::fclose(f);
 }
 
+/* Saving is off for the rest of a run whose settings file did not parse.
+ * g_path still points at that file and the run is on defaults, so the next
+ * save would replace the file the user still has to fix with a defaults
+ * document; the .bad copy on its own does not keep the "never overwritten
+ * again" promise, this does. Every path that writes a .bad copy calls
+ * this. */
+void block_saving_for_broken_file(const std::string& path) {
+    g_save_allowed = false;
+    g_save_blocked_reason = path + " failed to parse and was copied to " + path +
+        ".bad; fix or delete it, then restart";
+}
+
 /* Opens `path` and reads its entire contents into `*out`. Returns false
  * (leaving `*out` empty) when the file cannot be opened; a file that opens
  * but is empty returns true with `*out` cleared. */
@@ -540,17 +577,20 @@ void load_file(const std::string& path) {
     if (!rt_json_parse(text, &parsed, &err)) {
         write_bad_copy(path, text);
         rt_log("settings", "settings: %s:%s; running on defaults, file copied to %s.bad", path.c_str(), err.c_str(), path.c_str());
+        block_saving_for_broken_file(path);
         return;
     }
     if (parsed.type != RtJson::Type::Object) {
         write_bad_copy(path, text);
         rt_log("settings", "settings: %s: top level is not an object; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
+        block_saving_for_broken_file(path);
         return;
     }
     const RtJson* ver = parsed.find("version");
     if (!ver || ver->type != RtJson::Type::Number) {
         write_bad_copy(path, text);
         rt_log("settings", "settings: %s: missing or non-numeric \"version\"; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
+        block_saving_for_broken_file(path);
         return;
     }
     if (ver->number > 1.0) {
@@ -564,6 +604,7 @@ void load_file(const std::string& path) {
         write_bad_copy(path, text);
         rt_log("settings", "settings: %s: unsupported \"version\" %.6g (expected 1); running on defaults, file copied to %s.bad",
             path.c_str(), ver->number, path.c_str());
+        block_saving_for_broken_file(path);
         return;
     }
 
@@ -659,11 +700,14 @@ void revert_int(int* v, int prev, const char* dotted, int lo, int hi) {
     *v = prev;
 }
 
-void revert_float(float* v, float prev, const char* dotted, float lo, float hi, bool lo_exclusive) {
-    bool ok = (lo_exclusive ? *v > lo : *v >= lo) && *v <= hi;
+/* Bounds in double, and the value promoted to double before comparing, so
+ * this is the same predicate load_float_range applies (see its comment). */
+void revert_float(float* v, float prev, const char* dotted, double lo, double hi, bool lo_exclusive) {
+    const double d = *v;
+    bool ok = (lo_exclusive ? d > lo : d >= lo) && d <= hi;
     if (ok) return;
     rt_log("settings", "settings: %s = %.6g is out of range %c%.6g, %.6g]; reverted to %.6g",
-        dotted, (double)*v, lo_exclusive ? '(' : '[', (double)lo, (double)hi, (double)prev);
+        dotted, d, lo_exclusive ? '(' : '[', lo, hi, (double)prev);
     *v = prev;
 }
 
@@ -679,6 +723,14 @@ void revert_float(float* v, float prev, const char* dotted, float lo, float hi, 
  *      presses two DS2 buttons at once. That is a legal thing to want but
  *      almost never a thing anyone meant, and the menu offers no way to say
  *      "yes, both". Rejected.
+ *
+ * Both rules revert only the slots this commit changed, and skip a pair
+ * where neither slot changed since the last commit: that pair was not
+ * introduced here, it came in from the settings file, log_bind_duplicates()
+ * reported it at load, and re-rejecting it on every unrelated commit would
+ * leave a permanent message in the menu for something the user cannot fix
+ * from there. Picking a slot to revert in that case would also drop a name
+ * the user wrote by hand.
  *
  * A rejection reverts to the previously committed name, never to the
  * compiled default: the user's earlier choice for that slot is theirs and
@@ -717,21 +769,28 @@ void note_reject(const char* fmt, ...) {
 void validate_binds(std::string* cur, const std::string* prev, const BindDef* defs,
                     int count, int menu_slot, const char* section) {
     /* Rule 1, first: whatever the menu key ends up as, the ordinary-slot pass
-     * below then sees the settled value. */
+     * below then sees the settled value. Which side moved decides which side
+     * reverts: binding the menu key onto an existing pad slot is the menu
+     * key's fault, binding a pad slot onto the menu key is the pad slot's,
+     * and reverting the menu slot in the second case would leave the
+     * collision standing. */
     for (int i = 0; i < count; ++i) {
         if (i == menu_slot) continue;
         if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
-        note_reject("%s.menu = \"%s\" is already %s.%s; the menu key never reaches the pad,"
-            " so it was reverted to \"%s\"",
-            section, cur[menu_slot].c_str(), section, defs[i].json_key, prev[menu_slot].c_str());
-        cur[menu_slot] = prev[menu_slot];
-        break;
+        const bool menu_changed = cur[menu_slot] != prev[menu_slot];
+        const bool other_changed = cur[i] != prev[i];
+        if (!menu_changed && !other_changed) continue;
+        note_reject("%s.menu and %s.%s are both \"%s\"; the menu key never reaches the pad,"
+            " so %s%s%s reverted",
+            section, section, defs[i].json_key, cur[menu_slot].c_str(),
+            menu_changed ? "menu" : "",
+            (menu_changed && other_changed) ? " and " : "",
+            other_changed ? defs[i].json_key : "");
+        if (menu_changed) cur[menu_slot] = prev[menu_slot];
+        if (other_changed) cur[i] = prev[i];
     }
 
-    /* Rule 2. A pair where neither name changed since the last commit was
-     * not introduced here; it came in from the settings file and
-     * log_bind_duplicates() reported it at load. Reverting it now would pick
-     * a slot arbitrarily and silently drop a name the user wrote. */
+    /* Rule 2, the same way: only the slots this commit moved revert. */
     for (int i = 0; i < count; ++i) {
         if (i == menu_slot) continue;
         for (int j = i + 1; j < count; ++j) {
@@ -780,9 +839,9 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
     revert_int(&cur->audio.master_volume, prev.audio.master_volume, "audio.master_volume", 0, 100);
     revert_int(&cur->debug.profile_fields, prev.debug.profile_fields, "debug.profile_fields", 0, 100000);
 
-    revert_float(&cur->input.left_deadzone, prev.input.left_deadzone, "input.left_deadzone", 0.0f, 0.95f, false);
-    revert_float(&cur->input.right_deadzone, prev.input.right_deadzone, "input.right_deadzone", 0.0f, 0.95f, false);
-    revert_float(&cur->input.trigger_threshold, prev.input.trigger_threshold, "input.trigger_threshold", 0.0f, 1.0f, true);
+    revert_float(&cur->input.left_deadzone, prev.input.left_deadzone, "input.left_deadzone", 0.0, 0.95, false);
+    revert_float(&cur->input.right_deadzone, prev.input.right_deadzone, "input.right_deadzone", 0.0, 0.95, false);
+    revert_float(&cur->input.trigger_threshold, prev.input.trigger_threshold, "input.trigger_threshold", 0.0, 1.0, true);
 
     if (!(cur->debug.fps_limit_hz == 0.0 || (cur->debug.fps_limit_hz >= 1.0 && cur->debug.fps_limit_hz <= 1000.0))) {
         rt_log("settings", "settings: debug.fps_limit_hz = %.6g is out of range (must be 0 or [1, 1000]); reverted to %.6g",
@@ -891,8 +950,7 @@ void rt_settings_init() {
     log_bind_duplicates(g_current.input.gamepad, kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "input.gamepad");
 
     for (const EnvTwin& t : kEnvTwins) {
-        const char* v = std::getenv(t.env_var);
-        if (v) {
+        if (const char* v = env_twin_value(t)) {
             rt_log("settings", "settings: %s is overridden by %s=%s", t.dotted_key, t.env_var, v);
         }
     }
@@ -940,7 +998,11 @@ bool rt_settings_save() {
         return false;
     }
 
-    write_struct_into_dom(g_current, &g_dom);
+    /* g_committed, not g_current: g_current is the UI's and window.cpp's
+     * scratch struct and can be mid-edit (a resize handler writes a size
+     * there a second before its debounced commit), and only the committed
+     * struct has been through commit_validate. */
+    write_struct_into_dom(g_committed, &g_dom);
     std::string text = rt_json_write(g_dom);
 
     if (!g_path.empty()) {
@@ -998,7 +1060,7 @@ const char* rt_settings_last_reject() {
 bool rt_settings_overridden(const char* dotted_key) {
     for (const EnvTwin& t : kEnvTwins) {
         if (std::strcmp(t.dotted_key, dotted_key) == 0) {
-            return std::getenv(t.env_var) != nullptr;
+            return env_twin_value(t) != nullptr;
         }
     }
     return false;

@@ -117,6 +117,30 @@ GsBackend* make_backend(const char* mode, const char* dump_path) {
 
 } // namespace
 
+/* The same resolution make_backend does, with nothing created: no Vulkan
+ * device, no window, and no ICORECOMP_GS_DUMP file opened. main.cpp's
+ * launcher gate needs the answer before rt_mem_init/rt_hw_init, because a
+ * dump run that goes through rt_hw_init first has already truncated the
+ * dump file by the time the cheap boot checks can fail.
+ *
+ * A build with no paraLLEl-GS answers false for every value: parallel and
+ * both are fatal there, which make_backend reports when it actually runs. */
+bool rt_gs_backend_selects_live() {
+    const char* mode = std::getenv("ICORECOMP_GS");
+    if (!mode || !*mode) {
+#if defined(_WIN32) && defined(ICORECOMP_HAVE_PARALLEL_GS)
+        return true;
+#else
+        return false;
+#endif
+    }
+#ifdef ICORECOMP_HAVE_PARALLEL_GS
+    return std::strcmp(mode, "parallel") == 0 || std::strcmp(mode, "both") == 0;
+#else
+    return false;
+#endif
+}
+
 GsBackend* rt_gs_backend() {
     if (!g_backend) {
         g_backend = make_backend(std::getenv("ICORECOMP_GS"),

@@ -178,9 +178,23 @@ bool capture_gamepad_axis(const SDL_Event& e) {
 
 void rebind_begin(bool gamepad, int slot) {
     if (slot < 0 || slot >= slot_count(gamepad)) return;
+    if (g_state == State::Accepted) {
+        /* A capture is accepted and waiting for the next rebind_tick to write
+         * it to the settings. Re-arming here would clear g_pending and throw
+         * that binding away with nothing on screen to say so, which reads as
+         * a rebind that silently did not take. Refuse instead: the commit
+         * happens at the coming field boundary, and a second click then arms
+         * normally. */
+        settings_model_set_rebind(false, g_gamepad, g_slot,
+            "applying the previous capture, press Rebind again");
+        rt_log("ui", "rebind %s.%s: refused, the previous capture is still being applied",
+            gamepad ? "gamepad" : "keyboard", rt_settings_binding_key(gamepad, slot));
+        return;
+    }
     if (g_state != State::Idle) {
-        /* Re-arming on a different slot before the first finished: drop the
-         * old one silently, the user just clicked somewhere else. */
+        /* Capturing, and the user clicked a different Rebind button before
+         * pressing anything: drop the old one silently and arm the new slot.
+         * Nothing has been captured yet, so nothing is lost. */
         g_state = State::Idle;
         g_pending.clear();
     }

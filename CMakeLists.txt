@@ -562,9 +562,15 @@ if(ICORECOMP_UI)
     set(ICORECOMP_PACKAGE_UI "\n    ui/")
     set(ICORECOMP_PACKAGE_UI_NOTE
         "\n\nui/ holds the settings menu's documents, stylesheet and fonts, plus those\nfonts' licenses. It stays next to the executable as well.")
+    # The FreeType License requires a binary distribution to say in its
+    # documentation that the software is based in part on the FreeType
+    # Team's work; the two OFL fonts ship their notices beside them.
+    set(ICORECOMP_PACKAGE_UI_LICENSE
+        "\n\nThe settings menu and launcher are built with RmlUi under the MIT license\nand FreeType under the FreeType License. Portions of this software are\ncopyright (c) 2024 The FreeType Project (https://www.freetype.org). All\nrights reserved.\n\nThe two fonts in ui/ are licensed under the SIL Open Font License, Version\n1.1: JetBrains Mono, copyright 2020 The JetBrains Mono Project Authors, and\nPlayfair Display, copyright 2017 The Playfair Display Project Authors, with\nthe Reserved Font Name Playfair Display. Each font's full notice ships beside\nit in ui/fonts.")
 else()
     set(ICORECOMP_PACKAGE_UI "")
     set(ICORECOMP_PACKAGE_UI_NOTE "")
+    set(ICORECOMP_PACKAGE_UI_LICENSE "")
 endif()
 
 # Rendered at install time because the library file names are generator
@@ -576,6 +582,7 @@ install(CODE "
     set(ICORECOMP_PACKAGE_LIBS \"${ICORECOMP_PACKAGE_LIBS}\")
     set(ICORECOMP_PACKAGE_UI \"${ICORECOMP_PACKAGE_UI}\")
     set(ICORECOMP_PACKAGE_UI_NOTE \"${ICORECOMP_PACKAGE_UI_NOTE}\")
+    set(ICORECOMP_PACKAGE_UI_LICENSE \"${ICORECOMP_PACKAGE_UI_LICENSE}\")
     configure_file(\"${CMAKE_SOURCE_DIR}/packaging/README.txt.in\"
                    \"\${CMAKE_INSTALL_PREFIX}/README.txt\" @ONLY)
 ")

@@ -131,6 +131,19 @@ private:
     /* LoadTexture has no implementation in v1 (text and solid boxes only);
      * one log line per distinct source keeps a repeated draw quiet. */
     std::set<std::string> m_missing_textures;
+
+    /* Deferred texture destruction. RmlUi releases a texture the moment it
+     * drops the last reference, which for a glyph atlas can happen partway
+     * through Context::Render() while commands already emitted this tick,
+     * and the frame the library still holds from the previous tick, name
+     * that id. See ReleaseTexture in ui_render.cpp for the full reasoning
+     * and for the two-tick rule begin_frame() applies. */
+    struct PendingTextureDestroy {
+        uint32_t texture;
+        uint64_t tick;
+    };
+    std::vector<PendingTextureDestroy> m_pending_destroy;
+    uint64_t m_tick = 0;
 };
 
 /* ---- system interface --------------------------------------------------- */

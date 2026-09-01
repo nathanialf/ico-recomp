@@ -151,10 +151,17 @@ void rt_settings_flush_save();
  * calls it every field. */
 void rt_settings_flush_save_if_due();
 
-/* Atomically writes the current settings to rt_settings_path() (choosing a
- * save target on first use if none is set yet). Returns false, with a log
- * naming the reason, when saving is blocked (ICORECOMP_SETTINGS=-/0, or a
- * loaded file with version > 1) or when the write itself fails. */
+/* Atomically writes the last committed settings to rt_settings_path()
+ * (choosing a save target on first use if none is set yet). What goes to
+ * the file is the struct rt_settings_commit() last accepted, never the
+ * in-flight rt_settings_mutable() one: an edit that has not been committed
+ * has not been validated, and host/window.cpp's resize handler holds an
+ * uncommitted size there for up to a second. Commit first, then save.
+ *
+ * Returns false, with a log naming the reason, when saving is blocked
+ * (ICORECOMP_SETTINGS=-/0, a loaded file with version > 1, or a loaded file
+ * that failed to parse and was copied to <path>.bad) or when the write
+ * itself fails. */
 bool rt_settings_save();
 
 /* Resets the in-memory struct (rt_settings_mutable()'s target) to compiled-
@@ -202,7 +209,12 @@ const char* rt_settings_last_reject();
  * variable twin and that variable is currently set. The environment always
  * wins over the file for these; each consumer reads its own env var at its
  * own call site, this only powers the startup log and UI "overridden by"
- * display. */
+ * display.
+ *
+ * "Set" means present, even as an empty string, matching the getenv() !=
+ * NULL every consumer tests. ICORECOMP_LOG is the exception: log.cpp reads
+ * it as `env && *env`, so an empty value leaves debug.log_file in charge
+ * and this returns false for it. */
 bool rt_settings_overridden(const char* dotted_key);
 
 /* The environment variable that overrides `dotted_key`, or "" when that key

@@ -48,6 +48,10 @@ Apply timing:
   changed mid-frame.
 - **cold**: only takes effect on the next run of the executable.
 
+A hot setting needs no applier when its consumer reads `rt_settings()` fresh
+at every use; `settings_apply.cpp` marks those "nothing to push here" rather
+than calling them cold.
+
 ### display
 
 | key | type | allowed / range | default | apply | env override |
@@ -55,7 +59,7 @@ Apply timing:
 | mode | enum | `windowed`, `fullscreen_desktop`, `fullscreen_exclusive` | `windowed` | hot | - |
 | window_width | int | [320, 16384] | 1280 | hot | - |
 | window_height | int | [320, 16384] | 960 | hot | - |
-| remember_window_size | bool | - | true | cold | - |
+| remember_window_size | bool | - | true | hot | - |
 | present | enum | `mailbox`, `fifo`, `immediate` | `mailbox` | warm | `ICORECOMP_GS_PRESENT` |
 | fit | enum | `letterbox`, `integer`, `stretch` | `letterbox` | hot | - |
 | filter | enum | `linear`, `nearest` | `linear` | hot | - |
@@ -88,8 +92,9 @@ function of the sound engine alone.
 | rumble | bool | - | true | hot | - |
 
 An unresolvable binding name (a typo, a name from a different SDL version)
-keeps the previous value for that one slot with a named log line; it never
-falls back to "no binding".
+falls back to the compiled-in default for that one slot
+(`rt_settings_default_binding()`), with a log line naming the slot and the
+name that did not resolve; it never falls back to "no binding".
 
 `host/input.cpp` reads every one of these keys, including
 `input.keyboard.menu` and `input.gamepad.menu`: it builds a keyboard table
@@ -120,16 +125,22 @@ build did.
 
 Two rules keep one host key or button from being asked to do two things at
 once, both enforced by `validate_binds()` in `settings.cpp` at commit time:
-a menu key that also names a pad slot is reverted (the menu consumes that
-input before the pad ever sees it), and two ordinary slots on the same
-device sharing a name are reverted, because one host input cannot press two
-DS2 buttons. Either rejection reverts to the previously committed name (not
-the compiled default), logs why, and is also shown inline in the Input tab
-that made the change. A duplicate that arrives already in the settings
-file is different: `log_bind_duplicates()` reports it once at load and
-leaves it alone, since the load path never rewrites the user's own file.
-Name comparison for both rules is case-insensitive, matching how
-`SDL_GetScancodeFromName` itself resolves names.
+the menu key must not also name a pad slot (the menu consumes that input
+before the pad ever sees it), and two ordinary slots on the same device must
+not share a name, because one host input cannot press two DS2 buttons.
+
+Both rules revert only the slots that commit changed, whichever side of the
+pair they are: binding the menu key onto an existing pad slot reverts the
+menu key, binding a pad slot onto the menu key reverts the pad slot, and
+changing both reverts both. A revert goes back to the previously committed
+name, not the compiled default, logs why, and is also shown inline in the
+Input tab that made the change. A collision where neither slot changed is
+skipped: it arrived in the settings file, `log_bind_duplicates()` reports it
+once at load, and the load path never rewrites the user's own file, so
+re-rejecting it on every later commit would only leave a permanent message
+in a pane that cannot fix it. Name comparison for both rules is
+case-insensitive, matching how `SDL_GetScancodeFromName` itself resolves
+names.
 
 Default keyboard bindings (`kKeyboardBinds`, `settings.cpp`):
 
@@ -199,6 +210,12 @@ string, because that is exactly what every consumer of these variables tests
 (`getenv() != NULL`). An empty `ICORECOMP_VERBOSE=` still counts as set, for
 instance.
 
+`ICORECOMP_LOG` is the one exception: it must be non-empty to count as set.
+An empty log path names no file, so `log.cpp` reads the variable as
+`env && *env` and leaves `debug.log_file` in charge. Reporting the key as
+overridden there would say the setting was ignored when it is exactly what
+took effect.
+
 The full table (`kEnvTwins`, `settings.cpp`):
 
 | settings key | environment variable |
@@ -229,9 +246,14 @@ working file, let alone the run:
   value and the allowed range or set. The rest of the file still loads
   normally.
 - **An unparseable file** (invalid JSON, a non-object top level, a missing or
-  non-numeric `"version"`) is copied byte-for-byte to `settings.json.bad`,
-  its line:column (1-based) is logged, and the run proceeds on compiled-in
-  defaults. The broken original is never overwritten again.
+  non-numeric `"version"`, or a `"version"` other than 1) is copied
+  byte-for-byte to `settings.json.bad`, its line:column (1-based) is logged,
+  and the run proceeds on compiled-in defaults. Saving is disabled for the
+  rest of that run, which is what makes "the broken original is never
+  overwritten again" true: the save target is still that file, so a later
+  save would replace what the user has to fix with a defaults document.
+  `rt_settings_save()` returns false and logs the file and its `.bad` copy
+  as the reason. Fix or delete the file and restart.
 - **`"version"` greater than 1** means a newer build wrote this file. The run
   proceeds on defaults and the file is left untouched, so downgrading and
   later re-upgrading does not lose anything.
@@ -415,9 +437,17 @@ decides against showing the launcher, and the rest are not checked:
    boot and exit on its own.
 4. `--no-launcher` was passed.
 5. `launcher.show_at_startup` is `false`.
-6. After memory and the GS backend come up (needed to answer this one),
-   there is no live windowed backend in this run: a dump-only or headless
-   run has nothing to draw the launcher into.
+6. `ICORECOMP_GS` selects the dump backend: a dump run has nothing to draw
+   the launcher into. This is answered from the variable alone
+   (`rt_gs_backend_selects_live()`, `gs/gs_select.cpp`), before memory and
+   the GS backend come up, because bringing the backend up opens and
+   truncates the `ICORECOMP_GS_DUMP` file, which would happen before the
+   cheap failures (no disc, a SHA-1 pin mismatch) get their chance to stop
+   the run.
+7. After memory and the GS backend come up (needed to answer this one),
+   there is no live windowed backend in this run: a live backend that
+   opened no window (headless), or a build with no paraLLEl-GS at all, has
+   nothing to draw the launcher into.
 
 If none of these stop it, the launcher runs. Either way, startup logs the
 outcome and the reason on one line:

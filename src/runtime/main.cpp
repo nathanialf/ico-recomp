@@ -283,10 +283,15 @@ int main(int argc, char** argv) {
      *   - ICORECOMP_MAX_VBLANKS: a bounded diagnostic run, expected to boot
      *     and exit on its own.
      *   - --no-launcher, and launcher.show_at_startup: the user said so.
-     *   - no live windowed backend: a dump-only or headless run has nothing
-     *     to draw the launcher into. That one can only be answered after
-     *     rt_hw_init(), so the two init calls it needs happen first and the
-     *     rest of the sequence below skips them.
+     *   - ICORECOMP_GS selects the dump backend: a dump run has nothing to
+     *     draw the launcher into. Asked here, before rt_mem_init and
+     *     rt_hw_init, because those two open the ICORECOMP_GS_DUMP file
+     *     (truncating it) and would do so before the cheap failures below
+     *     -- no disc, bad pin -- get their chance to stop the run.
+     *   - no live windowed backend: a live backend that opened no window
+     *     (headless), or a build with no paraLLEl-GS at all. That one can
+     *     only be answered after rt_hw_init(), so the two init calls it
+     *     needs happen first and the rest of the sequence below skips them.
      */
     bool launcher = false;
     const char* launcher_reason = "UI built in, live window, no bypass, launcher.show_at_startup";
@@ -299,6 +304,8 @@ int main(int argc, char** argv) {
         launcher_reason = "--no-launcher";
     } else if (!rt_settings().launcher.show_at_startup) {
         launcher_reason = "launcher.show_at_startup is false";
+    } else if (!rt_gs_backend_selects_live()) {
+        launcher_reason = "ICORECOMP_GS selects the dump backend";
     } else {
         launcher = true;
     }

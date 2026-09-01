@@ -1156,13 +1156,26 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
 
     if (!m_overlay_cmds.empty()) {
         /* Overlay pass: draw the retained frame on top of what was just
-         * blitted, instead of presenting straight from TRANSFER_DST. */
+         * blitted, instead of presenting straight from TRANSFER_DST.
+         *
+         * The render pass declares its own layouts for a swapchain
+         * attachment and we do not get to pick them (Granite
+         * vulkan/render_pass.cpp lines 238-248): with loadOp LOAD the
+         * initialLayout is the image's swapchain layout, and the finalLayout
+         * is always that same swapchain layout. Granite's WSI records the
+         * swapchain layout as VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+         * (Device::init_swapchain's default layout argument, device.hpp),
+         * so the pass wants PRESENT_SRC_KHR going in and leaves the image in
+         * PRESENT_SRC_KHR coming out. Hand it PRESENT_SRC_KHR here and let
+         * the pass be the last transition: no post-pass barrier, because
+         * there is nothing left to transition from COLOR_ATTACHMENT_OPTIMAL,
+         * the image was never in it. */
         cmd->image_barrier(backbuffer,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                            VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT,
                            VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
         Vulkan::RenderPassInfo rp = device.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
         /* get_swapchain_render_pass defaults to clear_attachments = ~0u
@@ -1174,12 +1187,6 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
         cmd->begin_render_pass(rp);
         draw_overlay(*cmd);
         cmd->end_render_pass();
-
-        cmd->image_barrier(backbuffer,
-                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                           VK_PIPELINE_STAGE_2_NONE, 0);
     } else {
         cmd->image_barrier(backbuffer,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -1376,15 +1383,21 @@ uint32_t RtPgs::present_ui_windowed() {
         } else {
             auto& device = m_wsi->get_device();
             auto cmd = device.request_command_buffer();
-            auto& backbuffer = device.get_swapchain_view().get_image();
 
             cmd->swapchain_touch_in_stages(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
-            cmd->image_barrier(backbuffer,
-                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
-                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
+            /* No barriers around the pass. For a swapchain attachment the
+             * render pass declares its own layouts and we do not get to pick
+             * them (Granite vulkan/render_pass.cpp lines 238-248): this pass
+             * clears, so initialLayout is UNDEFINED, and finalLayout is the
+             * image's swapchain layout, which the WSI records as
+             * VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (Device::init_swapchain's
+             * default layout argument, device.hpp). A pre-pass
+             * UNDEFINED-to-COLOR_ATTACHMENT_OPTIMAL barrier is therefore
+             * redundant, and a post-pass barrier out of
+             * COLOR_ATTACHMENT_OPTIMAL names a layout the image was never
+             * left in. The pass alone takes it from UNDEFINED to
+             * PRESENT_SRC_KHR. */
             Vulkan::RenderPassInfo rp = device.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
             rp.clear_attachments = 1u << 0;
             /* Opaque near-black, not full black: distinguishes "launcher up,
@@ -1398,12 +1411,6 @@ uint32_t RtPgs::present_ui_windowed() {
             cmd->begin_render_pass(rp);
             draw_overlay(*cmd);
             cmd->end_render_pass();
-
-            cmd->image_barrier(backbuffer,
-                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                               VK_PIPELINE_STAGE_2_NONE, 0);
             device.submit(cmd);
 
             if (!m_wsi->end_frame()) {

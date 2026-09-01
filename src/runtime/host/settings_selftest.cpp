@@ -309,6 +309,12 @@ int main() {
         CHECK(rt_settings().display.window_width == 1280);
         CHECK(std::filesystem::exists(path + ".bad"));
         CHECK(read_file(path + ".bad") == original);
+        /* The save target is still the broken file, so saving has to stay
+         * off for the run: otherwise the next save replaces the file the
+         * user has to fix with a defaults document, and "never overwritten
+         * again" is not true. */
+        CHECK(!rt_settings_save());
+        CHECK(read_file(path) == original);
     }
     { /* 13. ICORECOMP_SETTINGS=- : defaults only, no file, save refused */
         set_env("ICORECOMP_SETTINGS", "-");
@@ -514,6 +520,50 @@ int main() {
         rt_settings_init();
         CHECK(rt_settings_generation() != after_commit);
         CHECK(rt_settings_generation() != 0);
+    }
+
+    { /* 25. the same menu-key collision from the other side: the ordinary
+       * slot is what changed, so it is what reverts. Reverting the menu key
+       * here would leave both slots holding the same name. */
+        std::string path = scratch + "/menubind_other.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        const std::string kb_menu = rt_settings().input.keyboard[RT_KB_MENU];
+        const std::string start = rt_settings().input.keyboard[RT_KB_START];
+        CHECK(kb_menu != start);
+
+        rt_settings_mutable().input.keyboard[RT_KB_START] = kb_menu;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_START] == start);
+        CHECK(rt_settings().input.keyboard[RT_KB_MENU] == kb_menu);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 26. a menu-key collision that arrived in the file is reported once
+       * at load and then left alone. A later commit that changes something
+       * else must not re-reject it: the message is what the menu shows
+       * inline, and the user cannot fix a file-borne collision from there. */
+        std::string path = scratch + "/menubind_file.json";
+        write_file(path, "{\"version\": 1, \"input\": {\"keyboard\": {\"start\": \"F1\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().input.keyboard[RT_KB_MENU] == "F1");
+        CHECK(rt_settings().input.keyboard[RT_KB_START] == "F1");
+
+        rt_settings_mutable().audio.master_volume = 61;
+        rt_settings_commit(false);
+        CHECK(std::string(rt_settings_last_reject()).empty());
+        CHECK(rt_settings().input.keyboard[RT_KB_MENU] == "F1");
+        CHECK(rt_settings().input.keyboard[RT_KB_START] == "F1");
+    }
+    { /* 27. the documented maximum deadzone loads as itself. 0.95 parsed as
+       * a double is above (double)0.95f, so float-narrowed bounds would
+       * reject exactly the value the schema names as the top of the range
+       * while the commit path accepted it. */
+        std::string path = scratch + "/deadzone_max.json";
+        write_file(path, "{\"version\": 1, \"input\": {\"left_deadzone\": 0.95}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().input.left_deadzone == 0.95f);
     }
 
     unset_env("ICORECOMP_SETTINGS");

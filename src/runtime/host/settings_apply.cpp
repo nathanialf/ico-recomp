@@ -20,8 +20,9 @@
  *   display.render_scale,
  *   display.hires_scanout        warm  queued the same way, applied via
  *                                       rt_pgs_set_render_scale
- *   display.remember_window_size cold  read directly by host/window.cpp's
- *                                       resize handler; nothing to push here
+ *   display.remember_window_size hot   read fresh by host/window.cpp's
+ *                                       resize handler on every resize
+ *                                       event; nothing to push here
  *   display.show_fps             hot   UI-side only: ui/ui_settings_model.cpp
  *                                       shows or hides the fps.rml document
  *                                       from its own refresh, at the field

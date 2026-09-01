@@ -39,6 +39,13 @@
  * rt_mem_init(). */
 void rt_hw_init();
 
+/* True when ICORECOMP_GS selects a live backend (parallel or both,
+ * including the per-platform default an unset variable resolves to).
+ * Answers the question without creating anything, so a caller that has to
+ * know before rt_hw_init() can ask; gs/gs_select.cpp keeps it and
+ * make_backend in step. */
+bool rt_gs_backend_selects_live();
+
 /* ---- DMAC (dmac.cpp) ---------------------------------------------------- */
 
 bool rt_dmac_mmio_read(uint32_t addr, uint32_t* out);
