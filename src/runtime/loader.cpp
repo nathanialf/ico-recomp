@@ -20,12 +20,20 @@
 #include "iso/iso9660.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#ifdef ICORECOMP_HAVE_GENERATED
+/* Same declaration main.cpp carries; see check_entry_fn below for why the
+ * precheck may have to call it. */
+extern "C" void g_functab_init(void);
+#endif
 
 namespace {
 
@@ -216,100 +224,302 @@ void rt_resolve_elf_path(const LoaderConfig& cfg, char* buf, size_t buf_size) {
 
 namespace {
 
-/* Reads a whole file. Returns false (out untouched) when it cannot be
- * opened; fatal on a short read after a successful open. */
-bool read_whole_file(const char* path, std::vector<uint8_t>* out) {
+/* Every check below exists once, as a bool + message helper. rt_load_elf
+ * calls the helpers and turns a false into rt_fatal with the same message
+ * text it has always printed; rt_boot_precheck calls the same helpers and
+ * hands the message to the launcher instead. */
+
+/* Formats into a std::string, for message helpers whose text used to be a
+ * printf-style rt_fatal argument list. */
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+std::string fmt(const char* f, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, f);
+    std::vsnprintf(buf, sizeof(buf), f, ap);
+    va_end(ap);
+    return buf;
+}
+
+/* Reads a whole file. On failure *err says why; `opened` distinguishes "no
+ * such file" (the caller's cue to fall back to the disc image) from a read
+ * failure after a successful open, which is a hard error. */
+bool read_whole_file(const char* path, std::vector<uint8_t>* out, bool* opened, std::string* err) {
+    *opened = false;
     std::FILE* f = std::fopen(path, "rb");
-    if (!f) return false;
+    if (!f) {
+        *err = fmt("cannot open '%s': %s", path, std::strerror(errno));
+        return false;
+    }
+    *opened = true;
     std::fseek(f, 0, SEEK_END);
     long size = std::ftell(f);
     if (size < 0) {
         std::fclose(f);
-        rt_fatal("loader", nullptr, "ftell('%s') failed", path);
+        *err = fmt("ftell('%s') failed", path);
+        return false;
     }
     std::fseek(f, 0, SEEK_SET);
     out->resize(size_t(size));
     if (size > 0 && std::fread(out->data(), 1, size_t(size), f) != size_t(size)) {
         std::fclose(f);
-        rt_fatal("loader", nullptr, "short read on '%s'", path);
+        *err = fmt("short read on '%s'", path);
+        return false;
     }
     std::fclose(f);
     return true;
 }
 
-/* Reads SCUS_971.13 out of the mounted disc image (mounting it first; the
- * mount is fatal when no image is found, and already verifies the file
- * exists on the disc). */
-void read_elf_from_disc(std::vector<uint8_t>* out) {
-    rt_iso_mount();
+/* Reads SCUS_971.13 out of the already mounted disc image (the mount
+ * verified the file is there). */
+bool read_elf_from_disc(std::vector<uint8_t>* out, std::string* err) {
     RtIsoFile f;
     if (!rt_iso_search("\\SCUS_971.13;1", &f)) {
-        rt_fatal("loader", nullptr, "mounted disc has no SCUS_971.13 (wrong image?)");
+        *err = "mounted disc has no SCUS_971.13 (wrong image?)";
+        return false;
     }
     out->resize(f.size);
     uint8_t sec[2048];
     uint32_t remaining = f.size;
     for (uint32_t i = 0; remaining > 0; ++i) {
         if (!rt_iso_read_sector(f.lsn + i, sec)) {
-            rt_fatal("loader", nullptr, "disc read failed at LBA %u while extracting SCUS_971.13", f.lsn + i);
+            *err = fmt("disc read failed at LBA %u while extracting SCUS_971.13", f.lsn + i);
+            out->clear();
+            return false;
         }
         uint32_t chunk = remaining < 2048 ? remaining : 2048;
         std::memcpy(out->data() + (size_t(i) * 2048), sec, chunk);
         remaining -= chunk;
     }
     rt_log("loader", "boot ELF read from disc: SCUS_971.13, LBA %u, %u bytes", f.lsn, f.size);
+    return true;
 }
 
-/* Bounds-checked read out of the in-memory ELF image. */
-void image_read(const std::vector<uint8_t>& img, size_t off, void* dst, size_t len,
-                const char* what, const char* src) {
-    if (off + len > img.size() || off + len < off) {
-        rt_fatal("loader", nullptr, "short read on %s of '%s' (offset %zu + %zu > %zu bytes)",
-            what, src, off, len, img.size());
-    }
-    std::memcpy(dst, img.data() + off, len);
-}
+/* Source label rt_load_elf has always used for the disc-supplied ELF. Also
+ * the cache key for that case (see g_elf_cache). */
+constexpr char kDiscElfSrc[] = "SCUS_971.13 (from the mounted disc image)";
 
-} // namespace
+/* The ELF image rt_boot_precheck already read and pin-checked, kept so the
+ * rt_load_elf that follows a successful precheck does not read the file (or
+ * ~1 MB off the disc) a second time. Only used when the source string
+ * rt_load_elf resolves to is the one the precheck cached. */
+struct ElfImageCache {
+    bool valid = false;
+    char src[1536] = {0};
+    std::vector<uint8_t> bytes;
+};
+ElfImageCache g_elf_cache;
 
-void rt_load_elf(const LoaderConfig& cfg) {
-    std::vector<uint8_t> elf;
-    char elf_src[1536]; /* comfortably covers the base dir + two 512-byte config fields + separators */
+/* Produces the boot ELF bytes and the source string used in messages: the
+ * decomp checkout's ELF when the config names one and it is readable,
+ * otherwise SCUS_971.13 off the disc image. mount_if_needed selects what
+ * happens when the disc is needed and nothing is mounted yet:
+ *   true  -> rt_iso_mount(), which is fatal when no image is found. This is
+ *            rt_load_elf's historical behavior, and it mounts only on the
+ *            fallback path, never when the decomp ELF was used.
+ *   false -> fails with a message. rt_boot_precheck mounts the disc itself,
+ *            non-fatally, before calling this. */
+bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint8_t>* out,
+                 char* src, size_t src_len, std::string* err) {
+    out->clear();
 
     if (cfg.decomp_root[0] && cfg.decomp_elf[0]) {
-        rt_resolve_elf_path(cfg, elf_src, sizeof(elf_src));
-        rt_log("loader", "ELF path: %s", elf_src);
-        if (!read_whole_file(elf_src, &elf)) {
-            rt_log("loader", "'%s' not readable; falling back to the disc image's SCUS_971.13", elf_src);
+        rt_resolve_elf_path(cfg, src, src_len);
+        rt_log("loader", "ELF path: %s", src);
+        if (g_elf_cache.valid && std::strcmp(g_elf_cache.src, src) == 0) {
+            *out = g_elf_cache.bytes;
+            rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
+            return true;
         }
-    }
-    if (elf.empty()) {
-        read_elf_from_disc(&elf);
-        std::snprintf(elf_src, sizeof(elf_src), "SCUS_971.13 (from the mounted disc image)");
+        bool opened = false;
+        std::string e;
+        if (read_whole_file(src, out, &opened, &e)) {
+            /* A zero-byte file falls through to the disc, matching the
+             * `if (elf.empty())` fallback this replaced. */
+            if (!out->empty()) return true;
+        } else if (opened) {
+            *err = e;
+            return false;
+        } else {
+            rt_log("loader", "'%s' not readable; falling back to the disc image's SCUS_971.13", src);
+        }
+        out->clear();
     }
 
+    std::snprintf(src, src_len, "%s", kDiscElfSrc);
+    if (g_elf_cache.valid && std::strcmp(g_elf_cache.src, src) == 0) {
+        *out = g_elf_cache.bytes;
+        rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
+        return true;
+    }
+    if (!rt_iso_mounted()) {
+        if (!mount_if_needed) {
+            *err = "no disc image is mounted, so SCUS_971.13 cannot be read";
+            return false;
+        }
+        rt_iso_mount(); /* fatal when no image is found, as before */
+    }
+    return read_elf_from_disc(out, err);
+}
+
+/* SHA-1 pin check. Logs the OK line; the message on failure is the text
+ * rt_load_elf has always fataled with. */
+bool check_elf_pin(const std::vector<uint8_t>& elf, const LoaderConfig& cfg, const char* src,
+                   std::string* err) {
     Sha1Digest digest = rt_sha1_buffer(elf.data(), elf.size());
     char hex[41];
     rt_sha1_to_hex(digest, hex);
     if (!rt_sha1_equals_hex(digest, cfg.elf_sha1)) {
-        rt_fatal("loader", nullptr, "SHA-1 mismatch for '%s': got %s, expected %s ([pins].elf_sha1)",
-            elf_src, hex, cfg.elf_sha1);
+        *err = fmt("SHA-1 mismatch for '%s': got %s, expected %s ([pins].elf_sha1)",
+            src, hex, cfg.elf_sha1);
+        return false;
     }
     rt_log("loader", "SHA-1 pin OK: %s", hex);
+    return true;
+}
+
+/* Bounds-checked read out of the in-memory ELF image. */
+bool image_read_checked(const std::vector<uint8_t>& img, size_t off, void* dst, size_t len,
+                        const char* what, const char* src, std::string* err) {
+    if (off + len > img.size() || off + len < off) {
+        *err = fmt("short read on %s of '%s' (offset %zu + %zu > %zu bytes)",
+            what, src, off, len, img.size());
+        return false;
+    }
+    std::memcpy(dst, img.data() + off, len);
+    return true;
+}
+
+void image_read(const std::vector<uint8_t>& img, size_t off, void* dst, size_t len,
+                const char* what, const char* src) {
+    std::string err;
+    if (!image_read_checked(img, off, dst, len, what, src, &err)) {
+        rt_fatal("loader", nullptr, "%s", err.c_str());
+    }
+}
+
+/* ELF header sanity: readable header, magic, 32-bit little-endian, ET_EXEC,
+ * at least one program header. */
+bool validate_elf_header(const std::vector<uint8_t>& elf, const char* src, Elf32Ehdr* out,
+                         std::string* err) {
+    if (!image_read_checked(elf, 0, out, sizeof(*out), "ELF header", src, err)) return false;
+    if (std::memcmp(out->e_ident, "\x7f""ELF", 4) != 0) {
+        *err = fmt("'%s' is not an ELF file (bad magic)", src);
+        return false;
+    }
+    if (out->e_ident[4] != 1 /* ELFCLASS32 */ || out->e_ident[5] != 1 /* ELFDATA2LSB */) {
+        *err = fmt("'%s' is not a 32-bit little-endian ELF (class=%u data=%u)",
+            src, unsigned(out->e_ident[4]), unsigned(out->e_ident[5]));
+        return false;
+    }
+    if (out->e_type != kEtExec) {
+        *err = fmt("'%s' e_type=%u, expected ET_EXEC (2)", src, unsigned(out->e_type));
+        return false;
+    }
+    if (out->e_phnum == 0) {
+        *err = fmt("'%s' has no program headers", src);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+/* The function table (g_functab, mem.cpp) and the boot precheck that reads
+ * it are compiled only into the full runtime executable.
+ * icorecomp-ipu-selftest links loader.cpp for rt_base_dir/rt_load_config
+ * and links neither mem.cpp nor host/settings.cpp, so a reference to the
+ * table from here breaks its link. ICORECOMP_HAVE_SETTINGS is the existing
+ * "this target is the full runtime" gate (CMakeLists.txt, prof.h).
+ * rt_boot_precheck stays declared unconditionally in runtime.h: a call from
+ * a target that does not link the table fails to link naming
+ * rt_boot_precheck, which is the right diagnosis to get. */
+#ifdef ICORECOMP_HAVE_SETTINGS
+
+namespace {
+
+/* The entry lookup main.cpp does after g_functab_init(). The two messages
+ * are the ones main.cpp logs, without its "FATAL: " log prefix: they are
+ * what users grep for, so they stay byte-identical on both sides. */
+bool check_entry_fn(const LoaderConfig& cfg, std::string* err) {
+    if (cfg.entry < RECOMP_TEXT_BASE || cfg.entry >= RECOMP_TEXT_LIMIT) {
+        *err = fmt("config [target].entry 0x%08x is outside the function table range [0x%08x, 0x%08x)",
+            cfg.entry, RECOMP_TEXT_BASE, RECOMP_TEXT_LIMIT);
+        return false;
+    }
+#ifdef ICORECOMP_HAVE_GENERATED
+    /* The precheck can run before main's g_functab_init(), and then every
+     * slot is still null and this check would fail for any address. The
+     * generated g_functab_init is a memset, a fixed list of assignments and
+     * a memcpy, so running it early (and again in main) is idempotent, and
+     * nothing installs a g_functab override before main's call. */
+    if (!g_functab[RECOMP_FUNC_IDX(cfg.entry)]) g_functab_init();
+#endif
+    if (!g_functab[RECOMP_FUNC_IDX(cfg.entry)]) {
+#ifdef ICORECOMP_HAVE_GENERATED
+        *err = fmt("entry function at vram 0x%08x not found in g_functab after g_functab_init()"
+                   " -- generated code does not cover this address", cfg.entry);
+#else
+        *err = fmt("no generated code linked (stub build); entry function at vram 0x%08x cannot be"
+                   " resolved. Configure with generated/ee present (or -DGENERATED_DIR=...) to run the game.",
+            cfg.entry);
+#endif
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool rt_boot_precheck(char* err, size_t err_len) {
+    if (err && err_len) err[0] = 0;
+    auto fail = [&](const std::string& msg) {
+        if (err && err_len) std::snprintf(err, err_len, "%s", msg.c_str());
+        return false;
+    };
+
+    LoaderConfig cfg;
+    if (!rt_load_config(&cfg)) return fail("could not load config/recomp.toml");
+
+    char disc_err[1024];
+    if (!rt_iso_probe_mount(disc_err, sizeof(disc_err))) return fail(disc_err);
+
+    std::vector<uint8_t> elf;
+    char src[1536];
+    std::string e;
+    if (!acquire_elf(cfg, /*mount_if_needed=*/false, &elf, src, sizeof(src), &e)) return fail(e);
+    if (!check_elf_pin(elf, cfg, src, &e)) return fail(e);
+    Elf32Ehdr eh;
+    if (!validate_elf_header(elf, src, &eh, &e)) return fail(e);
+    if (!check_entry_fn(cfg, &e)) return fail(e);
+
+    /* Hand the bytes to the rt_load_elf that follows, so the disc read or
+     * file read happens once per run. The disc stays mounted. */
+    std::snprintf(g_elf_cache.src, sizeof(g_elf_cache.src), "%s", src);
+    g_elf_cache.bytes = std::move(elf);
+    g_elf_cache.valid = true;
+    return true;
+}
+
+#endif /* ICORECOMP_HAVE_SETTINGS */
+
+void rt_load_elf(const LoaderConfig& cfg) {
+    std::vector<uint8_t> elf;
+    char elf_src[1536]; /* comfortably covers the base dir + two 512-byte config fields + separators */
+    std::string err;
+
+    if (!acquire_elf(cfg, /*mount_if_needed=*/true, &elf, elf_src, sizeof(elf_src), &err)) {
+        rt_fatal("loader", nullptr, "%s", err.c_str());
+    }
+    if (!check_elf_pin(elf, cfg, elf_src, &err)) {
+        rt_fatal("loader", nullptr, "%s", err.c_str());
+    }
 
     Elf32Ehdr eh;
-    image_read(elf, 0, &eh, sizeof(eh), "ELF header", elf_src);
-    if (std::memcmp(eh.e_ident, "\x7f""ELF", 4) != 0) {
-        rt_fatal("loader", nullptr, "'%s' is not an ELF file (bad magic)", elf_src);
-    }
-    if (eh.e_ident[4] != 1 /* ELFCLASS32 */ || eh.e_ident[5] != 1 /* ELFDATA2LSB */) {
-        rt_fatal("loader", nullptr, "'%s' is not a 32-bit little-endian ELF (class=%u data=%u)", elf_src, eh.e_ident[4], eh.e_ident[5]);
-    }
-    if (eh.e_type != kEtExec) {
-        rt_fatal("loader", nullptr, "'%s' e_type=%u, expected ET_EXEC (2)", elf_src, eh.e_type);
-    }
-    if (eh.e_phnum == 0) {
-        rt_fatal("loader", nullptr, "'%s' has no program headers", elf_src);
+    if (!validate_elf_header(elf, elf_src, &eh, &err)) {
+        rt_fatal("loader", nullptr, "%s", err.c_str());
     }
 
     rt_log("loader", "ELF header: entry=0x%08x phoff=%u phentsize=%u phnum=%u",

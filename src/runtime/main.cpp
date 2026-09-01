@@ -185,14 +185,19 @@ void install_crash_handler() {
     std::signal(SIGINT, sigint_handler);
 }
 
+/* --no-launcher: skip the launcher window and boot straight into the game
+ * (see rt_no_launcher_flag). */
+bool g_no_launcher = false;
+
 void print_usage(const char* argv0) {
     std::printf(
-        "usage: %s [--disc <path>]\n"
+        "usage: %s [--disc <path>] [--no-launcher]\n"
         "\n"
         "  --disc <path>   ICO (US) disc image to mount (.iso, or the .bin of a\n"
         "                  bin/cue rip). Without it the runtime looks for a disc\n"
         "                  per the order in src/runtime/iso/iso9660.h (config,\n"
         "                  decomp checkout, then ico.iso next to the exe).\n"
+        "  --no-launcher   skip the launcher window and boot the disc directly\n"
         "\n"
         "Behavior toggles are environment variables (ICORECOMP_GS, ICORECOMP_MAX_VBLANKS,\n"
         "ICORECOMP_INPUT_SCRIPT, ICORECOMP_SAVES_DIR, ...); see the runtime sources or\n"
@@ -201,6 +206,8 @@ void print_usage(const char* argv0) {
 }
 
 } // namespace
+
+bool rt_no_launcher_flag() { return g_no_launcher; }
 
 int main(int argc, char** argv) {
     /* The log file has to exist before anything can log to it, including
@@ -219,6 +226,8 @@ int main(int argc, char** argv) {
             rt_iso_set_path(argv[++i]);
         } else if (std::strncmp(arg, "--disc=", 7) == 0) {
             rt_iso_set_path(arg + 7);
+        } else if (std::strcmp(arg, "--no-launcher") == 0) {
+            g_no_launcher = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
             print_usage(argv[0]);
             return 0;

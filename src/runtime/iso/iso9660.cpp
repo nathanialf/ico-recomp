@@ -17,8 +17,10 @@
  * sector boundaries (a zero len byte skips to the next sector).
  *
  * No game data or content hashes are committed by this file; the disc path
- * itself comes from an untracked local config or the read-only decomp
- * checkout (CLAUDE.md).
+ * itself comes from the command line, the user's own settings.json, an
+ * untracked local config or the read-only decomp checkout (CLAUDE.md). The
+ * order those are consulted in is documented on rt_iso_mount in iso9660.h,
+ * and implemented once, in probe_and_mount below.
  */
 #include "iso9660.h"
 
@@ -29,7 +31,16 @@
 #include "../host/portable.h"
 #include "../runtime.h"
 
+/* Only targets that link host/settings.cpp may read a setting from here.
+ * icorecomp-ipu-selftest links this file but not settings.cpp, so it does
+ * not define ICORECOMP_HAVE_SETTINGS and loses the launcher.disc_path step
+ * of the resolution order (see iso9660.h). Same gate as prof.h. */
+#ifdef ICORECOMP_HAVE_SETTINGS
+#include "../host/settings.h"
+#endif
+
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -39,6 +50,8 @@ namespace {
 
 std::FILE* g_disc = nullptr;
 std::string g_forced_path; /* rt_iso_set_path (--disc) */
+std::string g_mounted_path;
+std::string g_mounted_source;
 uint32_t g_sector_size = 0;
 uint32_t g_data_offset = 0;
 uint32_t g_total_sectors = 0;
@@ -178,21 +191,213 @@ bool path_is_absolute(const std::string& p) {
     return p.size() >= 2 && p[1] == ':';
 }
 
-bool try_open(const std::string& path, const char* how) {
+/* Why a mount attempt did not produce a usable disc. The two "the file is a
+ * disc image but not the right one" outcomes are separated from the two
+ * "there is no image here" outcomes because rt_iso_mount is fatal on the
+ * former and moves on to the next candidate on the latter. */
+enum class MountFail {
+    None,    /* mounted */
+    Open,    /* not openable/seekable: candidate absent */
+    Layout,  /* no ISO9660 PVD at any known sector layout */
+    Pvd,     /* PVD sector unreadable after a successful layout probe */
+    NoBoot,  /* mounted, but SCUS_971.13 is not on it */
+};
+
+void unmount() {
+    if (g_disc) {
+        std::fclose(g_disc);
+        g_disc = nullptr;
+    }
+    g_sector_size = 0;
+    g_data_offset = 0;
+    g_total_sectors = 0;
+    g_root_lba = 0;
+    g_root_size = 0;
+    g_mounted_path.clear();
+    g_mounted_source.clear();
+}
+
+/* The one mount implementation: opens `path`, probes the sector layout,
+ * reads the PVD and verifies the disc by locating SCUS_971.13 (and warning
+ * about a missing DFDATAS/DATA.DF). Unmounts whatever was mounted before,
+ * first thing, and leaves nothing mounted on any failure. Never fatal:
+ * every caller decides for itself whether a failure is loud. `err` gets one
+ * human-readable line on failure. */
+MountFail mount_path(const std::string& path, const char* how, std::string* err) {
+    unmount();
+
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    if (rt_fseek64(f, 0, SEEK_END) != 0) { std::fclose(f); return false; }
+    if (!f) {
+        *err = "cannot open '" + path + "': " + std::strerror(errno);
+        return MountFail::Open;
+    }
+    if (rt_fseek64(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        *err = "cannot seek to the end of '" + path + "'";
+        return MountFail::Open;
+    }
     long long size = rt_ftell64(f);
     g_disc = f;
     if (!probe_layout(size)) {
         rt_log("iso", "'%s' (%s): no ISO9660 PVD found at any known sector layout; skipping",
             path.c_str(), how);
-        std::fclose(f);
-        g_disc = nullptr;
-        return false;
+        unmount();
+        *err = "'" + path + "' has no ISO9660 volume descriptor at any known sector layout "
+               "(plain 2048, raw 2352); not a disc image?";
+        return MountFail::Layout;
     }
     rt_log("iso", "mounted '%s' (%s), %lld bytes", path.c_str(), how, size);
-    return true;
+
+    /* PVD: root directory record at offset 156; volume id at 40. */
+    uint8_t pvd[2048];
+    if (!read_raw_sector(16, pvd)) {
+        unmount();
+        *err = "'" + path + "': failed to read the ISO9660 primary volume descriptor at LBA 16";
+        return MountFail::Pvd;
+    }
+    g_root_lba = le32(&pvd[156 + 2]);
+    g_root_size = le32(&pvd[156 + 10]);
+    {
+        char volid[33];
+        std::memcpy(volid, &pvd[40], 32);
+        volid[32] = 0;
+        for (int i = 31; i >= 0 && volid[i] == ' '; --i) volid[i] = 0;
+        rt_log("iso", "PVD: volume id '%s', root dir LBA=%u size=%u", volid, g_root_lba, g_root_size);
+    }
+
+    /* Mount verification: the boot ELF and the game's data archive must
+     * resolve (paths are public facts from the disc's own filesystem). */
+    RtIsoFile file;
+    if (!rt_iso_search("\\SCUS_971.13;1", &file)) {
+        unmount();
+        *err = "'" + path + "' has no SCUS_971.13; it is not an ICO (US) disc image";
+        return MountFail::NoBoot;
+    }
+    rt_log("iso", "verify: SCUS_971.13 at LBA %u, %u bytes", file.lsn, file.size);
+    if (rt_iso_search("\\DFDATAS\\DATA.DF;1", &file)) {
+        rt_log("iso", "verify: DFDATAS/DATA.DF at LBA %u, %u bytes", file.lsn, file.size);
+    } else {
+        rt_log("iso", "WARNING: DFDATAS/DATA.DF not found on the mounted image");
+    }
+
+    g_mounted_path = path;
+    g_mounted_source = how;
+    return MountFail::None;
+}
+
+/* The fatal text rt_iso_mount has always used for a candidate that opened
+ * and probed as a disc image but is not usable. Kept separate from the
+ * richer message mount_path builds so the loud path stays byte-identical
+ * for anyone grepping the log. */
+const char* candidate_fatal_text(MountFail f) {
+    return f == MountFail::Pvd ? "failed to read the PVD sector"
+                               : "mounted image has no SCUS_971.13; wrong disc?";
+}
+
+/* Walks the resolution order documented in iso9660.h. `fatal` selects
+ * rt_iso_mount's historical behavior (rt_fatal with the same text it has
+ * always used); otherwise the same condition returns false with the message
+ * in *err. Returns true with a disc mounted. */
+bool probe_and_mount(bool fatal, std::string* err) {
+    if (g_disc) return true;
+
+    std::string tried;
+    std::string e;
+    int outcome = 0; /* 0 keep probing, 1 mounted, -1 gave up with *err set */
+
+    auto give_up = [&](const char* fatal_text, const std::string& err_text) {
+        if (fatal) rt_fatal("iso", nullptr, "%s", fatal_text);
+        *err = err_text;
+        outcome = -1;
+    };
+
+    /* One candidate. `soft` candidates never stop the search: a saved
+     * setting that has gone stale must not be able to brick a run, so its
+     * failure is logged with its source label and the search continues. */
+    auto attempt = [&](const std::string& path, const char* how, bool soft) {
+        if (outcome != 0) return;
+        MountFail f = mount_path(path, how, &e);
+        if (f == MountFail::None) {
+            outcome = 1;
+            return;
+        }
+        if (soft) {
+            rt_log("iso", "%s: %s; continuing the disc search", how, e.c_str());
+        } else if (f == MountFail::Pvd || f == MountFail::NoBoot) {
+            give_up(candidate_fatal_text(f), e);
+            return;
+        }
+        tried += path + " ";
+    };
+
+    if (!g_forced_path.empty()) {
+        MountFail f = mount_path(g_forced_path, "--disc", &e);
+        if (f == MountFail::None) return true;
+        if (f == MountFail::Pvd || f == MountFail::NoBoot) {
+            give_up(candidate_fatal_text(f), e);
+        } else {
+            std::string msg = "--disc " + g_forced_path +
+                ": not readable or no ISO9660 filesystem found";
+            give_up(msg.c_str(), msg);
+        }
+        return false;
+    }
+
+#ifdef ICORECOMP_HAVE_SETTINGS
+    /* rt_settings_init() runs in main before anything reaches rt_iso_mount
+     * (main.cpp: settings init, then rt_mem_init, then the loader), so
+     * rt_settings() is valid here. The launcher writes this key when the
+     * user picks a disc. */
+    if (outcome == 0) {
+        const std::string& saved = rt_settings().launcher.disc_path;
+        if (!saved.empty()) {
+            std::string p = path_is_absolute(saved) ? saved
+                : std::string(rt_base_dir()) + "/" + saved;
+            attempt(p, "settings.json launcher.disc_path", true);
+        }
+    }
+#endif
+
+    if (outcome == 0) {
+        std::string local = std::string(rt_base_dir()) + "/config/local.toml";
+        std::string cfg_path = toml_lookup(local.c_str(), "disc", "path");
+        if (!cfg_path.empty()) {
+            std::string p = path_is_absolute(cfg_path) ? cfg_path
+                : std::string(rt_base_dir()) + "/" + cfg_path;
+            attempt(p, "config/local.toml [disc].path", false);
+        }
+    }
+
+    if (outcome == 0) {
+        /* Dev checkout only: the sibling decomp tree's baserom. A packaged
+         * run has no decomp_root, and probing one there would just put a
+         * meaningless path in the "tried:" list below. */
+        LoaderConfig cfg;
+        if (rt_load_config(&cfg) && cfg.decomp_root[0]) {
+            std::string base = std::string(rt_base_dir()) + "/" + cfg.decomp_root + "/baserom/Ico_USA";
+            attempt(base + ".bin", "decomp baserom bin/cue", false);
+            attempt(base + ".iso", "decomp baserom iso", false);
+        }
+    }
+
+    if (outcome == 0) {
+        /* Packaged convention: the disc sits in the same folder as the
+         * executable. rt_base_dir() is that folder for a packaged run, so
+         * this holds however the exe was launched. */
+        static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_USA.iso", "Ico_USA.bin" };
+        for (const char* name : kLocal) {
+            attempt(std::string(rt_base_dir()) + "/" + name, "next to the executable", false);
+        }
+    }
+
+    if (outcome == 1) return true;
+    if (outcome == -1) return false;
+
+    std::string msg = "no disc image found (tried: " + tried +
+        "). Pass --disc <path>, set [disc] path in config/local.toml, "
+        "or put the image next to the exe as ico.iso.";
+    give_up(msg.c_str(), msg);
+    return false;
 }
 
 } // namespace
@@ -289,78 +494,34 @@ void rt_iso_set_path(const char* path) {
     g_forced_path = path ? path : "";
 }
 
+/* Thin wrapper over the shared probe: same candidate order, same source
+ * labels, same log lines and same fatal messages as before this function was
+ * factored out. */
 void rt_iso_mount() {
-    if (g_disc) return;
-
-    std::string tried;
-    if (!g_forced_path.empty()) {
-        if (try_open(g_forced_path, "--disc")) goto mounted;
-        rt_fatal("iso", nullptr, "--disc %s: not readable or no ISO9660 filesystem found",
-            g_forced_path.c_str());
-    }
-    {
-        std::string local = std::string(rt_base_dir()) + "/config/local.toml";
-        std::string cfg_path = toml_lookup(local.c_str(), "disc", "path");
-        if (!cfg_path.empty()) {
-            std::string p = path_is_absolute(cfg_path) ? cfg_path
-                : std::string(rt_base_dir()) + "/" + cfg_path;
-            if (try_open(p, "config/local.toml [disc].path")) goto mounted;
-            tried += p + " ";
-        }
-    }
-    {
-        /* Dev checkout only: the sibling decomp tree's baserom. A packaged
-         * run has no decomp_root, and probing one there would just put a
-         * meaningless path in the "tried:" list below. */
-        LoaderConfig cfg;
-        if (rt_load_config(&cfg) && cfg.decomp_root[0]) {
-            std::string base = std::string(rt_base_dir()) + "/" + cfg.decomp_root + "/baserom/Ico_USA";
-            if (try_open(base + ".bin", "decomp baserom bin/cue")) goto mounted;
-            tried += base + ".bin ";
-            if (try_open(base + ".iso", "decomp baserom iso")) goto mounted;
-            tried += base + ".iso ";
-        }
-    }
-    {
-        /* Packaged convention: the disc sits in the same folder as the
-         * executable. rt_base_dir() is that folder for a packaged run, so
-         * this holds however the exe was launched. */
-        static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_USA.iso", "Ico_USA.bin" };
-        for (const char* name : kLocal) {
-            std::string p = std::string(rt_base_dir()) + "/" + name;
-            if (try_open(p, "next to the executable")) goto mounted;
-            tried += p + " ";
-        }
-    }
-    rt_fatal("iso", nullptr, "no disc image found (tried: %s). Pass --disc <path>, set [disc] path "
-        "in config/local.toml, or put the image next to the exe as ico.iso.",
-        tried.c_str());
-
-mounted:
-    /* PVD: root directory record at offset 156; volume id at 40. */
-    {
-        uint8_t pvd[2048];
-        if (!read_raw_sector(16, pvd)) rt_fatal("iso", nullptr, "failed to read the PVD sector");
-        g_root_lba = le32(&pvd[156 + 2]);
-        g_root_size = le32(&pvd[156 + 10]);
-        char volid[33];
-        std::memcpy(volid, &pvd[40], 32);
-        volid[32] = 0;
-        for (int i = 31; i >= 0 && volid[i] == ' '; --i) volid[i] = 0;
-        rt_log("iso", "PVD: volume id '%s', root dir LBA=%u size=%u", volid, g_root_lba, g_root_size);
-    }
-
-    /* Mount verification: the boot ELF and the game's data archive must
-     * resolve (paths are public facts from the disc's own filesystem). */
-    RtIsoFile f;
-    if (rt_iso_search("\\SCUS_971.13;1", &f)) {
-        rt_log("iso", "verify: SCUS_971.13 at LBA %u, %u bytes", f.lsn, f.size);
-    } else {
-        rt_fatal("iso", nullptr, "mounted image has no SCUS_971.13; wrong disc?");
-    }
-    if (rt_iso_search("\\DFDATAS\\DATA.DF;1", &f)) {
-        rt_log("iso", "verify: DFDATAS/DATA.DF at LBA %u, %u bytes", f.lsn, f.size);
-    } else {
-        rt_log("iso", "WARNING: DFDATAS/DATA.DF not found on the mounted image");
-    }
+    std::string err;
+    (void)probe_and_mount(true, &err); /* never returns false: fatal inside */
 }
+
+bool rt_iso_probe_mount(char* err, size_t err_len) {
+    if (err && err_len) err[0] = 0;
+    std::string e;
+    if (probe_and_mount(false, &e)) return true;
+    if (err && err_len) std::snprintf(err, err_len, "%s", e.c_str());
+    return false;
+}
+
+bool rt_iso_try_mount(const char* path, char* err, size_t err_len) {
+    if (err && err_len) err[0] = 0;
+    if (!path || !path[0]) {
+        if (err && err_len) std::snprintf(err, err_len, "no disc image path given");
+        unmount();
+        return false;
+    }
+    std::string e;
+    if (mount_path(path, "explicit path", &e) == MountFail::None) return true;
+    if (err && err_len) std::snprintf(err, err_len, "%s", e.c_str());
+    return false;
+}
+
+const char* rt_iso_mounted_path() { return g_mounted_path.c_str(); }
+const char* rt_iso_mounted_source() { return g_mounted_source.c_str(); }

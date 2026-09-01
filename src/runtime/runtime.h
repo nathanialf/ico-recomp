@@ -148,7 +148,33 @@ void rt_resolve_elf_path(const LoaderConfig& cfg, char* buf, size_t buf_size);
  * RAM (via g_pages) at its vaddr and zeroes bss (memsz - filesz). The ELF
  * bytes come from the decomp checkout when the config names one and the
  * file exists, otherwise from SCUS_971.13 on the mounted disc image (same
- * bytes, same pin). Fatal on any failure. */
+ * bytes, same pin). Fatal on any failure.
+ *
+ * After a successful rt_boot_precheck this reuses the ELF image the
+ * precheck already read (matched on the same source string), so the file or
+ * disc read happens once per run. */
 void rt_load_elf(const LoaderConfig& cfg);
+
+/* Everything main does between rt_load_config and the entry lookup, run for
+ * its failures rather than its effects: config load, disc mount (the same
+ * probe list rt_iso_mount walks, non-fatal), boot ELF acquisition, the
+ * SHA-1 pin, ELF header sanity, and the entry-function lookup. Returns
+ * false with one human-readable line in `err` where those paths would
+ * rt_fatal, so the launcher can report the problem in its window instead of
+ * dying before it can draw. err may be null.
+ *
+ * On success the disc is left mounted and the ELF image is cached for the
+ * rt_load_elf that follows. Nothing is written into guest memory: the
+ * PT_LOAD segments are still loaded by rt_load_elf.
+ *
+ * Defined only in the full runtime executable: it reads g_functab, which
+ * lives in mem.cpp, and the standalone selftests that link loader.cpp do
+ * not link mem.cpp (see the gate in loader.cpp). */
+bool rt_boot_precheck(char* err, size_t err_len);
+
+/* ---- main (main.cpp) ---------------------------------------------------- */
+
+/* True when the run was started with --no-launcher. */
+bool rt_no_launcher_flag();
 
 #endif /* ICORECOMP_RUNTIME_H */
