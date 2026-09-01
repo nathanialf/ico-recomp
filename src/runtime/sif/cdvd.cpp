@@ -24,6 +24,7 @@
 
 #include "../host/portable.h"
 #include "../iso/iso9660.h"
+#include "../snd/snd.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -136,11 +137,12 @@ uint32_t g_stream_lsn = 0;
  * addresses are EE-side library statics in both cases. Confirmed against
  * a raw dump of the block: 3a b3 01 00 | b8 00 00 00 | 00 80 2b 00 |
  * 02 00 00 00 | 00 1a 55 00 | c0 1a 55 00 decodes as lbn=111418
- * sectors=184 buf=0x2b8000 mode=2, so the field layout is right and the
- * constant destination across reads is what the game actually asks for. Layout confirmed
- * against the vendor libcdvd read entry points in the decomp repo's
- * disassembly (behavioral reference; the fno assignments predate the
- * ps2sdk table, where 0x0C is readiopmem and 0x0D is diskready). */
+ * sectors=184 buf=0x2b8000 mode=2. 184 sectors is 0x5C000, exactly one
+ * stream ring, which is the sound library's initial fill; later refills
+ * are a third of a ring and move their destination along the ring. Layout
+ * confirmed against the vendor libcdvd read entry points in the decomp
+ * repo's disassembly (behavioral reference; the fno assignments predate
+ * the ps2sdk table, where 0x0C is readiopmem and 0x0D is diskready). */
 /* Virtual clock value until which the drive reports itself as reading. */
 uint64_t g_drive_busy_until = 0;
 
@@ -170,8 +172,8 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     }
     /* The streaming loader's prefetch window slides off the end of the
      * disc once it runs through the trailing LDUMMY padding file (observed
-     * after the title transition: overlapping fno=0x0D reads advancing
-     * ~376 sectors each). On hardware those reads fail in the lead-out and
+     * after the title transition, as overlapping fno=0x0D reads). On
+     * hardware those reads fail in the lead-out and
      * the streamer shrugs it off; here we zero-fill and log so the run
      * stays alive without hiding the event. */
     if ((uint64_t)lbn + sectors > rt_iso_total_sectors()) {
@@ -179,9 +181,13 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
             lbn, sectors, rt_iso_total_sectors(),
             (uint32_t)((uint64_t)lbn + sectors - (lbn < rt_iso_total_sectors() ? rt_iso_total_sectors() : lbn)));
     }
-    /* One bulk read, then one copy into the guest. The retail streaming
-     * path asks for ~1400 sectors at a time; a per-sector loop turns that
-     * into 1400 seek/read pairs. */
+    /* One bulk read, then one copy into the guest. A stream refill is a
+     * third of the ring at a time (0x1EAAA bytes, 62 sectors) and the
+     * initial fill is a whole ring (184). The refill lands on a whole
+     * number of sectors because the reported cursor moves in 0x4000
+     * transfer blocks, so eight blocks clear the threshold: 0x20000 bytes,
+     * 64 sectors. A per-sector loop would turn either into that many
+     * seek/read pairs. */
     /* sectors is guest supplied. The IOP path has a fatal guard above; the
      * EE path had none, so a wild count sized a multi-gigabyte vector before
      * any I/O happened. Refuse loudly instead. */
@@ -198,35 +204,44 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
             ((size_t)sectors - got) * 2048);
     }
     if (to_iop) {
-        /* The retail streaming reads ask for ~1400 sectors (2.8 MB) into a
-         * 755712-byte iopheap buffer. Writing the whole request runs past
-         * the allocation and through everything the game allocated after
-         * it, which for this title is the other streams' buffers: each
-         * refill destroys the other tracks. Clamp to the allocation and say
-         * so, rather than corrupting memory quietly. */
         size_t want = (size_t)sectors * 2048;
+        /* A stream refill writes at ring_base + PREV for `consumed` bytes
+         * (retail ACTSetEnvAllmighty), which stays inside the ring: the end
+         * of the write is either the reported cursor or, on the wrap path,
+         * exactly the ring size. Describe every refill, since the ring
+         * arithmetic is otherwise invisible and it paces the whole stream,
+         * and flag a write that leaves the ring as the anomaly it is. */
+        uint32_t ring_base = 0, ring = 0, cursor = 0;
+        if (rt_snd_stream_ring(buf, &ring_base, &ring, &cursor)) {
+            uint32_t at = buf - ring_base;
+            rt_log("cdvd", "stream refill: ring 0x%06x+0x%05x, write +0x%05x..+0x%05x "
+                           "(%zu bytes, %u sectors from lbn %u), voice cursor +0x%05x%s",
+                ring_base, ring, at, (uint32_t)(at + want), want, sectors, lbn, cursor,
+                at + want > ring ? ", past the ring end" : "");
+        }
+        /* IOP RAM has no allocator protection, so the write lands where the
+         * game aimed it even when that leaves the allocation; truncating
+         * would drop bytes the game expects to be there. The hard bound is
+         * the IOP RAM fatal above. Report a departure rather than hide it. */
         uint32_t room = iop_alloc_room(buf);
         if (room == 0) {
             /* Not inside any tracked allocation: either the game never got
-             * this buffer from iopheap, or the allocation table filled. Say
-             * so rather than writing an unbounded amount into it. */
+             * this buffer from iopheap, or the allocation table filled. */
             static uint64_t untracked = 0;
             ++untracked;
             if (rt_trace() || (untracked & (untracked - 1)) == 0) {
                 rt_log("cdvd", "read into untracked IOP buffer 0x%06x (%zu bytes); "
-                               "extent unknown, cannot bound the write [#%" PRIu64 "]",
+                               "extent unknown [#%" PRIu64 "]",
                     buf, want, untracked);
             }
         }
         if (room && want > room) {
-            static uint64_t clamped = 0;
-            ++clamped;
-            if (rt_trace() || (clamped & (clamped - 1)) == 0) {
-                rt_log("cdvd", "read into IOP buffer 0x%06x clamped: %zu bytes requested, "
-                               "allocation has %u left [#%" PRIu64 "]",
-                    buf, want, room, clamped);
-            }
-            want = room;
+            /* Never sampled: with the ring model correct this cannot happen,
+             * so every occurrence is a real divergence and all of them have
+             * to be visible, not one in a power of two. */
+            rt_log("cdvd", "read into IOP buffer 0x%06x runs past its allocation: "
+                           "%zu bytes requested, allocation has %u left",
+                buf, want, room);
         }
         std::memcpy(rt_iop_ptr(buf), disc_buf.data(), want);
     } else {

@@ -31,7 +31,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 
 namespace {
 
@@ -91,6 +90,7 @@ struct Voice {
     uint32_t st_ring = 0;      /* total ring size in bytes (shared) */
     uint32_t st_chunk = 0x800; /* contiguous bytes per voice per stride */
     uint32_t st_stride = 0x800;
+    uint32_t st_blk = 0;       /* IOP transfer block; cursor granularity */
     uint32_t st_pos = 0;
 
     uint64_t keyon_count = 0;
@@ -153,15 +153,34 @@ void decode_block(Voice& v) {
     }
 }
 
+/* The ring base is recovered from the voice's own buffer: the game hands
+ * out base + chunk * slot, and base is stride-aligned. */
+uint32_t ring_base(const Voice& v) { return v.st_iop_buf & ~(v.st_stride - 1); }
+
 /* Absolute IOP RAM address of stream byte i for this voice: chunks of
- * st_chunk bytes at st_stride spacing, wrapping at the shared ring size.
- * The ring base is recovered from the voice's own buffer (game hands out
- * base + chunk * slot, base stride-aligned). */
+ * st_chunk bytes at st_stride spacing, wrapping at the shared ring size. */
 uint32_t stream_addr(const Voice& v, uint32_t i) {
     uint32_t slot = v.st_iop_buf & (v.st_stride - 1);
-    uint32_t base = v.st_iop_buf - slot;
     uint32_t off = slot + (i / v.st_chunk) * v.st_stride + (i % v.st_chunk);
-    return base + (v.st_ring ? off % v.st_ring : off);
+    return ring_base(v) + (v.st_ring ? off % v.st_ring : off);
+}
+
+/* Byte offset within the ring of the next byte this voice will consume,
+ * rounded down to the IOP transfer block. This is the number the EE reads
+ * back; see rt_snd_fill_status.
+ *
+ * The rounding is not a convenience. The retail refill converts the byte
+ * delta to sectors by truncation (func_00132DC0: `sra $22, 11`, with the
+ * +0x7FF only on the negative branch) while ACTSetEnvAllmighty advances its
+ * own PREV by the untruncated delta. Any delta that is not a whole number
+ * of sectors therefore leaves `delta % 2048` bytes of the ring holding the
+ * previous lap's audio, permanently. Reporting a 16-byte-granular decoder
+ * position would do exactly that, roughly every 2.3 s. The hardware cursor
+ * moves in whole transfer blocks (0x4000 here, and the 0x5C000 ring is
+ * exactly 23 of them), which keeps every delta a whole number of sectors. */
+uint32_t stream_cursor(const Voice& v) {
+    uint32_t off = stream_addr(v, v.st_pos) - ring_base(v);
+    return v.st_blk ? off - (off % v.st_blk) : off;
 }
 
 void decode_stream_block(Voice& v) {
@@ -336,13 +355,13 @@ void selftest_dump(const Voice& v) {
 
     char path[1024];
     std::snprintf(path, sizeof(path), "%s.vag", prefix);
-    std::FILE* f = std::fopen(path, "wb");
+    std::FILE* f = rt_fopen_utf8(path, "wb");
     if (f) { std::fwrite(ram + v.start_addr, 1, len, f); std::fclose(f); }
 
     /* Decode the same bytes with a scratch voice (linear stream decode, no
      * loop handling: matches decode_vag.py stop_on_end=False over `len`). */
     std::snprintf(path, sizeof(path), "%s.s16", prefix);
-    f = std::fopen(path, "wb");
+    f = rt_fopen_utf8(path, "wb");
     if (f) {
         Voice scratch;
         scratch.start_addr = scratch.cur_addr = scratch.loop_addr = v.start_addr;
@@ -395,41 +414,6 @@ float mix_voice(Voice& v, float* out_l, float* out_r, float* out_rev) {
     return sample;
 }
 
-/* One-shot dump of a stream ring once it has been filled, so the channel
- * interleave can be recovered offline instead of inferred. Opt in with
- * ICORECOMP_RING_DUMP=path: the contents are ROM-derived, so this must
- * never write without being asked, and never inside the repository. */
-void maybe_dump_ring(const Voice& v) {
-    static bool done = false;
-    if (done || !v.st_ring) return;
-    const char* e = std::getenv("ICORECOMP_RING_DUMP");
-    if (!e || !*e) { done = true; return; }
-    if (v.st_pos < 0x8000) return; /* let the ring hold real data first */
-    done = true;
-    /* Dump the whole streaming allocation, not just one ring's worth. The
-     * iopheap alloc for streaming is 755712 = 0x800 + 2 * 0x5c000, which is
-     * two rings plus a 0x800 header, so the layout has to be checked across
-     * the entire region rather than assumed from the voice pointers. */
-    uint32_t base = g_voices[0].st_iop_buf & ~0xFFFu;
-    /* st_iop_buf comes straight from the guest, so it may be out of range;
-     * clamp with unsigned arithmetic that cannot wrap. */
-    if (base >= RT_IOP_RAM_SIZE) {
-        rt_log("snd", "ring dump skipped: stream buffer 0x%06x is outside IOP RAM", base);
-        return;
-    }
-    uint64_t len = (uint64_t)0x800 + 2ull * v.st_ring;
-    if (len > RT_IOP_RAM_SIZE - base) len = RT_IOP_RAM_SIZE - base;
-    std::string path = e;
-    if (std::FILE* f = rt_fopen_utf8(path.c_str(), "wb")) {
-        std::fwrite(rt_iop_ptr(base), 1, (size_t)len, f);
-        std::fclose(f);
-        rt_log("snd", "ring dump -> %s (base=0x%06x len=0x%x, ring=0x%x, voice "
-                      "bases 0x%06x/0x%06x)",
-            path.c_str(), base, (unsigned)len, v.st_ring, g_voices[0].st_iop_buf,
-            g_voices[1].st_iop_buf);
-    }
-}
-
 void render(uint32_t frames) {
     /* Render in small stack chunks. */
     float buf[256 * 2];
@@ -473,18 +457,45 @@ void rt_snd_engine_init(uint32_t voice_budget) {
 }
 
 void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
-    /* Per-voice stream read cursors: absolute IOP RAM address of the next
-     * ring byte this voice will consume. The EE computes per-tick deltas
-     * from these to schedule CD refills of the ring (retail adpcmTickProc2
-     * via func_0025DFB0). */
+    /* Per-voice stream read cursors. The value is a byte OFFSET WITHIN THE
+     * RING, 0 .. ring - 1, not an IOP address. Reporting an address here is
+     * what made the boot ambience play as fragments from all over its file.
+     *
+     * Ground truth is ACTSetEnvAllmighty, the read callback AdpcmOpen hands
+     * to iosCdvdChgFileName. Per tick it does:
+     *
+     *   CUR      = func_0025DFB0(slot->0x08)      // this word, channel-0 voice
+     *   PREV     = slot->0x10                     // 0 at open, kept < slot->0x1C
+     *   consumed = CUR >= PREV ? CUR - PREV : slot->0x1C - PREV
+     *   if (consumed > 0x1EAAA || CUR < PREV)     // a third of the ring, or wrap
+     *       read(slot->0x18 + PREV, consumed)     // 0x18 = ring base
+     *   slot->0x10 = PREV + consumed < slot->0x1C ? PREV + consumed : 0
+     *
+     * slot->0x1C is the ring size (0x5C000), so CUR is compared and
+     * subtracted against a ring offset throughout. Feed it an address and
+     * every refill asks for `address` bytes and lands back at offset 0. */
     for (int i = 0; i < kNumVoices; ++i) {
         const Voice& v = g_voices[i];
         if (!v.is_stream) continue;
         uint32_t off = 0xC0 + (uint32_t)(i % 24) * 4 + (uint32_t)(i / 24) * 0x60;
         if (off + 4 > recv_size) continue;
-        uint32_t cur = stream_addr(v, v.st_pos);
+        uint32_t cur = stream_cursor(v);
         std::memcpy(recv + off, &cur, 4);
     }
+}
+
+bool rt_snd_stream_ring(uint32_t addr, uint32_t* base, uint32_t* ring, uint32_t* cursor) {
+    for (int i = 0; i < kNumVoices; ++i) {
+        const Voice& v = g_voices[i];
+        if (!v.is_stream || v.st_ring == 0) continue;
+        uint32_t b = ring_base(v);
+        if (addr < b || addr >= b + v.st_ring) continue;
+        if (base) *base = b;
+        if (ring) *ring = v.st_ring;
+        if (cursor) *cursor = stream_cursor(v);
+        return true;
+    }
+    return false;
 }
 
 void rt_snd_flush_tick() {
@@ -505,9 +516,14 @@ void rt_snd_flush_tick() {
         for (int i = 0; i < kNumVoices; ++i) {
             const Voice& v = g_voices[i];
             if (!v.is_stream || !v.st_playing) continue;
-            const uint8_t* p = rt_iop_ptr(v.st_iop_buf & ~(v.st_stride - 1));
+            uint32_t base = ring_base(v);
+            /* st_iop_buf comes from the guest, so the scan window has to be
+             * clipped to IOP RAM rather than trusted to fit. */
+            uint32_t span = base < RT_IOP_RAM_SIZE ? RT_IOP_RAM_SIZE - base : 0;
+            if (span > 0x1000) span = 0x1000;
+            const uint8_t* p = rt_iop_ptr(base);
             uint32_t nonzero = 0;
-            for (uint32_t b = 0; b < 0x1000; ++b) nonzero += p[b] != 0;
+            for (uint32_t b = 0; b < span; ++b) nonzero += p[b] != 0;
             /* pitch is the whole ballgame for a stream: 0x1000 means the
              * voice is stepping one 48 kHz sample per output sample, so
              * 44.1 kHz source material plays 8.8% fast and outruns the
@@ -515,12 +531,11 @@ void rt_snd_flush_tick() {
             static uint32_t last_pos[kNumVoices] = {0};
             uint32_t advanced = v.st_pos - last_pos[i];
             last_pos[i] = v.st_pos;
-            maybe_dump_ring(v);
             rt_log("snd", "stream voice %d: pitch=0x%04x (%.0f Hz) pos=0x%x "
-                          "(+%u bytes/s = %.0f Hz effective) cursor=0x%06x nonzero=%u",
+                          "(+%u bytes/s = %.0f Hz effective) cursor=+0x%05x nonzero=%u",
                 i, v.pitch, (double)v.pitch * RT_AUDIO_RATE / 4096.0, v.st_pos,
                 advanced, (double)advanced * 28.0 / 16.0,
-                stream_addr(v, v.st_pos), nonzero);
+                stream_cursor(v), nonzero);
         }
     }
 }
@@ -628,16 +643,47 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
             break;
         /* ---- ADPCM streaming (SgStAdpcm*) ---- */
         case 0x3E: { /* Open (func_0025DD20): claims a voice for a stream.
-                      * w1 = vc<<24 | nch<<16 | (blk>>8)<<8 | spu[23:16],
+                      * w1 = vc<<24 | mode | blk[15:8] | spu[23:16],
                       * w2 = spu[15:0]<<16 | ring[23:8],
-                      * w3 = ring[7:0]<<24 | iopBuf[23:0] */
+                      * w3 = ring[7:0]<<24 | iopBuf[23:0].
+                      * The vendor loads the ring size once and packs it into
+                      * both w2 and w3's top byte, so both halves are needed;
+                      * blk is a separate field (`lw $3,0x14($16); andi
+                      * $3,0xFF00`) and carries only its bits 15:8. mode is
+                      * 0x10000/0x20000/0x40000 for 1/2/4 channels, so
+                      * reading it as a channel count is exact. spu is the
+                      * voice's SPU RAM address, which this model does not
+                      * need: playback reads the IOP ring directly. */
             uint32_t vc = w1 >> 24;
             uint32_t nch = (w1 >> 16) & 0xFF;
             uint32_t ring = ((w2 & 0xFFFF) << 8) | (w3 >> 24);
+            uint32_t blk = w1 & 0xFF00;
             uint32_t iop = w3 & 0xFFFFFF;
-            if (vc >= kNumVoices || nch == 0 || nch > 4) {
-                rt_log("snd", "stream open rejected: voice=%u nch=%u", vc, nch);
+            /* mode carries exactly 1, 2 or 4. Three would give a chunk of
+             * 682, which is not a multiple of 16, and decode_stream_block
+             * would read VAG blocks across the interleave boundary into the
+             * next channel's data. Reject rather than guess. */
+            if (vc >= kNumVoices || (nch != 1 && nch != 2 && nch != 4)) {
+                rt_log("snd", "stream open rejected: voice=%u nch=%u "
+                              "(w1=0x%08x w2=0x%08x w3=0x%08x)", vc, nch, w1, w2, w3);
                 return;
+            }
+            /* iop and ring are guest values. Validate the whole ring here,
+             * at the one point they enter, so playback, the health scan and
+             * the play-time peek can all index it without re-checking. */
+            if ((uint64_t)(iop & ~0x7FFu) + ring > RT_IOP_RAM_SIZE) {
+                rt_log("snd", "stream open rejected: voice=%u ring 0x%06x+0x%x leaves "
+                              "IOP RAM", vc, iop & ~0x7FFu, ring);
+                return;
+            }
+            /* Quantizing the cursor only keeps refills sector-aligned if the
+             * block is a whole number of sectors and tiles the ring exactly.
+             * ICO: blk 0x4000, ring 0x5C000 = 23 blocks. */
+            if (blk == 0 || blk % 2048 != 0 || ring == 0 || ring % blk != 0) {
+                rt_log("snd", "stream open: voice=%u block 0x%x does not tile ring 0x%x in "
+                              "whole sectors; reporting an unquantized cursor, so refills "
+                              "will leave gaps", vc, blk, ring);
+                blk = 0;
             }
             Voice& v = g_voices[vc];
             v = Voice();
@@ -646,8 +692,9 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
             v.st_ring = ring;
             v.st_chunk = 0x800 / nch;
             v.st_stride = 0x800;
-            rt_log("snd", "stream open: voice=%u nch=%u iop=0x%06x ring=0x%x spu=0x%06x",
-                vc, nch, iop, ring, ((w1 & 0xFF) << 16) | (w2 >> 16));
+            v.st_blk = blk;
+            rt_log("snd", "stream open: voice=%u nch=%u iop=0x%06x ring=0x%x blk=0x%x "
+                          "spu=0x%06x", vc, nch, iop, ring, blk, ((w1 & 0xFF) << 16) | (w2 >> 16));
             break;
         }
         case 0x3F: /* Close(voice) */

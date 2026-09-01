@@ -52,8 +52,15 @@ void rt_snd_flush_tick();
 /* Fills the IOP-written fields of the 0x200-byte EE status block that the
  * library reads besides the ack word: per-voice stream read cursors at
  * +0xC0 + (v % 24) * 4 + (v / 24) * 0x60 (retail func_0025DFB0,
- * SgStAdpcmIopReadAddr). */
+ * SgStAdpcmIopReadAddr). The cursor is a byte offset within the ring, not
+ * an address; see the derivation on rt_snd_fill_status in engine.cpp. */
 void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size);
+
+/* True when `addr` lands inside a playing stream voice's ring, with the ring
+ * base, its size and the ring-relative cursor last reported to the EE. Lets
+ * the disc read path describe a refill without repeating the base recovery
+ * that stream_addr already does. */
+bool rt_snd_stream_ring(uint32_t addr, uint32_t* base, uint32_t* ring, uint32_t* cursor);
 
 /* ---- reverb.cpp ---------------------------------------------------------- */
 

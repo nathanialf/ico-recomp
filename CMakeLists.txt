@@ -394,14 +394,6 @@ endif()
 
 install(TARGETS icorecomp-runtime RUNTIME DESTINATION .)
 
-# Fallback launcher: captures the console to a file using cmd.exe's own
-# redirect, so a run can be diagnosed even when the runtime cannot open a
-# log file of its own.
-if(WIN32)
-    install(FILES ${CMAKE_SOURCE_DIR}/packaging/run-with-log.bat DESTINATION .)
-    install(FILES ${CMAKE_SOURCE_DIR}/packaging/run-diagnostic.bat DESTINATION .)
-endif()
-
 if(ICORECOMP_PARALLEL_GS)
     # RUNTIME catches the Windows DLL, LIBRARY the Linux .so.
     install(TARGETS icorecomp-parallel-gs RUNTIME DESTINATION . LIBRARY DESTINATION .)

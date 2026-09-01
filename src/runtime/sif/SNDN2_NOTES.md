@@ -123,13 +123,31 @@ Reverb and output (w1 = core 0/1):
 
 ADPCM streaming (SgStAdpcm*, retail func_0025DCF0..func_0025DFB0):
 - `0x3C` Init, `0x3D` Quit (no args).
-- `0x3E` Open (retail `func_0025DD20`): w1 = voice << 24 | nch << 16 |
-  (blocksize >> 8) << 8 | spu_addr[23:16], w2 = spu_addr[15:0] << 16 |
-  ring_size[23:8], w3 = ring_size[7:0] << 24 | iop_buf[23:0].
+- `0x3E` Open (retail `func_0025DD20`): w1 = voice << 24 | mode |
+  blocksize[15:8] << 8 | spu_addr[23:16], w2 = spu_addr[15:0] << 16 |
+  ring_size[23:8], w3 = ring_size[7:0] << 24 | iop_buf[23:0]. The vendor
+  loads the ring size once (`lw $10, 0xC($16)`) and packs it twice, into w2
+  and into w3's top byte, so both halves are needed to recover it.
+  `blocksize` is a separate field (`lw $3, 0x14($16); andi $3, 0xFF00`) and
+  only its bits 15:8 survive into w1. `mode` is 0x10000, 0x20000 or 0x40000
+  for 1, 2 or 4 channels, so `(w1 >> 16) & 0xFF` reads as an exact channel
+  count; anything else is rejected, since a chunk of 0x800/3 would break the
+  16-byte VAG alignment decode_stream_block relies on.
   Boot ambience: two voices (0 and 1), nch = 2, blocksize 0x4000,
-  spu 0x1E0000/0x1E4000, ring 0x5C000, iop 0x2B8000/0x2B8400. The ring
-  interleaves the channels in 0x800/nch chunks (stride 0x800).
-- `0x3F` Close(voice) (w1 = voice number, not a handle).
+  spu 0x1E0000/0x1E4000, ring 0x5C000, iop 0x2B8000/0x2B8400.
+- Ring layout, from `AdpcmOpen` in the decomp rather than inferred. There
+  are exactly two stream slots. `AdpcmUseAreaGet` (`sound/adpcm_init.c`,
+  inlined into `AdpcmInterLeaveVolumeSet` in the nonmatching asm) picks a
+  free one out of `D_00633CB8[2]` and returns
+  `base = D_00633CB0 + slot * 0x5C000`;
+  the sound heap block is `0x800 + 2 * 0x5C000` = 755712 bytes. `AdpcmOpen`
+  then opens one voice per channel at `base + (0x800 / nch) * ch`, so
+  stereo is 0x400 apart inside a 0x800 stride. Only slot 0 has been
+  observed; slot 1 would sit at base + 0x5C000. Known gap: the runtime
+  models a single slot and recovers its base by stride alignment, so two
+  concurrent streams are not represented.
+- `0x3F` Close(voice) (w1 = voice number, not a handle; retail
+  `func_0025DDB0` passes it in w1 with w2 = w3 = 0).
 - `0x40` ChannelVolume(handle, L, R): w1|w2<<24 = 48-bit voice mask handle,
   w3 = L << 16 | R, each < 0x4000.
 - `0x41` ChannelPitch(handle, rate): w3 = playback rate in Hz, capped at
@@ -191,10 +209,12 @@ path when `+0x44` is set (`func_0025C638`):
 
 Beyond the ack, the EE reads the per-voice STREAM READ CURSORS from the
 status block: `+0xC0 + (voice % 24) * 4 + (voice / 24) * 0x60` (retail
-`func_0025DFB0`, aug6 `SgStAdpcmIopReadAddr`) holds the absolute IOP RAM
-address the driver will consume next for that stream voice. The game's
-adpcm tick uses the per-tick delta to schedule ring refills, so the HLE
-fills these words every flush (engine.cpp `rt_snd_fill_status`).
+`func_0025DFB0`, aug6 `SgStAdpcmIopReadAddr`) holds the byte OFFSET WITHIN
+THE RING, 0 .. ring - 1, that the driver will consume next for that stream
+voice. It is not an address; see the ADPCM streaming section below for the
+derivation from `ACTSetEnvAllmighty`. The game's adpcm tick uses the
+per-tick delta to schedule ring refills, so the HLE fills these words every
+flush (engine.cpp `rt_snd_fill_status`).
 
 ## Boot behavior after the fix
 
@@ -224,9 +244,35 @@ frames, fraction carried). Implementation notes and known deviations:
 - Reverb is a Schroeder/Moorer send bus keyed off the type/depth commands
   (0x15/0x16) and the 0x0C send-enable mask, not an SPU2 DSP model.
 - Streams decode straight out of the virtual-IOP ring (interleave
-  de-chunking as above), report their cursors, and play whatever the ring
-  holds; refill DMA from the EE side is the pending piece (ring observed
-  all-zero during boot).
+  de-chunking as above) and play whatever the ring holds. Refill is paced
+  entirely by the cursor the runtime reports back at status +0xC0 +
+  (v % 24) * 4 + (v / 24) * 0x60, read by retail `func_0025DFB0`. That word
+  is a byte OFFSET WITHIN THE RING, 0 .. ring - 1, not an IOP address:
+  `ACTSetEnvAllmighty` (the read callback `AdpcmOpen` registers with
+  `iosCdvdChgFileName`) keeps its own `PREV` in the same units, takes
+  `consumed = CUR - PREV`, refills when that passes 0x1EAAA (a third of the
+  ring) or the cursor wraps, reads `consumed` bytes to `ring_base + PREV`,
+  then advances `PREV` or resets it to 0 when it would leave the ring.
+  Reporting an address there made every refill ask for `address` bytes and
+  land back at offset 0, which played the ambience as fragments from all
+  over its file.
+- The cursor moves in whole transfer blocks (`blocksize`, 0x4000 here), not
+  in decoder steps. `func_00132DC0` converts the byte delta to sectors by
+  truncation (`sra $22, 11`; the `+0x7FF` applies only to the negative
+  branch) while `ACTSetEnvAllmighty` advances PREV by the untruncated
+  delta, so a delta that is not a whole number of sectors leaves
+  `delta % 2048` bytes of the ring holding the previous lap's audio for
+  good. Block granularity is what keeps every delta whole: 0x5C000 is
+  exactly 23 blocks of 0x4000, and the 0x1EAAA threshold is first crossed at
+  eight blocks, so a steady-state refill is 0x20000 bytes, 64 sectors.
+- With the cursor correct, a refill never leaves its ring: the read is
+  `PREV .. PREV + consumed` and `PREV + consumed` is either `CUR`, which is
+  below the ring size by construction, or exactly the ring size on the wrap
+  path. cdvd.cpp therefore writes refills where the game aimed them and
+  does not truncate; a read that runs past its iopheap allocation is now
+  purely an anomaly signal, and is logged rather than clamped, because IOP
+  RAM has no allocator protection and truncating would drop bytes the game
+  expects to find.
 - Output: host/audio.cpp, SDL3 audio stream at 48 kHz stereo f32 when a
   playback device exists, plus `ICORECOMP_WAV_CAPTURE=path` (48 kHz stereo
   s16, header kept valid incrementally). snd/tests/wav_stats.py prints
