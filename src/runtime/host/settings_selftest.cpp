@@ -353,6 +353,42 @@ int main() {
         set_env("ICORECOMP_SETTINGS", "-");
         CHECK(rt_settings_peek_log_file() == true);
     }
+    { /* 19. commit(false) applies without writing; the write comes from
+       * request_save + flush_save. This is the settings menu's path: it
+       * commits on every control change and asks for one debounced write. */
+        std::string path = scratch + "/nosave.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(!std::filesystem::exists(path));
+
+        rt_settings_mutable().audio.master_volume = 42;
+        rt_settings_commit(false);
+        CHECK(rt_settings().audio.master_volume == 42);
+        CHECK(!std::filesystem::exists(path));
+
+        /* Requesting a save does not write either: the debounce owns when. */
+        rt_settings_request_save();
+        CHECK(!std::filesystem::exists(path));
+
+        rt_settings_flush_save();
+        CHECK(std::filesystem::exists(path));
+        CHECK(read_file(path).find("42") != std::string::npos);
+
+        /* Nothing outstanding: a second flush is a no-op, not a second
+         * write. Checked by removing the file and flushing again. */
+        std::error_code rm_ec;
+        std::filesystem::remove(path, rm_ec);
+        rt_settings_flush_save();
+        CHECK(!std::filesystem::exists(path));
+
+        /* And commit(true) still writes, which is what every non-UI caller
+         * relies on. */
+        rt_settings_mutable().audio.master_volume = 43;
+        rt_settings_commit();
+        CHECK(std::filesystem::exists(path));
+        rt_settings_init();
+        CHECK(rt_settings().audio.master_volume == 43);
+    }
 
     unset_env("ICORECOMP_SETTINGS");
     std::printf("settings-selftest: all checks passed\n");

@@ -22,9 +22,10 @@
  *                                       rt_pgs_set_render_scale
  *   display.remember_window_size cold  read directly by host/window.cpp's
  *                                       resize handler; nothing to push here
- *   display.show_fps             --    not yet consumed (the FPS readout
- *                                       lands with the overlay, milestone
- *                                       5-6); no applier needed until then
+ *   display.show_fps             hot   UI-side only: ui/ui_settings_model.cpp
+ *                                       shows or hides the fps.rml document
+ *                                       from its own refresh, at the field
+ *                                       boundary. Nothing to push from here
  *
  *   debug.verbose                hot   rt_log_set_verbose, unless
  *                                       ICORECOMP_VERBOSE is set (log.cpp
@@ -35,7 +36,8 @@
  * launcher.*) needs no applier: those consumers read rt_settings() fresh on
  * every use (pace_period_seconds in gspriv.cpp, sdl_submit in audio.cpp,
  * rt_prof_field in prof.h), and launcher.* is cold for the current run by
- * design.
+ * design. Milestone 6 (the settings menu) added no applier for that reason:
+ * every control it exposes outside display.* was already read fresh.
  *
  * Every rt_pgs_* call is guarded on rt_gs_parallel_handle() != nullptr: a
  * dump-only run, a headless live run, or a build with no paraLLEl-GS backend
@@ -151,9 +153,11 @@ void rt_settings_apply(const RtSettings& before, const RtSettings& now) {
 
 void rt_settings_apply_pending() {
     /* Field boundary, outside WSI::begin_frame: the one context where the
-     * debounced remember_window_size commit may run, since committing runs
-     * the display applier (see window.h). */
+     * remember_window_size commit may run, since committing runs the display
+     * applier (see window.h), and the one context where the settings file
+     * may be written. */
     rt_window_flush_pending_save();
+    rt_settings_flush_save_if_due();
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
     if (!g_pending.present_mode && !g_pending.render_scale) return;
     RtPgs* pgs = rt_gs_parallel_handle();

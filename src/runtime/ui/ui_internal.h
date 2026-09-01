@@ -138,6 +138,14 @@ private:
 struct UiState {
     bool initialized = false;
     bool visible = false;
+    /* display.show_fps, mirrored here because rt_ui_tick has to know whether
+     * anything at all is on screen before it decides to render. The fps
+     * document is shown and hidden by settings_model_refresh(). */
+    bool fps_visible = false;
+    /* Set by rt_ui_set_visible(false), consumed by the next rt_ui_tick: the
+     * menu closes from inside the event pump, and the settings file write
+     * belongs at the field boundary. */
+    bool flush_save_pending = false;
     /* True while the library holds an overlay frame from us. Drives the one
      * rt_pgs_overlay_set_frame(NULL) that clears the overlay on hide. */
     bool frame_posted = false;
@@ -145,11 +153,39 @@ struct UiState {
 
     Rml::Context* context = nullptr;
     Rml::ElementDocument* menu = nullptr;
+    Rml::ElementDocument* fps = nullptr;
     UiRenderInterface* render = nullptr;
     UiSystemInterface* system = nullptr;
 };
 
 extern UiState g_ui;
+
+/* ---- settings data model (ui_settings_model.cpp) -------------------------
+ *
+ * One Rml data model named "settings", bound to a UI-side mirror of
+ * RtSettings plus the per-key "overridden by ICORECOMP_X" flags, the active
+ * tab and the fps readout text. The documents under ui/ read and write the
+ * mirror; nothing there touches rt_settings() directly.
+ */
+
+/* Creates the data model on the context. Must run after the context exists
+ * and before any document that carries data-model="settings" is loaded,
+ * because a document binds its views at load time. Returns false, having
+ * logged, when the model could not be created. */
+bool settings_model_init(Rml::Context* context);
+
+/* Copies rt_settings() into the mirror, re-reads the override flags and the
+ * settings path, dirties every bound variable, and shows or hides the fps
+ * document to match display.show_fps. Called when the menu opens and after
+ * every commit: commit-time validation can revert a value, and the menu has
+ * to show what was actually kept, not what was typed. */
+void settings_model_refresh();
+
+/* The model's half of rt_ui_tick, at the field boundary: applies a control
+ * change queued by an event callback (see the file comment in
+ * ui_settings_model.cpp for why it is queued rather than applied inline) and
+ * refreshes the fps readout text a few times a second. */
+void settings_model_tick();
 
 #ifdef ICORECOMP_PGS_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
@@ -160,6 +196,12 @@ void resolve_menu_hotkey();
 /* SDL's name for the resolved keyboard hotkey, for the menu document's
  * "press X to close" line. Valid after resolve_menu_hotkey(). */
 const char* menu_hotkey_name();
+/* SDL3 delivers SDL_EVENT_TEXT_INPUT only between SDL_StartTextInput and
+ * SDL_StopTextInput, so the menu turns it on while it is up and off again
+ * when it closes. Called from rt_ui_set_visible (ui.cpp), which is why it
+ * lives behind a wrapper: ui.cpp includes no SDL headers. Both are plain SDL
+ * calls and are legal from the event pump. */
+void menu_set_text_input(bool enabled);
 #endif
 
 } // namespace rtui

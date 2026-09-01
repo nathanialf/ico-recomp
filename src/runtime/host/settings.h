@@ -117,9 +117,34 @@ RtSettings& rt_settings_mutable();
  * fails validation reverts to its previously committed value (not the
  * compiled-in default) with a log naming the dotted key, the bad value, and
  * what it was reverted to. Then runs rt_settings_apply(before, now) with
- * the previously committed struct and saves.
+ * the previously committed struct.
+ *
+ * `save` controls the file write only. The settings menu commits with
+ * save=false on every control change (a slider drag would otherwise be one
+ * atomic file write per field) and asks for the write through
+ * rt_settings_request_save() below, which coalesces them.
  */
-void rt_settings_commit();
+void rt_settings_commit(bool save = true);
+
+/* Marks the settings dirty and timestamps the request (steady_clock). The
+ * write itself happens later, from rt_settings_apply_pending() once a
+ * second has passed with no further request, or immediately from
+ * rt_settings_flush_save(). This is the runtime's one save debounce: window
+ * resizes (host/window.cpp) and menu edits (ui/ui_settings_model.cpp) both
+ * go through it. */
+void rt_settings_request_save();
+
+/* Writes now if a save was requested and has not been written yet; does
+ * nothing otherwise. Called when the menu closes, so a change is on disk
+ * before the user can quit. It runs no applier, but it does write and
+ * fsync a file, so callers place it at the field boundary rather than
+ * inside the event pump. */
+void rt_settings_flush_save();
+
+/* The debounced half of the pair: writes only when a save was requested and
+ * the last request is at least a second old. rt_settings_apply_pending()
+ * calls it every field. */
+void rt_settings_flush_save_if_due();
 
 /* Atomically writes the current settings to rt_settings_path() (choosing a
  * save target on first use if none is set yet). Returns false, with a log
@@ -143,6 +168,12 @@ const char* rt_settings_path();
  * own call site, this only powers the startup log and UI "overridden by"
  * display. */
 bool rt_settings_overridden(const char* dotted_key);
+
+/* The environment variable that overrides `dotted_key`, or "" when that key
+ * has no environment twin. The settings menu names it in the hint under a
+ * disabled control ("overridden by ICORECOMP_X"), which is why the name is
+ * exposed here instead of being duplicated in the UI. */
+const char* rt_settings_env_twin(const char* dotted_key);
 
 /* The one place a settings diff becomes subsystem calls (settings_apply.cpp).
  * Called from rt_settings_commit(), after validation, with the previously

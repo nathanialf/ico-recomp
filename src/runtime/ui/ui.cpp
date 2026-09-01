@@ -132,7 +132,11 @@ bool rt_ui_init() {
         return false;
     }
 
-    const std::string font_path = ui_dir + "/fonts/OpenSans-Regular.ttf";
+    /* One variable font, one file. RmlUi's FreeType engine walks the named
+     * instances of a variable face (FreeTypeInterface.cpp GetFaceVariations)
+     * and registers one face per weight, so "Playfair Display" at
+     * font-weight 400 and 700 both resolve out of this single file. */
+    const std::string font_path = ui_dir + "/fonts/PlayfairDisplay[wght].ttf";
     if (!Rml::LoadFontFace(font_path)) {
         rt_log("ui", "font %s failed to load; the settings UI is disabled", font_path.c_str());
         return false;
@@ -152,11 +156,24 @@ bool rt_ui_init() {
     }
     apply_surface_size(width, height);
 
+    /* Before any LoadDocument: a document binds its data views while it is
+     * parsed, so the model has to exist first. */
+    if (!settings_model_init(g_ui.context)) return false;
+
     const std::string doc_path = ui_dir + "/menu.rml";
     g_ui.menu = g_ui.context->LoadDocument(doc_path);
     if (!g_ui.menu) {
         rt_log("ui", "document %s failed to load; the settings UI is disabled", doc_path.c_str());
         return false;
+    }
+
+    /* The fps readout is its own always-loaded document: it is visible with
+     * or without the menu, entirely on display.show_fps. Failing to load it
+     * costs the readout, not the menu. */
+    const std::string fps_path = ui_dir + "/fps.rml";
+    g_ui.fps = g_ui.context->LoadDocument(fps_path);
+    if (!g_ui.fps) {
+        rt_log("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
     }
 
     g_ui.visible = false;
@@ -176,6 +193,10 @@ bool rt_ui_init() {
 #else
     rt_log("ui", "no SDL in this build: the menu has no hotkey and cannot be opened");
 #endif
+
+    /* Fills the model from the loaded settings and puts the fps readout in
+     * the state display.show_fps asks for, before the first tick. */
+    settings_model_refresh();
     return true;
 }
 
@@ -197,9 +218,21 @@ void rt_ui_tick() {
             double(density_for(height)));
     }
 
-    if (!g_ui.visible) {
-        /* Exactly one clear on the way down; never a set_frame call while
-         * the menu stays hidden. */
+    /* Everything that changes settings, writes the settings file or shows
+     * and hides a document happens here, at the field boundary, never in the
+     * event handler: see the reentrancy rules in ui.h. */
+    settings_model_tick();
+    if (g_ui.flush_save_pending) {
+        g_ui.flush_save_pending = false;
+        rt_settings_flush_save();
+    }
+
+    /* The tick renders whenever any document is up. The menu is one of them;
+     * the fps readout is the other, and it is shown on display.show_fps with
+     * the menu closed. */
+    if (!g_ui.visible && !g_ui.fps_visible) {
+        /* Exactly one clear on the way down, keyed on whether anything was
+         * drawn last time; never a set_frame call while nothing is up. */
         if (g_ui.frame_posted) {
             backend_set_frame(nullptr);
             g_ui.frame_posted = false;
@@ -216,8 +249,8 @@ void rt_ui_tick() {
         backend_set_frame(&frame);
         g_ui.frame_posted = true;
     } else if (g_ui.frame_posted) {
-        /* Visible but with nothing to draw (an empty document). Clearing is
-         * the honest result; leaving the previous frame up would show stale
+        /* Up but with nothing to draw (an empty document). Clearing is the
+         * honest result; leaving the previous frame up would show stale
          * geometry. */
         backend_set_frame(nullptr);
         g_ui.frame_posted = false;
@@ -233,10 +266,24 @@ void rt_ui_set_visible(bool visible) {
     if (!g_ui.initialized || g_ui.visible == visible) return;
     g_ui.visible = visible;
     if (visible) {
+        /* Open on what the settings actually hold: another consumer (a
+         * window resize, an env-overridden key) may have moved a value since
+         * the menu was last up. */
+        settings_model_refresh();
         g_ui.menu->Show();
     } else {
         g_ui.menu->Hide();
+        /* Not rt_settings_flush_save() here. This function runs from the
+         * event handler, which can execute from inside WSI::begin_frame; the
+         * write belongs at the field boundary, so the next rt_ui_tick does
+         * it. */
+        g_ui.flush_save_pending = true;
     }
+#ifdef ICORECOMP_PGS_SDL
+    /* SDL3 gates SDL_EVENT_TEXT_INPUT on this, so the text fields in the
+     * menu stay dead without it. */
+    menu_set_text_input(visible);
+#endif
     rt_log("ui", "menu %s", visible ? "opened" : "closed");
 }
 

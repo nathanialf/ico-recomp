@@ -37,6 +37,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -154,6 +155,16 @@ RtJson g_dom = RtJson::make_object(); /* retained DOM: carries unknown keys */
 std::string g_path;               /* "" until a load or save has picked one */
 bool g_save_allowed = true;
 std::string g_save_blocked_reason;
+
+/* Save debounce. One mechanism for the whole runtime: every producer of
+ * settings changes (the menu's control callbacks, window.cpp's remembered
+ * window size) calls rt_settings_request_save() and the write lands from
+ * rt_settings_flush_save_if_due() at a later field boundary. A slider drag
+ * or a resize drag would otherwise be one atomic file write per field. */
+using SaveClock = std::chrono::steady_clock;
+bool g_save_dirty = false;
+SaveClock::time_point g_save_requested_at;
+constexpr auto kSaveDebounce = std::chrono::seconds(1);
 
 void apply_compiled_defaults(RtSettings* s) {
     *s = RtSettings{};
@@ -724,6 +735,7 @@ void rt_settings_init() {
     g_path.clear();
     g_save_allowed = true;
     g_save_blocked_reason.clear();
+    g_save_dirty = false;
 
     ResolvedSource src = resolve_source();
     switch (src.kind) {
@@ -771,11 +783,29 @@ RtSettings& rt_settings_mutable() {
     return g_current;
 }
 
-void rt_settings_commit() {
+void rt_settings_commit(bool save) {
     RtSettings before = g_committed;
     commit_validate(&g_current, g_committed);
     g_committed = g_current;
     rt_settings_apply(before, g_committed);
+    if (save) rt_settings_save();
+}
+
+void rt_settings_request_save() {
+    g_save_dirty = true;
+    g_save_requested_at = SaveClock::now();
+}
+
+void rt_settings_flush_save() {
+    if (!g_save_dirty) return;
+    g_save_dirty = false;
+    rt_settings_save();
+}
+
+void rt_settings_flush_save_if_due() {
+    if (!g_save_dirty) return;
+    if (SaveClock::now() - g_save_requested_at < kSaveDebounce) return;
+    g_save_dirty = false;
     rt_settings_save();
 }
 
@@ -825,4 +855,11 @@ bool rt_settings_overridden(const char* dotted_key) {
         }
     }
     return false;
+}
+
+const char* rt_settings_env_twin(const char* dotted_key) {
+    for (const EnvTwin& t : kEnvTwins) {
+        if (std::strcmp(t.dotted_key, dotted_key) == 0) return t.env_var;
+    }
+    return "";
 }

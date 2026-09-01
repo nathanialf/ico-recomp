@@ -192,7 +192,41 @@ void pace_field() {
     }
 }
 
+/* Field-rate measurement for the menu's FPS readout (rt_gs_field_stats).
+ * A handful of statics, counted in the vsync hook: no allocation, no
+ * per-field work beyond an increment and one clock read. The window is
+ * closed and republished once a second, so the readout is a real average
+ * over that second rather than the reciprocal of one field interval. */
+using StatClock = std::chrono::steady_clock;
+StatClock::time_point g_stat_window_start;
+bool g_stat_started = false;
+unsigned g_stat_fields = 0;
+double g_stat_fps = 0.0;
+double g_stat_field_ms = 0.0;
+
+void note_field() {
+    const auto now = StatClock::now();
+    if (!g_stat_started) {
+        g_stat_started = true;
+        g_stat_window_start = now;
+        g_stat_fields = 0;
+        return;
+    }
+    ++g_stat_fields;
+    const std::chrono::duration<double> elapsed = now - g_stat_window_start;
+    if (elapsed.count() < 1.0) return;
+    g_stat_fps = double(g_stat_fields) / elapsed.count();
+    g_stat_field_ms = elapsed.count() * 1000.0 / double(g_stat_fields);
+    g_stat_window_start = now;
+    g_stat_fields = 0;
+}
+
 } // namespace
+
+void rt_gs_field_stats(double* fields_per_second, double* field_ms) {
+    if (fields_per_second) *fields_per_second = g_stat_fps;
+    if (field_ms) *field_ms = g_stat_field_ms;
+}
 
 void rt_gs_vsync_hook(unsigned field) {
     /* The event pump also runs from inside WSI::begin_frame via the
@@ -206,6 +240,7 @@ void rt_gs_vsync_hook(unsigned field) {
      * between frames every field. rt_ui_tick() follows for the same reason:
      * RmlUi's update and render call the overlay texture and set_frame entry
      * points, which are between-frames-only too (see ui/ui.h). */
+    note_field();
     rt_window_pump();
     rt_settings_apply_pending();
     rt_ui_tick();

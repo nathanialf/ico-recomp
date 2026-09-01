@@ -5,61 +5,492 @@
  * scissored regions. No border-radius, box-shadow, gradients, filters,
  * container opacity or clip masks: each of those reaches a RenderInterface
  * function that is not implemented in this build and logs a line saying so.
+ * The one transform in the document is the rotated bracket label.
  *
  * Sizes are in dp, not px. The context's density-independent pixel ratio is
  * set from the surface height against the 640x480 baseline (ui.cpp), so the
  * same document reads at the same size in a small window and a large one.
+ *
+ * RmlUi ships no default stylesheet, so every element used by a document
+ * gets its display value here.
+ *
+ * Palette, one place:
+ *   panels    #0a0a0a  #0d0d0d  #171717
+ *   hairlines #1a1a1a  #262626  #525252
+ *   type      #333333  #404040  #525252  #737373  #a3a3a3  #d4d4d4
+ *             #e5e5e5  #f9fafb
+ *   accent    #bfff00 (a control that is on)
+ *   warning   #d4a000 on #2d2000, border #4d3800
  */
 
+/* ---- elements ----------------------------------------------------------- */
+
 body {
-	font-family: "Open Sans";
-	font-weight: normal;
+	font-family: "Playfair Display";
+	font-weight: 400;
 	font-style: normal;
-	font-size: 15dp;
-	color: #e6e6ea;
+	font-size: 11dp;
+	color: #d4d4d4;
+}
+
+div {
+	display: block;
+}
+
+span {
+	display: inline;
+}
+
+/* ---- menu shell --------------------------------------------------------- */
+
+body.menu {
 	width: 100%;
 	height: 100%;
+	box-sizing: border-box;
+	padding: 12dp 14dp;
 	display: flex;
-	align-items: center;
-	justify-content: center;
+	flex-direction: column;
+	/* The one translucent surface: the game's scanout stays visible behind
+	 * the panel. The alpha is on the background color, not on the element;
+	 * container opacity would need a render layer. */
+	background-color: rgba(10, 10, 10, 217);
 }
 
-.panel {
-	width: 420dp;
-	padding: 20dp 24dp;
-	/* Translucent panel over the game's scanout. The alpha is on the
-	 * background color, not on the element: container opacity would need a
-	 * render layer. */
-	background-color: rgba(16, 17, 22, 235);
-	border: 1dp #4a4d5a;
+.shell {
+	display: flex;
+	flex-direction: row;
+	flex-grow: 1;
+	min-height: 0;
 }
 
-h1 {
+/* ---- left navigation column --------------------------------------------- */
+
+.nav {
+	display: flex;
+	flex-direction: row;
+	width: 150dp;
+	flex-shrink: 0;
+}
+
+.nav-stack {
 	display: block;
-	font-size: 22dp;
-	font-weight: bold;
+	flex-grow: 1;
+	min-width: 0;
+}
+
+.nav-button {
+	display: flex;
+	flex-direction: column;
+	width: 100%;
+	box-sizing: border-box;
+	padding: 7dp 9dp;
+	margin-bottom: 5dp;
+	background-color: transparent;
+	border: 1dp #262626;
+	tab-index: auto;
+	nav: auto;
+}
+
+.nav-button:hover,
+.nav-button:focus,
+.nav-button.active {
+	background-color: #525252;
+	border-color: #525252;
+}
+
+.nav-name {
+	display: block;
+	font-weight: 700;
+	font-size: 11dp;
+	letter-spacing: 0.05em;
+	color: #f9fafb;
+	line-height: 1.2;
+}
+
+.nav-tagline {
+	display: block;
+	font-size: 8dp;
+	letter-spacing: 0.02em;
+	color: #737373;
+	margin-top: 2dp;
+}
+
+.nav-button:hover .nav-name,
+.nav-button:focus .nav-name,
+.nav-button.active .nav-name {
 	color: #ffffff;
+}
+
+.nav-button:hover .nav-tagline,
+.nav-button:focus .nav-tagline,
+.nav-button.active .nav-tagline {
+	color: rgba(255, 255, 255, 204);
+}
+
+/* The bracket beside the nav stack: a 1dp vertical line with 1dp caps
+ * reaching back toward the buttons, and a label rotated onto the line.
+ * Built from nested divs because RCSS has no ::before/::after. */
+.bracket {
+	display: flex;
+	flex-direction: column;
+	width: 14dp;
+	flex-shrink: 0;
+	margin-left: 6dp;
+	margin-bottom: 5dp;
+}
+
+.bracket-cap {
+	display: block;
+	width: 5dp;
+	height: 1dp;
+	margin-left: -5dp;
+	background-color: #525252;
+}
+
+.bracket-line {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	width: 1dp;
+	flex-grow: 1;
+	background-color: #525252;
+}
+
+/* Rotated about its own center, so the pre-rotation box is centered on the
+ * line with a negative margin of half its width. */
+.bracket-label {
+	display: block;
+	width: 70dp;
+	margin-left: -35dp;
+	padding: 2dp 0;
+	background-color: #0a0a0a;
+	text-align: center;
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	font-size: 8dp;
+	color: #525252;
+	transform: rotate(-90deg);
+}
+
+/* ---- content pane ------------------------------------------------------- */
+
+.pane {
+	display: block;
+	flex-grow: 1;
+	min-width: 0;
+	overflow-y: auto;
+	padding-left: 14dp;
+	padding-right: 4dp;
+}
+
+scrollbarvertical {
+	width: 5dp;
+}
+
+scrollbarvertical slidertrack {
+	background-color: #1a1a1a;
+}
+
+scrollbarvertical sliderbar {
+	width: 5dp;
+	min-height: 24dp;
+	background-color: #404040;
+}
+
+scrollbarvertical sliderbar:hover {
+	background-color: #525252;
+}
+
+.section {
+	display: block;
 	margin-bottom: 14dp;
 }
 
-p {
+.section-header {
+	display: flex;
+	flex-direction: row;
+	align-items: baseline;
+	border-bottom: 1dp #262626;
+	padding-bottom: 3dp;
+	margin-bottom: 8dp;
+}
+
+.section-number {
+	display: block;
+	font-size: 8dp;
+	color: #404040;
+	flex-shrink: 0;
+	margin-right: 8dp;
+}
+
+.section-title {
+	display: block;
+	font-size: 11dp;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: #d4d4d4;
+}
+
+.note {
+	display: block;
+	font-size: 9dp;
+	color: #525252;
+	line-height: 1.5;
+}
+
+/* ---- controls ----------------------------------------------------------- */
+
+.control {
 	display: block;
 	margin-bottom: 10dp;
-	line-height: 1.4;
 }
 
-.dim {
-	color: #9a9aa6;
+.control-label {
+	display: block;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: #737373;
+	margin-bottom: 3dp;
 }
+
+.hint {
+	display: block;
+	font-size: 8dp;
+	color: #525252;
+	margin-top: 3dp;
+}
+
+/* An environment variable owns this key for the life of the run. */
+.override {
+	display: block;
+	font-size: 8dp;
+	color: #d4a000;
+	background-color: #2d2000;
+	border: 1dp #4d3800;
+	padding: 4dp 5dp;
+	margin-top: 4dp;
+}
+
+input,
+select {
+	tab-index: auto;
+	nav: auto;
+}
+
+input.text,
+select {
+	display: block;
+	box-sizing: border-box;
+	width: 100%;
+	height: 20dp;
+	padding: 4dp 6dp;
+	font-size: 10dp;
+	background-color: #171717;
+	border: 1dp #262626;
+	color: #e5e5e5;
+	text-align: left;
+}
+
+input.text:focus,
+select:focus {
+	border-color: #404040;
+}
+
+input.text:disabled,
+select:disabled,
+input.checkbox:disabled,
+input.range:disabled {
+	color: #525252;
+	border-color: #1a1a1a;
+}
+
+select selectvalue {
+	width: auto;
+	height: 20dp;
+	margin-right: 16dp;
+	padding: 4dp 6dp;
+	box-sizing: border-box;
+	color: #e5e5e5;
+}
+
+select selectarrow {
+	width: 16dp;
+	height: 20dp;
+	background-color: #262626;
+}
+
+select:hover selectarrow {
+	background-color: #404040;
+}
+
+select selectbox {
+	margin-left: 0;
+	width: 100%;
+	max-height: 120dp;
+	background-color: #171717;
+	border: 1dp #262626;
+}
+
+select selectbox option {
+	width: auto;
+	padding: 3dp 6dp;
+	font-size: 10dp;
+	color: #a3a3a3;
+	background-color: #171717;
+}
+
+select selectbox option:checked {
+	color: #e5e5e5;
+}
+
+select selectbox option:hover {
+	background-color: #262626;
+	color: #f9fafb;
+}
+
+.check-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+}
+
+input.checkbox {
+	display: inline-block;
+	width: 11dp;
+	height: 11dp;
+	margin-right: 7dp;
+	background-color: #171717;
+	border: 1dp #262626;
+}
+
+input.checkbox:hover {
+	border-color: #404040;
+}
+
+input.checkbox:checked {
+	background-color: #bfff00;
+	border-color: #bfff00;
+}
+
+.check-label {
+	display: block;
+	font-size: 10dp;
+	color: #d4d4d4;
+}
+
+.range-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+}
+
+input.range {
+	display: block;
+	flex-grow: 1;
+	height: 14dp;
+}
+
+input.range slidertrack {
+	height: 4dp;
+	margin-top: 5dp;
+	background-color: #262626;
+}
+
+input.range sliderbar {
+	width: 14dp;
+	height: 14dp;
+	background-color: #525252;
+}
+
+input.range sliderbar:hover,
+input.range sliderbar:active {
+	background-color: #737373;
+}
+
+.range-value {
+	display: block;
+	width: 34dp;
+	flex-shrink: 0;
+	margin-left: 8dp;
+	text-align: right;
+	font-size: 10dp;
+	color: #a3a3a3;
+}
+
+/* ---- footer ------------------------------------------------------------- */
 
 .footer {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	flex-shrink: 0;
+	margin-top: 10dp;
+	padding-top: 8dp;
+	border-top: 1dp #262626;
+}
+
+.button {
 	display: block;
-	margin-top: 16dp;
-	font-size: 12dp;
-	color: #71717e;
+	flex-shrink: 0;
+	margin-right: 8dp;
+	padding: 4dp 10dp;
+	background-color: transparent;
+	border: 1dp #262626;
+	font-size: 9dp;
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	color: #525252;
+	tab-index: auto;
+	nav: auto;
+}
+
+.button:hover,
+.button:focus {
+	color: #a3a3a3;
+	border-color: #404040;
+}
+
+.footer-path {
+	display: block;
+	flex-grow: 1;
+	min-width: 0;
+	text-align: right;
+	font-size: 8dp;
+	color: #333333;
+}
+
+.footer-hotkey {
+	display: block;
+	flex-shrink: 0;
+	margin-left: 12dp;
+	font-size: 8dp;
+	color: #525252;
 }
 
 .key {
-	font-weight: bold;
-	color: #ffffff;
+	color: #a3a3a3;
+}
+
+/* ---- fps readout (fps.rml) ---------------------------------------------- */
+
+body.fps {
+	top: 8dp;
+	right: 8dp;
+	width: 116dp;
+	height: 16dp;
+	/* Never in the way of a click aimed at the menu underneath. */
+	pointer-events: none;
+	background-color: #0a0a0a;
+	border: 1dp #262626;
+}
+
+.fps-text {
+	display: block;
+	padding: 2dp 5dp;
+	font-size: 9dp;
+	letter-spacing: 0.05em;
+	color: #a3a3a3;
+	text-align: right;
 }

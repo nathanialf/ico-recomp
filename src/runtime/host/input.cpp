@@ -4,6 +4,7 @@
 #include "input.h"
 
 #include "../runtime.h"
+#include "../ui/ui.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -245,7 +246,22 @@ void rt_input_poll(uint64_t field) {
             break;
 #ifdef ICORECOMP_PGS_SDL
         case Provider::Sdl:
-            if (sdl_active()) sdl_poll();
+            if (rt_ui_wants_input()) {
+                /* The menu owns the keyboard and the pad while it is up, so
+                 * the game must not also see them. A default-constructed
+                 * RtPadState is a real untouched-controller report (no
+                 * buttons, both sticks centered at 0x80), not a fabricated
+                 * one: it is exactly what sdl_poll would produce from a
+                 * device nobody is touching. The guest keeps running.
+                 *
+                 * The script provider is deliberately not gated: a scripted
+                 * run never brings the UI up (main.cpp skips rt_ui_init when
+                 * ICORECOMP_INPUT_SCRIPT is set) and its input must stay
+                 * bit-identical. */
+                g_state = RtPadState{};
+            } else if (sdl_active()) {
+                sdl_poll();
+            }
             break;
 #endif
         default:

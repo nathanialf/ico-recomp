@@ -35,6 +35,12 @@
  * Both providers can be inactive (headless, no script): every port then
  * reports "no controller" and sif/pad.cpp presents an empty port.
  *
+ * While the settings menu is up (rt_ui_wants_input(), ui/ui.h) the SDL
+ * provider reports a centered pad with no buttons instead of sampling the
+ * devices, so keys and pad presses aimed at the menu do not also reach the
+ * game. The scripted provider is never gated that way: a scripted run does
+ * not bring the UI up at all.
+ *
  * Runtime-internal, NOT part of the ABI contract (include/recomp_*.h).
  */
 #ifndef ICORECOMP_HOST_INPUT_H

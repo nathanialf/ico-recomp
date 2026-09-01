@@ -137,6 +137,17 @@ bool rt_gspriv_mmio_write(uint32_t addr, uint64_t v);
 /* Called from ee/intc.cpp at vblank start: snapshots CSR into the backend
  * shadow and emits the backend vsync (dump Vsync packet). */
 void rt_gs_vsync_hook(unsigned field);
+/* Measured field rate, for the menu's FPS readout (ui/ui_settings_model.cpp).
+ * `fields_per_second` is the number of rt_gs_vsync_hook calls in the last
+ * completed one-second window divided by that window's real duration, and
+ * `field_ms` is the mean interval between them in milliseconds. Both are 0
+ * until the first window completes. Either pointer may be null.
+ *
+ * This counts vsync hook calls, which are fields: when the window is live
+ * every one of them ends in a present, so it is the presented field rate.
+ * A dump or headless backend still counts fields; it just never presents
+ * them. */
+void rt_gs_field_stats(double* fields_per_second, double* field_ms);
 /* Called from the SetGsCrt syscall HLE: programs SMODE1/SMODE2 in the
  * backend priv shadow the way the real kernel does. Without SMODE1 (games
  * never write it directly) the GS cannot deduce the video mode and refuses

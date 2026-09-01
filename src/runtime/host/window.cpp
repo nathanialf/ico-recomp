@@ -45,11 +45,15 @@ namespace {
 
 using WindowClock = std::chrono::steady_clock;
 
-/* display.remember_window_size debounce: a live-resize drag delivers many
- * WINDOW_RESIZED events per second; saving on every one would mean many
- * atomic settings-file writes per second. Coalesce to at most one save per
- * second of quiet after the last size change, performed from a later
- * rt_window_pump() call (this file has no timer of its own). */
+/* display.remember_window_size: a live-resize drag delivers many
+ * WINDOW_RESIZED events per second. This flag is not the save debounce (that
+ * is rt_settings_request_save(), one mechanism for the whole runtime); it is
+ * this file's "when is it safe to commit" gate. record_window_size runs
+ * inside the pump, which can execute from inside WSI::begin_frame, and a
+ * commit runs the display applier, which touches the window. So the size
+ * change is recorded here and committed a second of quiet later from
+ * rt_window_flush_pending_save(), which rt_settings_apply_pending() calls at
+ * the field boundary. */
 bool g_size_dirty = false;
 WindowClock::time_point g_size_dirty_since;
 
@@ -57,7 +61,11 @@ void maybe_save_window_size() {
     if (!g_size_dirty) return;
     if (WindowClock::now() - g_size_dirty_since < std::chrono::seconds(1)) return;
     g_size_dirty = false;
-    rt_settings_commit();
+    /* Validate and apply, but do not write here: the file write is asked for
+     * through the settings layer's own debounce, so a resize drag and a menu
+     * edit in the same second produce one write, not two. */
+    rt_settings_commit(false);
+    rt_settings_request_save();
 }
 
 /* Records the window's current size into settings when the user (not
@@ -114,11 +122,11 @@ void rt_window_pump() {
          * when this build has no UI. */
         rt_ui_handle_sdl_event(e);
     }
-    /* The debounced size save happens in rt_window_flush_pending_save, not
-     * here: rt_settings_commit runs the display applier, and this function
-     * can execute from inside WSI::begin_frame via pump_events, where
-     * window and swapchain calls are off limits (the reentrancy rule at the
-     * top of this file). */
+    /* The size commit happens in rt_window_flush_pending_save, not here:
+     * rt_settings_commit runs the display applier, and this function can
+     * execute from inside WSI::begin_frame via pump_events, where window and
+     * swapchain calls are off limits (the reentrancy rule at the top of this
+     * file). */
 }
 
 void rt_window_flush_pending_save() {

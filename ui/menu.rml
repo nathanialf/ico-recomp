@@ -3,16 +3,260 @@
 	<title>Settings</title>
 	<link type="text/rcss" href="style/base.rcss"/>
 </head>
-<body>
-	<!-- The root overlay document. Milestone 6 of the settings plan fills
-	     this in with the Display, Audio, Input and Debug categories; for now
-	     it exists to prove the RmlUi path end to end: font, layout, text and
-	     the overlay draw list. -->
-	<div class="panel">
-		<h1>Settings</h1>
-		<p>The settings menu is not wired up yet.</p>
-		<p class="dim">Press <span class="key" id="menu-key">F1</span> to close this.</p>
-		<p class="footer">icorecomp</p>
+<!--
+	The settings menu. Every control is bound to the "settings" data model
+	(src/runtime/ui/ui_settings_model.cpp): data-value / data-checked carry
+	the value both ways, and data-event-change (plus data-event-blur on the
+	text fields) calls apply(), which queues the commit for the next field
+	boundary. The text fields deliberately apply on Enter or blur only; the
+	callback ignores an ordinary keystroke. Option values below must match
+	the enum name tables in ui_settings_model.cpp, which are the spellings
+	settings.json holds.
+-->
+<body class="menu" data-model="settings">
+	<div class="shell">
+		<div class="nav">
+			<div class="nav-stack">
+				<div class="nav-button" data-class-active="active_tab == 'display'" data-event-click="active_tab = 'display'">
+					<span class="nav-name">Display</span>
+					<span class="nav-tagline">window, scaling, readout</span>
+				</div>
+				<div class="nav-button" data-class-active="active_tab == 'audio'" data-event-click="active_tab = 'audio'">
+					<span class="nav-name">Audio</span>
+					<span class="nav-tagline">output volume</span>
+				</div>
+				<div class="nav-button" data-class-active="active_tab == 'input'" data-event-click="active_tab = 'input'">
+					<span class="nav-name">Input</span>
+					<span class="nav-tagline">sticks, triggers, rumble</span>
+				</div>
+				<div class="nav-button" data-class-active="active_tab == 'debug'" data-event-click="active_tab = 'debug'">
+					<span class="nav-name">Debug</span>
+					<span class="nav-tagline">logging, pacing, profiler</span>
+				</div>
+				<div class="nav-button" data-class-active="active_tab == 'about'" data-event-click="active_tab = 'about'">
+					<span class="nav-name">About</span>
+					<span class="nav-tagline">this port</span>
+				</div>
+			</div>
+			<div class="bracket">
+				<div class="bracket-cap"/>
+				<div class="bracket-line">
+					<div class="bracket-label">Settings</div>
+				</div>
+				<div class="bracket-cap"/>
+			</div>
+		</div>
+
+		<div class="pane">
+			<div class="section" data-if="active_tab == 'display'">
+				<div class="section-header">
+					<span class="section-number">01</span>
+					<span class="section-title">Display</span>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Mode</div>
+					<select data-value="display_mode" data-event-change="apply()">
+						<option value="windowed">Windowed</option>
+						<option value="fullscreen_desktop">Fullscreen (desktop)</option>
+						<option value="fullscreen_exclusive">Fullscreen (exclusive)</option>
+					</select>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Window width</div>
+					<input type="text" data-value="window_width" data-event-change="apply()" data-event-blur="apply()"/>
+					<div class="hint">applies on Enter or when the field loses focus</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Window height</div>
+					<input type="text" data-value="window_height" data-event-change="apply()" data-event-blur="apply()"/>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Present</div>
+					<select data-value="present" data-event-change="apply()" data-attrif-disabled="overridden_present">
+						<option value="mailbox">Mailbox</option>
+						<option value="fifo">FIFO</option>
+						<option value="immediate">Immediate</option>
+					</select>
+					<div class="hint">mailbox: low latency, no tearing</div>
+					<div class="override" data-if="overridden_present">{{override_text_present}}</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Fit</div>
+					<select data-value="fit" data-event-change="apply()">
+						<option value="letterbox">Letterbox</option>
+						<option value="integer">Integer scale</option>
+						<option value="stretch">Stretch</option>
+					</select>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Filter</div>
+					<select data-value="filter" data-event-change="apply()">
+						<option value="linear">Linear</option>
+						<option value="nearest">Nearest</option>
+					</select>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Render scale</div>
+					<select data-value="render_scale" data-event-change="apply()">
+						<option value="1">1x</option>
+						<option value="2">2x</option>
+						<option value="4">4x</option>
+						<option value="8">8x</option>
+						<option value="16">16x</option>
+					</select>
+					<div class="hint">internal resolution multiplier, applies at the next field</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="hires_scanout" data-event-change="apply()"/>
+						<span class="check-label">High resolution scanout</span>
+					</div>
+					<div class="hint">needs render scale 4 or more; stays off below that</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="show_fps" data-event-change="apply()"/>
+						<span class="check-label">Show the field rate</span>
+					</div>
+				</div>
+			</div>
+
+			<div class="section" data-if="active_tab == 'audio'">
+				<div class="section-header">
+					<span class="section-number">02</span>
+					<span class="section-title">Audio</span>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Master volume</div>
+					<div class="range-row">
+						<input type="range" min="0" max="100" step="1" data-value="master_volume" data-event-change="apply()"/>
+						<span class="range-value">{{master_volume_text}}</span>
+					</div>
+					<div class="hint">host output gain only; nothing the game mixes changes</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="mute" data-event-change="apply()" data-attrif-disabled="overridden_mute"/>
+						<span class="check-label">Mute</span>
+					</div>
+					<div class="override" data-if="overridden_mute">{{override_text_mute}}</div>
+				</div>
+			</div>
+
+			<div class="section" data-if="active_tab == 'input'">
+				<div class="section-header">
+					<span class="section-number">03</span>
+					<span class="section-title">Input</span>
+				</div>
+				<!-- Nothing in host/input.cpp reads these yet: the poll still
+				     uses its compiled-in map and thresholds. They are stored
+				     and take effect when the input rework lands, and saying so
+				     beats a control that looks live and is not. -->
+				<div class="note">Stored now; the input path starts reading these in the next milestone</div>
+
+				<div class="control">
+					<div class="control-label">Left stick deadzone</div>
+					<div class="range-row">
+						<input type="range" min="0" max="0.95" step="0.05" data-value="left_deadzone" data-event-change="apply()"/>
+						<span class="range-value">{{left_deadzone_text}}</span>
+					</div>
+					<div class="hint">0 reports the stick exactly as the device does</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Right stick deadzone</div>
+					<div class="range-row">
+						<input type="range" min="0" max="0.95" step="0.05" data-value="right_deadzone" data-event-change="apply()"/>
+						<span class="range-value">{{right_deadzone_text}}</span>
+					</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Trigger threshold</div>
+					<div class="range-row">
+						<input type="range" min="0.05" max="1" step="0.05" data-value="trigger_threshold" data-event-change="apply()"/>
+						<span class="range-value">{{trigger_threshold_text}}</span>
+					</div>
+					<div class="hint">how far L2 and R2 travel before they count as pressed</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="rumble" data-event-change="apply()"/>
+						<span class="check-label">Rumble</span>
+					</div>
+				</div>
+
+				<div class="section-header">
+					<span class="section-number">03.1</span>
+					<span class="section-title">Bindings</span>
+				</div>
+				<div class="note">Remapping lands in the next milestone</div>
+			</div>
+
+			<div class="section" data-if="active_tab == 'debug'">
+				<div class="section-header">
+					<span class="section-number">04</span>
+					<span class="section-title">Debug</span>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Verbose channels</div>
+					<input type="text" data-value="verbose" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_verbose"/>
+					<div class="hint">channel list as for ICORECOMP_VERBOSE; empty means the defaults</div>
+					<div class="override" data-if="overridden_verbose">{{override_text_verbose}}</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="log_file" data-event-change="apply()" data-attrif-disabled="overridden_log_file"/>
+						<span class="check-label">Write a log file</span>
+					</div>
+					<div class="hint">takes effect at the next start</div>
+					<div class="override" data-if="overridden_log_file">{{override_text_log_file}}</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Profiler period, fields</div>
+					<input type="text" data-value="profile_fields" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_profile_fields"/>
+					<div class="hint">0 turns the profiler off; 180 is one summary every 3 seconds</div>
+					<div class="override" data-if="overridden_profile_fields">{{override_text_profile_fields}}</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Frame limit, Hz</div>
+					<input type="text" data-value="fps_limit_hz" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_fps_limit_hz"/>
+					<div class="hint">0 disables pacing</div>
+					<div class="override" data-if="overridden_fps_limit_hz">{{override_text_fps_limit_hz}}</div>
+				</div>
+			</div>
+
+			<div class="section" data-if="active_tab == 'about'">
+				<div class="section-header">
+					<span class="section-number">05</span>
+					<span class="section-title">About</span>
+				</div>
+				<div class="note">Credits land with the launcher</div>
+			</div>
+		</div>
+	</div>
+
+	<div class="footer">
+		<div class="button" data-event-click="reset_defaults()">Reset to defaults</div>
+		<div class="button" data-event-click="close_menu()">Close</div>
+		<div class="footer-path">{{settings_path}}</div>
+		<div class="footer-hotkey"><span class="key" id="menu-key">F1</span> closes</div>
 	</div>
 </body>
 </rml>

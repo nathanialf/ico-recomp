@@ -4,9 +4,10 @@
  * Reentrancy: rt_ui_handle_sdl_event runs from rt_window_pump
  * (host/window.cpp), which can execute from inside Granite's
  * WSI::begin_frame. Nothing here may call an rt_pgs_* function. It only
- * translates events into Rml::Context::Process* calls and flips the
- * visibility flag; the surface size it needs for coordinate scaling is the
- * one rt_ui_tick read at the last field boundary.
+ * translates events into Rml::Context::Process* calls, flips the visibility
+ * flag and makes plain SDL calls (SDL_CaptureMouse, SDL_StartTextInput);
+ * the surface size it needs for coordinate scaling is the one rt_ui_tick
+ * read at the last field boundary.
  *
  * The key/mouse/modifier mapping below is ported from RmlUi 6.3's
  * Backends/RmlUi_Platform_SDL.cpp (RmlSDL::InputEventHandler, ConvertKey,
@@ -202,7 +203,51 @@ bool toggle_menu() {
     return true;
 }
 
+/* Escape (and its gamepad twin) closes the menu, except while a text field
+ * has the focus: there Escape belongs to the field, which uses it to revert
+ * the edit. Anything else focused, or nothing focused, closes. */
+bool text_input_focused() {
+    Rml::Element* focus = g_ui.context->GetFocusElement();
+    if (!focus || focus->GetTagName() != "input") return false;
+    const Rml::String type = focus->GetAttribute<Rml::String>("type", "text");
+    return type == "text" || type == "password";
+}
+
+bool close_menu() {
+    if (text_input_focused()) return false;
+    rt_ui_set_visible(false);
+    return true;
+}
+
+/* Gamepad navigation while the menu is up. RmlUi drives focus from the
+ * arrow keys and Enter (ElementDocument::ProcessDefaultAction), so the
+ * translation is a d-pad-to-arrow-keys mapping plus south for Enter; the
+ * documents carry `nav: auto` and `tab-index: auto` on every control, which
+ * is what makes the arrow keys move the focus at all. KI_UNKNOWN means
+ * "this button has no menu meaning", and the event falls through unconsumed.
+ */
+Rml::Input::KeyIdentifier convert_gamepad_button(SDL_GamepadButton button) {
+    switch (button) {
+    case SDL_GAMEPAD_BUTTON_DPAD_UP:    return Rml::Input::KI_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  return Rml::Input::KI_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  return Rml::Input::KI_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Rml::Input::KI_RIGHT;
+    case SDL_GAMEPAD_BUTTON_SOUTH:      return Rml::Input::KI_RETURN;
+    default:                            return Rml::Input::KI_UNKNOWN;
+    }
+}
+
 } // namespace
+
+void menu_set_text_input(bool enabled) {
+    SDL_Window* win = (SDL_Window*)backend_window_handle();
+    if (!win) return;
+    if (enabled) {
+        SDL_StartTextInput(win);
+    } else {
+        SDL_StopTextInput(win);
+    }
+}
 
 void resolve_menu_hotkey() {
     const std::string& kb = rt_settings().input.keyboard[RT_KB_MENU];
@@ -261,6 +306,24 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
 
     Rml::Context* context = g_ui.context;
     switch (e.type) {
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        const SDL_GamepadButton button = SDL_GamepadButton(e.gbutton.button);
+        if (button == SDL_GAMEPAD_BUTTON_EAST) return close_menu();
+        const Rml::Input::KeyIdentifier key = convert_gamepad_button(button);
+        if (key == Rml::Input::KI_UNKNOWN) return false;
+        bool consumed = context->ProcessKeyDown(key, 0);
+        if (key == Rml::Input::KI_RETURN) {
+            /* The keyboard path pairs Enter with a newline text input; the
+             * text widget needs both to commit a field. */
+            consumed &= context->ProcessTextInput('\n');
+        }
+        return consumed;
+    }
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+        const Rml::Input::KeyIdentifier key = convert_gamepad_button(SDL_GamepadButton(e.gbutton.button));
+        if (key == Rml::Input::KI_UNKNOWN) return false;
+        return context->ProcessKeyUp(key, 0);
+    }
     case SDL_EVENT_MOUSE_MOTION: {
         int x = 0, y = 0;
         window_to_surface(e.motion.x, e.motion.y, &x, &y);
@@ -279,6 +342,7 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
     case SDL_EVENT_MOUSE_WHEEL:
         return context->ProcessMouseWheel(float(-e.wheel.y), key_modifier_state());
     case SDL_EVENT_KEY_DOWN: {
+        if (e.key.key == SDLK_ESCAPE && close_menu()) return true;
         bool consumed = context->ProcessKeyDown(convert_key(e.key.key), key_modifier_state());
         if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER) {
             consumed &= context->ProcessTextInput('\n');

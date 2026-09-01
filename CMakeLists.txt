@@ -460,6 +460,7 @@ if(ICORECOMP_UI)
         src/runtime/ui/ui_render.cpp
         src/runtime/ui/ui_system.cpp
         src/runtime/ui/ui_events.cpp
+        src/runtime/ui/ui_settings_model.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)
     # RmlUi::Core only. The debugger is a separate target that nothing here

@@ -34,12 +34,11 @@ RtPgs* rt_gs_parallel_handle();
 /* The process's one and only SDL_PollEvent loop. Routes SDL_EVENT_QUIT to
  * rt_pgs_notify_quit and the two resize events to rt_pgs_notify_resize (plus
  * recording the new window size into settings when display.
- * remember_window_size is set and the window is not fullscreen; the
- * debounced commit itself runs from rt_window_flush_pending_save, never
- * from the pump, per the reentrancy rule above). Everything else is dropped
- * for now
- * (RmlUi event translation and rebind capture attach here in a later
- * milestone). Called once per field from rt_gs_vsync_hook (hw/gspriv.cpp)
+ * remember_window_size is set and the window is not fullscreen; the commit
+ * itself runs from rt_window_flush_pending_save, never from the pump, per
+ * the reentrancy rule above), then hands every event to the UI
+ * (rt_ui_handle_sdl_event). Rebind capture attaches here in a later
+ * milestone. Called once per field from rt_gs_vsync_hook (hw/gspriv.cpp)
  * and also from inside WSI::begin_frame via pump_events; either caller may
  * see any given event first, harmlessly, since SDL_PollEvent drains the
  * queue. No-op, with no SDL calls compiled in, when there is no live
@@ -47,10 +46,13 @@ RtPgs* rt_gs_parallel_handle();
  * window). */
 void rt_window_pump();
 
-/* Runs the debounced remember_window_size commit when one is due. Called
- * from rt_settings_apply_pending() at the field boundary, the one place
- * guaranteed to be outside WSI::begin_frame, because the commit runs the
- * display applier and that may touch the window. */
+/* Commits a recorded remember_window_size change once the resize has been
+ * quiet for a second. Called from rt_settings_apply_pending() at the field
+ * boundary, the one place guaranteed to be outside WSI::begin_frame,
+ * because the commit runs the display applier and that may touch the
+ * window. The commit does not write the file itself; it asks the settings
+ * layer for a write through rt_settings_request_save(), which is where the
+ * runtime's one save debounce lives. */
 void rt_window_flush_pending_save();
 
 /* Applies display.mode and window size to the live window: FullscreenDesktop

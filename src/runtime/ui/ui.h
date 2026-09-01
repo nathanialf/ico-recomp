@@ -42,17 +42,22 @@ union SDL_Event;
 bool rt_ui_init();
 
 /* One UI tick, from rt_gs_vsync_hook after rt_settings_apply_pending():
- * re-reads the surface size, updates and renders the RmlUi context, and
- * hands the resulting draw list to the library as one overlay frame. No-op
- * until rt_ui_init() has succeeded. */
+ * re-reads the surface size, applies whatever the menu's controls queued
+ * since the last field (see ui_settings_model.cpp on why that is queued),
+ * writes a pending settings save, and, whenever any document is up (the
+ * menu, the fps readout, or both), updates and renders the RmlUi context
+ * and hands the resulting draw list to the library as one overlay frame.
+ * With nothing up it clears the overlay once and does no RmlUi work at all.
+ * No-op until rt_ui_init() has succeeded. */
 void rt_ui_tick();
 
 bool rt_ui_visible();
 void rt_ui_set_visible(bool visible);
 
-/* True while the menu owns input. Milestone 6 makes sdl_poll return a
- * neutral pad (no buttons, sticks centered) while this is true; for now it
- * is exactly rt_ui_visible(). */
+/* True while the menu owns input, which is exactly while it is visible.
+ * host/input.cpp's SDL provider reports a centered pad with no buttons
+ * instead of sampling the devices while this is true, so a keypress aimed at
+ * the menu does not also reach the game. */
 bool rt_ui_wants_input();
 
 #ifdef ICORECOMP_PGS_SDL

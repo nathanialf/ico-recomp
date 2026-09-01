@@ -1,0 +1,15 @@
+<rml>
+<head>
+	<title>Field rate</title>
+	<link type="text/rcss" href="style/base.rcss"/>
+</head>
+<!--
+	The field-rate readout. Its own document because it is shown on
+	display.show_fps with or without the menu; ui_settings_model.cpp shows
+	and hides it and refreshes fps_text four times a second from
+	rt_gs_field_stats (hw/gspriv.cpp).
+-->
+<body class="fps" data-model="settings">
+	<div class="fps-text">{{fps_text}}</div>
+</body>
+</rml>
