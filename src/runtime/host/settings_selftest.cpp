@@ -16,6 +16,7 @@
 #include "host/json.h"
 #include "host/settings.h"
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -388,6 +389,131 @@ int main() {
         CHECK(std::filesystem::exists(path));
         rt_settings_init();
         CHECK(rt_settings().audio.master_volume == 43);
+    }
+
+    { /* 20. rt_settings_default_binding / rt_settings_binding_key are the
+       * tables settings.cpp itself loads from, checked against the values a
+       * fresh load produces. host/input.cpp and ui/ui_rebind.cpp reach the
+       * compiled defaults only through these two, so a drift between the
+       * accessor and the table would be silent everywhere else. */
+        set_env("ICORECOMP_SETTINGS", "-");
+        rt_settings_init();
+        const RtSettings& s = rt_settings();
+        for (int i = 0; i < RT_KB_COUNT; ++i) {
+            CHECK(s.input.keyboard[i] == rt_settings_default_binding(false, i));
+            CHECK(rt_settings_binding_key(false, i)[0] != '\0');
+        }
+        for (int i = 0; i < RT_GP_COUNT; ++i) {
+            CHECK(s.input.gamepad[i] == rt_settings_default_binding(true, i));
+            CHECK(rt_settings_binding_key(true, i)[0] != '\0');
+        }
+        CHECK(std::string(rt_settings_default_binding(false, RT_KB_COUNT)).empty());
+        CHECK(std::string(rt_settings_default_binding(true, -1)).empty());
+        CHECK(std::string(rt_settings_binding_key(false, RT_KB_COUNT)).empty());
+    }
+    { /* 21. Every default binding is a usable name and unique on its device.
+       * Pure string checks: this target links no SDL, so it cannot ask SDL
+       * whether a scancode name resolves. What it can prove is that the
+       * table has no empty slot (which host/input.cpp would report as
+       * unresolvable), no duplicate (which the commit rules below reject),
+       * and that a name carrying an axis direction carries a valid one. */
+        set_env("ICORECOMP_SETTINGS", "-");
+        rt_settings_init();
+        const RtSettings& s = rt_settings();
+        for (int i = 0; i < RT_KB_COUNT; ++i) {
+            CHECK(!s.input.keyboard[i].empty());
+            /* A keyboard binding is a scancode name; the axis suffix is a
+             * gamepad-only convention and must not appear here. */
+            const char last = s.input.keyboard[i].back();
+            CHECK(last != '+' && last != '-');
+            for (int j = i + 1; j < RT_KB_COUNT; ++j) {
+                CHECK(s.input.keyboard[i] != s.input.keyboard[j]);
+            }
+        }
+        int axis_defaults = 0;
+        for (int i = 0; i < RT_GP_COUNT; ++i) {
+            CHECK(!s.input.gamepad[i].empty());
+            const char last = s.input.gamepad[i].back();
+            if (last == '+' || last == '-') {
+                ++axis_defaults;
+                CHECK(s.input.gamepad[i].size() > 1);
+            }
+            for (int j = i + 1; j < RT_GP_COUNT; ++j) {
+                CHECK(s.input.gamepad[i] != s.input.gamepad[j]);
+            }
+        }
+        /* L2 and R2 ship as trigger axes. */
+        CHECK(axis_defaults == 2);
+        CHECK(s.input.gamepad[RT_GP_L2].back() == '+');
+        CHECK(s.input.gamepad[RT_GP_R2].back() == '+');
+    }
+    { /* 22. duplicate at commit: the slot that changed reverts, the other
+       * keeps its name, and the reject message survives for the menu. */
+        std::string path = scratch + "/dupbind.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(std::string(rt_settings_last_reject()).empty());
+        const std::string cross = rt_settings().input.keyboard[RT_KB_CROSS];
+        const std::string circle = rt_settings().input.keyboard[RT_KB_CIRCLE];
+        CHECK(cross != circle);
+
+        rt_settings_mutable().input.keyboard[RT_KB_CIRCLE] = cross;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_CIRCLE] == circle);
+        CHECK(rt_settings().input.keyboard[RT_KB_CROSS] == cross);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+
+        /* Case only: SDL resolves names case-insensitively, so this is the
+         * same key and has to be rejected the same way. */
+        std::string lower = cross;
+        for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+        rt_settings_mutable().input.keyboard[RT_KB_CIRCLE] = lower;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_CIRCLE] == circle);
+
+        /* A commit with nothing wrong clears the message again. */
+        rt_settings_mutable().audio.master_volume = 70;
+        rt_settings_commit(false);
+        CHECK(std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 23. menu key colliding with a pad binding, on both devices. */
+        std::string path = scratch + "/menubind.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        const std::string kb_menu = rt_settings().input.keyboard[RT_KB_MENU];
+        const std::string gp_menu = rt_settings().input.gamepad[RT_GP_MENU];
+
+        rt_settings_mutable().input.keyboard[RT_KB_MENU] =
+            rt_settings().input.keyboard[RT_KB_START];
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_MENU] == kb_menu);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+
+        rt_settings_mutable().input.gamepad[RT_GP_MENU] =
+            rt_settings().input.gamepad[RT_GP_CROSS];
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == gp_menu);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+
+        /* A menu key that collides with nothing is accepted. */
+        rt_settings_mutable().input.keyboard[RT_KB_MENU] = "F9";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_MENU] == "F9");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 24. rt_settings_generation moves on every init and every commit, and
+       * is never zero: host/input.cpp rebuilds its SDL tables on the
+       * difference, and a zero-initialized cache has to differ from it. */
+        set_env("ICORECOMP_SETTINGS", "-");
+        rt_settings_init();
+        const unsigned after_init = rt_settings_generation();
+        CHECK(after_init != 0);
+        rt_settings_commit(false);
+        CHECK(rt_settings_generation() != after_init);
+        const unsigned after_commit = rt_settings_generation();
+        rt_settings_init();
+        CHECK(rt_settings_generation() != after_commit);
+        CHECK(rt_settings_generation() != 0);
     }
 
     unset_env("ICORECOMP_SETTINGS");

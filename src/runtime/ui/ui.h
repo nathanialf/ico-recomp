@@ -62,9 +62,10 @@ bool rt_ui_wants_input();
 
 #ifdef ICORECOMP_PGS_SDL
 /* Called from rt_window_pump for every event window.cpp does not fully own.
- * Returns true when the UI consumed the event, so later consumers (rebind
- * capture in milestone 7) can stop routing it. The menu hotkey is consumed
- * here and never reaches RmlUi or the pad. */
+ * Inside, the order is binding capture (ui/ui_rebind.cpp), then the menu
+ * hotkey, then RmlUi; the returned bool says whether the UI consumed the
+ * event. The menu hotkey is consumed here and never reaches RmlUi or the
+ * pad. */
 bool rt_ui_handle_sdl_event(const SDL_Event& e);
 #endif
 

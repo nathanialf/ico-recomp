@@ -108,17 +108,16 @@ void rt_window_pump() {
             record_window_size(win);
             break;
         default:
-            /* Rebind capture attaches here once it lands (milestone 7 of the
-             * settings plan). */
             break;
         }
         /* The UI sees every event, after this file has done its own part of
          * the handling: the menu hotkey has to work whether the menu is up
-         * or not, and window/quit events are harmless to hand it. It returns
-         * true when RmlUi consumed the event, which is the signal later
-         * consumers (rebind capture) will check before routing it further.
-         * It stays inside the reentrancy rule: event translation and flag
-         * flips only, no rt_pgs_* calls. No-op (an inline stub in ui.h)
+         * or not, and window/quit events are harmless to hand it. Inside the
+         * UI the order is binding capture, then the hotkey, then RmlUi
+         * (ui/ui_events.cpp); the bool it returns says whether the UI
+         * consumed the event, and nothing downstream of this loop needs it
+         * today. It stays inside the reentrancy rule: event translation and
+         * flag flips only, no rt_pgs_* calls. No-op (an inline stub in ui.h)
          * when this build has no UI. */
         rt_ui_handle_sdl_event(e);
     }

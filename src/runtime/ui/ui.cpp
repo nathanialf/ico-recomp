@@ -88,6 +88,23 @@ float density_for(uint32_t surface_height) {
     return std::min(std::max(ratio, 1.0f), 4.0f);
 }
 
+#ifdef ICORECOMP_PGS_SDL
+/* Re-resolves the menu hotkey whenever the committed settings have moved
+ * (rt_settings_generation), and names the key in force in the document's
+ * "press X to close" line, which ships with the compiled-in default. Cheap:
+ * one integer compare per field when nothing changed. */
+void sync_menu_hotkey() {
+    static unsigned resolved_gen = 0;
+    const unsigned gen = rt_settings_generation();
+    if (gen == resolved_gen) return;
+    resolved_gen = gen;
+    resolve_menu_hotkey();
+    if (Rml::Element* key = g_ui.menu->GetElementById("menu-key")) {
+        key->SetInnerRML(menu_hotkey_name());
+    }
+}
+#endif
+
 void apply_surface_size(uint32_t width, uint32_t height) {
     g_ui.surface_width = width;
     g_ui.surface_height = height;
@@ -184,12 +201,7 @@ bool rt_ui_init() {
         width, height, double(density_for(height)));
 
 #ifdef ICORECOMP_PGS_SDL
-    resolve_menu_hotkey();
-    /* The document ships with the compiled-in default in that slot; name the
-     * binding actually in force instead. */
-    if (Rml::Element* key = g_ui.menu->GetElementById("menu-key")) {
-        key->SetInnerRML(menu_hotkey_name());
-    }
+    sync_menu_hotkey();
 #else
     rt_log("ui", "no SDL in this build: the menu has no hotkey and cannot be opened");
 #endif
@@ -222,6 +234,16 @@ void rt_ui_tick() {
      * and hides a document happens here, at the field boundary, never in the
      * event handler: see the reentrancy rules in ui.h. */
     settings_model_tick();
+#ifdef ICORECOMP_PGS_SDL
+    /* After the model's own tick: a capture that was accepted this field
+     * commits here, and a queued control change has already gone through, so
+     * the two never write the settings in the same call. */
+    rebind_tick();
+    /* A rebind or a reset may have changed input.keyboard.menu or
+     * input.gamepad.menu in the commit just above; the hotkey follows the
+     * committed settings, not the init-time value. */
+    sync_menu_hotkey();
+#endif
     if (g_ui.flush_save_pending) {
         g_ui.flush_save_pending = false;
         rt_settings_flush_save();
@@ -272,6 +294,12 @@ void rt_ui_set_visible(bool visible) {
         settings_model_refresh();
         g_ui.menu->Show();
     } else {
+#ifdef ICORECOMP_PGS_SDL
+        /* A capture never outlives the menu. That is what keeps
+         * rt_ui_wants_input() (and so the neutral pad in host/input.cpp) true
+         * for the whole of a capture: the menu is up for all of it. */
+        rebind_cancel("the menu closed");
+#endif
         g_ui.menu->Hide();
         /* Not rt_settings_flush_save() here. This function runs from the
          * event handler, which can execute from inside WSI::begin_frame; the

@@ -285,11 +285,19 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
 
     if (!g_ui.initialized) return false;
 
+    /* A capture in progress gets first refusal on everything, ahead of the
+     * hotkey and RmlUi: the whole point is that the next key or button the
+     * user presses becomes the binding rather than doing what it normally
+     * does. It consumes only keyboard and gamepad events (ui_rebind.cpp), so
+     * the mouse still drives the menu underneath. */
+    if (rebind_active() && rebind_handle_sdl_event(e)) return true;
+
     /* The hotkey is looked at whether the menu is up or not, and is consumed
      * here: it never reaches RmlUi and never reaches the pad (host/input.cpp
-     * polls key state, so milestone 7's rebind rules keep it out of a pad
-     * binding at commit time). Gamepad button events only arrive for gamepads
-     * somebody opened; host/input.cpp does that, this file never does. */
+     * polls key state, and the commit-time binding rules in settings.cpp keep
+     * the menu key out of a pad slot). Gamepad button events only arrive for
+     * gamepads somebody opened; host/input.cpp does that, this file never
+     * does. */
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
         if (!e.key.repeat && e.key.scancode == g_menu_scancode) return toggle_menu();

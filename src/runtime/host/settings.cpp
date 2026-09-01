@@ -34,7 +34,9 @@
 #include "host/portable.h"
 #include "host/settings.h"
 
+#include <cctype>
 #include <cerrno>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -52,11 +54,11 @@ namespace {
 
 /* ---- bind default tables ------------------------------------------------
  *
- * These are SDL_GetScancodeName / SDL mapping-string tokens mirroring the
- * pre-settings hardcoded map in host/input.cpp (kButtonNames at
- * input.cpp:37, the keyboard scancode table at input.cpp:170, and the
- * gamepad button table at input.cpp:193). Keep the two in sync until
- * milestone 7 replaces that hardcoded map with these tables.
+ * These are SDL_GetScancodeName / SDL mapping-string tokens. They are the
+ * only copy: host/input.cpp builds its SDL tables from rt_settings() and
+ * falls back to these through rt_settings_default_binding() when a stored
+ * name does not resolve, so there is no second hardcoded map to keep in
+ * sync. The values reproduce the pre-settings map exactly.
  */
 struct BindDef {
     const char* json_key;
@@ -153,6 +155,10 @@ RtSettings g_current;             /* rt_settings_mutable()'s target */
 RtSettings g_committed;           /* last value rt_settings_commit() accepted */
 RtJson g_dom = RtJson::make_object(); /* retained DOM: carries unknown keys */
 std::string g_path;               /* "" until a load or save has picked one */
+/* Never zero, so a consumer's zero-initialized cache always differs from it
+ * on the first check and rebuilds even if rt_settings_init() never ran. */
+unsigned g_generation = 1;
+std::string g_last_reject;        /* "" when the last commit rejected nothing */
 bool g_save_allowed = true;
 std::string g_save_blocked_reason;
 
@@ -661,6 +667,113 @@ void revert_float(float* v, float prev, const char* dotted, float lo, float hi, 
     *v = prev;
 }
 
+/* ---- binding rules -------------------------------------------------------
+ *
+ * Two rules, both about one name being claimed twice on one device:
+ *
+ *   1. The menu key (input.keyboard.menu / input.gamepad.menu) is consumed
+ *      in the event pump and never reaches the pad (ui/ui_events.cpp), so a
+ *      menu key that is also a pad binding is a pad button the game can
+ *      never see. Rejected.
+ *   2. Two ordinary slots holding the same name means one host key or button
+ *      presses two DS2 buttons at once. That is a legal thing to want but
+ *      almost never a thing anyone meant, and the menu offers no way to say
+ *      "yes, both". Rejected.
+ *
+ * A rejection reverts to the previously committed name, never to the
+ * compiled default: the user's earlier choice for that slot is theirs and
+ * this commit is not a reason to lose it. Empty names are skipped rather
+ * than treated as equal to each other: an empty slot is a name that did not
+ * resolve, host/input.cpp already replaces it with the compiled default and
+ * says so, and two of them are not a collision the user made.
+ *
+ * Comparison is case-insensitive because that is how SDL_GetScancodeFromName
+ * resolves ("f1" and "F1" are the same key), so a case difference in a
+ * hand-edited file must not read as two different bindings.
+ */
+
+bool bind_name_equal(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+
+void note_reject(const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    rt_log("settings", "settings: %s", buf);
+    if (!g_last_reject.empty()) g_last_reject += "; ";
+    g_last_reject += buf;
+}
+
+/* One device's slots. `menu_slot` is the last entry in both enums, which is
+ * why `count` and `menu_slot` are passed rather than derived. */
+void validate_binds(std::string* cur, const std::string* prev, const BindDef* defs,
+                    int count, int menu_slot, const char* section) {
+    /* Rule 1, first: whatever the menu key ends up as, the ordinary-slot pass
+     * below then sees the settled value. */
+    for (int i = 0; i < count; ++i) {
+        if (i == menu_slot) continue;
+        if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
+        note_reject("%s.menu = \"%s\" is already %s.%s; the menu key never reaches the pad,"
+            " so it was reverted to \"%s\"",
+            section, cur[menu_slot].c_str(), section, defs[i].json_key, prev[menu_slot].c_str());
+        cur[menu_slot] = prev[menu_slot];
+        break;
+    }
+
+    /* Rule 2. A pair where neither name changed since the last commit was
+     * not introduced here; it came in from the settings file and
+     * log_bind_duplicates() reported it at load. Reverting it now would pick
+     * a slot arbitrarily and silently drop a name the user wrote. */
+    for (int i = 0; i < count; ++i) {
+        if (i == menu_slot) continue;
+        for (int j = i + 1; j < count; ++j) {
+            if (j == menu_slot) continue;
+            if (!bind_name_equal(cur[i], cur[j])) continue;
+            const bool i_changed = cur[i] != prev[i];
+            const bool j_changed = cur[j] != prev[j];
+            if (!i_changed && !j_changed) continue;
+            note_reject("%s.%s and %s.%s are both \"%s\"; one host input cannot drive two"
+                " buttons, so %s%s%s reverted",
+                section, defs[i].json_key, section, defs[j].json_key, cur[i].c_str(),
+                i_changed ? defs[i].json_key : "",
+                (i_changed && j_changed) ? " and " : "",
+                j_changed ? defs[j].json_key : "");
+            if (i_changed) cur[i] = prev[i];
+            if (j_changed) cur[j] = prev[j];
+        }
+    }
+}
+
+/* Load-time report only, no value change: a duplicate that came in from the
+ * settings file is the user's own file and this layer never rewrites user
+ * data on load (see the bad-value policy at the top). Saying so once at
+ * startup is what keeps the commit-time rule above from having to guess. */
+void log_bind_duplicates(const std::string* v, const BindDef* defs, int count,
+                         int menu_slot, const char* section) {
+    for (int i = 0; i < count; ++i) {
+        for (int j = i + 1; j < count; ++j) {
+            if (!bind_name_equal(v[i], v[j])) continue;
+            if (i == menu_slot || j == menu_slot) {
+                rt_log("settings", "settings: %s.menu and %s.%s are both \"%s\"; the menu key is"
+                    " consumed by the menu, so that pad binding will never fire",
+                    section, section, defs[i == menu_slot ? j : i].json_key, v[i].c_str());
+            } else {
+                rt_log("settings", "settings: %s.%s and %s.%s are both \"%s\"; that one input will"
+                    " press both buttons", section, defs[i].json_key, section, defs[j].json_key,
+                    v[i].c_str());
+            }
+        }
+    }
+}
+
 void commit_validate(RtSettings* cur, const RtSettings& prev) {
     revert_int(&cur->display.window_width, prev.display.window_width, "display.window_width", 320, 16384);
     revert_int(&cur->display.window_height, prev.display.window_height, "display.window_height", 320, 16384);
@@ -691,6 +804,11 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
         rt_log("settings", "settings: display.hires_scanout is set but display.render_scale is %d;"
             " hires scanout stays inert below 4x", cur->display.render_scale);
     }
+
+    validate_binds(cur->input.keyboard, prev.input.keyboard, kKeyboardBinds, RT_KB_COUNT,
+        RT_KB_MENU, "input.keyboard");
+    validate_binds(cur->input.gamepad, prev.input.gamepad, kGamepadBinds, RT_GP_COUNT,
+        RT_GP_MENU, "input.gamepad");
 }
 
 } // namespace
@@ -766,6 +884,11 @@ void rt_settings_init() {
     }
 
     g_committed = g_current;
+    g_last_reject.clear();
+    ++g_generation;
+
+    log_bind_duplicates(g_current.input.keyboard, kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "input.keyboard");
+    log_bind_duplicates(g_current.input.gamepad, kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "input.gamepad");
 
     for (const EnvTwin& t : kEnvTwins) {
         const char* v = std::getenv(t.env_var);
@@ -785,8 +908,10 @@ RtSettings& rt_settings_mutable() {
 
 void rt_settings_commit(bool save) {
     RtSettings before = g_committed;
+    g_last_reject.clear();
     commit_validate(&g_current, g_committed);
     g_committed = g_current;
+    ++g_generation;
     rt_settings_apply(before, g_committed);
     if (save) rt_settings_save();
 }
@@ -846,6 +971,28 @@ void rt_settings_reset_defaults() {
 
 const char* rt_settings_path() {
     return g_path.c_str();
+}
+
+unsigned rt_settings_generation() {
+    return g_generation;
+}
+
+const char* rt_settings_default_binding(bool gamepad, int slot) {
+    if (gamepad) {
+        return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadBinds[slot].def : "";
+    }
+    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardBinds[slot].def : "";
+}
+
+const char* rt_settings_binding_key(bool gamepad, int slot) {
+    if (gamepad) {
+        return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadBinds[slot].json_key : "";
+    }
+    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardBinds[slot].json_key : "";
+}
+
+const char* rt_settings_last_reject() {
+    return g_last_reject.c_str();
 }
 
 bool rt_settings_overridden(const char* dotted_key) {

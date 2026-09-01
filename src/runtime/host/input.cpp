@@ -5,7 +5,9 @@
 
 #include "../runtime.h"
 #include "../ui/ui.h"
+#include "settings.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,15 +36,6 @@ struct Step {
 };
 std::vector<Step> g_script;
 size_t g_script_pos = 0;
-
-const struct { const char* name; uint16_t bit; } kButtonNames[] = {
-    {"select", RT_PAD_SELECT}, {"l3", RT_PAD_L3}, {"r3", RT_PAD_R3},
-    {"start", RT_PAD_START}, {"up", RT_PAD_UP}, {"right", RT_PAD_RIGHT},
-    {"down", RT_PAD_DOWN}, {"left", RT_PAD_LEFT}, {"l2", RT_PAD_L2},
-    {"r2", RT_PAD_R2}, {"l1", RT_PAD_L1}, {"r1", RT_PAD_R1},
-    {"triangle", RT_PAD_TRIANGLE}, {"circle", RT_PAD_CIRCLE},
-    {"cross", RT_PAD_CROSS}, {"square", RT_PAD_SQUARE},
-};
 
 bool parse_script(const char* path) {
     std::FILE* f = std::fopen(path, "r");
@@ -94,7 +87,7 @@ bool parse_script(const char* path) {
         for (size_t i = 1; i <= nbtn; ++i) {
             if (tok[i] == "none") continue;
             bool found = false;
-            for (const auto& b : kButtonNames) {
+            for (const auto& b : RT_PAD_BUTTON_NAMES) {
                 if (tok[i] == b.name) { s.buttons |= b.bit; found = true; break; }
             }
             if (!found) {
@@ -162,54 +155,233 @@ uint8_t axis_to_u8(Sint16 v) {
     return (uint8_t)(x < 0 ? 0 : (x > 255 ? 255 : x));
 }
 
+/* ---- tables built from settings ------------------------------------------
+ *
+ * The first sixteen RtKeyBind slots and the first sixteen RtPadBind slots are
+ * the same sixteen DS2 buttons in the same order (host/settings.h), so one
+ * bit table serves both. The keyboard's eight stick slots and each device's
+ * menu slot are handled separately: the menu key is consumed by the UI pump
+ * (ui/ui_events.cpp) and is not a pad binding at all.
+ */
+constexpr uint16_t kSlotBits[16] = {
+    RT_PAD_UP, RT_PAD_DOWN, RT_PAD_LEFT, RT_PAD_RIGHT,
+    RT_PAD_CROSS, RT_PAD_CIRCLE, RT_PAD_SQUARE, RT_PAD_TRIANGLE,
+    RT_PAD_L1, RT_PAD_R1, RT_PAD_L2, RT_PAD_R2, RT_PAD_L3, RT_PAD_R3,
+    RT_PAD_START, RT_PAD_SELECT,
+};
+
+struct KeyBind {
+    SDL_Scancode sc;
+    uint16_t bit;
+};
+
+/* A gamepad slot resolves either to a button or to one direction of an axis
+ * (the "lefttrigger+" convention, a trailing '+' or '-' on an SDL axis
+ * name). Exactly one of `button` and `axis` is valid. */
+struct PadBind {
+    uint16_t bit;
+    SDL_GamepadButton button = SDL_GAMEPAD_BUTTON_INVALID;
+    SDL_GamepadAxis axis = SDL_GAMEPAD_AXIS_INVALID;
+    int dir = 0;                /* +1 or -1, axis binds only */
+};
+
+std::vector<KeyBind> g_key_buttons;
+/* Indexed by slot - RT_KB_LSTICK_UP; SDL_SCANCODE_UNKNOWN means unbound. */
+SDL_Scancode g_key_stick[8] = {};
+std::vector<PadBind> g_pad_binds;
+
+/* The rt_settings_generation() the tables above were built from. Zero is
+ * never a live generation (settings.cpp starts at 1), so the first poll
+ * always builds. */
+unsigned g_tables_gen = 0;
+
+bool g_rumble_suppressed_logged = false;
+
+/* Resolves one stored name for a keyboard slot, falling back to the compiled
+ * default with a named log line. Never returns "no binding" quietly: if even
+ * the default fails to resolve, that is this build's table and SDL
+ * disagreeing, and it says so. */
+SDL_Scancode resolve_scancode(int slot, const std::string& name) {
+    SDL_Scancode sc = name.empty() ? SDL_SCANCODE_UNKNOWN : SDL_GetScancodeFromName(name.c_str());
+    if (sc != SDL_SCANCODE_UNKNOWN) return sc;
+
+    const char* def = rt_settings_default_binding(false, slot);
+    rt_log("input", "input.keyboard.%s = \"%s\" is not an SDL scancode name; using the default \"%s\"",
+        rt_settings_binding_key(false, slot), name.c_str(), def);
+    sc = SDL_GetScancodeFromName(def);
+    if (sc == SDL_SCANCODE_UNKNOWN) {
+        rt_log("input", "input.keyboard.%s: the compiled-in default \"%s\" is not an SDL scancode"
+            " name either; this build's default table and SDL disagree, so that slot has no key"
+            " this run", rt_settings_binding_key(false, slot), def);
+    }
+    return sc;
+}
+
+/* Splits "lefttrigger+" into the SDL axis token and the direction. Returns
+ * false when `name` carries no direction suffix, which means it has to
+ * resolve as a button instead. */
+bool split_axis_name(const std::string& name, std::string* token, int* dir) {
+    if (name.size() < 2) return false;
+    const char last = name[name.size() - 1];
+    if (last != '+' && last != '-') return false;
+    *token = name.substr(0, name.size() - 1);
+    *dir = (last == '+') ? 1 : -1;
+    return true;
+}
+
+bool resolve_pad_name(const std::string& name, PadBind* out) {
+    std::string token;
+    int dir = 0;
+    if (split_axis_name(name, &token, &dir)) {
+        const SDL_GamepadAxis axis = SDL_GetGamepadAxisFromString(token.c_str());
+        if (axis == SDL_GAMEPAD_AXIS_INVALID) return false;
+        out->axis = axis;
+        out->dir = dir;
+        return true;
+    }
+    const SDL_GamepadButton button = name.empty()
+        ? SDL_GAMEPAD_BUTTON_INVALID : SDL_GetGamepadButtonFromString(name.c_str());
+    if (button == SDL_GAMEPAD_BUTTON_INVALID) return false;
+    out->button = button;
+    return true;
+}
+
+void rebuild_tables() {
+    const RtSettings& cfg = rt_settings();
+
+    g_key_buttons.clear();
+    g_key_buttons.reserve(16);
+    for (int slot = 0; slot < 16; ++slot) {
+        const SDL_Scancode sc = resolve_scancode(slot, cfg.input.keyboard[slot]);
+        if (sc != SDL_SCANCODE_UNKNOWN) g_key_buttons.push_back({sc, kSlotBits[slot]});
+    }
+    for (int i = 0; i < 8; ++i) {
+        g_key_stick[i] = resolve_scancode(RT_KB_LSTICK_UP + i, cfg.input.keyboard[RT_KB_LSTICK_UP + i]);
+    }
+
+    g_pad_binds.clear();
+    g_pad_binds.reserve(16);
+    for (int slot = 0; slot < 16; ++slot) {
+        PadBind b;
+        b.bit = kSlotBits[slot];
+        if (!resolve_pad_name(cfg.input.gamepad[slot], &b)) {
+            const char* def = rt_settings_default_binding(true, slot);
+            rt_log("input", "input.gamepad.%s = \"%s\" is not an SDL gamepad button or axis name;"
+                " using the default \"%s\"",
+                rt_settings_binding_key(true, slot), cfg.input.gamepad[slot].c_str(), def);
+            if (!resolve_pad_name(def, &b)) {
+                rt_log("input", "input.gamepad.%s: the compiled-in default \"%s\" is not an SDL"
+                    " gamepad button or axis name either; this build's default table and SDL"
+                    " disagree, so that slot has no pad input this run",
+                    rt_settings_binding_key(true, slot), def);
+                continue;
+            }
+        }
+        g_pad_binds.push_back(b);
+    }
+}
+
+void sync_tables() {
+    const unsigned gen = rt_settings_generation();
+    if (gen == g_tables_gen) return;
+    g_tables_gen = gen;
+    rebuild_tables();
+}
+
+/* Radial deadzone with remainder rescale, applied to the raw SDL stick pair
+ * before axis_to_u8.
+ *
+ * dz == 0 (the shipped default) skips the math entirely rather than running
+ * it with a zero threshold: the float round trip would not be bit-identical
+ * to the pre-settings build, and every existing user is on 0.
+ *
+ * The clamp on the way out is a type limit, not a value policy: a stick with
+ * a square gate reports up to 32767 on both axes at once, r reaches 1.41,
+ * and the rescale can push a component past the int16 the SDL axis is. It
+ * cannot be reached at all with a round gate. */
+Sint16 clamp_axis(float v) {
+    if (v <= -32768.0f) return -32768;
+    if (v >= 32767.0f) return 32767;
+    return (Sint16)v;
+}
+
+void apply_deadzone(float dz, Sint16* x, Sint16* y) {
+    if (dz <= 0.0f) return;
+    const float fx = (float)*x, fy = (float)*y;
+    const float r = std::sqrt(fx * fx + fy * fy) / 32767.0f;
+    if (r <= dz) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
+    const float scale = ((r - dz) / (1.0f - dz)) / r;
+    *x = clamp_axis(fx * scale);
+    *y = clamp_axis(fy * scale);
+}
+
 void sdl_poll() {
     sdl_probe();
+    sync_tables();
+
+    const RtSettings& cfg = rt_settings();
     RtPadState s;
+
     /* Keyboard (event pump runs in the WSI present path each field). */
     const bool* keys = SDL_GetKeyboardState(nullptr);
     if (keys) {
-        struct { SDL_Scancode sc; uint16_t bit; } map[] = {
-            {SDL_SCANCODE_UP, RT_PAD_UP}, {SDL_SCANCODE_DOWN, RT_PAD_DOWN},
-            {SDL_SCANCODE_LEFT, RT_PAD_LEFT}, {SDL_SCANCODE_RIGHT, RT_PAD_RIGHT},
-            {SDL_SCANCODE_X, RT_PAD_CROSS}, {SDL_SCANCODE_C, RT_PAD_CIRCLE},
-            {SDL_SCANCODE_Z, RT_PAD_SQUARE}, {SDL_SCANCODE_V, RT_PAD_TRIANGLE},
-            {SDL_SCANCODE_Q, RT_PAD_L1}, {SDL_SCANCODE_E, RT_PAD_R1},
-            {SDL_SCANCODE_1, RT_PAD_L2}, {SDL_SCANCODE_3, RT_PAD_R2},
-            {SDL_SCANCODE_T, RT_PAD_L3}, {SDL_SCANCODE_Y, RT_PAD_R3},
-            {SDL_SCANCODE_RETURN, RT_PAD_START}, {SDL_SCANCODE_BACKSPACE, RT_PAD_SELECT},
-        };
-        for (const auto& m : map) {
-            if (keys[m.sc]) s.buttons |= m.bit;
+        for (const KeyBind& b : g_key_buttons) {
+            if (keys[b.sc]) s.buttons |= b.bit;
         }
-        if (keys[SDL_SCANCODE_A]) s.lx = 0x00;
-        if (keys[SDL_SCANCODE_D]) s.lx = 0xFF;
-        if (keys[SDL_SCANCODE_W]) s.ly = 0x00;
-        if (keys[SDL_SCANCODE_S]) s.ly = 0xFF;
-        if (keys[SDL_SCANCODE_J]) s.rx = 0x00;
-        if (keys[SDL_SCANCODE_L]) s.rx = 0xFF;
-        if (keys[SDL_SCANCODE_I]) s.ry = 0x00;
-        if (keys[SDL_SCANCODE_K]) s.ry = 0xFF;
+        /* Left before right and up before down on each stick, so a user
+         * holding both opposing keys gets the same answer as the
+         * pre-settings build (the later assignment wins). */
+        struct { int slot; uint8_t* axis; uint8_t value; } sticks[] = {
+            {RT_KB_LSTICK_LEFT,  &s.lx, 0x00}, {RT_KB_LSTICK_RIGHT, &s.lx, 0xFF},
+            {RT_KB_LSTICK_UP,    &s.ly, 0x00}, {RT_KB_LSTICK_DOWN,  &s.ly, 0xFF},
+            {RT_KB_RSTICK_LEFT,  &s.rx, 0x00}, {RT_KB_RSTICK_RIGHT, &s.rx, 0xFF},
+            {RT_KB_RSTICK_UP,    &s.ry, 0x00}, {RT_KB_RSTICK_DOWN,  &s.ry, 0xFF},
+        };
+        for (const auto& st : sticks) {
+            const SDL_Scancode sc = g_key_stick[st.slot - RT_KB_LSTICK_UP];
+            if (sc != SDL_SCANCODE_UNKNOWN && keys[sc]) *st.axis = st.value;
+        }
     }
+
     if (g_gamepad) {
-        struct { SDL_GamepadButton b; uint16_t bit; } map[] = {
-            {SDL_GAMEPAD_BUTTON_SOUTH, RT_PAD_CROSS}, {SDL_GAMEPAD_BUTTON_EAST, RT_PAD_CIRCLE},
-            {SDL_GAMEPAD_BUTTON_WEST, RT_PAD_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH, RT_PAD_TRIANGLE},
-            {SDL_GAMEPAD_BUTTON_DPAD_UP, RT_PAD_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, RT_PAD_DOWN},
-            {SDL_GAMEPAD_BUTTON_DPAD_LEFT, RT_PAD_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, RT_PAD_RIGHT},
-            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, RT_PAD_L1}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, RT_PAD_R1},
-            {SDL_GAMEPAD_BUTTON_LEFT_STICK, RT_PAD_L3}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, RT_PAD_R3},
-            {SDL_GAMEPAD_BUTTON_START, RT_PAD_START}, {SDL_GAMEPAD_BUTTON_BACK, RT_PAD_SELECT},
-        };
-        for (const auto& m : map) {
-            if (SDL_GetGamepadButton(g_gamepad, m.b)) s.buttons |= m.bit;
+        /* An axis bind counts as pressed past input.trigger_threshold of full
+         * scale, in the bound direction.
+         *
+         * The pre-settings build hardcoded `> 8192` on the two triggers. The
+         * default threshold 0.25 gives 8191.75, so with the same `>` the
+         * trigger now counts as pressed at a raw axis value of 8192 instead
+         * of 8193: one unit out of 32767, under one LSB of the axis the pad
+         * reports. Reproducing 8193 exactly would need a threshold of
+         * 8192/32767 = 0.2500076, which is not a number a user can type into
+         * the menu, and pinning the default there would make every other
+         * threshold read wrong by the same amount. The one unit is stated
+         * here rather than hidden. */
+        const float press = cfg.input.trigger_threshold * 32767.0f;
+        for (const PadBind& b : g_pad_binds) {
+            if (b.axis != SDL_GAMEPAD_AXIS_INVALID) {
+                const float v = (float)SDL_GetGamepadAxis(g_gamepad, b.axis) * (float)b.dir;
+                if (v > press) s.buttons |= b.bit;
+            } else if (SDL_GetGamepadButton(g_gamepad, b.button)) {
+                s.buttons |= b.bit;
+            }
         }
-        if (SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8192) s.buttons |= RT_PAD_L2;
-        if (SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8192) s.buttons |= RT_PAD_R2;
+
+        Sint16 lx = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX);
+        Sint16 ly = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY);
+        Sint16 rx = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX);
+        Sint16 ry = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY);
+        apply_deadzone(cfg.input.left_deadzone, &lx, &ly);
+        apply_deadzone(cfg.input.right_deadzone, &rx, &ry);
+
         /* Keyboard sticks win only while deflected. */
-        if (s.lx == 0x80) s.lx = axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX));
-        if (s.ly == 0x80) s.ly = axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY));
-        if (s.rx == 0x80) s.rx = axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX));
-        if (s.ry == 0x80) s.ry = axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY));
+        if (s.lx == 0x80) s.lx = axis_to_u8(lx);
+        if (s.ly == 0x80) s.ly = axis_to_u8(ly);
+        if (s.rx == 0x80) s.rx = axis_to_u8(rx);
+        if (s.ry == 0x80) s.ry = axis_to_u8(ry);
     }
     g_state = s;
 }
@@ -289,6 +461,17 @@ void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor) {
     }
 #ifdef ICORECOMP_PGS_SDL
     if (g_provider == Provider::Sdl && g_gamepad) {
+        /* input.rumble off suppresses the host motors only. The values the
+         * game wrote are still recorded above, so the log still shows what
+         * the game asked for; nothing the guest sees changes. */
+        if (!rt_settings().input.rumble) {
+            if (!g_rumble_suppressed_logged) {
+                g_rumble_suppressed_logged = true;
+                rt_log("input", "input.rumble is off; the game's actuator values are logged but not"
+                    " sent to the pad");
+            }
+            return;
+        }
         /* Small motor is on/off, big is 0..255; hold until the next update
          * (the game refreshes every frame while rumbling). */
         SDL_RumbleGamepad(g_gamepad,

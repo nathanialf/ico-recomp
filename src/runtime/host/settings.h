@@ -162,6 +162,37 @@ void rt_settings_reset_defaults();
  * yet, or ICORECOMP_SETTINGS selected defaults-only). */
 const char* rt_settings_path();
 
+/* Bumped by every rt_settings_init() and every rt_settings_commit(), and
+ * never zero, so a consumer that caches something derived from the settings
+ * can hold the generation it built from and rebuild when the two differ.
+ * host/input.cpp uses it for its SDL scancode/button tables, which are the
+ * one derived structure in the runtime that is too expensive to rebuild per
+ * poll. Everything else reads rt_settings() fresh. */
+unsigned rt_settings_generation();
+
+/* The compiled-in default binding for one slot, and the JSON key that slot
+ * is written under ("cross", "lstick_up", "menu"). `gamepad` selects
+ * input.gamepad (RtPadBind slots) over input.keyboard (RtKeyBind slots);
+ * an out-of-range slot returns "".
+ *
+ * host/input.cpp needs both: when a stored name does not resolve through SDL
+ * it falls back to the compiled default for that slot and names the slot in
+ * the log line, and it must not carry its own second copy of these tables
+ * (the pre-settings hardcoded map drifting out of sync with the JSON is
+ * exactly what this milestone removes). ui/ui_rebind.cpp needs them for the
+ * same reason. */
+const char* rt_settings_default_binding(bool gamepad, int slot);
+const char* rt_settings_binding_key(bool gamepad, int slot);
+
+/* The message from the last rt_settings_commit() that rejected something and
+ * reverted it, or "" when the last commit accepted everything. Cleared at
+ * the start of every commit. Only the binding rules (the menu key colliding
+ * with a pad binding, or two slots on one device sharing a name) fill this
+ * in: they are the rejections a user makes deliberately, from the menu, and
+ * the menu has to say so inline instead of only in the log. Range reverts
+ * stay log-only, as before. */
+const char* rt_settings_last_reject();
+
 /* True when `dotted_key` (e.g. "debug.fps_limit_hz") has an environment
  * variable twin and that variable is currently set. The environment always
  * wins over the file for these; each consumer reads its own env var at its

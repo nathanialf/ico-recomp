@@ -159,12 +159,6 @@
 					<span class="section-number">03</span>
 					<span class="section-title">Input</span>
 				</div>
-				<!-- Nothing in host/input.cpp reads these yet: the poll still
-				     uses its compiled-in map and thresholds. They are stored
-				     and take effect when the input rework lands, and saying so
-				     beats a control that looks live and is not. -->
-				<div class="note">Stored now; the input path starts reading these in the next milestone</div>
-
 				<div class="control">
 					<div class="control-label">Left stick deadzone</div>
 					<div class="range-row">
@@ -198,11 +192,45 @@
 					</div>
 				</div>
 
+				<!--
+					Both binding tables come from one array of rows each
+					(keyboard_binds / gamepad_binds in the settings data model),
+					so the row count follows RtKeyBind/RtPadBind rather than a
+					hand-written row per slot. it_index is the slot number the
+					Rebind button hands back to ui_rebind.cpp.
+				-->
 				<div class="section-header">
 					<span class="section-number">03.1</span>
-					<span class="section-title">Bindings</span>
+					<span class="section-title">Keyboard</span>
 				</div>
-				<div class="note">Remapping lands in the next milestone</div>
+				<div class="bind-table">
+					<div class="bind-row" data-for="row : keyboard_binds">
+						<span class="bind-slot">{{row.label}}</span>
+						<span class="bind-name" data-class-capturing="row.capturing">{{row.binding}}</span>
+						<div class="bind-button" data-event-click="rebind_keyboard(it_index)">Rebind</div>
+					</div>
+				</div>
+				<div class="bind-actions">
+					<div class="button" data-event-click="reset_keyboard_binds()">Reset keyboard bindings</div>
+				</div>
+
+				<div class="section-header">
+					<span class="section-number">03.2</span>
+					<span class="section-title">Gamepad</span>
+				</div>
+				<div class="bind-table">
+					<div class="bind-row" data-for="row : gamepad_binds">
+						<span class="bind-slot">{{row.label}}</span>
+						<span class="bind-name" data-class-capturing="row.capturing">{{row.binding}}</span>
+						<div class="bind-button" data-event-click="rebind_gamepad(it_index)">Rebind</div>
+					</div>
+				</div>
+				<div class="bind-actions">
+					<div class="button" data-event-click="reset_gamepad_binds()">Reset gamepad bindings</div>
+				</div>
+
+				<div class="bind-status" data-if="has_rebind_status">{{rebind_status}}</div>
+				<div class="note">Escape cancels a capture; it times out after five seconds. The menu key is never handed to the game.</div>
 			</div>
 
 			<div class="section" data-if="active_tab == 'debug'">

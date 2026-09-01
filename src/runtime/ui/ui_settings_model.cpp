@@ -56,10 +56,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace rtui {
 
 namespace {
+
+/* One row of a binding table. The Input pane renders both tables with a
+ * data-for loop over an array of these rather than binding 41 scalars: a
+ * scalar per slot would mean 41 Bind() calls here and 41 hand-written rows
+ * in menu.rml, and adding a slot would mean touching both.
+ *
+ * `binding` is the name to show, which is the stored name except while that
+ * row is capturing, when it is the prompt. `capturing` drives the row's
+ * style, not its text. */
+struct UiBindRow {
+    std::string label;
+    std::string binding;
+    bool capturing = false;
+};
 
 /* ---- the mirror ---------------------------------------------------------
  *
@@ -95,6 +110,15 @@ struct UiSettingsMirror {
     std::string right_deadzone_text;
     std::string trigger_threshold_text;
     bool rumble = true;
+    std::vector<UiBindRow> keyboard_binds;
+    std::vector<UiBindRow> gamepad_binds;
+    /* Inline result of the last capture or commit: a reject reason, a
+     * timeout, or "" when there is nothing to say. The bool is what the
+     * document tests: an Rml data expression coerces a String to bool
+     * through Variant's string parse, which reads "rebind cancelled" as
+     * false, so "is there a message" has to be its own variable. */
+    std::string rebind_status;
+    bool has_rebind_status = false;
 
     /* debug */
     std::string verbose;
@@ -130,6 +154,8 @@ bool g_model_valid = false;
 /* Queued by the control callbacks, drained by settings_model_tick(). */
 bool g_apply_pending = false;
 bool g_reset_pending = false;
+bool g_reset_keyboard_binds_pending = false;
+bool g_reset_gamepad_binds_pending = false;
 
 using ModelClock = std::chrono::steady_clock;
 ModelClock::time_point g_fps_text_at;
@@ -164,6 +190,27 @@ constexpr EnumName kFits[] = {
 constexpr EnumName kFilters[] = {
     {"linear", (int)RtFilter::Linear},
     {"nearest", (int)RtFilter::Nearest},
+};
+
+/* Slot labels, in the RtKeyBind and RtPadBind orders. These are what the
+ * user reads; the JSON keys settings.cpp holds ("lstick_up") are what the
+ * file and the log lines use. */
+const char* const kKeyboardLabels[RT_KB_COUNT] = {
+    "Up", "Down", "Left", "Right",
+    "Cross", "Circle", "Square", "Triangle",
+    "L1", "R1", "L2", "R2", "L3", "R3",
+    "Start", "Select",
+    "Left stick up", "Left stick down", "Left stick left", "Left stick right",
+    "Right stick up", "Right stick down", "Right stick left", "Right stick right",
+    "Menu key",
+};
+
+const char* const kGamepadLabels[RT_GP_COUNT] = {
+    "Up", "Down", "Left", "Right",
+    "Cross", "Circle", "Square", "Triangle",
+    "L1", "R1", "L2", "R2", "L3", "R3",
+    "Start", "Select",
+    "Menu button",
 };
 
 template <size_t N>
@@ -268,6 +315,23 @@ void settings_to_mirror() {
     g_m.trigger_threshold_text = fmt("%.2f", (double)s.input.trigger_threshold);
     g_m.rumble = s.input.rumble;
 
+    /* Rebuilt rather than patched: a commit can revert a binding (the menu
+     * key colliding with a pad slot, a duplicate), and the pane has to show
+     * what was kept. A capture in progress re-marks its own row afterwards
+     * through settings_model_set_rebind(). */
+    g_m.keyboard_binds.resize(RT_KB_COUNT);
+    for (int i = 0; i < RT_KB_COUNT; ++i) {
+        g_m.keyboard_binds[i].label = kKeyboardLabels[i];
+        g_m.keyboard_binds[i].binding = s.input.keyboard[i];
+        g_m.keyboard_binds[i].capturing = false;
+    }
+    g_m.gamepad_binds.resize(RT_GP_COUNT);
+    for (int i = 0; i < RT_GP_COUNT; ++i) {
+        g_m.gamepad_binds[i].label = kGamepadLabels[i];
+        g_m.gamepad_binds[i].binding = s.input.gamepad[i];
+        g_m.gamepad_binds[i].capturing = false;
+    }
+
     g_m.verbose = s.debug.verbose;
     g_m.log_file = s.debug.log_file;
     g_m.profile_fields = fmt("%d", s.debug.profile_fields);
@@ -350,6 +414,49 @@ void on_close(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     rt_ui_set_visible(false);
 }
 
+#ifdef ICORECOMP_PGS_SDL
+/* data-for gives the row index as it_index; the document passes it through.
+ * A missing or out-of-range argument means the document and this file
+ * disagree about the tables, which is worth a line rather than a silent
+ * no-op. */
+int slot_argument(const Rml::VariantList& arguments, int count) {
+    const int slot = arguments.size() == 1 ? arguments[0].Get<int>(-1) : -1;
+    if (slot < 0 || slot >= count) {
+        rt_log("ui", "settings menu: rebind was asked for slot %d, which is not one of this"
+            " device's 0..%d; the document and ui_settings_model.cpp disagree", slot, count - 1);
+        return -1;
+    }
+    return slot;
+}
+
+void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
+    const int slot = slot_argument(arguments, RT_KB_COUNT);
+    if (slot >= 0) rebind_begin(false, slot);
+}
+
+void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
+    const int slot = slot_argument(arguments, RT_GP_COUNT);
+    if (slot >= 0) rebind_begin(true, slot);
+}
+#else
+/* No SDL means no capture: there are no events to capture and no names to
+ * resolve. The buttons stay in the document and say so when pressed. */
+void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+}
+void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+}
+#endif
+
+void on_reset_keyboard_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    g_reset_keyboard_binds_pending = true;
+}
+
+void on_reset_gamepad_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    g_reset_gamepad_binds_pending = true;
+}
+
 } // namespace
 
 bool settings_model_init(Rml::Context* context) {
@@ -381,6 +488,23 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("trigger_threshold_text", &g_m.trigger_threshold_text);
     c.Bind("rumble", &g_m.rumble);
 
+    /* The struct has to be registered before the array whose value type it
+     * is, and both before the Bind of a vector of them. */
+    if (Rml::StructHandle<UiBindRow> row = c.RegisterStruct<UiBindRow>()) {
+        row.RegisterMember("label", &UiBindRow::label);
+        row.RegisterMember("binding", &UiBindRow::binding);
+        row.RegisterMember("capturing", &UiBindRow::capturing);
+    } else {
+        rt_log("ui", "RegisterStruct<UiBindRow> failed; the binding tables are disabled");
+    }
+    if (!c.RegisterArray<std::vector<UiBindRow>>()) {
+        rt_log("ui", "RegisterArray<vector<UiBindRow>> failed; the binding tables are disabled");
+    }
+    c.Bind("keyboard_binds", &g_m.keyboard_binds);
+    c.Bind("gamepad_binds", &g_m.gamepad_binds);
+    c.Bind("rebind_status", &g_m.rebind_status);
+    c.Bind("has_rebind_status", &g_m.has_rebind_status);
+
     c.Bind("verbose", &g_m.verbose);
     c.Bind("log_file", &g_m.log_file);
     c.Bind("profile_fields", &g_m.profile_fields);
@@ -406,15 +530,50 @@ bool settings_model_init(Rml::Context* context) {
     c.BindEventCallback("apply", on_control_change);
     c.BindEventCallback("reset_defaults", on_reset_defaults);
     c.BindEventCallback("close_menu", on_close);
+    c.BindEventCallback("rebind_keyboard", on_rebind_keyboard);
+    c.BindEventCallback("rebind_gamepad", on_rebind_gamepad);
+    c.BindEventCallback("reset_keyboard_binds", on_reset_keyboard_binds);
+    c.BindEventCallback("reset_gamepad_binds", on_reset_gamepad_binds);
 
     g_model = c.GetModelHandle();
     g_model_valid = true;
     return true;
 }
 
+const char* bind_slot_label(bool gamepad, int slot) {
+    if (gamepad) return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadLabels[slot] : "?";
+    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardLabels[slot] : "?";
+}
+
+void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::string& status) {
+    if (!g_model_valid) return;
+
+    /* Start from the stored names either way: ending a capture has to put
+     * the row's real binding back, and starting one has to clear a row an
+     * earlier capture was on. */
+    settings_to_mirror();
+    if (active) {
+        std::vector<UiBindRow>& rows = gamepad ? g_m.gamepad_binds : g_m.keyboard_binds;
+        if (slot >= 0 && slot < (int)rows.size()) {
+            rows[slot].capturing = true;
+            rows[slot].binding = gamepad ? "press a button or move an axis" : "press a key";
+        }
+    }
+    g_m.rebind_status = status;
+    g_m.has_rebind_status = !status.empty();
+    g_model.DirtyAllVariables();
+}
+
 void settings_model_refresh() {
     if (!g_model_valid) return;
     settings_to_mirror();
+    /* The rebind status line is about one capture, not about the settings.
+     * Clearing it here retires it when the menu is reopened or any other
+     * control is changed; ui_rebind.cpp sets it through
+     * settings_model_set_rebind() after this runs, so a message a capture
+     * just produced is not the one being cleared. */
+    g_m.rebind_status.clear();
+    g_m.has_rebind_status = false;
     g_model.DirtyAllVariables();
     sync_fps_document();
 }
@@ -425,11 +584,37 @@ void settings_model_tick() {
     if (g_reset_pending) {
         g_reset_pending = false;
         g_apply_pending = false;
+#ifdef ICORECOMP_PGS_SDL
+        rebind_cancel("the settings were reset to defaults");
+#endif
         rt_settings_reset_defaults();
         rt_settings_commit(false);
         rt_settings_request_save();
         settings_model_refresh();
         rt_log("ui", "settings menu: reset to defaults");
+    } else if (g_reset_keyboard_binds_pending || g_reset_gamepad_binds_pending) {
+        /* One device per tick, keyboard first. Clicking both buttons before
+         * the next field is unlikely but the second click must not be
+         * dropped: the other flag stays set and lands next tick. */
+        const bool gamepad = !g_reset_keyboard_binds_pending;
+        if (gamepad) {
+            g_reset_gamepad_binds_pending = false;
+        } else {
+            g_reset_keyboard_binds_pending = false;
+        }
+#ifdef ICORECOMP_PGS_SDL
+        rebind_cancel("the bindings for that device were reset");
+#endif
+        RtSettings& m = rt_settings_mutable();
+        const int count = gamepad ? (int)RT_GP_COUNT : (int)RT_KB_COUNT;
+        for (int i = 0; i < count; ++i) {
+            std::string* slot = gamepad ? &m.input.gamepad[i] : &m.input.keyboard[i];
+            *slot = rt_settings_default_binding(gamepad, i);
+        }
+        rt_settings_commit(false);
+        rt_settings_request_save();
+        settings_model_refresh();
+        rt_log("ui", "settings menu: %s bindings reset to defaults", gamepad ? "gamepad" : "keyboard");
     } else if (g_apply_pending) {
         g_apply_pending = false;
         mirror_to_settings();

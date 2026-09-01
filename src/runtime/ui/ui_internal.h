@@ -26,6 +26,13 @@
 #include <string>
 #include <vector>
 
+#ifdef ICORECOMP_PGS_SDL
+/* Declared, not included, for the same reason ui.h declares it: this header
+ * is included by files that see no SDL. SDL3/SDL.h's own typedef agrees with
+ * it, so either include order works. */
+union SDL_Event;
+#endif
+
 namespace rtui {
 
 /* ---- overlay backend ----------------------------------------------------
@@ -187,6 +194,19 @@ void settings_model_refresh();
  * refreshes the fps readout text a few times a second. */
 void settings_model_tick();
 
+/* The Input pane's label for one binding slot ("Cross", "Left stick up",
+ * "Menu key"). `gamepad` selects the RtPadBind slots over the RtKeyBind
+ * ones. Out of range returns "?". ui_rebind.cpp names the conflicting slot
+ * in its inline reject message with this. */
+const char* bind_slot_label(bool gamepad, int slot);
+
+/* Puts the Input pane into or out of the "waiting for input" state for one
+ * slot and sets the inline status line under the binding tables. `active`
+ * false ends the capture; `slot` is then ignored and the tables are read
+ * back from the settings. `status` is shown as-is and may be empty. Called
+ * only from ui_rebind.cpp. */
+void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::string& status);
+
 #ifdef ICORECOMP_PGS_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
  * SDL scancode and gamepad button, once, at init. An unresolvable name logs
@@ -202,6 +222,41 @@ const char* menu_hotkey_name();
  * lives behind a wrapper: ui.cpp includes no SDL headers. Both are plain SDL
  * calls and are legal from the event pump. */
 void menu_set_text_input(bool enabled);
+
+/* ---- rebind capture (ui_rebind.cpp) -------------------------------------
+ *
+ * A capture takes over the keyboard and gamepad events while it is up: the
+ * pump routes every event here first, ahead of the menu hotkey and RmlUi
+ * (rt_ui_handle_sdl_event). Mouse and window events still fall through, so
+ * the menu underneath keeps working and the click that started the capture
+ * gets its matching release.
+ *
+ * The accepted name is written to the settings and committed from
+ * rebind_tick(), at the field boundary, for the same reason every other
+ * settings change in this module is (see the file comment in
+ * ui_settings_model.cpp): a commit runs the appliers and those touch the
+ * window and the GS library.
+ */
+
+/* Starts capturing for one slot. Safe from an event callback: it only sets
+ * state and updates the data model. */
+void rebind_begin(bool gamepad, int slot);
+
+/* True between rebind_begin() and the accept, cancel or timeout that ends
+ * the capture. */
+bool rebind_active();
+
+/* Cancels a capture in progress, if any, with `reason` in the log. Called
+ * when the menu closes: a capture never outlives the menu, which is what
+ * keeps rt_ui_wants_input() true for the whole of it. */
+void rebind_cancel(const char* reason);
+
+/* Returns true when the capture consumed the event. */
+bool rebind_handle_sdl_event(const SDL_Event& e);
+
+/* The field-boundary half: applies an accepted capture and expires one that
+ * has been waiting too long. Called from rt_ui_tick. */
+void rebind_tick();
 #endif
 
 } // namespace rtui

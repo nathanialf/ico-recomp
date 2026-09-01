@@ -453,13 +453,14 @@ if(ICORECOMP_UI)
     add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/rmlui"
                      "${CMAKE_BINARY_DIR}/icorecomp-rmlui" EXCLUDE_FROM_ALL SYSTEM)
 
-    # ui_events.cpp is empty without SDL, exactly like host/window.cpp: the
-    # event translation has nothing to translate.
+    # ui_events.cpp and ui_rebind.cpp are empty without SDL, exactly like
+    # host/window.cpp: there are no events to translate or capture.
     target_sources(icorecomp-runtime PRIVATE
         src/runtime/ui/ui.cpp
         src/runtime/ui/ui_render.cpp
         src/runtime/ui/ui_system.cpp
         src/runtime/ui/ui_events.cpp
+        src/runtime/ui/ui_rebind.cpp
         src/runtime/ui/ui_settings_model.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)

@@ -419,6 +419,90 @@ input.range sliderbar:active {
 	color: #a3a3a3;
 }
 
+/* ---- binding tables ------------------------------------------------------
+ *
+ * One row per RtKeyBind / RtPadBind slot, rendered by a data-for loop in
+ * menu.rml. Same construction as the controls above: hairline separators and
+ * flat boxes only, nothing that reaches an unimplemented RenderInterface
+ * call. */
+
+.bind-table {
+	display: block;
+	margin-bottom: 8dp;
+	border-top: 1dp #1a1a1a;
+}
+
+.bind-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	padding: 3dp 0;
+	border-bottom: 1dp #1a1a1a;
+}
+
+.bind-slot {
+	display: block;
+	width: 110dp;
+	flex-shrink: 0;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: #404040;
+}
+
+.bind-name {
+	display: block;
+	flex-grow: 1;
+	min-width: 0;
+	font-size: 9dp;
+	color: #737373;
+}
+
+/* The row waiting for a key or a button. */
+.bind-name.capturing {
+	color: #bfff00;
+}
+
+.bind-button {
+	display: block;
+	flex-shrink: 0;
+	margin-left: 8dp;
+	padding: 2dp 7dp;
+	background-color: transparent;
+	border: 1dp #262626;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #525252;
+	tab-index: auto;
+	nav: auto;
+}
+
+.bind-button:hover,
+.bind-button:focus {
+	color: #a3a3a3;
+	border-color: #404040;
+}
+
+.bind-actions {
+	display: flex;
+	flex-direction: row;
+	margin-bottom: 12dp;
+}
+
+/* The inline result of a capture: a reject reason, a timeout, or the name
+ * that was stored. Same treatment as .override, which is the other line in
+ * this menu that reports something the user has to read. */
+.bind-status {
+	display: block;
+	font-size: 8dp;
+	color: #d4a000;
+	background-color: #2d2000;
+	border: 1dp #4d3800;
+	padding: 4dp 5dp;
+	margin-bottom: 6dp;
+}
+
 /* ---- footer ------------------------------------------------------------- */
 
 .footer {

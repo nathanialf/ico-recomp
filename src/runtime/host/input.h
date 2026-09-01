@@ -20,8 +20,11 @@
  *   2. SDL3 gamepad + keyboard, active only when the paraLLEl-GS window
  *      path already initialized SDL video (the dump/headless path never
  *      touches SDL; without the window there is no key focus anyway).
- *      First detected gamepad maps through the SDL3 gamepad layout
- *      (south=cross east=circle west=square north=triangle). Keyboard map:
+ *      First detected gamepad is opened.
+ *
+ *      Both maps come from rt_settings().input (host/settings.h), rebuilt
+ *      whenever rt_settings_generation() moves. The compiled-in defaults
+ *      there reproduce the pre-settings map:
  *
  *          arrows            d-pad
  *          W A S D           left stick
@@ -31,6 +34,10 @@
  *          Q / E             L1 / R1      1 3 L2 / R2
  *          T / Y             L3 / R3
  *          Enter             start        Backspace  select
+ *
+ *      and, on the pad, the SDL3 gamepad layout (south=cross east=circle
+ *      west=square north=triangle, both triggers as L2/R2 past
+ *      input.trigger_threshold).
  *
  * Both providers can be inactive (headless, no script): every port then
  * reports "no controller" and sif/pad.cpp presents an empty port.
@@ -68,6 +75,19 @@ constexpr uint16_t RT_PAD_CIRCLE   = 1u << 13;
 constexpr uint16_t RT_PAD_CROSS    = 1u << 14;
 constexpr uint16_t RT_PAD_SQUARE   = 1u << 15;
 
+/* Button names accepted in an input script, paired with the bit each one
+ * sets. The script parser (host/input.cpp) is the only consumer today; it
+ * lives here because the script format is documented above and the names
+ * are part of it. */
+constexpr struct { const char* name; uint16_t bit; } RT_PAD_BUTTON_NAMES[16] = {
+    {"select", RT_PAD_SELECT}, {"l3", RT_PAD_L3}, {"r3", RT_PAD_R3},
+    {"start", RT_PAD_START}, {"up", RT_PAD_UP}, {"right", RT_PAD_RIGHT},
+    {"down", RT_PAD_DOWN}, {"left", RT_PAD_LEFT}, {"l2", RT_PAD_L2},
+    {"r2", RT_PAD_R2}, {"l1", RT_PAD_L1}, {"r1", RT_PAD_R1},
+    {"triangle", RT_PAD_TRIANGLE}, {"circle", RT_PAD_CIRCLE},
+    {"cross", RT_PAD_CROSS}, {"square", RT_PAD_SQUARE},
+};
+
 struct RtPadState {
     uint16_t buttons = 0;           /* active-high RT_PAD_* mask */
     uint8_t lx = 0x80, ly = 0x80;   /* left stick, 0x80 = centered */
@@ -89,8 +109,9 @@ void rt_input_poll(uint64_t field);
 bool rt_input_get(int port, RtPadState* out);
 
 /* Actuator (rumble) values from the game: small motor 0/1, big motor
- * 0..255. Forwarded to SDL gamepad rumble when that provider is active;
- * always recorded for the log. */
+ * 0..255. Forwarded to SDL gamepad rumble when that provider is active and
+ * rt_settings().input.rumble is true; always recorded for the log, so a run
+ * with rumble switched off still shows what the game asked for. */
 void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor);
 
 #endif /* ICORECOMP_HOST_INPUT_H */
