@@ -18,7 +18,10 @@
 #include "gs_parallel_api.h"
 #include "runtime.h"
 
+#include "../host/settings.h"
+
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -30,11 +33,62 @@ void host_fatal(const char* component, const char* message) {
     rt_fatal(component, nullptr, "%s", message);
 }
 
+/* Startup options for rt_pgs_create: env resolution plus settings.json.
+ * Called from rt_hw_init() (see main.cpp), which runs after
+ * rt_settings_init(), so rt_settings() already reflects the loaded file. */
+RtPgsCreateOptions resolve_create_options() {
+    RtPgsCreateOptions opts = {};
+    const RtSettings& s = rt_settings();
+
+    /* present: ICORECOMP_GS_PRESENT wins when set, mapped exactly as the
+     * library mapped it itself before this option existed (vsync/fifo ->
+     * FIFO, tear/immediate -> IMMEDIATE, anything else -> MAILBOX);
+     * otherwise display.present decides. */
+    if (const char* pm = std::getenv("ICORECOMP_GS_PRESENT"); pm && *pm) {
+        uint32_t mode = RT_PGS_PRESENT_MAILBOX;
+        if (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0) {
+            mode = RT_PGS_PRESENT_FIFO;
+        } else if (std::strcmp(pm, "tear") == 0 || std::strcmp(pm, "immediate") == 0) {
+            mode = RT_PGS_PRESENT_IMMEDIATE;
+        }
+        opts.present_mode = mode;
+
+        uint32_t settings_mode = RT_PGS_PRESENT_MAILBOX;
+        switch (s.display.present) {
+        case RtPresentMode::Fifo: settings_mode = RT_PGS_PRESENT_FIFO; break;
+        case RtPresentMode::Immediate: settings_mode = RT_PGS_PRESENT_IMMEDIATE; break;
+        default: break;
+        }
+        if (settings_mode != mode) {
+            rt_log("gs", "display.present: using ICORECOMP_GS_PRESENT=%s, settings.json value ignored", pm);
+        }
+    } else {
+        switch (s.display.present) {
+        case RtPresentMode::Fifo: opts.present_mode = RT_PGS_PRESENT_FIFO; break;
+        case RtPresentMode::Immediate: opts.present_mode = RT_PGS_PRESENT_IMMEDIATE; break;
+        default: opts.present_mode = RT_PGS_PRESENT_MAILBOX; break;
+        }
+    }
+
+    /* fit/filter/render_scale/hires_scanout have no env twin: straight from
+     * settings. */
+    switch (s.display.fit) {
+    case RtFit::IntegerScale: opts.fit = RT_PGS_FIT_INTEGER; break;
+    case RtFit::Stretch: opts.fit = RT_PGS_FIT_STRETCH; break;
+    default: opts.fit = RT_PGS_FIT_LETTERBOX; break;
+    }
+    opts.filter = s.display.filter == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
+    opts.render_scale = (uint32_t)s.display.render_scale;
+    opts.hires_scanout = s.display.hires_scanout ? 1u : 0u;
+    return opts;
+}
+
 class ParallelBackend final : public GsBackend {
 public:
     ParallelBackend() {
         const RtPgsHost host = { host_log, host_fatal };
-        m_pgs = rt_pgs_create(&host); /* fatal (never null) on setup failure */
+        RtPgsCreateOptions opts = resolve_create_options();
+        m_pgs = rt_pgs_create(&host, &opts); /* fatal (never null) on setup failure */
     }
 
     ~ParallelBackend() override {

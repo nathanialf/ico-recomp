@@ -2,6 +2,7 @@
 #include "audio.h"
 
 #include "portable.h"
+#include "settings.h"
 
 #include "../runtime.h"
 
@@ -105,7 +106,14 @@ uint64_t g_sdl_dropped = 0;
 constexpr uint32_t kMaxQueuedBytes = RT_AUDIO_RATE * 2 * sizeof(float);
 
 void sdl_open() {
-    if (std::getenv("ICORECOMP_NO_AUDIO")) {
+    if (const char* e = std::getenv("ICORECOMP_NO_AUDIO")) {
+        /* audio.mute's env twin. The env var's actual effect predates
+         * settings.json and is stronger than a plain mute (the stream never
+         * opens at all); it still wins over the file per the env-precedence
+         * rule, so only the "value ignored" log is new here. */
+        if (*e && !rt_settings().audio.mute) {
+            rt_log("audio", "audio.mute: using ICORECOMP_NO_AUDIO=%s, settings.json value ignored", e);
+        }
         rt_log("audio", "ICORECOMP_NO_AUDIO set: SDL audio disabled");
         return;
     }
@@ -165,7 +173,29 @@ void sdl_submit(const float* lr, uint32_t frames) {
         }
         return;
     }
-    SDL_PutAudioStreamData(g_sdl_stream, lr, (int)(frames * 2 * sizeof(float)));
+
+    /* Host master gain applies HERE ONLY, to the samples handed to this SDL
+     * sink. wav_submit (above, in rt_audio_submit, called before this with
+     * the same unscaled `lr`) must never see it: the WAV capture is the
+     * headless verification baseline and has to stay a function of the
+     * sound engine alone, not of a host output setting. At 100/unmuted this
+     * skips the multiply, so the stream is bit-identical to a build with no
+     * volume control. */
+    const RtSettings& s = rt_settings();
+    const float gain = s.audio.mute ? 0.0f : (float)s.audio.master_volume / 100.0f;
+    if (gain == 1.0f) {
+        SDL_PutAudioStreamData(g_sdl_stream, lr, (int)(frames * 2 * sizeof(float)));
+        return;
+    }
+    float scaled[512 * 2];
+    uint32_t done = 0;
+    while (done < frames) {
+        uint32_t n = frames - done;
+        if (n > 512) n = 512;
+        for (uint32_t i = 0; i < n * 2; ++i) scaled[i] = lr[done * 2 + i] * gain;
+        SDL_PutAudioStreamData(g_sdl_stream, scaled, (int)(n * 2 * sizeof(float)));
+        done += n;
+    }
 }
 #endif /* ICORECOMP_SND_SDL */
 

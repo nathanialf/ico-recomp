@@ -48,6 +48,10 @@
 #include "host/audio.h"
 #include "runtime.h"
 
+#ifdef ICORECOMP_HAVE_SETTINGS
+#include "host/settings.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -87,8 +91,26 @@ enum RtProfZone : int {
     RT_PROF_COUNT
 };
 
-/* Fast gate. Read on every zone entry; written once by rt_prof_init. */
+/* Fast gate. Read on every zone entry; written once by rt_prof_init, and
+ * again once per field by rt_prof_field when ICORECOMP_PROFILE is unset
+ * (see g_rt_prof_env_set below). */
 inline bool g_rt_prof_on = false;
+
+/* True once rt_prof_init has seen ICORECOMP_PROFILE set. The environment
+ * variable then owns g_rt_prof_on/g_every for the rest of the run, exactly
+ * as before debug.profile_fields existed; unset, rt_prof_field re-reads
+ * debug.profile_fields every field instead of latching it once, cheap
+ * enough at once-per-field and it means a settings reload takes effect
+ * without a restart. Builds with no ICORECOMP_HAVE_SETTINGS (selftest
+ * targets that do not link settings.cpp; see CMakeLists.txt) never look at
+ * this and keep the historical env-only, on-by-default behavior. */
+inline bool g_rt_prof_env_set = false;
+
+/* True once the one-time ICORECOMP_PROFILE-vs-debug.profile_fields mismatch
+ * log has run (see rt_prof_field). Only meaningful when g_rt_prof_env_set;
+ * the check lives in rt_prof_field, not rt_prof_init, because rt_prof_init
+ * runs before rt_settings_init and so cannot yet see the loaded file. */
+inline bool g_rt_prof_env_checked = false;
 
 namespace rt_prof_detail {
 
@@ -161,28 +183,51 @@ inline uint64_t rt_prof_zone_ns(int zone) { return rt_prof_detail::g_ns[zone]; }
 
 /* Parses ICORECOMP_PROFILE. Call once from main, after rt_log_init.
  *
- * On by default. The report is one block of at most 14 lines every
- * g_every fields, which is negligible next to the rest of the log, and a
- * run that arrives without it cannot be diagnosed at all. Set
- * ICORECOMP_PROFILE=0 (or none, or -) to turn it off; set it to a field
- * count to change the interval. */
+ * Set: identical to before debug.profile_fields existed, including being
+ * on by default for any spelling that is not one of the "off" ones below,
+ * and it wins over the settings file for the rest of the run (a mismatch
+ * between the two is logged once, here). Unset: debug.profile_fields
+ * decides instead (0 = off, matching the file's own documented default),
+ * re-read every field by rt_prof_field rather than latched here -- see
+ * g_rt_prof_env_set. Builds with no ICORECOMP_HAVE_SETTINGS keep today's
+ * on-by-default behavior when the env var is unset, since there is no
+ * settings.json in those targets to ask.
+ *
+ * The report is one block of at most 14 lines every g_every fields, which
+ * is negligible next to the rest of the log, and a run that arrives
+ * without it cannot be diagnosed at all. */
 inline void rt_prof_init() {
     const char* e = std::getenv("ICORECOMP_PROFILE");
+    g_rt_prof_env_set = e != nullptr;
     if (e && (!*e || std::strcmp(e, "0") == 0 || std::strcmp(e, "-") == 0
               || std::strcmp(e, "none") == 0)) {
         return;
     }
-    const char* shown = e ? e : "unset, default";
     if (e) {
         unsigned long n = std::strtoul(e, nullptr, 10);
         if (n > 1) rt_prof_detail::g_every = (unsigned)n;
+        rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
+        rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
+        g_rt_prof_on = true;
+        rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE=%s)."
+                       " Buckets are exclusive self time and sum to wall clock.",
+            rt_prof_detail::g_every, e);
+        return;
     }
+#ifndef ICORECOMP_HAVE_SETTINGS
+    /* No settings link in this target (e.g. icorecomp-ipu-selftest): keep
+     * the historical on-by-default behavior. With ICORECOMP_HAVE_SETTINGS,
+     * rt_prof_field decides instead, once debug.profile_fields is actually
+     * loaded: rt_prof_init runs before rt_settings_init (see main.cpp), so
+     * rt_settings() here would still read the compiled-in defaults, not
+     * whatever settings.json says. */
     rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
     rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
     g_rt_prof_on = true;
-    rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE=%s)."
+    rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE unset, default)."
                    " Buckets are exclusive self time and sum to wall clock.",
-        rt_prof_detail::g_every, shown);
+        rt_prof_detail::g_every);
+#endif
 }
 
 /* Emits one window summary, largest bucket first, then reopens the
@@ -290,8 +335,55 @@ inline void rt_prof_report() {
     g_window_ns = g_last_ns;
 }
 
-/* Called once per field from the GS vsync hook (hw/gspriv.cpp). */
+/* Called once per field from the GS vsync hook (hw/gspriv.cpp).
+ *
+ * When ICORECOMP_PROFILE is unset, debug.profile_fields is re-read here
+ * every field rather than latched once by rt_prof_init: rt_prof_init runs
+ * before rt_settings_init (see main.cpp), so on the very first call this is
+ * what actually picks up the loaded settings.json value, and afterwards it
+ * is what makes an in-run settings edit take effect without a restart.
+ * Transitions log once; a steady value never logs again here. */
 inline void rt_prof_field() {
+#ifdef ICORECOMP_HAVE_SETTINGS
+    if (g_rt_prof_env_set) {
+        /* rt_prof_init already fully decided g_rt_prof_on/g_every from
+         * ICORECOMP_PROFILE; this only logs, once, whether settings.json
+         * would have said something different, now that it is actually
+         * loaded. */
+        if (!g_rt_prof_env_checked) {
+            g_rt_prof_env_checked = true;
+            const int settings_fields = rt_settings().debug.profile_fields;
+            const bool settings_on = settings_fields > 0;
+            const bool differs = settings_on != g_rt_prof_on
+                || (settings_on && (unsigned)settings_fields != rt_prof_detail::g_every);
+            if (differs) {
+                rt_log("prof", "debug.profile_fields: using ICORECOMP_PROFILE (applied at startup),"
+                               " settings.json value ignored");
+            }
+        }
+    } else {
+        const int fields = rt_settings().debug.profile_fields;
+        const bool was_on = g_rt_prof_on;
+        if (fields > 0) {
+            if (!was_on) {
+                rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
+                rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
+                rt_prof_detail::g_window_fields = 0;
+                rt_log("prof", "profiling on: one summary every %d fields (debug.profile_fields=%d)."
+                               " Buckets are exclusive self time and sum to wall clock.",
+                    fields, fields);
+            } else if ((unsigned)fields != rt_prof_detail::g_every) {
+                rt_log("prof", "debug.profile_fields changed to %d; one summary every %d fields from here",
+                    fields, fields);
+            }
+            rt_prof_detail::g_every = (unsigned)fields;
+            g_rt_prof_on = true;
+        } else if (was_on) {
+            rt_log("prof", "profiling off (debug.profile_fields=0)");
+            g_rt_prof_on = false;
+        }
+    }
+#endif
     if (!g_rt_prof_on) return;
     ++rt_prof_detail::g_fields;
     if (++rt_prof_detail::g_window_fields >= rt_prof_detail::g_every) rt_prof_report();

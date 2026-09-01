@@ -67,7 +67,7 @@
 #include <thread>
 
 extern "C" const char* icorecomp_parallel_gs_shim_version(void) {
-    return "icorecomp-parallel-gs shim 2 (C ABI, see gs_parallel_api.h)";
+    return "icorecomp-parallel-gs shim 3 (C ABI, see gs_parallel_api.h)";
 }
 
 namespace {
@@ -158,7 +158,7 @@ constexpr Vulkan::ContextCreationFlags kContextFlags =
  * pre-C-ABI gs_parallel.cpp ParallelBackend; behavior changes are limited to
  * host-callback logging and reporting window closure instead of exiting. */
 struct RtPgs {
-    explicit RtPgs(const RtPgsHost& host);
+    RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts);
     ~RtPgs();
 
     void logf(const char* fmt, ...);
@@ -293,6 +293,12 @@ private:
 #endif /* ICORECOMP_PGS_SDL */
 
     RtPgsHost m_host;
+    RtPgsCreateOptions m_opts{};
+    /* True when rt_pgs_create was given a non-NULL opts: the caller (today,
+     * always gs_parallel.cpp) has already resolved settings.json vs
+     * environment, so this instance must not re-read ICORECOMP_GS_PRESENT
+     * itself. False is the NULL path documented on rt_pgs_create. */
+    bool m_have_opts = false;
     std::unique_ptr<Vulkan::Context> m_headless_context;
     std::unique_ptr<Vulkan::Device> m_headless_device;
 #ifdef ICORECOMP_PGS_SDL
@@ -332,7 +338,28 @@ void RtPgs::fatalf(const char* fmt, ...) {
     std::abort();
 }
 
-RtPgs::RtPgs(const RtPgsHost& host) : m_host(host) {
+RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(host) {
+    m_have_opts = opts != nullptr;
+    if (m_have_opts) {
+        m_opts = *opts;
+    } else {
+        /* Pre-settings defaults, documented on rt_pgs_create: present mode
+         * comes from ICORECOMP_GS_PRESENT below, in init_windowed, exactly
+         * as it did before this struct existed. */
+        m_opts.present_mode = RT_PGS_PRESENT_MAILBOX;
+        m_opts.fit = RT_PGS_FIT_LETTERBOX;
+        m_opts.filter = RT_PGS_FILTER_LINEAR;
+        m_opts.render_scale = 1;
+        m_opts.hires_scanout = 0;
+    }
+    if (m_opts.hires_scanout && m_opts.render_scale < 4) {
+        /* Loud, once: upstream documents high_resolution_scanout as
+         * requiring at least 4x super-sampling. Silently engaging it below
+         * that (or silently ignoring the request) would both be worse than
+         * saying so. */
+        logf("paraLLEl-GS: high_resolution_scanout needs render_scale >= 4; staying off");
+    }
+
     if (!env_is_1("ICORECOMP_VVL")) {
         /* Granite auto-enables the validation layer when installed; keep
          * runs reproducible unless explicitly requested. */
@@ -368,8 +395,24 @@ RtPgs::RtPgs(const RtPgsHost& host) : m_host(host) {
     if (!m_device) init_headless();
 
     m_iface = std::make_unique<ParallelGS::GSInterface>();
-    ParallelGS::GSOptions opts = {};
-    if (!m_iface->init(m_device, opts)) {
+    ParallelGS::GSOptions gs_opts = {};
+    switch (m_opts.render_scale) {
+    case 1: gs_opts.super_sampling = ParallelGS::SuperSampling::X1; break;
+    case 2: gs_opts.super_sampling = ParallelGS::SuperSampling::X2; break;
+    case 4: gs_opts.super_sampling = ParallelGS::SuperSampling::X4; break;
+    case 8: gs_opts.super_sampling = ParallelGS::SuperSampling::X8; break;
+    case 16: gs_opts.super_sampling = ParallelGS::SuperSampling::X16; break;
+    default:
+        /* The host (gs_parallel.cpp) validates render_scale against
+         * settings.json's allowed set before it ever reaches here, so
+         * anything else is a programming error, not user input. */
+        fatalf("paraLLEl-GS: render_scale %u is not one of 1/2/4/8/16", m_opts.render_scale);
+    }
+    /* Lets rt_pgs_set_render_scale retune this in flight later without a
+     * reinit (milestone 6); harmless to set now even before that ABI call
+     * exists. */
+    gs_opts.dynamic_super_sampling = true;
+    if (!m_iface->init(m_device, gs_opts)) {
         fatalf("paraLLEl-GS: GSInterface::init failed; the Vulkan device does not meet its "
                "requirements (see the log above for the missing features)");
     }
@@ -431,6 +474,9 @@ uint32_t RtPgs::vsync(unsigned field) {
      * non-overscan mode area only. Flipping this to true without deriving a
      * new constant distorts geometry. */
     info.overscan = kScanoutOverscan;
+    /* Below 4x this is already logged and left off at construction; not
+     * repeated per field. */
+    info.high_resolution_scanout = m_opts.hires_scanout != 0 && m_opts.render_scale >= 4;
     /* Both consumers of the scanout image here (swapchain blit, screenshot
      * readback) want a transfer source. */
     info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -537,18 +583,39 @@ void RtPgs::init_windowed() {
      * tearing. ICORECOMP_GS_PRESENT=vsync restores the old behavior,
      * =tear forces IMMEDIATE. */
     {
-        const char* pm = std::getenv("ICORECOMP_GS_PRESENT");
         Vulkan::PresentMode mode = Vulkan::PresentMode::UnlockedNoTearing;
         const char* what = "mailbox (non-blocking, no tearing)";
-        if (pm && (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0)) {
-            mode = Vulkan::PresentMode::SyncToVBlank;
-            what = "FIFO (blocks on the display refresh)";
-        } else if (pm && (std::strcmp(pm, "tear") == 0 || std::strcmp(pm, "immediate") == 0)) {
-            mode = Vulkan::PresentMode::UnlockedForceTearing;
-            what = "immediate (may tear)";
+        if (m_have_opts) {
+            /* The host already resolved settings.json vs ICORECOMP_GS_PRESENT
+             * (gs_parallel.cpp); this reads only the result. */
+            switch (m_opts.present_mode) {
+            case RT_PGS_PRESENT_FIFO:
+                mode = Vulkan::PresentMode::SyncToVBlank;
+                what = "FIFO (blocks on the display refresh)";
+                break;
+            case RT_PGS_PRESENT_IMMEDIATE:
+                mode = Vulkan::PresentMode::UnlockedForceTearing;
+                what = "immediate (may tear)";
+                break;
+            default:
+                break; /* RT_PGS_PRESENT_MAILBOX, the default above */
+            }
+            logf("paraLLEl-GS: present mode %s (display.present, resolved by the host)", what);
+        } else {
+            /* opts == NULL: the pre-settings default path documented on
+             * rt_pgs_create. ICORECOMP_GS_PRESENT is read here, and only
+             * here, in this one case. */
+            const char* pm = std::getenv("ICORECOMP_GS_PRESENT");
+            if (pm && (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0)) {
+                mode = Vulkan::PresentMode::SyncToVBlank;
+                what = "FIFO (blocks on the display refresh)";
+            } else if (pm && (std::strcmp(pm, "tear") == 0 || std::strcmp(pm, "immediate") == 0)) {
+                mode = Vulkan::PresentMode::UnlockedForceTearing;
+                what = "immediate (may tear)";
+            }
+            logf("paraLLEl-GS: present mode %s (ICORECOMP_GS_PRESENT=vsync|mailbox|tear)", what);
         }
         wsi->set_present_mode(mode);
-        logf("paraLLEl-GS: present mode %s (ICORECOMP_GS_PRESENT=vsync|mailbox|tear)", what);
     }
     /* WSI owns context creation here, so the CPU-device auto-fallback in
      * gs_pgs_context.h does not apply; a windowed run on a software device
@@ -610,29 +677,70 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
     cmd->clear_image(backbuffer, clear);
 
     if (scanout.image) {
-        /* Letterbox: fit the scanout's display aspect inside the window.
-         * scanout_display_aspect() explains why that is not the image's own
-         * width:height. */
+        /* Presentation of the already-rendered scanout only: fit and filter
+         * decide how it is scaled and sampled into the window backbuffer.
+         * Nothing below this point can change what the game rendered. */
         const int bb_w = int(backbuffer.get_width());
         const int bb_h = int(backbuffer.get_height());
         int dst_w = bb_w, dst_h = bb_h;
-        /* aspect <= 0 means the renderer reported no mode, which vsync() has
-         * already logged. Fill the window rather than invent a ratio; this is
-         * what the pre-aspect code did whenever the mode was zero. */
-        if (aspect > 0.0) {
-            if (double(bb_w) > double(bb_h) * aspect) {
-                dst_w = int(std::lround(double(bb_h) * aspect));
+        uint32_t fit = m_opts.fit;
+
+        if (fit == RT_PGS_FIT_STRETCH) {
+            dst_w = bb_w;
+            dst_h = bb_h;
+        } else if (fit == RT_PGS_FIT_INTEGER) {
+            /* Largest integer n whose n * (the scanout image's own pixel
+             * height) copy fits the backbuffer in BOTH dimensions; width
+             * follows from the SAME display aspect the letterbox path below
+             * derives from, so a tall narrow window must shrink n rather
+             * than let the derived width spill past the backbuffer edge
+             * (a negative blit offset is not a valid Vulkan region). */
+            const int scanout_h = int(scanout.image->get_height());
+            int n = scanout_h > 0 ? bb_h / scanout_h : 0;
+            if (aspect > 0.0) {
+                while (n >= 1 && std::lround(double(n * scanout_h) * aspect) > bb_w) --n;
+            }
+            if (n >= 1 && aspect > 0.0) {
+                dst_h = n * scanout_h;
+                dst_w = int(std::lround(double(dst_h) * aspect));
             } else {
-                dst_h = int(std::lround(double(bb_w) / aspect));
+                static bool warned_no_integer_fit = false;
+                if (!warned_no_integer_fit) {
+                    warned_no_integer_fit = true;
+                    logf("paraLLEl-GS: display.fit=integer has no room for a 1x copy"
+                         " (window %dx%d, scanout height %d); falling back to letterbox",
+                         bb_w, bb_h, scanout_h);
+                }
+                fit = RT_PGS_FIT_LETTERBOX;
             }
         }
+        if (fit == RT_PGS_FIT_LETTERBOX) {
+            /* Letterbox: fit the scanout's display aspect inside the window.
+             * scanout_display_aspect() explains why that is not the image's
+             * own width:height. aspect <= 0 means the renderer reported no
+             * mode, which vsync() has already logged; fill the window rather
+             * than invent a ratio, as the pre-aspect code did whenever the
+             * mode was zero. */
+            dst_w = bb_w;
+            dst_h = bb_h;
+            if (aspect > 0.0) {
+                if (double(bb_w) > double(bb_h) * aspect) {
+                    dst_w = int(std::lround(double(bb_h) * aspect));
+                } else {
+                    dst_h = int(std::lround(double(bb_w) / aspect));
+                }
+            }
+        }
+
         const int x0 = (bb_w - dst_w) / 2;
         const int y0 = (bb_h - dst_h) / 2;
+        const VkFilter filter = m_opts.filter == RT_PGS_FILTER_NEAREST
+            ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         cmd->blit_image(backbuffer, *scanout.image,
                         { x0, y0, 0 }, { dst_w, dst_h, 1 },
                         { 0, 0, 0 },
                         { int(scanout.image->get_width()), int(scanout.image->get_height()), 1 },
-                        0, 0, 0, 0, 1, VK_FILTER_LINEAR);
+                        0, 0, 0, 0, 1, filter);
     }
 
     cmd->image_barrier(backbuffer,
@@ -653,8 +761,8 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
 
 extern "C" {
 
-RtPgs* rt_pgs_create(const RtPgsHost* host) {
-    return new RtPgs(*host);
+RtPgs* rt_pgs_create(const RtPgsHost* host, const RtPgsCreateOptions* opts) {
+    return new RtPgs(*host, opts);
 }
 
 void rt_pgs_destroy(RtPgs* pgs) {

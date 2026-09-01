@@ -44,6 +44,7 @@
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "host/settings.h"
 #include "hw/hw.h"
 #include "iso/iso9660.h"
 #include "prof.h"
@@ -226,6 +227,19 @@ int main(int argc, char** argv) {
     }
 
     set_fpu_ftz_daz();
+
+    /* After the log sink, profiler and crash handler are up, and after
+     * argument parsing so --disc has already latched, but before anything
+     * that reads a setting (mem init has none today, but the GS backend and
+     * audio init later in this sequence do). ICORECOMP_VERBOSE always wins
+     * over debug.verbose; only apply the settings value when the env var
+     * was never set, matching every other env-twin consumer in this
+     * codebase (see rt_log_set_verbose's own comment). */
+    rt_settings_init();
+    if (!std::getenv("ICORECOMP_VERBOSE") && !rt_settings().debug.verbose.empty()) {
+        rt_log_set_verbose(rt_settings().debug.verbose.c_str());
+    }
+
     rt_mem_init();
 
     LoaderConfig cfg;

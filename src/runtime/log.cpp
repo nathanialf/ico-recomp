@@ -553,6 +553,15 @@ bool rt_verbose(const char* component) {
     return false;
 }
 
+void rt_log_set_verbose(const char* spec) {
+    g_verbose_all = false;
+    g_verbose_tags.clear();
+    if (!spec) return;
+    const bool off = std::strcmp(spec, "-") == 0 || std::strcmp(spec, "0") == 0
+        || std::strcmp(spec, "none") == 0;
+    if (!off) parse_verbose(spec);
+}
+
 void rt_logv(const char* component, const char* fmt, ...) {
     char line[3072];
     va_list ap;

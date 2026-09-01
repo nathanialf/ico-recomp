@@ -18,9 +18,11 @@
 #include "../gs/gs_backend.h"
 #include "../host/audio.h"
 #include "../host/portable.h"
+#include "../host/settings.h"
 #include "../prof.h"
 #include <cstring>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 #include <chrono>
 
@@ -93,24 +95,40 @@ namespace {
  * to hide this by accident, at the cost of collapsing to half speed.
  *
  * Paces to the NTSC field rate. ICORECOMP_FPS_LIMIT=0 disables it, or set
- * it to a field rate to override. Bounded diagnostic runs
- * (ICORECOMP_MAX_VBLANKS) are never paced. */
+ * it to a field rate to override. debug.fps_limit_hz is the settings.json
+ * twin (0 disables the same way); the environment variable wins for the
+ * life of the run when it is set, latched once on first use like the old
+ * read-once static did. Bounded diagnostic runs (ICORECOMP_MAX_VBLANKS)
+ * are never paced. */
 using PaceClock = std::chrono::steady_clock;
 
 double pace_period_seconds() {
     if (std::getenv("ICORECOMP_MAX_VBLANKS")) return 0.0;
-    const char* e = std::getenv("ICORECOMP_FPS_LIMIT");
-    double hz = 59.94;
-    if (e) {
-        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return 0.0;
-        double v = std::strtod(e, nullptr);
-        if (v > 1.0) hz = v;
-    }
-    return 1.0 / hz;
+
+    /* std::nullopt means ICORECOMP_FPS_LIMIT is unset: debug.fps_limit_hz
+     * is then read fresh below on every call, so a settings reload takes
+     * effect without a restart (a "hot" setting per settings.h). Set, it
+     * is latched once, exactly like the pre-settings behavior. */
+    static const std::optional<double> env_hz = [] () -> std::optional<double> {
+        const char* e = std::getenv("ICORECOMP_FPS_LIMIT");
+        if (!e) return std::nullopt;
+        double hz = 0.0; /* "0" or "off": disabled, same as debug.fps_limit_hz = 0 */
+        if (std::strcmp(e, "0") != 0 && std::strcmp(e, "off") != 0) {
+            double v = std::strtod(e, nullptr);
+            hz = v > 1.0 ? v : 59.94;
+        }
+        if (hz != rt_settings().debug.fps_limit_hz) {
+            rt_log("gs", "debug.fps_limit_hz: using ICORECOMP_FPS_LIMIT=%s, settings.json value ignored", e);
+        }
+        return hz;
+    }();
+
+    const double hz = env_hz.has_value() ? *env_hz : rt_settings().debug.fps_limit_hz;
+    return hz > 0.0 ? 1.0 / hz : 0.0;
 }
 
 void pace_field() {
-    static const double period = pace_period_seconds();
+    const double period = pace_period_seconds();
     if (period <= 0.0) return;
     RT_PROF_ZONE(RT_PROF_LIMIT);
     static bool started = false;

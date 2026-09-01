@@ -44,6 +44,16 @@ void rt_log_init(const char* dir);
  * short list walk, so hot callers should cache the answer in a static. */
 bool rt_verbose(const char* component);
 
+/* Parses `spec` exactly like ICORECOMP_VERBOSE at startup ("-", "0" or
+ * "none" clears every channel) and replaces the enabled-channel set with
+ * it. Only adjusts what rt_verbose() answers; never touches the log file or
+ * which sink a line goes to (that is fixed at rt_log_init). Called at most
+ * once at startup, from main.cpp, and only when ICORECOMP_VERBOSE itself is
+ * unset -- the environment variable always wins over debug.verbose, so
+ * main never calls this when it is set. The settings UI (later milestones)
+ * calls it again on a live edit. */
+void rt_log_set_verbose(const char* spec);
+
 /* A verbose diagnostic line. Goes to the log file only, never to the
  * console echo, so enabling a channel does not make the console unusable.
  * Callers gate on rt_verbose() first; this does not check again. */

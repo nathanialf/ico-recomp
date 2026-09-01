@@ -128,6 +128,11 @@ target_include_directories(icorecomp-runtime PRIVATE
 
 target_compile_definitions(icorecomp-runtime PRIVATE
     ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+    # Gates the rt_settings() read in prof.h (header-only; see its comment).
+    # Only targets that link host/settings.cpp may define this: icorecomp-
+    # ipu-selftest also includes prof.h transitively (hw/ipu.cpp,
+    # iso/iso9660.cpp) but does not link settings.cpp, so it must not.
+    ICORECOMP_HAVE_SETTINGS
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

@@ -44,11 +44,34 @@ typedef struct RtPgsHost {
  * ParallelGS::GSInterface, all library-side). */
 typedef struct RtPgs RtPgs;
 
+#define RT_PGS_PRESENT_MAILBOX   0u
+#define RT_PGS_PRESENT_FIFO      1u
+#define RT_PGS_PRESENT_IMMEDIATE 2u
+#define RT_PGS_FIT_LETTERBOX 0u
+#define RT_PGS_FIT_INTEGER   1u
+#define RT_PGS_FIT_STRETCH   2u
+#define RT_PGS_FILTER_LINEAR  0u
+#define RT_PGS_FILTER_NEAREST 1u
+
+/* Startup options resolved by the host (settings.json with environment
+ * variables taking precedence). Extend at the end only. */
+typedef struct RtPgsCreateOptions {
+    uint32_t present_mode;   /* RT_PGS_PRESENT_* */
+    uint32_t fit;            /* RT_PGS_FIT_* */
+    uint32_t filter;         /* RT_PGS_FILTER_* */
+    uint32_t render_scale;   /* 1/2/4/8/16, paraLLEl-GS SuperSampling factor */
+    uint32_t hires_scanout;  /* nonzero: high resolution scanout; needs render_scale >= 4 */
+} RtPgsCreateOptions;
+
 /* Creates the live backend. Never returns NULL: unrecoverable setup errors
  * (no Vulkan loader/device, GSInterface init failure) go through
  * host->fatal. `host` is copied; the pointed-to struct need not outlive the
- * call. */
-RT_GS_API RtPgs* rt_pgs_create(const RtPgsHost* host);
+ * call. `opts` may be NULL, meaning the pre-settings defaults (present mode
+ * from ICORECOMP_GS_PRESENT as before this struct existed, letterbox,
+ * linear filtering, render scale 1, hires scanout off); otherwise it is
+ * copied and the caller resolved it (settings.json with environment
+ * variables taking precedence -- see gs_parallel.cpp). */
+RT_GS_API RtPgs* rt_pgs_create(const RtPgsHost* host, const RtPgsCreateOptions* opts);
 RT_GS_API void rt_pgs_destroy(RtPgs* pgs);
 
 /* Mirrors GsBackend (gs_backend.h): path 0..2, data is qwords*16 bytes. */
