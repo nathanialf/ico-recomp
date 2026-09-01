@@ -1,0 +1,18 @@
+<rml>
+<head>
+	<title>Settings</title>
+	<link type="text/rcss" href="style/base.rcss"/>
+</head>
+<body>
+	<!-- The root overlay document. Milestone 6 of the settings plan fills
+	     this in with the Display, Audio, Input and Debug categories; for now
+	     it exists to prove the RmlUi path end to end: font, layout, text and
+	     the overlay draw list. -->
+	<div class="panel">
+		<h1>Settings</h1>
+		<p>The settings menu is not wired up yet.</p>
+		<p class="dim">Press <span class="key" id="menu-key">F1</span> to close this.</p>
+		<p class="footer">icorecomp</p>
+	</div>
+</body>
+</rml>

@@ -1,0 +1,79 @@
+/* ui/ui.h: the runtime's RmlUi overlay (settings menu, later the launcher).
+ *
+ * Everything in this module runs on the main OS thread, at the field
+ * boundary, with no locking: guest threads are minicoro coroutines on that
+ * same thread (see host/settings.h for the same statement about settings).
+ *
+ * Two entry points with very different rules:
+ *   - rt_ui_tick() runs from rt_gs_vsync_hook (hw/gspriv.cpp), which is
+ *     outside Granite's WSI::begin_frame. RmlUi's Update()/Render() call
+ *     GenerateTexture/ReleaseTexture and the tick ends with
+ *     rt_pgs_overlay_set_frame, all of which are between-frames-only entry
+ *     points (the library's m_in_frame fatal guard). This is the only place
+ *     they may be called from.
+ *   - rt_ui_handle_sdl_event() runs from rt_window_pump (host/window.cpp),
+ *     which can execute from inside WSI::begin_frame. It may only translate
+ *     events into Rml::Context::Process* calls and flip flags. It must never
+ *     call any rt_pgs_* function.
+ *
+ * This header deliberately includes no RmlUi headers; only the .cpp files in
+ * this directory see them. Callers may include it in any build: without
+ * ICORECOMP_UI the functions below are inline no-ops, so no call site needs
+ * its own #ifdef.
+ */
+#ifndef ICORECOMP_UI_UI_H
+#define ICORECOMP_UI_UI_H
+
+#ifdef ICORECOMP_PGS_SDL
+/* Declared, not included: ui.h stays free of SDL and RmlUi headers.
+ * SDL3/SDL.h's own `typedef union SDL_Event {...} SDL_Event;` agrees with
+ * this declaration, so either include order works. */
+union SDL_Event;
+#endif
+
+#ifdef ICORECOMP_UI
+
+/* Brings up RmlUi: interfaces, font, context and the menu document. Call
+ * after rt_hw_init(), so the window (and therefore the surface size) exists.
+ * Returns false, having logged the reason, when this build has no live
+ * windowed backend, when rt_base_dir()/ui is missing, or when RmlUi itself
+ * fails to initialize. A false return is not fatal: the game runs without a
+ * settings menu. */
+bool rt_ui_init();
+
+/* One UI tick, from rt_gs_vsync_hook after rt_settings_apply_pending():
+ * re-reads the surface size, updates and renders the RmlUi context, and
+ * hands the resulting draw list to the library as one overlay frame. No-op
+ * until rt_ui_init() has succeeded. */
+void rt_ui_tick();
+
+bool rt_ui_visible();
+void rt_ui_set_visible(bool visible);
+
+/* True while the menu owns input. Milestone 6 makes sdl_poll return a
+ * neutral pad (no buttons, sticks centered) while this is true; for now it
+ * is exactly rt_ui_visible(). */
+bool rt_ui_wants_input();
+
+#ifdef ICORECOMP_PGS_SDL
+/* Called from rt_window_pump for every event window.cpp does not fully own.
+ * Returns true when the UI consumed the event, so later consumers (rebind
+ * capture in milestone 7) can stop routing it. The menu hotkey is consumed
+ * here and never reaches RmlUi or the pad. */
+bool rt_ui_handle_sdl_event(const SDL_Event& e);
+#endif
+
+#else /* !ICORECOMP_UI */
+
+inline bool rt_ui_init() { return false; }
+inline void rt_ui_tick() {}
+inline bool rt_ui_visible() { return false; }
+inline void rt_ui_set_visible(bool) {}
+inline bool rt_ui_wants_input() { return false; }
+#ifdef ICORECOMP_PGS_SDL
+inline bool rt_ui_handle_sdl_event(const SDL_Event&) { return false; }
+#endif
+
+#endif /* ICORECOMP_UI */
+
+#endif /* ICORECOMP_UI_UI_H */

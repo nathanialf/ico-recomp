@@ -1238,11 +1238,6 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
     cmd.set_program(m_overlay_program);
     cmd.set_depth_test(false, false);
     cmd.set_blend_enable(true);
-    /* Straight (non-premultiplied) alpha, per gs_parallel_api.h: color uses
-     * SRC_ALPHA/ONE_MINUS_SRC_ALPHA, alpha uses ONE/ONE_MINUS_SRC_ALPHA so
-     * overlapping translucent draws accumulate coverage correctly. */
-    cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE,
-                          VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
     cmd.set_blend_op(VK_BLEND_OP_ADD);
 
     cmd.set_vertex_attrib(0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(RtPgsOverlayVertex, x));
@@ -1258,6 +1253,16 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
     std::memcpy(idx, m_overlay_indices.data(), size_t(idx_size));
 
     for (const RtPgsOverlayCmd& c : m_overlay_cmds) {
+        /* Per command, per gs_parallel_api.h: straight alpha multiplies the
+         * source by SRC_ALPHA here, premultiplied alpha (what RmlUi hands us)
+         * has that factor already folded into the color and takes ONE. Alpha
+         * uses ONE/ONE_MINUS_SRC_ALPHA either way so overlapping translucent
+         * draws accumulate coverage correctly. */
+        const bool premultiplied = (c.flags & RT_PGS_OVERLAY_PREMULTIPLIED) != 0;
+        cmd.set_blend_factors(premultiplied ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA,
+                              VK_BLEND_FACTOR_ONE,
+                              VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+
         float mvp[16];
         build_overlay_mvp(mvp, c, bb_w, bb_h, surface_w, surface_h);
         cmd.push_constants(mvp, 0, sizeof(mvp));

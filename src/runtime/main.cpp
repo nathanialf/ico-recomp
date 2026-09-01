@@ -48,6 +48,7 @@
 #include "hw/hw.h"
 #include "iso/iso9660.h"
 #include "prof.h"
+#include "ui/ui.h"
 
 #include <csignal>
 #include <cstdio>
@@ -289,6 +290,12 @@ int main(int argc, char** argv) {
      * into a black window that vanished, which reads as a crash rather
      * than the specific error it is. */
     rt_hw_init();
+
+    /* The UI needs the window (and its surface size) to exist, so it comes
+     * up right after the backend. A scripted run bypasses the UI entirely
+     * (settings plan): ICORECOMP_INPUT_SCRIPT drives the pad from a file and
+     * must stay reproducible, which a menu that eats input would break. */
+    if (!std::getenv("ICORECOMP_INPUT_SCRIPT")) rt_ui_init();
 
     rt_sched_init();
 

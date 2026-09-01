@@ -44,6 +44,38 @@ jobs:
       - name: run
         run: ICORECOMP_SETTINGS_SELFTEST_DIR=$(mktemp -d) ./build/icorecomp-settings-selftest
 
+  runtime-ui-linux:
+    # The RmlUi UI built without the live GS backend: the cheap gate that
+    # keeps the UI sources compiling and linking. The UI is independent of
+    # ICORECOMP_PARALLEL_GS at build level; at run time it reports there is
+    # no window and disables itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch UI submodules
+        run: git submodule update --init third_party/rmlui third_party/freetype
+      - name: configure and build (UI, no GS backend)
+        run: |
+          cmake -B build-ui -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF -DICORECOMP_UI=ON
+          cmake --build build-ui --target icorecomp-runtime -j4
+
+  runtime-ui-mingw:
+    # The same build cross-compiled for Windows. RmlUi and FreeType under
+    # mingw-w64 are the named risk of the settings plan, so this is a merge
+    # blocker like the job above, not informational.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: fetch UI submodules
+        run: git submodule update --init third_party/rmlui third_party/freetype
+      - name: configure and build (UI, mingw cross, no GS backend)
+        run: |
+          cmake -B build-ui-mingw -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
+                -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF -DICORECOMP_UI=ON
+          cmake --build build-ui-mingw --target icorecomp-runtime -j4
+
   runtime-stub-windows:
     # Informational until the Windows port lands: failures here are
     # portability debt to burn down, not merge blockers.

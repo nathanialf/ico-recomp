@@ -386,6 +386,91 @@ else()
     message(STATUS "icorecomp: paraLLEl-GS backend disabled; ICORECOMP_GS=parallel will fail loudly")
 endif()
 
+# ---- RmlUi settings/launcher UI (third_party/rmlui, third_party/freetype) --
+#
+# The UI lives entirely in the MIT executable: RmlUi (MIT) and FreeType (FTL,
+# MIT-compatible) are linked statically into icorecomp-runtime, and the only
+# thing that crosses the LGPL boundary is the plain POD overlay draw list in
+# gs/gs_parallel_api.h. See src/runtime/ui/ui.h.
+#
+# Independent of ICORECOMP_PARALLEL_GS on purpose: with the live backend off
+# the UI sources still compile and link (that is the cheap CI gate on both
+# Linux and the mingw cross build), and at run time rt_ui_init reports there
+# is no window and disables itself.
+option(ICORECOMP_UI "Build the RmlUi settings/launcher UI" ON)
+
+if(ICORECOMP_UI AND NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/rmlui/CMakeLists.txt")
+    message(STATUS "icorecomp: rmlui submodule not initialized "
+                   "(git submodule update --init third_party/rmlui); UI disabled")
+    set(ICORECOMP_UI OFF)
+endif()
+if(ICORECOMP_UI AND NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/freetype/CMakeLists.txt")
+    message(STATUS "icorecomp: freetype submodule not initialized "
+                   "(git submodule update --init third_party/freetype); UI disabled")
+    set(ICORECOMP_UI OFF)
+endif()
+
+if(ICORECOMP_UI)
+    # Both dependencies static into the executable. FreeType's
+    # cmake_minimum_required is 3.0...3.5, so CMP0077 is OLD in its scope and
+    # its option() calls overwrite plain variables: every FT_* knob below has
+    # to be a cache entry to survive. RmlUi's range reaches 3.27, where
+    # CMP0077 is NEW, so a normal variable is enough there.
+    set(BUILD_SHARED_LIBS OFF)
+    set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+    # FreeType honors this (its CMakeLists guards every install() with it):
+    # nothing of FreeType belongs in the packaged folder, only the linked
+    # objects inside the executable.
+    set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/freetype"
+                     "${CMAKE_BINARY_DIR}/icorecomp-freetype" EXCLUDE_FROM_ALL SYSTEM)
+    # FreeType only sets EXPORT_NAME Freetype::Freetype on an interface
+    # target; there is no such alias in the build tree, and RmlUi checks for
+    # the target by name.
+    if(NOT TARGET Freetype::Freetype)
+        add_library(Freetype::Freetype ALIAS freetype)
+    endif()
+
+    # cmake/FindFreetype.cmake answers RmlUi's find_package(Freetype) with the
+    # target above; see the comment in that file.
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
+    set(RMLUI_FONT_ENGINE "freetype" CACHE STRING "" FORCE)
+    set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(RMLUI_LUA_BINDINGS OFF CACHE BOOL "" FORCE)
+    set(RMLUI_SVG_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(RMLUI_LOTTIE_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(RMLUI_HARFBUZZ_SAMPLE OFF CACHE BOOL "" FORCE)
+    set(RMLUI_TRACY_PROFILING OFF CACHE BOOL "" FORCE)
+    # RMLUI_BACKEND is left alone: "none" is not one of its accepted values
+    # (CMake/OptionsLists.cmake) and the setting only picks a backend for the
+    # samples, which are off. RMLUI_INSTALL_RUNTIME_DEPENDENCIES likewise:
+    # RmlUi only declares that option on WIN32 with a shared build.
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/rmlui"
+                     "${CMAKE_BINARY_DIR}/icorecomp-rmlui" EXCLUDE_FROM_ALL SYSTEM)
+
+    # ui_events.cpp is empty without SDL, exactly like host/window.cpp: the
+    # event translation has nothing to translate.
+    target_sources(icorecomp-runtime PRIVATE
+        src/runtime/ui/ui.cpp
+        src/runtime/ui/ui_render.cpp
+        src/runtime/ui/ui_system.cpp
+        src/runtime/ui/ui_events.cpp
+    )
+    target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)
+    # RmlUi::Core only. The debugger is a separate target that nothing here
+    # links, so EXCLUDE_FROM_ALL means it is never built.
+    target_link_libraries(icorecomp-runtime PRIVATE RmlUi::Core)
+
+    message(STATUS "icorecomp: RmlUi UI enabled (static RmlUi 6.3 + FreeType 2.13.3)")
+else()
+    message(STATUS "icorecomp: RmlUi UI disabled; the settings menu and launcher are not built")
+endif()
+
 # ---- packaging -------------------------------------------------------------
 #
 # `cmake --install <build> --prefix <dir>` lays down a self-contained,
@@ -424,6 +509,13 @@ endif()
 
 install(TARGETS icorecomp-runtime RUNTIME DESTINATION .)
 
+if(ICORECOMP_UI)
+    # The UI's documents, stylesheets and font, found at run time under
+    # rt_base_dir()/ui (src/runtime/ui/ui.cpp). The font's OFL license text
+    # ships beside it, which is what the license requires.
+    install(DIRECTORY ui/ DESTINATION ui)
+endif()
+
 if(ICORECOMP_PARALLEL_GS)
     # RUNTIME catches the Windows DLL, LIBRARY the Linux .so.
     install(TARGETS icorecomp-parallel-gs RUNTIME DESTINATION . LIBRARY DESTINATION .)
@@ -448,6 +540,18 @@ else()
     set(ICORECOMP_PACKAGE_LIBS "    (no shared libraries in this build)")
 endif()
 
+# The ui/ folder ships only when the UI is built, so the README's folder
+# listing names it the same way it names the libraries: through a variable,
+# not a fixed line.
+if(ICORECOMP_UI)
+    set(ICORECOMP_PACKAGE_UI "\n    ui/")
+    set(ICORECOMP_PACKAGE_UI_NOTE
+        "\n\nui/ holds the settings menu's documents, stylesheet and font, plus that\nfont's license. It stays next to the executable as well.")
+else()
+    set(ICORECOMP_PACKAGE_UI "")
+    set(ICORECOMP_PACKAGE_UI_NOTE "")
+endif()
+
 # Rendered at install time because the library file names are generator
 # expressions; configure_file alone cannot resolve them.
 install(CODE "
@@ -455,6 +559,8 @@ install(CODE "
     set(ICORECOMP_PACKAGE_EXE \"${ICORECOMP_PACKAGE_EXE}\")
     set(ICORECOMP_PACKAGE_GSLIB \"${ICORECOMP_PACKAGE_GSLIB}\")
     set(ICORECOMP_PACKAGE_LIBS \"${ICORECOMP_PACKAGE_LIBS}\")
+    set(ICORECOMP_PACKAGE_UI \"${ICORECOMP_PACKAGE_UI}\")
+    set(ICORECOMP_PACKAGE_UI_NOTE \"${ICORECOMP_PACKAGE_UI_NOTE}\")
     configure_file(\"${CMAKE_SOURCE_DIR}/packaging/README.txt.in\"
                    \"\${CMAKE_INSTALL_PREFIX}/README.txt\" @ONLY)
 ")

@@ -134,11 +134,22 @@ RT_GS_API void  rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor, uint32_t hi
 typedef struct RtPgsOverlayVertex {
     float x, y;       /* pixels, origin top-left of the surface */
     float u, v;
-    uint32_t rgba;    /* R8G8B8A8_UNORM byte order, straight (non-premultiplied) alpha */
+    uint32_t rgba;    /* R8G8B8A8_UNORM byte order, straight (non-premultiplied)
+                       * alpha unless the command sets
+                       * RT_PGS_OVERLAY_PREMULTIPLIED */
 } RtPgsOverlayVertex;
 
 #define RT_PGS_OVERLAY_SCISSOR   1u   /* scissor_* fields are valid */
 #define RT_PGS_OVERLAY_TRANSFORM 2u   /* transform[] is not identity */
+/* This command's vertex colors and texture texels carry premultiplied alpha:
+ * blend with ONE / ONE_MINUS_SRC_ALPHA for both color and alpha instead of
+ * the default SRC_ALPHA / ONE_MINUS_SRC_ALPHA. Set per command, so one frame
+ * may mix both conventions. RmlUi hands the renderer premultiplied vertex
+ * colors (Rml::Vertex::colour is ColourbPremultiplied) and premultiplied
+ * texture bytes (RenderInterface::GenerateTexture), so the UI path
+ * (src/runtime/ui/ui_render.cpp) sets this on every command it emits; the
+ * ICORECOMP_UI_TEST frame in gs_parallel.cpp stays straight-alpha. */
+#define RT_PGS_OVERLAY_PREMULTIPLIED 4u
 
 typedef struct RtPgsOverlayCmd {
     uint32_t texture;        /* id from rt_pgs_overlay_texture_create; 0 = solid white */

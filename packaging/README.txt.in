@@ -33,11 +33,11 @@ What this folder holds
 
     @ICORECOMP_PACKAGE_EXE@
 @ICORECOMP_PACKAGE_LIBS@
-    README.txt
+    README.txt@ICORECOMP_PACKAGE_UI@
 
 The two libraries are the renderer (paraLLEl-GS) and SDL3, which provides
 the window, controller input and audio. Both must stay next to the
-executable.
+executable.@ICORECOMP_PACKAGE_UI_NOTE@
 
 After the first run you will also see icorecomp.log, the last run's log,
 and saves/mc0, the virtual memory card.

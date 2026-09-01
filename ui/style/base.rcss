@@ -1,0 +1,65 @@
+/* ui/style/base.rcss: the shared look of the overlay documents.
+ *
+ * Deliberately restricted to what the overlay renderer can draw
+ * (src/runtime/ui/ui_render.cpp): solid and translucent boxes, text, and
+ * scissored regions. No border-radius, box-shadow, gradients, filters,
+ * container opacity or clip masks: each of those reaches a RenderInterface
+ * function that is not implemented in this build and logs a line saying so.
+ *
+ * Sizes are in dp, not px. The context's density-independent pixel ratio is
+ * set from the surface height against the 640x480 baseline (ui.cpp), so the
+ * same document reads at the same size in a small window and a large one.
+ */
+
+body {
+	font-family: "Open Sans";
+	font-weight: normal;
+	font-style: normal;
+	font-size: 15dp;
+	color: #e6e6ea;
+	width: 100%;
+	height: 100%;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.panel {
+	width: 420dp;
+	padding: 20dp 24dp;
+	/* Translucent panel over the game's scanout. The alpha is on the
+	 * background color, not on the element: container opacity would need a
+	 * render layer. */
+	background-color: rgba(16, 17, 22, 235);
+	border: 1dp #4a4d5a;
+}
+
+h1 {
+	display: block;
+	font-size: 22dp;
+	font-weight: bold;
+	color: #ffffff;
+	margin-bottom: 14dp;
+}
+
+p {
+	display: block;
+	margin-bottom: 10dp;
+	line-height: 1.4;
+}
+
+.dim {
+	color: #9a9aa6;
+}
+
+.footer {
+	display: block;
+	margin-top: 16dp;
+	font-size: 12dp;
+	color: #71717e;
+}
+
+.key {
+	font-weight: bold;
+	color: #ffffff;
+}

@@ -19,6 +19,7 @@
 #include "window.h"
 
 #include "../runtime.h"
+#include "../ui/ui.h"
 
 #ifdef ICORECOMP_PGS_SDL
 #include "../gs/gs_parallel_api.h"
@@ -99,10 +100,19 @@ void rt_window_pump() {
             record_window_size(win);
             break;
         default:
-            /* RmlUi event translation and rebind capture attach here once
-             * those land (milestones 5 and 7 of the settings plan). */
+            /* Rebind capture attaches here once it lands (milestone 7 of the
+             * settings plan). */
             break;
         }
+        /* The UI sees every event, after this file has done its own part of
+         * the handling: the menu hotkey has to work whether the menu is up
+         * or not, and window/quit events are harmless to hand it. It returns
+         * true when RmlUi consumed the event, which is the signal later
+         * consumers (rebind capture) will check before routing it further.
+         * It stays inside the reentrancy rule: event translation and flag
+         * flips only, no rt_pgs_* calls. No-op (an inline stub in ui.h)
+         * when this build has no UI. */
+        rt_ui_handle_sdl_event(e);
     }
     /* The debounced size save happens in rt_window_flush_pending_save, not
      * here: rt_settings_commit runs the display applier, and this function

@@ -21,6 +21,7 @@
 #include "../host/settings.h"
 #include "../host/window.h"
 #include "../prof.h"
+#include "../ui/ui.h"
 #include <cstring>
 #include <cstdlib>
 #include <optional>
@@ -202,9 +203,12 @@ void rt_gs_vsync_hook(unsigned field) {
      * calls begin_frame at all. rt_settings_apply_pending() applies warm
      * settings (present mode, render scale) here because their subsystem
      * calls fatal if made mid-frame; this is the one place guaranteed to run
-     * between frames every field. */
+     * between frames every field. rt_ui_tick() follows for the same reason:
+     * RmlUi's update and render call the overlay texture and set_frame entry
+     * points, which are between-frames-only too (see ui/ui.h). */
     rt_window_pump();
     rt_settings_apply_pending();
+    rt_ui_tick();
     {
         RT_PROF_ZONE(RT_PROF_PRESENT);
         GsBackend* be = rt_gs_backend();
