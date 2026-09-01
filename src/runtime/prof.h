@@ -152,6 +152,13 @@ private:
 #define RT_PROF_CAT(a, b) RT_PROF_CAT2(a, b)
 #define RT_PROF_ZONE(z) RtProfScope RT_PROF_CAT(rt_prof_scope_, __LINE__)(z)
 
+/* Exclusive nanoseconds billed to one zone so far this window. Read it
+ * either side of a scope and the difference is that scope's exclusive
+ * time, nested zones already subtracted. hw/vu1rt.cpp uses this to split
+ * the "vu1" bucket per microprogram without taking a second clock reading
+ * on the hot path. Returns 0 with the instrument off. */
+inline uint64_t rt_prof_zone_ns(int zone) { return rt_prof_detail::g_ns[zone]; }
+
 /* Parses ICORECOMP_PROFILE. Call once from main, after rt_log_init.
  *
  * On by default. The report is one block of at most 14 lines every
@@ -184,6 +191,13 @@ inline void rt_prof_init() {
 /* Implemented in ee/sched.cpp; reading it clears the counters. */
 extern "C" void rt_clock_sources(uint64_t* backedge, uint64_t* mmio, uint64_t* idle);
 
+/* Detail lines contributed by one subsystem to the summary. Each writes
+ * its own rt_log lines and clears its window counters, the same contract
+ * as rt_clock_sources; each is silent when it has nothing to report.
+ * Implemented in hw/vu1rt.cpp and hw/geomcheck.cpp. */
+extern "C" void rt_vu1_prof_report(double fields);
+extern "C" void rt_geom_prof_report(double fields);
+
 inline void rt_prof_report() {
     using namespace rt_prof_detail;
     const uint64_t t = now_ns();
@@ -197,8 +211,21 @@ inline void rt_prof_report() {
     std::sort(order, order + RT_PROF_COUNT,
               [](int a, int b) { return g_ns[a] > g_ns[b]; });
 
-    rt_log("prof", "%.0f fields in %.1f ms host = %.2f fields/s (PS2 target 59.94);"
+    /* Absolute field numbers, not just a count. A report of "it goes wrong
+     * ten seconds in" can only be matched to a summary if the summary says
+     * which fields it covers. NTSC fields are 59.94 Hz, so the seconds are
+     * game time, not host time; the two diverge exactly when this
+     * instrument is worth reading. */
+    /* Inclusive range. The window's last field is g_fields, and it covers
+     * g_window_fields of them, so the first is that many back plus one;
+     * without the +1 the line claims one field too many and overlaps the
+     * previous window's last field. */
+    const uint64_t first_field = g_fields - g_window_fields + 1;
+    rt_log("prof", "fields %llu..%llu (game time %.2f..%.2f s): %.0f fields in %.1f ms host"
+                   " = %.2f fields/s (PS2 target 59.94);"
                    " exclusive self time, buckets sum to wall",
+        (unsigned long long)first_field, (unsigned long long)g_fields,
+        (double)first_field / 59.94, (double)g_fields / 59.94,
         fields, wall_ms, wall > 0 ? fields * 1e9 / (double)wall : 0.0);
     for (int i = 0; i < RT_PROF_COUNT; ++i) {
         const int z = order[i];
@@ -210,6 +237,12 @@ inline void rt_prof_report() {
             (unsigned long long)g_calls[z],
             g_calls[z] ? (double)g_ns[z] / 1e3 / (double)g_calls[z] : 0.0);
     }
+
+    /* Decomposition of two of the buckets above: which microprogram the
+     * "vu1" time went to, and how many vertices the packets carried. Both
+     * clear their own counters. */
+    rt_vu1_prof_report(fields);
+    rt_geom_prof_report(fields);
 
     /* Audio device queue. An empty queue is a click; this is the number
      * that says whether choppy sound is starvation or something else. */

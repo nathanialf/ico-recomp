@@ -237,12 +237,22 @@ uint32_t unpack_words_needed(const Vif1& v, uint32_t code) {
 
 /* ---- command execution -------------------------------------------------- */
 
+/* Starting or continuing a microprogram: MSCAL, MSCALF and MSCNT.
+ *
+ * All three latch TOP from TOPS and flip the double buffer, MSCNT
+ * included. That looks wrong for a "continue" and it was tried the other
+ * way: leaving TOP and DBF alone across MSCNT makes the microprograms read
+ * stale data and XGKICK malformed GIF tags within a second of boot.
+ *
+ * The reason is what these programs are. They process one batch per run,
+ * stop at an E bit, and are resumed by MSCNT for the *next* batch, not to
+ * finish the previous one. Both of ICO's resume points open with an `xtop`
+ * instruction precisely because they are fetching a new buffer. So a
+ * continuation needs the same buffer swap a start does. */
 void mscal_common(Vif1& v, uint32_t pc_bytes, const char* how) {
     ++v.mscals;
     v.top = v.tops;
     v.itop = v.itops;
-    /* Double-buffer flip: TOPS points at the other half for the next
-     * frame's uploads while the microprogram reads TOP. */
     v.dbf = !v.dbf;
     v.tops = (v.base + (v.dbf ? v.ofst : 0)) & 0x3FF;
     rt_vu1_mscal(pc_bytes, v.top, v.itop, how);

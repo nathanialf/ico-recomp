@@ -51,6 +51,8 @@
 #include "../prof.h"
 #include "recomp_ops.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstdio>
 #include <map>
@@ -87,10 +89,17 @@ struct Prog {
     void (*entry)(Vu1State*) = nullptr;
     uint64_t calls = 0;
     uint64_t binds = 0;
+    /* Profiler window: calls and exclusive microprogram time since the last
+     * summary. The "vu1" bucket alone cannot say whether a rise is one
+     * program growing or all five, and with five programs sharing one
+     * average the two look identical. Cleared by rt_vu1_prof_report. */
+    uint64_t win_calls = 0;
+    uint64_t win_ns = 0;
 };
 std::vector<Prog> g_progs;
 Prog* g_bound = nullptr;
 uint32_t g_bound_hash = 0;
+uint32_t g_entry_pc = 0; /* pc of the MSCAL currently executing */
 
 uint64_t g_mscal_misses = 0;
 uint64_t g_xgkicks = 0;
@@ -214,6 +223,8 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
     Vu1State* vu = rt_vu1_state();
     const bool is_mscnt = (std::strcmp(how, "MSCNT") == 0);
     if (!is_mscnt) vu->pc = pc_bytes & (kVuDataBytes - 1);
+    /* Set on every entry, MSCNT included: a continuation resumes for the
+     * next batch and needs the buffer VIF1 just latched (see vif1.cpp). */
     vu->xtop = xtop;
     vu->itop = itop;
 
@@ -264,19 +275,70 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
     if (g_capture) capture_state(vu, g_bound->hash);
 
     ++g_bound->calls;
+    ++g_bound->win_calls;
     if (rt_trace() || is_pow2(g_bound->calls)) {
         rt_log("vu1", "%s pc=0x%x xtop=0x%x itop=0x%x -> program hash=0x%08x [call #%" PRIu64 "]",
             how, vu->pc, xtop, itop, g_bound->hash, g_bound->calls);
     }
+    /* The entry pc this call was dispatched at, for the geometry checker:
+     * these programs have ten entry points doing quite different work, and
+     * "normal_c emits bad vertices" is only actionable once it says which
+     * entry. Set before the call because vu->pc moves during it. */
+    g_entry_pc = vu->pc;
     {
         /* Recompiled microprogram. rt_xgkick calls out of here open
          * their own zones, so "vu1" is microprogram code only. */
-        RT_PROF_ZONE(RT_PROF_VU1);
-        g_bound->entry(vu);
+        const uint64_t before = rt_prof_zone_ns(RT_PROF_VU1);
+        {
+            RT_PROF_ZONE(RT_PROF_VU1);
+            g_bound->entry(vu);
+        }
+        /* The "vu1" bucket is exclusive time, so its increase across that
+         * scope is this call's own cost with the XGKICKs already
+         * subtracted. Reusing it costs two loads rather than a second
+         * clock reading on the hot path, and cannot disagree with the
+         * bucket it decomposes. Both reads are 0 with profiling off. */
+        g_bound->win_ns += rt_prof_zone_ns(RT_PROF_VU1) - before;
+    }
+}
+
+/* One line per microprogram that ran this window, largest first, under the
+ * "vu1" bucket it decomposes. Hashes are not named here: the names live in
+ * the decomp and naming them would copy its symbols into this repo. Map a
+ * hash to a name with the translator's own report, `recomp-cli vu1`. */
+extern "C" void rt_vu1_prof_report(double fields) {
+    /* Clear the window counters on every path, including this one: prof.h
+     * states that as the contract for these hooks, and carrying them into
+     * the next window would double-report the time. */
+    if (fields <= 0.0) {
+        for (Prog& p : g_progs) { p.win_calls = 0; p.win_ns = 0; }
+        return;
+    }
+    std::vector<const Prog*> ran;
+    for (const Prog& p : g_progs) {
+        if (p.win_calls) ran.push_back(&p);
+    }
+    if (!ran.empty()) {
+        std::sort(ran.begin(), ran.end(),
+                  [](const Prog* a, const Prog* b) { return a->win_ns > b->win_ns; });
+        for (const Prog* p : ran) {
+            const double ms = (double)p->win_ns / 1e6;
+            rt_log("prof", "    vu1 0x%08x %8.1f ms %7.3f ms/field  n=%-9llu mean %8.2f us",
+                p->hash, ms, ms / fields, (unsigned long long)p->win_calls,
+                (double)p->win_ns / 1e3 / (double)p->win_calls);
+        }
+    }
+    for (Prog& p : g_progs) {
+        p.win_calls = 0;
+        p.win_ns = 0;
     }
 }
 
 uint32_t rt_vu1_bound_hash() { return g_bound_hash; }
+
+uint32_t rt_vu1_entry_pc() { return g_entry_pc; }
+
+
 
 extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
     RT_PROF_ZONE(RT_PROF_GIF);

@@ -74,6 +74,37 @@ Steps, from a VS x64 developer prompt in the repo root:
      New Game
    - `ICORECOMP_MAX_VBLANKS=N` to stop after N fields
    - `ICORECOMP_WAV_CAPTURE=out.wav` to capture the audio mix
+   - `ICORECOMP_VERBOSE=geom` to turn on the vertex-level checker
+
+## Capturing a geometry run
+
+The profiler summary counts zone entries, never vertices, so on its own it
+cannot tell a rise in "vu1" caused by bigger vertex batches from one caused
+by a slower code path, and it cannot see wrong geometry at all. Two things
+close that gap and both are in the summary block:
+
+- one line per VU1 microprogram that ran in the window, so a rise attaches
+  to a program rather than to an average over five of them. The names live
+  in the decomp and are not repeated here; `recomp-cli vu1` prints the hash
+  for each name.
+- a `geom:` line with vertices, primitives, vertices behind the eye and
+  primitives wider than the GS guard band, broken down by microprogram and
+  by the MSCAL entry point it was dispatched at. These programs have ten
+  entries doing quite different work, so the entry pc is what turns "this
+  program emits bad geometry" into a code path.
+
+The summary header now carries absolute field numbers and game time, so a
+report of "it goes wrong ten seconds in" can be matched to a window.
+
+The per-microprogram lines are always present. The `geom:` line needs the
+checker, which is off by default because it re-parses every GIF packet:
+
+    set ICORECOMP_VERBOSE=geom
+    icorecomp-runtime.exe
+
+Play until well past the point where it goes wrong, then close the window
+and send `icorecomp.log`. A run made to read frame times should leave
+`ICORECOMP_VERBOSE` unset, since the checker costs per field.
 
 Input: any SDL3-supported controller (Xbox, DualSense, DualShock 4) or the
 keyboard (arrows d-pad, WASD/IJKL sticks, X/C/Z/V cross/circle/square/

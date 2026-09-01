@@ -125,6 +125,10 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
 /* Upload hash of the microprogram currently bound, 0 before the first
  * MSCAL. Used to attribute GIF traffic back to the program that built it. */
 uint32_t rt_vu1_bound_hash();
+/* Micro-memory byte offset the MSCAL now executing was dispatched at.
+ * These programs have ten entry points doing quite different work, so the
+ * hash alone does not localise geometry to a code path; the pair does. */
+uint32_t rt_vu1_entry_pc();
 
 /* ---- GS privileged registers (gspriv.cpp) ------------------------------- */
 

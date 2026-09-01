@@ -84,13 +84,16 @@ bool g_verbose_all = false;
 std::vector<std::string> g_verbose_tags;
 
 /* Channels a run gets without being asked, once it has a log file to put
- * them in. Deliberately empty. The candidate was "geom", but that channel
- * re-parses every GIF packet the runtime submits, around 86,000 quadwords
- * per field on this game, which is a second full pass over all graphics
- * traffic. A diagnostic must not cost frame time in a run nobody asked to
- * diagnose, so geom is opt-in: ICORECOMP_VERBOSE=geom. The ordinary
- * runtime channels still reach the log file by default, which is what
- * makes a packaged double-clicked run readable after the fact. */
+ * them in. Deliberately empty: "geom" re-parses every GIF packet the
+ * runtime submits, around 86,000 quadwords per field on this game, which
+ * is a second full pass over all graphics traffic, and a diagnostic must
+ * not cost frame time in a run nobody asked to diagnose.
+ *
+ * It was default-on for the opening-cutscene geometry investigation, on
+ * the grounds that a run made on one machine and read on another comes
+ * back useless without it. That was the right call while the bug was open
+ * and the wrong default to keep afterwards. Set ICORECOMP_VERBOSE=geom to
+ * turn it back on. */
 const char* const kDefaultVerbose = "";
 
 /* ---- asynchronous sink ---------------------------------------------------
@@ -547,6 +550,11 @@ void rt_log_init(const char* dir) {
         emit("[icorecomp][log] verbose channels enabled: %s (file only, not echoed to the console;"
             " set ICORECOMP_VERBOSE to change, or ICORECOMP_VERBOSE=none to turn off)\n",
             tags.c_str());
+    }
+    if (rt_verbose("geom")) {
+        emit("[icorecomp][log] the geometry checker is on: every GIF packet is re-parsed and"
+            " counted, per microprogram and per MSCAL entry, in the profiler summary."
+            " This costs per field, so frame times from this run read high.\n");
     }
 }
 

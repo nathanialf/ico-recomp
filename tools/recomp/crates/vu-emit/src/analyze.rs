@@ -602,6 +602,28 @@ pub fn analyze(prog: &Vu1Program) -> Result<Analysis> {
         if !srcs.contains(&w) {
             continue;
         }
+        // The hazard is the integer ALU's: a branch reads vi before the
+        // preceding IALU write lands. A vi written by a flag-read op
+        // (fcand/fcor/fmand/fsand) comes from the flag pipeline, not the
+        // IALU, and the retail code says it is not subject to this.
+        //
+        // The evidence is normal_c's six-plane clip cascade, 0x15d0-0x1660.
+        // At 0x15d0 an `iaddi vi09,-1` is followed one bundle later by
+        // `ibgtz vi09`: the loop-counter idiom, which only works because
+        // the branch sees the pre-decrement value, so the author knew the
+        // hazard. Two bundles on, `fcor vi01,mask` is followed one bundle
+        // later by `ibne vi01,vi00`, six times, with an unused nop in
+        // every delay slot that could have spaced them. Applying the
+        // hazard there makes each branch test the previous plane and
+        // leaves the sixth never tested, which is not a clipper anyone
+        // would ship. Both idioms sit inside one 19-bundle stretch, so one
+        // rule cannot cover both.
+        //
+        // Load-bearing, not cosmetic: this changes the drawn primitive set
+        // in 28 of 432 captured states.
+        if lowers[i - 1].reads_flags.is_some() {
+            continue;
+        }
         let off = bundles[i].offset;
         if labels.contains(&off) || dispatch.contains(&off) {
             bail!(

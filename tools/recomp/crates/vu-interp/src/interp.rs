@@ -182,6 +182,22 @@ impl<'a> Interp<'a> {
         unsafe { ffi::x_viset(self.st.as_mut_ptr(), n as i32, v) }
     }
 
+    /// vi write that does not arm the integer-branch hazard.
+    ///
+    /// The hazard belongs to the integer ALU: a branch reads vi before the
+    /// preceding IALU write lands. A vi written by a flag-read op comes
+    /// from the flag pipeline instead, and the retail code shows it is
+    /// readable by the next bundle's branch: normal_c's clip cascade puts
+    /// `fcor vi01,mask` immediately before `ibne vi01,vi00` six times over,
+    /// with unused nops in every delay slot, while two bundles earlier the
+    /// same stretch relies on the hazard for an `iaddi`/`ibgtz` loop
+    /// counter. See the matching note in vu-emit's analyze.rs; the two
+    /// schedulers are independent and have to agree here or the
+    /// differential gate fails.
+    fn viset_flag(&mut self, n: u8, v: u32) {
+        unsafe { ffi::x_viset(self.st.as_mut_ptr(), n as i32, v) }
+    }
+
     /// A Q read point. Commits the pending value only once the divider
     /// latency has elapsed, which is what makes this an independent check
     /// on analyze.rs's static q_commit_sites.
@@ -465,15 +481,15 @@ impl<'a> Interp<'a> {
             },
             Fsand { it, imm12 } => {
                 let v = self.vis_status() & imm12 as u32;
-                self.viset(it.0, v);
+                self.viset_flag(it.0, v);
             }
             Fmand { it, is } => {
                 let v = self.vis_mac() & self.vi(is.0);
-                self.viset(it.0, v);
+                self.viset_flag(it.0, v);
             }
             Fcand { imm24 } => {
                 let v = if (self.st.clip() & imm24) != 0 { 1 } else { 0 };
-                self.viset(1, v);
+                self.viset_flag(1, v);
             }
             Fcor { imm24 } => {
                 let v = if ((self.st.clip() | imm24) & 0x00FF_FFFF) == 0x00FF_FFFF {
@@ -481,11 +497,11 @@ impl<'a> Interp<'a> {
                 } else {
                     0
                 };
-                self.viset(1, v);
+                self.viset_flag(1, v);
             }
             Fcget { it } => {
                 let v = self.st.clip() & 0xFFF;
-                self.viset(it.0, v);
+                self.viset_flag(it.0, v);
             }
             Fcset { imm24 } => self.st.set_clip(imm24 & 0x00FF_FFFF),
             Xtop { it } => {
