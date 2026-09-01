@@ -20,6 +20,16 @@ P0-P8).
   submodule, with local patches carried as patch files.
 - Prose style, everywhere (docs, comments, commit messages): plain technical
   writing. No em-dashes. No marketing adjectives.
+- Accuracy decides design questions. When there is a choice between what the
+  hardware and the retail game actually do and what is convenient, safe or
+  tidy for the port, reproduce the hardware. Clamping, truncating, rounding
+  or defaulting a value the game supplied is a divergence, not a safety net:
+  guard it with a loud log or a fatal, never by quietly changing it. Where
+  accuracy is not yet known, say so in the code rather than substituting a
+  plausible value.
+- The decomp is the authority. Read it before proposing a cause. State plainly
+  which claims are measured and which are inferred, and prefer one decisive
+  measurement over several plausible fixes.
 
 ## ABI contract
 
