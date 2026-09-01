@@ -762,14 +762,9 @@ pub fn analyze(prog: &Vu1Program) -> Result<Analysis> {
         // The temp is written at save_idx and read at i. If anything between
         // them can be entered from elsewhere, the temp may not hold what
         // this path put there.
-        let mut linear = true;
-        for k in save_idx + 1..=i {
-            let off = bundles[k].offset;
-            if labels.contains(&off) || dispatch.contains(&off) {
-                linear = false;
-                break;
-            }
-        }
+        let linear = !bundles[save_idx + 1..=i]
+            .iter()
+            .any(|b| labels.contains(&b.offset) || dispatch.contains(&b.offset));
         if !linear {
             bail!(
                 "{}: flag read at {read_off:#x} needs a snapshot at {:#x}, but a \

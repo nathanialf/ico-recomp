@@ -14,8 +14,12 @@
 //! That is what gives the comparison its teeth.
 //!
 //! Requires the sibling ../ico checkout; skips cleanly without it, like
-//! the other gated tests.
+//! the other gated tests. Unix only: the generated C is loaded with dlopen,
+//! so the whole file is gated rather than the one test.
 
+#![cfg(unix)]
+
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -331,16 +335,20 @@ fn interpreter_and_generated_code_agree_on_all_programs() {
     let so_path = build_so(&out_dir);
 
     let handle = dso::open(so_path.to_str().unwrap());
-    let d_run: DRun = unsafe { std::mem::transmute(dso::sym(handle, "d_run")) };
+    let d_run = unsafe { std::mem::transmute::<*mut c_void, DRun>(dso::sym(handle, "d_run")) };
     let native = unsafe {
         Native {
-            reset: std::mem::transmute(dso::sym(handle, "d_reset")),
-            count: std::mem::transmute(dso::sym(handle, "d_kick_count")),
-            at: std::mem::transmute(dso::sym(handle, "d_kick_at")),
-            unimpl: std::mem::transmute(dso::sym(handle, "d_unimplemented")),
-            trace_count: std::mem::transmute(dso::sym(handle, "d_trace_count")),
-            trace_at: std::mem::transmute(dso::sym(handle, "d_trace_at")),
-            hash_at: std::mem::transmute(dso::sym(handle, "d_hash_at")),
+            reset: std::mem::transmute::<*mut c_void, DVoid>(dso::sym(handle, "d_reset")),
+            count: std::mem::transmute::<*mut c_void, DU32>(dso::sym(handle, "d_kick_count")),
+            at: std::mem::transmute::<*mut c_void, DAt>(dso::sym(handle, "d_kick_at")),
+            unimpl: std::mem::transmute::<*mut c_void, DU32>(
+                dso::sym(handle, "d_unimplemented"),
+            ),
+            trace_count: std::mem::transmute::<*mut c_void, DU32>(
+                dso::sym(handle, "d_trace_count"),
+            ),
+            trace_at: std::mem::transmute::<*mut c_void, DAt>(dso::sym(handle, "d_trace_at")),
+            hash_at: std::mem::transmute::<*mut c_void, DAt>(dso::sym(handle, "d_hash_at")),
         }
     };
 
