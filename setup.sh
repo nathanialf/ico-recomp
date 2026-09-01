@@ -21,6 +21,8 @@ done
     echo "clone the ICO decomp repo next to this one and run its setup first"
     exit 1
 }
+# Fetches third_party/parallel-gs (which pulls in its own Granite submodule),
+# third_party/rmlui, and third_party/freetype.
 git submodule update --init --recursive
 
 echo "==> building the translator"

@@ -231,8 +231,12 @@ namespace {
 
 /* Formats into a std::string, for message helpers whose text used to be a
  * printf-style rt_fatal argument list. */
+/* gnu_printf, not printf: on mingw the plain printf archetype means the
+ * Microsoft CRT's format set, which has no %zu, and the warning it raises
+ * for the size_t conversions below is spurious there because mingw-w64's
+ * C++ mode routes vsnprintf through its own ANSI implementation. */
 #if defined(__GNUC__)
-__attribute__((format(printf, 1, 2)))
+__attribute__((format(gnu_printf, 1, 2)))
 #endif
 std::string fmt(const char* f, ...) {
     char buf[2048];

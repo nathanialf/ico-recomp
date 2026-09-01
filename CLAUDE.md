@@ -55,3 +55,19 @@ Changing these headers invalidates generated code. Do it deliberately.
   CHCR write.
 - Loud failure beats silent wrongness: unknown syscall numbers, unknown VU1
   upload hashes, and unmapped MMIO are fatal logs with a state dump.
+
+## Settings and UI
+
+- Host-side only: no setting alters a value the game supplied. Widescreen and
+  game speed are out of scope by decision, not by omission.
+- For every settings key with an environment-variable twin, the environment
+  wins over `settings.json`, logged at startup, so every existing script and
+  CI invocation keeps behaving exactly as it did before settings.json
+  existed.
+- Settings handling is never fatal: a bad value keeps its compiled-in
+  default with a log naming the value and the allowed range, and an
+  unparseable file runs on defaults rather than stopping the run.
+- UI assets (documents, stylesheets, fonts) live under `ui/`, not `assets/`
+  (`tools/check_no_rom.sh` blocks `assets/*` outright). Stylesheets stay
+  within the overlay renderer's RenderInterface subset documented in
+  `docs/SETTINGS.md`.

@@ -43,6 +43,31 @@ After the first run you will also see icorecomp.log, the last run's log,
 and saves/mc0, the virtual memory card.
 
 
+Settings
+--------
+
+The first time you change a setting and it saves, settings.json appears
+next to the executable. It travels with the folder, so a copy on a USB
+stick keeps its own settings.
+
+Press F1 (or Guide on a gamepad) at any time to open the in-game menu.
+The game keeps running behind it. A launcher window appears at startup
+first, with a disc picker plus Start, Settings and Credits buttons; pass
+--no-launcher to skip it and boot straight into the game. The menu's Input
+tab lets you remap keys and gamepad buttons to any DS2 button.
+
+Any of the environment variables below always wins over the matching
+settings.json value for that run, so an existing script keeps behaving
+the same way it always did.
+
+If settings.json fails to parse, the runtime copies it to
+settings.json.bad and runs on defaults rather than stopping, so a bad
+hand-edit is never silently lost.
+
+Full schema and every settings key: docs/SETTINGS.md in the source tree
+(https://github.com/nathanialf/ico-recomp).
+
+
 Controls
 --------
 
