@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/gen_overlay_spirv.sh: compiles gs/overlay.{vert,frag} (GLSL, ours,
 # not ROM-derived) into src/runtime/gs/overlay_shaders.inc, a committed C
-# array of SPIR-V words consumed by gs_parallel_lib.cpp's overlay render
+# array of SPIR-V words consumed by gs_parallel_overlay.cpp's overlay render
 # pass (RtPgs::draw_overlay).
 #
 # Precedent: the vendored paraLLEl-GS compiles its own shaders ahead of time

@@ -51,13 +51,51 @@ bool rt_gs_backend_selects_live();
 bool rt_dmac_mmio_read(uint32_t addr, uint32_t* out);
 bool rt_dmac_mmio_write(uint32_t addr, uint32_t v);
 
+/* Logs the last 32 source-chain tags walked on a channel, oldest first,
+ * across kicks. The newest entry is marked "<- current": when a peripheral
+ * raises a fatal from inside sink_payload, that tag is the one whose
+ * payload is being fed. Channels 0-9; ch1, ch2 and ch9 walk chains in
+ * dmac.cpp, ch4 in hw/ipu.cpp through rt_dmac_record_tag. */
+void rt_dmac_dump_recent_tags(int ch);
+
+/* Records one source-chain tag in that ring. For a channel whose chain
+ * walk lives outside dmac.cpp: hw/ipu.cpp owns ch4 and calls this as it
+ * reads each tag, so the ch4 dump is not empty. */
+void rt_dmac_record_tag(int ch, uint32_t tadr, uint32_t id, uint32_t qwc, uint32_t taddr);
+
+/* True while the DMAC is held and no channel may advance: D_ENABLE
+ * (0x1000F590) bit 16 (suspend) is set, or D_CTRL.DMAE is clear. A CHCR
+ * write with STR=1 in that state arms the channel without starting it;
+ * dmac.cpp runs the armed channels, in channel-number order, when the hold
+ * is lifted. hw/ipu.cpp asks before pulling the next qword of its ch4
+ * source, since that walk is otherwise lazy and would advance the channel
+ * registers the MPEG library reads back while suspended. */
+bool rt_dmac_suspended();
+
+/* The newest tag of that ring: the one whose payload is being fed when a
+ * peripheral raises a fatal. id is the DMAtag ID (0 REFE, 3 REF, 4 REFS,
+ * ...), addr the tag's ADDR field, qwc its transfer length. False when the
+ * channel has walked no tags; the out pointers may be null. */
+bool rt_dmac_current_tag(int ch, uint32_t* id, uint32_t* addr, uint32_t* qwc);
+
 /* ---- VIF (vif1.cpp) ----------------------------------------------------- */
 
 bool rt_vif_mmio_read(uint32_t addr, uint32_t* out);
 bool rt_vif_mmio_write(uint32_t addr, uint32_t v);
+/* guest_addr value for words that do not come from guest memory (a CPU
+ * store into the VIF1 FIFO window). */
+constexpr uint32_t RT_VIF1_ADDR_NONE = 0xFFFFFFFFu;
+
 /* Feed 32-bit words into the VIF1 command stream (DMA ch1 payload, TTE tag
- * words, FIFO writes). Fully synchronous. */
-void rt_vif1_feed(const uint32_t* words, uint32_t count);
+ * words, FIFO writes). Fully synchronous. guest_addr is the guest address
+ * of words[0] as the DMAC saw it, bit 31 selecting the scratchpad the same
+ * way MADR/TADR do, or RT_VIF1_ADDR_NONE when there is no such address. */
+void rt_vif1_feed(const uint32_t* words, uint32_t count, uint32_t guest_addr);
+
+/* Logs VIF1 register state, the last 32 VIFcodes taken, and a hexdump of
+ * guest memory around the code word being executed. Called from the
+ * unknown-VIFcode fatal path. */
+void rt_vif1_dump_state();
 
 /* FIFO windows take 128-bit stores; mmio.cpp routes them here so the upper
  * 64 bits are not lost. Returns true when the address is a FIFO. */
@@ -74,6 +112,15 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v);
  * STR and raises D_STAT itself, possibly later, when a command produces or
  * consumes the data). */
 void rt_ipu_dma_kick(int ch);
+/* dmac.cpp forwards a guest CHCR write that clears STR on ch3/ch4 here.
+ * The transfer stops where it stands, with MADR/QWC/TADR and the input
+ * FIFO left exactly as the stop found them; that frozen state is what the
+ * MPEG library samples and rewinds from. No-op when the channel is idle. */
+void rt_ipu_dma_stop(int ch);
+/* dmac.cpp: the DMAC hold was just lifted and no ch3/ch4 kick was queued.
+ * Gives a command that stalled for input while the ch4 walk was frozen
+ * another chance to pull. No-op when neither IPU channel is active. */
+void rt_ipu_dma_resume();
 /* 128-bit CPU store to the toIPU FIFO window (0x10007010): appends one
  * qword to the bitstream input and resumes a stalled command. The game
  * primes SETIQ table data this way before the movie player switches the
@@ -87,6 +134,14 @@ uint32_t* rt_dmac_ipu_reg(int ch, int which);
 void rt_ipu_test_feed(const uint8_t* data, size_t len);
 size_t rt_ipu_test_out_avail();
 size_t rt_ipu_test_read_out(uint8_t* dst, size_t maxlen);
+/* Bits between the decode cursor and the end of the resident input. The
+ * restart test asserts this stays inside the input FIFO window, which is
+ * the invariant IPU_BP's IFC/FP fields claim. */
+size_t rt_ipu_test_avail_bits();
+/* Resident quadwords as IPU_BP reports them (IFC + FP) before the 4-bit
+ * IFC field saturates, so the test can see an overflow the register
+ * cannot express. */
+size_t rt_ipu_test_resident_qw();
 
 /* ---- GIF (gif.cpp) ------------------------------------------------------ */
 

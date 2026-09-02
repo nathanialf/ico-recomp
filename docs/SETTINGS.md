@@ -63,8 +63,7 @@ than calling them cold.
 | present | enum | `mailbox`, `fifo`, `immediate` | `mailbox` | warm | `ICORECOMP_GS_PRESENT` |
 | fit | enum | `letterbox`, `integer`, `stretch` | `letterbox` | hot | - |
 | filter | enum | `linear`, `nearest` | `linear` | hot | - |
-| render_scale | int, one of a set | 1, 2, 4, 8, 16 | 1 | warm | - |
-| hires_scanout | bool | needs `render_scale >= 4`; below that it logs and stays off | false | warm | - |
+| render_scale | int, one of a set | 1, 4, 8, 16 | 1 | warm | - |
 | show_fps | bool | - | false | hot | - |
 
 ### audio
@@ -177,6 +176,52 @@ Default gamepad bindings (`kGamepadBinds`, `settings.cpp`):
 Sticks are not rebindable slots: they map natively from the gamepad's own
 analog axes.
 
+### gameplay
+
+| key | type | allowed / range | default | apply | env override |
+|---|---|---|---|---|---|
+| run_any_direction | bool | - | false | hot | - |
+
+Off, the default, reproduces retail: a left-stick tilt that is not close to a
+cardinal direction makes the player walk rather than run, no matter how far
+the stick is pushed. On, a full tilt in any direction runs.
+
+The cause is in the decomp. `iosPadGetStick` (`ios/pad.c`) forms a radius
+from the stick's two raw bytes around a centre of 127.5, applies a deadzone
+of 48, then divides that radius by `1 + 0.2 * t / 45`, where `t` is the
+integer degrees the tilt sits off the nearest cardinal direction (0 at a
+cardinal, up to 45 at a diagonal), and saturates the result at a radius of
+120. The player code (`src/boyact.c`) only emits a run when that corrected
+value is at least 0.99 for four consecutive frames, which needs a corrected
+radius of `48 + 0.99 * 72 = 119.28`. The divisor was tuned for the DualShock
+2's octagonal gate, whose corners sit past the inscribed circle, so a
+diagonal push there still clears 119.28. An SDL gamepad reports a circular
+stick instead: radius 127.5 at every angle, with no octagonal overshoot at
+the corners. Divided by the same factor, a full circular tilt clears
+119.28 only within about 15.5 degrees of a cardinal; at 45 degrees it would
+need a raw radius of 143.1, which a circular stick never reaches.
+
+The fix stays on the host side. `host/input.cpp` pre-multiplies the left
+stick's byte pair by the same divisor the game is about to apply, before
+those bytes are handed to the virtual pad, capped so the pair never leaves
+the 0..255 byte square. That cancels the game's own division: a full tilt
+reads as a full radius in every direction. Nothing the game computes
+changes and no guest code is patched. The right stick and the keyboard
+sticks are untouched.
+
+The byte-square cap sets a ceiling, not a hole: near 13 degrees off a
+cardinal, the cap limits a full-radius stick to a corrected radius of about
+123.8, still above the 119.28 the run gate needs. Below full radius, the
+same cap means a pad reporting under about 96 percent of full radius can
+still land in the 5 to 25 degree walk band rather than running. The byte
+square bounds a physical pad the same way, so that is the game's own limit
+carried through, not a hole in the transform. This band is derived from the
+formula above, not measured on hardware.
+
+The first field the transform is active, `host/input.cpp` logs
+`gameplay.run_any_direction is on` once; the latch resets if the setting
+turns off, so a later re-enable logs again.
+
 ### debug
 
 | key | type | allowed / range | default | apply | env override |
@@ -278,16 +323,37 @@ the next launch.
   on Linux, so the file sink there is opt-in).
 - `ICORECOMP_LOG` always wins over `debug.log_file`. When the two disagree,
   startup logs that the settings value was ignored.
+- Before opening `icorecomp.log`, if a log from an earlier run is already
+  at that path, it is renamed to `icorecomp.prev.log` (replacing any older
+  `icorecomp.prev.log`), so a crash log is not overwritten by the next
+  run. A failed rename is not fatal: the run logs why and then overwrites
+  the file as before.
 
 ## 6. Render scale and display resolution
 
-`display.render_scale` is paraLLEl-GS super-sampling: a fixed integer
-multiple (1/2/4/8/16) of the game's own framebuffer resolution. Because it
-scales the whole framebuffer uniformly, the aspect ratio is preserved
-automatically and the game's 4:3 derivation is untouched. `hires_scanout`
-asks the renderer for a higher-resolution scanout on top of that, which only
-does anything at `render_scale >= 4`; below that it is logged and stays
-inert rather than silently doing nothing.
+`display.render_scale` is the single knob for both, and what it selects is
+paraLLEl-GS super-sampling: a fixed integer multiple (1/4/8/16) of the game's own
+framebuffer resolution. Because it scales the whole framebuffer uniformly,
+the aspect ratio is preserved automatically and the game's 4:3 derivation is
+untouched. At 1 the picture is the game's own resolution, a 512x448 (or
+whatever the game programmed) image stretched to the window. At 4, 8 and 16
+the runtime also asks for high-resolution scanout, so the picture is built
+from the super-samples at double resolution instead of being resolved back
+down; there is no separate setting for that request. That works because 4
+and up also turn on super-sampled textures, so the copy the game makes from
+its own render target into the buffer the CRTC reads keeps the sub-samples
+instead of resolving them away, and the scanout can rebuild the full frame
+from them.
+
+2 is not in the allowed set. `SuperSampling::X2` only doubles the vertical
+sampling rate, and the renderer drops a high-resolution scanout request when
+either axis has no extra samples, so 2x could smooth edges but never scale
+the picture. A `settings.json` holding 2 is an out-of-set value like any
+other: the key keeps its default of 1 and the load logs the allowed set.
+
+The renderer can still decline the request for some scanout configurations;
+the `hires=` field on the `scanout internal` log line reports what it
+actually did, per scanout geometry change.
 
 The window or fullscreen display size (`display.mode`,
 `display.window_width`/`window_height`) is a separate, independent setting:
@@ -536,8 +602,14 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `is overridden by` | an environment variable is winning over settings.json for one key |
 | `kept default` | a bad value in the file was rejected; the key stayed at its default |
 | `settings.json.bad` | the file failed to parse and was preserved under this name |
-| `hires scanout stays inert` | `hires_scanout` is set but `render_scale` is below 4 |
+| `no longer a setting` | the file still holds `display.hires_scanout`; render scale 4 and up now requests high-resolution scanout |
+| `super-sampling` | the render scale the paraLLEl-GS backend was created with, whether super-sampled textures are on, and whether it asked for high-resolution scanout |
+| `render scale applied live` | a render scale change from the menu reached the backend |
+| `scanout internal` | the scanout geometry; its `ss=` and `hires=` fields are the super-sampling rate in force and whether the renderer actually scanned out at high resolution |
 | `profiling on:` | the frame-time profiler is active, and how often it reports |
 | `RenderInterface::` | a stylesheet under `ui/` used something the overlay renderer cannot draw |
 | `launcher gate:` | which of the two boot orderings this run took, and why (section 8) |
 | `rebind ` | a capture starting, ending, being accepted or rejected (section 7) |
+| `previous run's log kept as` | the last run's `icorecomp.log` was renamed to `icorecomp.prev.log` before this run's log was opened |
+| `could not keep the previous run's log` | the rename above failed and why; this run's log overwrote the previous one as before rotation existed |
+| `gameplay.run_any_direction is on` | the left stick is being pre-scaled; a full tilt runs in every direction |

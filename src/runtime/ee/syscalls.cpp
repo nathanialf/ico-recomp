@@ -77,16 +77,13 @@ int64_t h_DisableIntc(const Args& a) { return rt_intc_disable((int)a.a0); }
 int64_t h_EnableDmac(const Args& a) { return rt_dmac_enable((int)a.a0); }
 int64_t h_DisableDmac(const Args& a) { return rt_dmac_disable((int)a.a0); }
 
+/* SetAlarm(u16 time, handler, arg): one-shot, `time` H-blank ticks away,
+ * handler(id, time, arg) in interrupt context. The handler's $gp is the
+ * caller's, the same convention AddIntcHandler uses here. See alarms.cpp. */
 int64_t h_SetAlarm(const Args& a) {
-    static bool warned = false;
-    if (!warned) {
-        rt_log("syscall", "WARNING: SetAlarm(time=%u, handler=0x%08x, arg=0x%08x): alarms are "
-            "recorded but never fire in P2; revisit if a library parks on one", a.a0, a.a1, a.a2);
-        warned = true;
-    }
-    return 1; /* alarm id */
+    return rt_alarm_set(a.a0, a.a1, a.a2, (uint32_t)a.ctx->r[28].u64x[0]);
 }
-int64_t h_ReleaseAlarm(const Args&) { return 0; }
+int64_t h_ReleaseAlarm(const Args& a) { return rt_alarm_release((int)a.a0); }
 
 int64_t h_CreateThread(const Args& a) {
     /* ee_thread_t: status, func, stack, stack_size, gp_reg,

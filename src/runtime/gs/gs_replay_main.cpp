@@ -9,7 +9,7 @@
  * artifact for the GS transport.
  *
  * The rendering itself lives inside libicorecomp-parallel-gs
- * (gs_parallel_lib.cpp, rt_pgs_replay); this file is only the argument
+ * (gs_parallel_abi.cpp, rt_pgs_replay); this file is only the argument
  * parser, so the executable stays on the MIT side of the LGPL boundary
  * (see gs_parallel_api.h).
  *

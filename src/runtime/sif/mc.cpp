@@ -374,7 +374,13 @@ int do_open(uint32_t port, uint32_t mode, const char* gname) {
     std::string hp = host_path(cp);
     std::error_code ec;
     if (mode & 0x40) { /* mkdir */
-        if (fs::exists(hp, ec)) return kResDenied;
+        /* An entry of that name already exists: sceMcResNoEntry (-4), as
+         * mcman's open path answers when sceMcFileCreateDir is set and the
+         * lookup finds the entry (ps2sdk mcman_open2, read as a behavioural
+         * reference). ICO re-runs GetInfo/Mkdir/ChDir before every file it
+         * writes, and its save thread continues only on 0 or -4; any other
+         * value (the -5 this used to return) aborts the save after icon.sys. */
+        if (fs::exists(hp, ec)) return kResNoEntry;
         if (!fs::create_directory(hp, ec) || ec) {
             rt_log("mc", "mkdir %s failed: %s", cp.c_str(), ec.message().c_str());
             return kResNoEntry;
@@ -389,6 +395,10 @@ int do_open(uint32_t port, uint32_t mode, const char* gname) {
     }
     bool exists = fs::exists(hp, ec);
     if (!exists && !(mode & 0x200)) return kResNoEntry;
+    /* Known divergence: mcman hands back a directory handle here (a read-only
+     * fd over the entry list); this returns -5. ICO never opens a directory
+     * without the create-dir bit, so it is left unmodelled rather than
+     * guessed at. */
     if (exists && fs::is_directory(hp, ec)) return kResDenied;
     int fd = alloc_fd();
     if (fd < 0) return kResNoFreeFd;

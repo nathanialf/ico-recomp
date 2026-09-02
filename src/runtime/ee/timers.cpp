@@ -16,8 +16,6 @@
 
 namespace {
 
-constexpr uint64_t kHblankCycles = RT_CYCLES_PER_FIELD * 2 / 525; /* per line */
-
 struct Timer {
     uint32_t mode = 0;
     uint32_t comp = 0;
@@ -35,7 +33,7 @@ uint64_t prescale(const Timer& t) {
         case 0: return 1;
         case 1: return 16;
         case 2: return 256;
-        default: return kHblankCycles;
+        default: return RT_CYCLES_PER_HBLANK;
     }
 }
 

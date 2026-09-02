@@ -14,19 +14,56 @@
 
 #include "../ee/kernel.h"
 
+/* ---- virtual IOP RAM and its address map --------------------------------- */
+
+/* Virtual IOP RAM. Raw SifSetDma payloads land here so a later RPC CALL can
+ * read the send data the EE staged into a server buffer, and the
+ * sceSifAllocIopHeap heap is carved out of it.
+ *
+ * The size is the hardware size. IOP addresses are not opaque tokens to the
+ * EE: the game's MPEG helper validates every IOP address it is handed
+ * against the retail IOP's 2 MB of RAM (decomp src/cod/vendor_258CC0.c
+ * func_0025E050 returns -1 when an address is above 0x1FFFFF), so an
+ * address outside 2 MB fails the attract movie's init. Everything the
+ * runtime mints therefore has to fit inside 2 MB alongside the heap.
+ *
+ * Address map. All addresses are virtual-IOP physical addresses; the whole
+ * map lives here so there is one place to check for an overlap.
+ *
+ *   0x000000 - 0x00FFFF  low memory. Nothing is minted here: on hardware
+ *                        this is the IOP kernel and the bottom of the
+ *                        loaded module region.
+ *   0x010000 - 0x06FFFF  per-service RPC staging buffers, kBufStride
+ *                        (0x4000) bytes for each of kMaxServices (24)
+ *                        services (rpc.cpp kBufBase). A CALL whose
+ *                        send_size exceeds the stride is fatal, so the
+ *                        stride is also the largest RPC send this runtime
+ *                        accepts.
+ *   0x070000 - 0x070BFF  minted SifRpcServerData structs, kServerStride
+ *                        (0x80) per service (rpc.cpp kServerBase).
+ *   0x078000 - 0x07807F  pad actuator receive blocks, 0x40 per port
+ *                        (pad.cpp kActBufBase).
+ *   0x080000 - 0x08FFFF  sifcmd packet buffer (RT_SIF_IOP_CMDBUF below).
+ *   0x090000 - 0x1FFFFF  sceSifAllocIopHeap heap, 1.4375 MB (cdvd.cpp
+ *                        kIopHeapBase/kIopHeapEnd).
+ *
+ * The heap base is a runtime choice, not a measured hardware fact. On
+ * hardware sceSifAllocIopHeap is served by AllocSysMemory(SMEM_LOW), which
+ * hands out the lowest free block above the loaded modules, so the real
+ * base depends on which IOP modules this title loads and that layout is not
+ * known here. What is known is the 2 MB ceiling and the game's measured
+ * peak live heap of 1,411,088 bytes, which fits the span above with about
+ * 94 KB spare after 256-byte rounding. */
+constexpr uint32_t RT_IOP_RAM_SIZE = 2u * 1024 * 1024;
+uint8_t* rt_iop_ptr(uint32_t addr); /* masked into IOP RAM, never null */
+
 /* Fictional IOP-side sifcmd packet buffer address handed to the EE via
  * SUBADDR/SMCOM at SIF init. The EE addresses every sifcmd packet (INIT,
  * RPC BIND/CALL/RDATA) to this IOP destination; SifSetDma entries with this
- * dest are command packets, everything else is raw data. */
-constexpr uint32_t RT_SIF_IOP_CMDBUF = 0x000BD000u;
-
-/* Virtual IOP RAM. Raw SifSetDma payloads land here so a later RPC CALL can
- * read the send data the EE staged into a server buffer. Retail IOP RAM is
- * 2 MB, but this virtual one is 8 MB: sceSifAllocIopHeap addresses are
- * opaque tokens to the EE, and the extra space lets the heap serve the
- * game's sound-buffer allocations without modeling IOP module layout. */
-constexpr uint32_t RT_IOP_RAM_SIZE = 8u * 1024 * 1024;
-uint8_t* rt_iop_ptr(uint32_t addr); /* masked into IOP RAM, never null */
+ * dest are command packets, everything else is raw data. The EE only ever
+ * learns this address from SifGetReg(SUBADDR), so any value outside the
+ * heap works. */
+constexpr uint32_t RT_SIF_IOP_CMDBUF = 0x00080000u;
 
 /* ---- guest memory block helpers (fatal on unmapped addresses) ------------ */
 

@@ -16,7 +16,8 @@
  * points (syscalls, MMIO accesses) and in the scheduler idle loop, which
  * jumps straight to the next timeline event. The timeline is: vblank field
  * boundaries (59.94 Hz NTSC, alternating fields), timer compare/overflow
- * interrupts (timers.cpp) and deferred SIF responses (sif/sif.cpp).
+ * interrupts (timers.cpp), kernel alarms (alarms.cpp) and deferred SIF
+ * responses (sif/sif.cpp).
  */
 #include "kernel.h"
 
@@ -261,6 +262,8 @@ static uint64_t clock_next_event() {
     if (t < nxt) nxt = t;
     t = rt_sif_next_event();
     if (t < nxt) nxt = t;
+    t = rt_alarms_next_event();
+    if (t < nxt) nxt = t;
     return nxt;
 }
 
@@ -314,6 +317,7 @@ void rt_clock_tick(uint64_t cycles) {
         }
         rt_timers_run_due();
         rt_sif_run_due();
+        rt_alarms_run_due();
     }
     g_vclk = target;
 }

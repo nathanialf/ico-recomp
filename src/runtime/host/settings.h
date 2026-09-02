@@ -1,6 +1,6 @@
 /* host/settings.h: typed settings model and JSON persistence for the
- * runtime's user-facing configuration (display, audio, input, debug,
- * launcher).
+ * runtime's user-facing configuration (display, audio, input, gameplay,
+ * debug, launcher).
  *
  * Everything in this layer runs on the main OS thread: guest threads are
  * minicoro coroutines scheduled on that same thread, never real OS threads,
@@ -50,15 +50,16 @@ struct RtSettings {
         /* 1280x960: twice the 640x480 4:3 baseline the UI documents are
          * laid out against (src/runtime/ui/ui.cpp density_for). The
          * shim's own fallback when either field is 0 is still 640x480
-         * (gs_parallel_lib.cpp init_windowed); the two no longer
+         * (gs_parallel_present.cpp init_windowed); the two no longer
          * coincide. */
         int window_width = 1280, window_height = 960;
         bool remember_window_size = true;
         RtPresentMode present = RtPresentMode::Mailbox;
         RtFit fit = RtFit::Letterbox;
         RtFilter filter = RtFilter::Linear;
-        int render_scale = 1;           /* 1/2/4/8/16, paraLLEl-GS SuperSampling */
-        bool hires_scanout = false;     /* needs render_scale >= 4 */
+        /* 1/4/8/16, paraLLEl-GS SuperSampling. 4 and up also request
+         * high-resolution scanout; there is no separate setting for it. */
+        int render_scale = 1;
         bool show_fps = false;
     } display;
     struct {
@@ -73,6 +74,12 @@ struct RtSettings {
         float trigger_threshold = 0.25f;     /* replaces the hardcoded >8192 */
         bool rumble = true;
     } input;
+    struct {
+        /* Off reproduces retail stick behaviour. On pre-scales the left
+         * stick by the game's octagonal-gate divisor so a full tilt runs at
+         * every angle (see docs/SETTINGS.md). */
+        bool run_any_direction = false;
+    } gameplay;
     struct {
         std::string verbose;            /* ICORECOMP_VERBOSE channel spec */
         bool log_file = true;

@@ -68,12 +68,17 @@
 namespace {
 
 /* Minted virtual-IOP addresses for the actuator receive blocks handed out
- * by OPEN: between the RPC server structs (0x1A0000+) and the staging
- * buffers (0x1C0000+). 0x40 bytes per port (two 0x20 halves). */
-constexpr uint32_t kActBufBase = 0x001B0000u;
+ * by OPEN: above the RPC server structs (rpc.cpp kServerBase 0x070000) and
+ * below the sifcmd command buffer, in the region the iopheap heap never
+ * covers. The full IOP address map is in rpc.h. 0x40 bytes per port (two
+ * 0x20 halves). */
+constexpr uint32_t kActBufBase = 0x00078000u;
 constexpr uint32_t kActBufStride = 0x40;
 
 constexpr uint32_t kPorts = 2;
+
+static_assert(kActBufBase + kPorts * kActBufStride <= RT_SIF_IOP_CMDBUF,
+    "pad actuator blocks run into the sifcmd command buffer");
 
 uint32_t rd32(const uint8_t* p, uint32_t off) { uint32_t v; std::memcpy(&v, p + off, 4); return v; }
 void wr32(uint8_t* p, uint32_t off, uint32_t v) { if (p) std::memcpy(p + off, &v, 4); }

@@ -39,6 +39,16 @@ constexpr uint32_t kVuQw = 1024; /* VU1 data memory in qwords */
 
 bool is_pow2(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
+/* One entry of the VIFcode history ring. index is the 1-based command
+ * number (Vif1::cmds at the time the code word was taken), addr the guest
+ * address the word came from or RT_VIF1_ADDR_NONE. */
+struct CodeRec {
+    uint32_t code;
+    uint32_t addr;
+    uint64_t index;
+    uint32_t need_words;
+};
+
 struct Vif1 {
     /* Persistent register state. */
     uint32_t cl = 0, wl = 0;      /* STCYCL */
@@ -62,6 +72,11 @@ struct Vif1 {
 
     /* Stats. */
     uint64_t cmds = 0, unpacks = 0, directs = 0, mpgs = 0, mscals = 0;
+
+    /* Diagnostics: the last 32 code words taken and the guest address of
+     * the one currently executing. */
+    CodeRec recent[32] = {};
+    uint32_t cur_addr = RT_VIF1_ADDR_NONE;
 };
 
 Vif1 g_vif;
@@ -235,6 +250,80 @@ uint32_t unpack_words_needed(const Vif1& v, uint32_t code) {
     return (uint32_t)((total_bits + 31) / 32);
 }
 
+/* Mnemonic for a VIFcode command field, for the diagnostic dump only. */
+const char* cmd_name(uint32_t cmd) {
+    if ((cmd & 0x60) == 0x60) return "UNPACK";
+    switch (cmd) {
+        case 0x00: return "NOP";
+        case 0x01: return "STCYCL";
+        case 0x02: return "OFFSET";
+        case 0x03: return "BASE";
+        case 0x04: return "ITOP";
+        case 0x05: return "STMOD";
+        case 0x06: return "MSKPATH3";
+        case 0x07: return "MARK";
+        case 0x10: return "FLUSHE";
+        case 0x11: return "FLUSH";
+        case 0x13: return "FLUSHA";
+        case 0x14: return "MSCAL";
+        case 0x15: return "MSCALF";
+        case 0x17: return "MSCNT";
+        case 0x20: return "STMASK";
+        case 0x30: return "STROW";
+        case 0x31: return "STCOL";
+        case 0x4A: return "MPG";
+        case 0x50: return "DIRECT";
+        case 0x51: return "DIRECTHL";
+        default: return "?";
+    }
+}
+
+/* Host pointer for one 16-byte-aligned guest qword, resolved the way
+ * dmac.cpp's dma_ptr resolves DMA addresses (bit 31 selects the
+ * scratchpad, which wraps at its architectural 16 KB). Null when the page
+ * is not mapped; an aligned qword never crosses a 64 KB page boundary. */
+const uint8_t* dump_qword_ptr(uint32_t addr) {
+    if (addr & 0x80000000u) {
+        const uint8_t* page = g_pages[0x70000000u >> 16];
+        return page ? page + (addr & 0x3FFFu) : nullptr;
+    }
+    return rt_gptr(addr);
+}
+
+/* ICO's allocator (ios/memory.c in the decomp, the "<ALLOC>________" /
+ * "<FREE AREA>____" magic strings) puts a 0x40-byte header ahead of every
+ * block: a 16-byte ASCII magic tag, the 16-byte source file name of the
+ * caller, then the partition pointer, the size in qwords and the caller's
+ * line number. When the DMA tag feeding the failing stream is a REF, REFS
+ * or REFE, those 64 bytes name the allocation the packet was built in. */
+void dump_alloc_header(uint32_t payload_addr) {
+    const uint32_t hdr = payload_addr - 0x40;
+    rt_log("vif1", "allocation header before REF payload 0x%08x", payload_addr);
+    char ascii[33];
+    uint32_t n = 0;
+    for (int line = 0; line < 4; ++line) {
+        const uint32_t a = hdr + (uint32_t)line * 16;
+        const uint8_t* p = dump_qword_ptr(a);
+        if (!p) {
+            rt_log("vif1", "0x%08x: unmapped", a);
+            if (line < 2) for (int i = 0; i < 16; ++i) ascii[n++] = '.';
+            continue;
+        }
+        uint32_t w[4];
+        std::memcpy(w, p, sizeof(w));
+        rt_log("vif1", "0x%08x: %08x %08x %08x %08x", a, w[0], w[1], w[2], w[3]);
+        /* First 32 bytes are the two ASCII fields. */
+        if (line < 2) {
+            for (int i = 0; i < 16; ++i) {
+                const uint8_t c = p[i];
+                ascii[n++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+            }
+        }
+    }
+    ascii[n] = '\0';
+    rt_log("vif1", "header ascii: %s", ascii);
+}
+
 /* ---- command execution -------------------------------------------------- */
 
 /* Starting or continuing a microprogram: MSCAL, MSCALF and MSCNT.
@@ -330,9 +419,23 @@ void exec_command(Vif1& v) {
         }
         default:
             /* Unknown VIFcode desynchronizes the stream; that is a fatal
-             * model error, not something to limp past. */
-            rt_fatal("vif1", nullptr, "unknown VIFcode 0x%08x (cmd 0x%02x) after %" PRIu64 " commands",
-                code, cmd, v.cmds);
+             * model error, not something to limp past. Dump the command
+             * history and the source bytes first: the interesting question
+             * is which DMA tag delivered the word, not the word itself. */
+            rt_vif1_dump_state();
+            rt_dmac_dump_recent_tags(1);
+            {
+                /* A REF/REFS/REFE payload sits inside an allocator block,
+                 * so the 0x40 bytes ahead of it say who allocated it. */
+                uint32_t tid = 0, taddr = 0, tqwc = 0;
+                if (rt_dmac_current_tag(1, &tid, &taddr, &tqwc) &&
+                    (tid == 0 || tid == 3 || tid == 4) && taddr >= 0x40) {
+                    dump_alloc_header(taddr);
+                }
+            }
+            rt_fatal("vif1", nullptr,
+                "unknown VIFcode 0x%08x (cmd 0x%02x) after %" PRIu64 " commands at guest 0x%08x",
+                code, cmd, v.cmds, v.cur_addr);
     }
 }
 
@@ -356,7 +459,53 @@ uint32_t words_needed(const Vif1& v, uint32_t code) {
 
 } // namespace
 
-void rt_vif1_feed(const uint32_t* words, uint32_t count) {
+void rt_vif1_dump_state() {
+    const Vif1& v = g_vif;
+    rt_log("vif1",
+        "state: cl=%u wl=%u mask=0x%08x mode=%u itops=0x%03x itop=0x%03x base=0x%03x ofst=0x%03x "
+        "tops=0x%03x top=0x%03x mark=0x%04x dbf=%d pending=%d need_words=%u payload=%u "
+        "cmds=%" PRIu64 " unpacks=%" PRIu64 " directs=%" PRIu64 " mpgs=%" PRIu64 " mscals=%" PRIu64,
+        v.cl, v.wl, v.mask, v.mode, v.itops, v.itop, v.base, v.ofst, v.tops, v.top, v.mark,
+        v.dbf ? 1 : 0, v.pending ? 1 : 0, v.need_words, (uint32_t)v.payload.size(),
+        v.cmds, v.unpacks, v.directs, v.mpgs, v.mscals);
+
+    if (v.cmds == 0) {
+        rt_log("vif1", "no VIFcodes have been taken yet");
+    } else {
+        const uint32_t shown = (uint32_t)(v.cmds < 32 ? v.cmds : 32);
+        for (uint32_t i = 0; i < shown; ++i) {
+            const CodeRec& r = v.recent[(v.cmds - shown + i) % 32];
+            const uint32_t cmd = (r.code >> 24) & 0x7F;
+            rt_log("vif1", "recent[%u]: 0x%08x cmd=0x%02x %s%s addr=0x%08x #%" PRIu64 " payload=%u",
+                i, r.code, cmd, cmd_name(cmd), (r.code & 0x80000000u) ? " i" : "",
+                r.addr, r.index, r.need_words);
+        }
+    }
+
+    /* Guest memory around the current code word. Anything upstream of it is
+     * the packet that desynchronized the stream, so the window leans
+     * backwards. */
+    if (v.cur_addr == RT_VIF1_ADDR_NONE) {
+        rt_log("vif1", "current code word has no guest address (fed by a FIFO store); no hexdump");
+        return;
+    }
+    const uint32_t base = v.cur_addr & ~15u;
+    if (!dump_qword_ptr(base)) {
+        rt_log("vif1", "guest address 0x%08x of the current code word is unmapped; no hexdump", v.cur_addr);
+        return;
+    }
+    for (int line = -8; line <= 4; ++line) {
+        const uint32_t a = base + (uint32_t)(line * 16);
+        const uint8_t* p = dump_qword_ptr(a);
+        if (!p) continue;
+        uint32_t w[4];
+        std::memcpy(w, p, sizeof(w));
+        rt_log("vif1", "0x%08x: %08x %08x %08x %08x%s", a, w[0], w[1], w[2], w[3],
+            line == 0 ? " <- code" : "");
+    }
+}
+
+void rt_vif1_feed(const uint32_t* words, uint32_t count, uint32_t guest_addr) {
     RT_PROF_ZONE(RT_PROF_VIF1);
     Vif1& v = g_vif;
     for (uint32_t i = 0; i < count; ++i) {
@@ -364,6 +513,10 @@ void rt_vif1_feed(const uint32_t* words, uint32_t count) {
             v.code = words[i];
             v.need_words = words_needed(v, v.code);
             ++v.cmds;
+            /* Scratchpad addresses keep bit 31; the word offset only ever
+             * touches the low bits. */
+            v.cur_addr = guest_addr == RT_VIF1_ADDR_NONE ? RT_VIF1_ADDR_NONE : guest_addr + i * 4;
+            v.recent[(v.cmds - 1) % 32] = {v.code, v.cur_addr, v.cmds, v.need_words};
             if (v.need_words == 0) {
                 v.payload.clear();
                 exec_command(v);
@@ -393,7 +546,7 @@ bool rt_hw_fifo_write128(uint32_t addr, const rc_u128* val) {
             return true;
         }
         case 0x10005000: /* VIF1 FIFO */
-            rt_vif1_feed(val->u32x, 4);
+            rt_vif1_feed(val->u32x, 4, RT_VIF1_ADDR_NONE);
             return true;
         case 0x10006000: /* GIF FIFO: direct PATH3 qword */
             rt_gif_submit(2, val->u8x, 1);
@@ -436,9 +589,13 @@ bool rt_vif_mmio_write(uint32_t addr, uint32_t v) {
     switch (addr) {
         case 0x10003C10: /* VIF1_FBRST: RST clears the interpreter state */
             if (v & 1) {
-                uint64_t cmds = g_vif.cmds;
-                g_vif = Vif1{};
-                g_vif.cmds = cmds;
+                /* cmds keeps counting across a reset and indexes the code
+                 * ring, so the ring and cur_addr carry over with it. */
+                Vif1 fresh;
+                fresh.cmds = g_vif.cmds;
+                std::memcpy(fresh.recent, g_vif.recent, sizeof(fresh.recent));
+                fresh.cur_addr = g_vif.cur_addr;
+                g_vif = fresh;
                 rt_log("vif1", "VIF1_FBRST reset");
             }
             return true;

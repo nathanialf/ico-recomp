@@ -14,7 +14,7 @@
  * correction: PS2 pixels are not square, so the image's width:height is not
  * its shape on screen. That is the point, it keeps the file a function of the
  * GS output alone. Presentation applies the display aspect separately; see
- * scanout_display_aspect in gs_parallel_lib.cpp.
+ * scanout_display_aspect in gs_parallel_scanout.cpp.
  */
 #ifndef ICORECOMP_GS_READBACK_H
 #define ICORECOMP_GS_READBACK_H

@@ -1,0 +1,51 @@
+From 1893c48870f11df240c293dd0c3a8e69099f4b2e Mon Sep 17 00:00:00 2001
+From: Nathanial Fine <nathanial.fine@gmail.com>
+Date: Wed, 2 Sep 2026 07:52:07 +0000
+Subject: [PATCH] Keep full-pixel raster snapping when super-sampled textures
+ are bound
+
+Field aware rendering halves the vertical raster snap mask for snapped
+primitives so that sprite coverage follows a field rendered game's half
+pixel offset. With super-sampled textures bound, the per-field content
+difference already comes from per-sample attribute interpolation, and the
+halved mask only adds per-sub-sample coverage. That leaves the last
+sub-sample row of a sprite whose extent ends on a pixel boundary
+uncovered: its layer keeps stale content, the pixel's samples differ, the
+super-sample reference is stamped valid, and high resolution scanout
+shows the stale value from then on.
+
+Keep the full pixel mask for those passes.
+---
+ gs/gs_renderer.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 439a572..7eb93e6 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -2609,7 +2609,24 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
+ 	cmd.set_program(shaders.ubershader[int(rp.feedback_color)][int(rp.feedback_depth)]);
+ 	auto snap_raster_mask = ivec2(-(1 << inst.sampling_rate_y_log2));
+ 	// Snap single-sampled raster to half-texel instead.
+-	if (inst.sampling_rate_y_log2 && field_aware_super_sampling && render_pass_instance_might_field_render(rp, instance))
++	//
++	// Not when the pass has super-sampled textures bound. The halved mask buys
++	// half-pixel granularity twice over in that case: the ubershader already
++	// re-interpolates i/j at the unsnapped sub-sample for a snapped sprite whose
++	// SNAP_ATTRIBUTE was cleared by triangle_setup (ubershader.comp, the
++	// snap_state == SNAP_RASTER_BIT branch), so the per-field content difference
++	// survives without it. What the halved mask does add is per-sub-sample
++	// coverage, and that breaks the "sprite covers the pixel centre" case: a
++	// sprite whose extent ends on a pixel boundary, such as a display copy
++	// spanning y in [-0.25, 223.75), leaves the last sub-sample row of the last
++	// pixel row uncovered. That sub-sample keeps whatever its layer held, the
++	// pixel's samples then differ, end_tile stamps the super-sample reference
++	// valid for the pixel, begin_tile reloads the uncovered sub-sample from its
++	// own layer on every later field, and high-resolution scanout puts the stale
++	// value on screen. Full-pixel snapping covers the whole pixel and the stale
++	// sub-sample never arises.
++	if (inst.sampling_rate_y_log2 && field_aware_super_sampling && !bound_texture_has_array &&
++	    render_pass_instance_might_field_render(rp, instance))
+ 		snap_raster_mask.y >>= 1;
+ 
+ 	// If we're doing channel shuffle, but insist on super-sampling, we must make sure

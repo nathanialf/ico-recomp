@@ -29,6 +29,10 @@
 					<span class="nav-name">Input</span>
 					<span class="nav-tagline">sticks, rumble, binds</span>
 				</div>
+				<div class="nav-button" data-class-active="active_tab == 'gameplay'" data-event-click="active_tab = 'gameplay'">
+					<span class="nav-name">Gameplay</span>
+					<span class="nav-tagline">retail by default</span>
+				</div>
 				<div class="nav-button" data-class-active="active_tab == 'debug'" data-event-click="active_tab = 'debug'">
 					<span class="nav-name">Debug</span>
 					<span class="nav-tagline">logs, pacing, profiler</span>
@@ -112,20 +116,11 @@
 					<div class="control-label">Render scale</div>
 					<select data-value="render_scale" data-event-change="apply()">
 						<option value="1">1x</option>
-						<option value="2">2x</option>
 						<option value="4">4x</option>
 						<option value="8">8x</option>
 						<option value="16">16x</option>
 					</select>
-					<div class="hint">internal resolution multiplier, applies at the next field</div>
-				</div>
-
-				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="hires_scanout" data-event-change="apply()"/>
-						<span class="check-label">High resolution scanout</span>
-					</div>
-					<div class="hint">needs render scale 4 or more; stays off below that</div>
+					<div class="hint">super-sampling; 4x and up also draw the picture at higher resolution, using super-sampled textures so the game's display copy keeps the detail. The renderer can still decline, which the log reports as hires=no. Applies at the next field</div>
 				</div>
 
 				<div class="control">
@@ -239,9 +234,24 @@
 				<div class="note">Escape cancels a capture; it times out after five seconds. The menu key is never handed to the game.</div>
 			</div>
 
-			<div class="section" data-if="active_tab == 'debug'">
+			<div class="section" data-if="active_tab == 'gameplay'">
 				<div class="section-header">
 					<span class="section-number">04</span>
+					<span class="section-title">Gameplay</span>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="run_any_direction" data-event-change="apply()"/>
+						<span class="check-label">Run in every stick direction</span>
+					</div>
+					<div class="hint">off reproduces the retail game: only near-cardinal tilts run. on pre-scales the left stick so a full tilt runs at any angle. the game's own code is unchanged</div>
+				</div>
+			</div>
+
+			<div class="section" data-if="active_tab == 'debug'">
+				<div class="section-header">
+					<span class="section-number">05</span>
 					<span class="section-title">Debug</span>
 				</div>
 
@@ -278,7 +288,7 @@
 
 			<div class="section" data-if="active_tab == 'about'">
 				<div class="section-header">
-					<span class="section-number">05</span>
+					<span class="section-number">06</span>
 					<span class="section-title">About</span>
 				</div>
 				<!--

@@ -230,7 +230,7 @@ void rt_gs_field_stats(double* fields_per_second, double* field_ms) {
 
 void rt_gs_vsync_hook(unsigned field) {
     /* The event pump also runs from inside WSI::begin_frame via the
-     * pump_events callback (gs_parallel_lib.cpp's RtPgs::present_frame), but
+     * pump_events callback (gs_parallel_present.cpp's RtPgs::present_frame), but
      * that only happens when a frame is actually presented. Running it here
      * too guarantees events (and window-close) still drain on a skipped
      * field -- a minimized window, or a dump/headless backend that never

@@ -41,7 +41,7 @@ uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
  * ICORECOMP_UI_TEST=1, costs nothing when unset, removed by nobody: this is
  * the only exercise of the overlay ABI until RmlUi replaces it (milestone
  * 5). Laid out for a 640x480 surface, the historic default window size (see
- * init_windowed's comment in gs_parallel_lib.cpp).
+ * init_windowed's comment in gs_parallel_present.cpp).
  */
 void run_overlay_ui_test(RtPgs* pgs) {
     std::vector<RtPgsOverlayVertex> verts;
@@ -145,7 +145,7 @@ void host_fatal(const char* component, const char* message) {
 }
 
 /* Event pump inversion (shim 3): the exe owns the only SDL_PollEvent loop.
- * Called from inside Granite's WSI::begin_frame (see gs_parallel_lib.cpp's
+ * Called from inside Granite's WSI::begin_frame (see gs_parallel_present.cpp's
  * RtPgs::present_frame); rt_window_pump honors that reentrancy contract
  * (queue/translate events, notify_quit/notify_resize only). */
 void host_pump_events() {
@@ -202,8 +202,7 @@ RtPgsCreateOptions resolve_create_options() {
         }
     }
 
-    /* fit/filter/render_scale/hires_scanout have no env twin: straight from
-     * settings. */
+    /* fit/filter/render_scale have no env twin: straight from settings. */
     switch (s.display.fit) {
     case RtFit::IntegerScale: opts.fit = RT_PGS_FIT_INTEGER; break;
     case RtFit::Stretch: opts.fit = RT_PGS_FIT_STRETCH; break;
@@ -211,7 +210,6 @@ RtPgsCreateOptions resolve_create_options() {
     }
     opts.filter = s.display.filter == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
     opts.render_scale = (uint32_t)s.display.render_scale;
-    opts.hires_scanout = s.display.hires_scanout ? 1u : 0u;
     /* No env twin either. 0 would mean "the shim's own 640x480 fallback"
      * (see RtPgsCreateOptions in gs_parallel_api.h), which is not what the
      * settings default to: display.window_width/height are 1280x960
@@ -236,7 +234,7 @@ public:
             run_overlay_ui_test(m_pgs);
         }
 
-        /* init_windowed (gs_parallel_lib.cpp) already opened the window at
+        /* init_windowed (gs_parallel_present.cpp) already opened the window at
          * opts.window_width/height, i.e. display.window_width/height, so a
          * Windowed-mode run needs no further action here. Either fullscreen
          * mode still needs rt_window_apply_mode to take the window from

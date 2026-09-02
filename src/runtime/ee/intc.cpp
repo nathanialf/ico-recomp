@@ -77,18 +77,30 @@ uint64_t csr_value() {
         | (0x1Bull << 16) | (0x55ull << 24);
 }
 
-uint32_t run_guest_handler(const Handler& h, uint32_t a0) {
+} // namespace
+
+/* Shared entry point for every guest function the kernel calls in handler
+ * context: INTC and DMAC handlers below, and kernel alarm handlers in
+ * alarms.cpp. */
+uint32_t rt_intc_run_handler(uint32_t vram, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t gp,
+                             int32_t sp_delta) {
     std::memset(&g_int_ctx, 0, sizeof(g_int_ctx));
     g_int_ctx.r[4].u64x[0] = a0;
-    g_int_ctx.r[28].u64x[0] = h.gp;
-    g_int_ctx.r[29].u64x[0] = kIntStackTop;
+    g_int_ctx.r[5].u64x[0] = a1;
+    g_int_ctx.r[6].u64x[0] = a2;
+    g_int_ctx.r[28].u64x[0] = gp;
+    /* sp_delta carries a prologue instruction the caller stepped over to
+     * reach a translated entry (alarms.cpp); zero for INTC/DMAC handlers. */
+    g_int_ctx.r[29].u64x[0] = (uint64_t)(int64_t)((int32_t)kIntStackTop + sp_delta);
     g_int_ctx.r[31].u64x[0] = RT_CLEAN_EXIT_VRAM;
-    if (h.vram < RECOMP_TEXT_BASE || h.vram >= RECOMP_TEXT_LIMIT || !g_functab[RECOMP_FUNC_IDX(h.vram)]) {
-        rt_fatal("intc", nullptr, "interrupt handler vram 0x%08x has no translation", h.vram);
+    if (vram < RECOMP_TEXT_BASE || vram >= RECOMP_TEXT_LIMIT || !g_functab[RECOMP_FUNC_IDX(vram)]) {
+        rt_fatal("intc", nullptr, "handler vram 0x%08x has no translation", vram);
     }
-    g_functab[RECOMP_FUNC_IDX(h.vram)](&g_int_ctx);
+    g_functab[RECOMP_FUNC_IDX(vram)](&g_int_ctx);
     return (uint32_t)g_int_ctx.r[2].u64x[0];
 }
+
+namespace {
 
 void dispatch_line(Line& line, int number, uint32_t a0, const char* kind, const char* name) {
     /* Guest handler code runs inside this zone, so "intc" measures time in
@@ -100,7 +112,7 @@ void dispatch_line(Line& line, int number, uint32_t a0, const char* kind, const 
     for (const Handler& h : line.h) {
         if (!h.used) continue;
         any = true;
-        uint32_t ret = run_guest_handler(h, a0);
+        uint32_t ret = rt_intc_run_handler(h.vram, a0, 0, 0, h.gp);
         if (rt_trace()) {
             rt_log("intc", "%s %d (%s) handler 0x%08x returned %u", kind, number, name, h.vram, ret);
         }
@@ -222,15 +234,19 @@ void rt_dmac_raise(int ch) {
 
 void rt_intc_deliver() {
     if (g_in_interrupt || !g_eie) return;
-    if (!(g_istat & g_imask) && !(g_dstat & g_dmask)) return;
+    if (!(g_istat & g_imask) && !(g_dstat & g_dmask) && !rt_alarms_pending()) return;
     g_in_interrupt = true;
     /* The kernel dispatcher clears the status bit, then calls the cause's
      * handlers. Loop until quiescent so a handler raising another line is
-     * served in this pass. */
+     * served in this pass. Kernel alarms that came due since the last pass
+     * are dispatched here too: they run in the same handler context, under
+     * the same nesting guard, and their wakeups are picked up by the same
+     * preemption check on the way out. */
     for (int guard = 0; guard < 64; ++guard) {
         uint32_t ipend = g_istat & g_imask;
         uint32_t dpend = g_dstat & g_dmask;
-        if (!ipend && !dpend) break;
+        bool apend = rt_alarms_pending();
+        if (!ipend && !dpend && !apend) break;
         for (int c = 0; c < kNumCauses; ++c) {
             if (ipend & (1u << c)) {
                 g_istat &= ~(1u << c);
@@ -245,6 +261,7 @@ void rt_intc_deliver() {
                 dispatch_line(g_dmac[ch], ch, (uint32_t)ch, "DMAC", nm);
             }
         }
+        if (apend) rt_alarms_dispatch_pending();
     }
     g_in_interrupt = false;
     rt_sched_maybe_preempt();

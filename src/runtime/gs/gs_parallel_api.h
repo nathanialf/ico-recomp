@@ -2,7 +2,7 @@
  *
  * This header is the whole boundary between the MIT runtime and the LGPLv3+
  * paraLLEl-GS shared library. Everything Granite/paraLLEl-GS (all C++) stays
- * inside the library, behind gs_parallel_lib.cpp; the executable side
+ * inside the library, behind the gs/gs_parallel_*.cpp units; the executable side
  * (gs_parallel.cpp, gs_replay_main.cpp) sees only these opaque-handle C
  * functions. The narrow surface is deliberate:
  *   - license: no LGPL class layouts, inline code or vtables compile into
@@ -66,8 +66,11 @@ typedef struct RtPgsCreateOptions {
     uint32_t present_mode;   /* RT_PGS_PRESENT_* */
     uint32_t fit;            /* RT_PGS_FIT_* */
     uint32_t filter;         /* RT_PGS_FILTER_* */
-    uint32_t render_scale;   /* 1/2/4/8/16, paraLLEl-GS SuperSampling factor */
-    uint32_t hires_scanout;  /* nonzero: high resolution scanout; needs render_scale >= 4 */
+    /* 1/4/8/16, paraLLEl-GS SuperSampling factor. 4 and up also turn on
+     * high-resolution scanout, which has no separate option: 2x is not in
+     * the set because it only doubles the vertical sampling rate, which the
+     * renderer refuses to scan out at higher resolution. */
+    uint32_t render_scale;
     /* Initial window size in logical pixels. 0 (either field): the shim's
      * own 640x480 fallback (see init_windowed's comment on why 4:3). That
      * fallback is not the host's default: display.window_width/height
@@ -80,7 +83,7 @@ typedef struct RtPgsCreateOptions {
  * host->fatal. `host` is copied; the pointed-to struct need not outlive the
  * call. `opts` may be NULL, meaning the pre-settings defaults (present mode
  * from ICORECOMP_GS_PRESENT as before this struct existed, letterbox,
- * linear filtering, render scale 1, hires scanout off); otherwise it is
+ * linear filtering, render scale 1); otherwise it is
  * copied and the caller resolved it (settings.json with environment
  * variables taking precedence -- see gs_parallel.cpp). */
 RT_GS_API RtPgs* rt_pgs_create(const RtPgsHost* host, const RtPgsCreateOptions* opts);
@@ -125,8 +128,9 @@ RT_GS_API void  rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode);
 RT_GS_API void  rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filter);
 /* Retunes super-sampling in flight (dynamic_super_sampling was set at
  * init). Between frames only; fatal mid-frame. Invalid factor is fatal
- * (host validates). hires_scanout below 4x logs once and stays off. */
-RT_GS_API void  rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor, uint32_t hires_scanout);
+ * (host validates). High-resolution scanout follows the factor: requested
+ * at 4 and up, off below. */
+RT_GS_API void  rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor);
 
 /* Overlay rendering: a small textured/scissored 2D pass drawn on top of the
  * swapchain backbuffer, used by the settings menu and (later) RmlUi. Plain

@@ -344,6 +344,44 @@ void parse_verbose(const char* spec) {
     }
 }
 
+/* Inserts ".prev" before the last '.' in the filename portion of `path`
+ * ("foo/icorecomp.log" -> "foo/icorecomp.prev.log"). Works on the string
+ * directly rather than through std::filesystem::path, so it never disturbs
+ * whichever separator style the caller's path already uses. */
+std::string with_prev_suffix(const std::string& path) {
+    size_t sep = path.find_last_of("/\\");
+    size_t name_start = (sep == std::string::npos) ? 0 : sep + 1;
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || dot < name_start) return path + ".prev";
+    return path.substr(0, dot) + ".prev" + path.substr(dot);
+}
+
+/* Outcome of rotate_prev_log, carried forward so the result can be logged
+ * once the log file is open (it is not open yet at rotation time). */
+struct RotateOutcome {
+    bool attempted = false;
+    bool ok = false;
+    std::string prev_path;
+    std::string error;
+};
+
+/* If a file already exists at `path`, renames it to the same path with
+ * ".prev" inserted before the extension, replacing any older ".prev" file,
+ * so the log about to be opened at `path` does not overwrite a crash log
+ * from the previous run. Never fatal: a failed rename just falls through
+ * to the normal open-and-truncate behavior. */
+RotateOutcome rotate_prev_log(const std::string& path) {
+    RotateOutcome out;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return out;
+    out.attempted = true;
+    out.prev_path = with_prev_suffix(path);
+    std::filesystem::rename(path, out.prev_path, ec);
+    out.ok = !ec;
+    if (!out.ok) out.error = ec.message();
+    return out;
+}
+
 /* One candidate location for the log. Returns the open file, or null with
  * `why` filled in. */
 std::FILE* try_open(const std::string& path, std::string* why) {
@@ -456,11 +494,14 @@ void rt_log_init(const char* dir, bool file_allowed) {
 
     std::FILE* f = nullptr;
     std::string path;
+    RotateOutcome rotated;
     for (const std::string& c : candidates) {
+        RotateOutcome rot = rotate_prev_log(c);
         std::string why;
         f = try_open(c, &why);
         if (f) {
             path = c;
+            rotated = rot;
             break;
         }
         /* stdout, not stderr: stderr is about to become the log file, and
@@ -544,6 +585,14 @@ void rt_log_init(const char* dir, bool file_allowed) {
         emit("%s", line.c_str());
     }
     emit("[icorecomp][log] writing this run's log to %s\n", path.c_str());
+    if (rotated.attempted) {
+        if (rotated.ok) {
+            emit("[icorecomp][log] previous run's log kept as %s\n", rotated.prev_path.c_str());
+        } else {
+            emit("[icorecomp][log] could not keep the previous run's log as %s (%s); it was overwritten\n",
+                rotated.prev_path.c_str(), rotated.error.c_str());
+        }
+    }
     emit("[icorecomp][log] base directory for config/, saves/ and the disc probe: %s\n", base.c_str());
     if (g_verbose_all || !g_verbose_tags.empty()) {
         std::string tags = g_verbose_all ? "all" : std::string();

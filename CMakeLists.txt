@@ -55,6 +55,7 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/ee/syscalls.cpp
     src/runtime/ee/intc.cpp
     src/runtime/ee/timers.cpp
+    src/runtime/ee/alarms.cpp
     src/runtime/sif/sif.cpp
     src/runtime/sif/rpc.cpp
     src/runtime/sif/cdvd.cpp
@@ -120,6 +121,22 @@ target_compile_definitions(icorecomp-settings-selftest PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-settings-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# Standalone exercise of the left-stick reshaping behind
+# gameplay.run_any_direction (host/stick_shape.h). The subject is header
+# only, so this links nothing: no SDL, no settings model, no runtime
+# services. Its angle sweep is the evidence that a full tilt reaches the
+# game's run threshold at every angle.
+add_executable(icorecomp-stick-shape-selftest
+    src/runtime/host/stick_shape_selftest.cpp
+)
+target_include_directories(icorecomp-stick-shape-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-stick-shape-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
 target_include_directories(icorecomp-runtime PRIVATE
@@ -256,7 +273,8 @@ endif()
 #                                C ABI (gs/gs_parallel_api.h), selected at
 #                                runtime by ICORECOMP_GS. The real backend
 #                                lives inside the library
-#                                (gs/gs_parallel_lib.cpp).
+#                                (gs/gs_parallel_lib.cpp and the other
+#                                gs/gs_parallel_*.cpp units it names).
 #   icorecomp-gs-replay          small headless tool (ours) that feeds a raw
 #                                dump through paraLLEl-GS's own GSDumpParser
 #                                via the same C ABI; validates the dump writer
@@ -266,6 +284,68 @@ endif()
 # $<LINK_LIBRARY:WHOLE_ARCHIVE>; older CMake just disables the live backend.
 option(ICORECOMP_PARALLEL_GS "Build the paraLLEl-GS live GS backend" ON)
 option(ICORECOMP_GS_WINDOW "Build SDL3 window presentation for the live GS backend" ON)
+
+# ---- submodule patches (third_party/patches) ------------------------------
+#
+# Submodule sources are never edited in place: LGPL compliance for
+# parallel-gs wants the pinned sources to stay pristine and replaceable, so
+# local changes are carried as patch files and applied to the working tree
+# here, at configure time. See third_party/patches/README.md.
+#
+# Idempotent: a patch that reverse-applies cleanly is already in the tree and
+# is skipped, so re-running cmake in an existing build directory is a no-op.
+# Anything else is fatal. A submodule that silently lacks a patch would build
+# and run with the bug the patch exists to fix, which is worse than not
+# building.
+find_package(Git QUIET)
+
+function(icorecomp_apply_submodule_patches submodule_name submodule_dir)
+    file(GLOB _patches
+         "${CMAKE_SOURCE_DIR}/third_party/patches/${submodule_name}-[0-9][0-9][0-9][0-9]-*.patch")
+    list(SORT _patches)
+    if(NOT _patches)
+        return()
+    endif()
+
+    # A patch file edit must re-run configure, or the tree keeps the old one.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_patches})
+
+    if(NOT GIT_FOUND)
+        message(FATAL_ERROR
+                "icorecomp: third_party/patches holds patches for ${submodule_name} "
+                "but git was not found; install git or apply them by hand "
+                "(git apply, from ${submodule_dir})")
+    endif()
+
+    foreach(_patch IN LISTS _patches)
+        get_filename_component(_patch_name "${_patch}" NAME)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_patch}"
+            WORKING_DIRECTORY "${submodule_dir}"
+            RESULT_VARIABLE _reverse_ok
+            OUTPUT_QUIET ERROR_QUIET)
+        if(_reverse_ok EQUAL 0)
+            message(STATUS "icorecomp: ${_patch_name} already applied to ${submodule_name}")
+            continue()
+        endif()
+
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply "${_patch}"
+            WORKING_DIRECTORY "${submodule_dir}"
+            RESULT_VARIABLE _apply_rc
+            ERROR_VARIABLE _apply_err)
+        if(NOT _apply_rc EQUAL 0)
+            message(FATAL_ERROR
+                    "icorecomp: could not apply ${_patch_name} to ${submodule_dir}: "
+                    "${_apply_err}"
+                    "The submodule is either not at the pinned commit or already "
+                    "carries conflicting local edits. Reset it "
+                    "(git -C ${submodule_dir} reset --hard && "
+                    "git submodule update --init --recursive) and configure again.")
+        endif()
+        message(STATUS "icorecomp: applied ${_patch_name} to ${submodule_name}")
+    endforeach()
+endfunction()
 
 set(ICORECOMP_PGS_DIR "${CMAKE_SOURCE_DIR}/third_party/parallel-gs")
 if(ICORECOMP_PARALLEL_GS AND CMAKE_VERSION VERSION_LESS 3.25)
@@ -295,13 +375,14 @@ if(ICORECOMP_PARALLEL_GS)
         # used instead. Everything is loaded dynamically either way.
         set(GRANITE_VULKAN_DXGI_INTEROP OFF CACHE BOOL "" FORCE)
     endif()
+    icorecomp_apply_submodule_patches(parallel-gs "${ICORECOMP_PGS_DIR}")
     add_subdirectory("${ICORECOMP_PGS_DIR}" EXCLUDE_FROM_ALL SYSTEM)
 
     # Optional SDL3 window presentation. Standalone parallel-gs does not
     # build Granite's vendored SDL3, so configure it here the same way
     # Granite's third_party/CMakeLists.txt does for its SDL platform.
     # SDL is a SHARED library on purpose: the window/WSI lives inside
-    # libicorecomp-parallel-gs (gs_parallel_lib.cpp) while keyboard/gamepad
+    # libicorecomp-parallel-gs (gs_parallel_present.cpp) while keyboard/gamepad
     # polling and audio live in the runtime executable (host/input.cpp,
     # host/audio.cpp), and both must talk to the SAME SDL instance. Two
     # static copies would give the exe a keyboard-state view of an SDL that
@@ -354,10 +435,17 @@ if(ICORECOMP_PARALLEL_GS)
     # library-internal backend uses). Remaining granite static deps resolve
     # symbol-by-symbol via the normal transitive link. The executables see
     # only the C ABI in gs_parallel_api.h (RT_GS_API exports; explicit
-    # exports also make MSVC emit the import library). gs_parallel_lib.cpp
-    # is ours (MIT) but compiles into the library, so it alone may use the
-    # Granite/paraLLEl-GS C++ interfaces.
-    add_library(icorecomp-parallel-gs SHARED src/runtime/gs/gs_parallel_lib.cpp)
+    # exports also make MSVC emit the import library). The gs_parallel_*.cpp
+    # sources below are ours (MIT) but compile into the library, so they
+    # alone may use the Granite/paraLLEl-GS C++ interfaces. They are one
+    # shim split by unit; gs_parallel_impl.h is the RtPgs type they share.
+    add_library(icorecomp-parallel-gs SHARED
+        src/runtime/gs/gs_parallel_lib.cpp
+        src/runtime/gs/gs_parallel_scanout.cpp
+        src/runtime/gs/gs_parallel_present.cpp
+        src/runtime/gs/gs_parallel_overlay.cpp
+        src/runtime/gs/gs_parallel_abi.cpp
+    )
     target_compile_definitions(icorecomp-parallel-gs PRIVATE ICORECOMP_PGS_BUILD_DLL)
     target_include_directories(icorecomp-parallel-gs PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
     target_link_libraries(icorecomp-parallel-gs PRIVATE

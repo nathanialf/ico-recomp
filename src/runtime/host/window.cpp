@@ -2,7 +2,7 @@
  *
  * Reentrancy rule (repeated from window.h because it is the one rule that
  * matters most here): rt_window_pump runs from inside WSI::begin_frame via
- * the pump_events callback (gs_parallel_lib.cpp's RtPgs::present_frame),
+ * the pump_events callback (gs_parallel_present.cpp's RtPgs::present_frame),
  * after a swapchain image may already be acquired. From that context this
  * file may only queue/translate events and call rt_pgs_notify_quit /
  * rt_pgs_notify_resize; any rt_pgs_set_* entry point fatals mid-frame (the

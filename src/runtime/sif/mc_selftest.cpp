@@ -127,6 +127,14 @@ int main() {
         put32(c.send, 8, 0x40);
         c.name("/BASCUS-97113ico");
         check(c.run(2) == 0, "Mkdir /BASCUS-97113ico");
+        /* ICO re-runs Mkdir before every file it writes; mcman answers -4
+         * (sceMcResNoEntry) for an entry that already exists, and the game's
+         * save thread continues only on 0 or -4. The ChDir below then proves
+         * the directory survived the second call. */
+        Call again;
+        put32(again.send, 8, 0x40);
+        again.name("/BASCUS-97113ico");
+        check(again.run(2) == -4, "Mkdir existing dir -> -4");
         Call cd;
         put32(cd.send, 0x10, 0x2000);   /* pwd writeback */
         cd.name("/BASCUS-97113ico");

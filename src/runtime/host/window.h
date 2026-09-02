@@ -2,11 +2,11 @@
  *
  * Event pump inversion (milestone 3 of the settings plan): the exe owns the
  * only SDL_PollEvent loop in the process. The library's SdlWsiPlatform
- * (gs_parallel_lib.cpp) calls back into rt_window_pump through the nullable
+ * (gs_parallel_impl.h) calls back into rt_window_pump through the nullable
  * RtPgsHost.pump_events (gs_parallel_api.h) instead of polling SDL itself.
  *
  * Reentrancy: pump_events is called from inside Granite's WSI::begin_frame
- * (see gs_parallel_lib.cpp's comment on RtPgs::present_frame), after a
+ * (see gs_parallel_present.cpp's comment on RtPgs::present_frame), after a
  * swapchain image may already be acquired. rt_window_pump must therefore
  * only queue/translate events and call rt_pgs_notify_quit / rt_pgs_notify_
  * resize; any other rt_pgs_* call from inside it is fatal (the library's

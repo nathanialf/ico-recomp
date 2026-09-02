@@ -126,8 +126,6 @@ void svc_scmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
 
 /* ---- 0x80000595: N-commands ---------------------------------------------- */
 
-uint32_t g_stream_lsn = 0;
-
 /* Shared by ncmd fno 0x01 (sceCdRead, destination in EE RAM) and fno 0x0D
  * (this library vintage's read into IOP memory, used by the streaming
  * loader: the destinations observed are the IOP ring buffers the game's
@@ -147,6 +145,52 @@ uint32_t g_stream_lsn = 0;
 uint64_t g_drive_busy_until = 0;
 
 uint32_t iop_alloc_room(uint32_t addr);
+
+/* ---- virtual drive timing ------------------------------------------------
+ *
+ * One rate and one seek latency serve both the sceCdRead busy model below
+ * and the stream ring model further down, so the two cannot drift apart.
+ */
+
+/* Sustained transfer rate of the virtual drive in MB/s. 5.4 MB/s is a PS2
+ * DVD at its nominal 4x. ICORECOMP_CDVD_MBPS overrides it for development;
+ * 0 turns the whole drive timing model off (transfers land instantly and
+ * the ring is always full), which is what this runtime did before the
+ * drive was paced. */
+double drive_mbps() {
+    static const double v = [] {
+        const char* e = std::getenv("ICORECOMP_CDVD_MBPS");
+        double x = e ? std::strtod(e, nullptr) : 5.4; /* PS2 DVD, about 4x */
+        return x < 0.0 ? 0.0 : x;
+    }();
+    return v;
+}
+
+/* Bus cycles one 2048-byte sector takes to arrive at drive_mbps(). 0 when
+ * the timing model is off. */
+uint64_t sector_cycles() {
+    const double mbps = drive_mbps();
+    if (mbps <= 0.0) return 0;
+    return (uint64_t)(2048.0 / (mbps * 1048576.0) * (double)RT_BUSCLK_HZ);
+}
+
+/* Bus cycles between a stream start/seek and the first sector reaching the
+ * ring. 100 ms is the order of a full-stroke seek plus the drive settling
+ * on a PS2 DVD; the retail figure for this drive is not measured here, so
+ * ICORECOMP_CDVD_SEEK_MS sits next to ICORECOMP_CDVD_MBPS for sweeping it.
+ * A negative value keeps the default with a log rather than being applied. */
+uint64_t seek_cycles() {
+    static const uint64_t v = [] {
+        const char* e = std::getenv("ICORECOMP_CDVD_SEEK_MS");
+        double ms = e ? std::strtod(e, nullptr) : 100.0;
+        if (ms < 0.0) {
+            rt_log("cdvd", "ICORECOMP_CDVD_SEEK_MS=%s is negative; keeping the 100 ms default", e);
+            ms = 100.0;
+        }
+        return (uint64_t)(ms / 1000.0 * (double)RT_BUSCLK_HZ);
+    }();
+    return drive_mbps() <= 0.0 ? 0 : v;
+}
 
 void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     if (send_size < 24) {
@@ -287,14 +331,113 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
      * the EE loop runs and rewrite the sound ring under the voices, which
      * sounds like fast forward. ICORECOMP_CDVD_MBPS sets the rate, 0
      * restores the unthrottled behaviour. */
-    static const double mbps = [] {
-        const char* e = std::getenv("ICORECOMP_CDVD_MBPS");
-        double v = e ? std::strtod(e, nullptr) : 5.4; /* PS2 DVD, about 4x */
-        return v < 0.0 ? 0.0 : v;
-    }();
-    if (mbps > 0.0) {
-        const double secs = (double)sectors * 2048.0 / (mbps * 1048576.0);
-        g_drive_busy_until = rt_clock_now() + (uint64_t)(secs * 147456000.0);
+    const uint64_t per_sector = sector_cycles();
+    if (per_sector) {
+        g_drive_busy_until = rt_clock_now() + (uint64_t)sectors * per_sector;
+    }
+}
+
+/* ---- the CD stream (ncmd fno 0x09) ---------------------------------------
+ *
+ * cdvdman owns a ring of sectors in IOP RAM which the drive fills in the
+ * background. sceCdStRead hands the caller only what has already arrived
+ * and returns that count packed as (error << 16) | sectors. Measured in the
+ * decomp: the game's own copy of sceCdStRead is func_0024DAB8 (decomp
+ * asm/nonmatchings/src/cod/vendor_24AAC8/func_0024DAB8.s), which after the
+ * stream RPC does "srl $16, $2, 16" for the error and
+ * "andi $19, $2, 0xFFFF" for the sector count. Same split as ps2sdk
+ * ee/rpc/cdvd/src/ncmd.c, whose STMNBLK path returns "ret & 0xFFFF" under
+ * the comment "read only data currently in stream buffer".
+ *
+ * A short read is normal and both callers handle it:
+ *   - blocking mode (the movie, ito/mpeg readBufBeginPut -> ios/inflate.c
+ *     inflate_start -> sceCdStRead(32 sectors, mode 1)) loops inside the EE
+ *     library until the whole request is satisfied, sleeping 8 hsyncs
+ *     through SetAlarm/WaitSema (func_0024BFD0, decomp
+ *     src/cod/vendor_24AAC8.c) whenever a call returns 0 sectors;
+ *   - non-blocking mode (the file loader, decomp
+ *     asm/nonmatchings/ios/cdvd/iosCdvdManager.s around lines 96-131 and
+ *     190-219) commits whatever came back, and on a zero-sector reply parks
+ *     the thread in SleepThread until the per-frame handler wakes it.
+ * So a latency model only has to get the returned count right.
+ *
+ * Ring geometry comes from sceCdStInit and this title uses two of them
+ * (decomp tough_nuts/func_00132FF0/func_00132FF0.c, the readable form of
+ * ios/cdvd.c func_00132FF0 and func_00131480): the movie stream asks for
+ * bufmax 0x240 sectors in 0x24 banks over a 0x120010-byte IOP allocation,
+ * the file loader for bufmax 0x50 in 5 banks over 0x28010 bytes. Both are
+ * bufmax * 2048 plus the 16-byte allocation tag, which is what fixes bufmax
+ * as a sector count rather than a byte count.
+ *
+ * Delivering everything the caller asked for inside one call is what broke
+ * the stage loader: 320 KB of stage data landed in the frame that tore the
+ * previous stage down, while the display list kicked in that same frame
+ * still carried the previous frame's model tags pointing into that memory.
+ * On hardware those bytes are still intact when that chain is kicked,
+ * because the drive needs ten or more fields to deliver them and the chain
+ * cursors are reset before the data arrives. VIF1 then took a stage model
+ * word as a VIFcode and raised its unknown-VIFcode fatal.
+ *
+ * State machine, driven entirely by the virtual clock (rt_clock_now, EE bus
+ * cycles): START/SEEK/SEEKF set the position, empty the ring and schedule
+ * the first arrival at now + seek_cycles(); each further sector arrives one
+ * sector_cycles() later until the ring is full, at which point the drive
+ * stalls and resumes when a read frees room; READ hands over
+ * min(requested, buffered); STAT reports what is buffered; PAUSE freezes
+ * arrival and RESUME shifts the schedule by the time spent paused; STOP
+ * discards the ring.
+ */
+struct StreamState {
+    bool inited = false;
+    uint32_t bufmax = 0;       /* ring capacity in sectors (sceCdStInit arg 1) */
+    uint32_t bankmax = 0;      /* number of banks (sceCdStInit arg 2) */
+    uint32_t iop_buf = 0;      /* ring address in IOP RAM (sceCdStInit arg 3) */
+    bool running = false;      /* between START/SEEK and STOP */
+    bool paused = false;
+    uint32_t pos = 0;          /* next sector READ will hand over */
+    uint32_t buffered = 0;     /* sectors sitting in the ring */
+    uint64_t next_arrival = 0; /* clock at which `buffered` grows by one */
+    uint64_t paused_at = 0;
+};
+StreamState g_st;
+
+/* Ring capacity in sectors. sceCdStInit is the only source for it, so when
+ * the game starts a stream without one the capacity is genuinely unknown:
+ * say so once and let the ring fill without a ceiling rather than invent a
+ * size. Arrival rate and seek latency still apply in that case. */
+uint32_t stream_capacity() {
+    if (g_st.bufmax) return g_st.bufmax;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        rt_log("cdvd", "stream started with no sceCdStInit seen: ring capacity is unknown, "
+                       "so the drive is never stalled on a full ring (rate and seek still modeled)");
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* Bring `buffered` up to date with the virtual clock. */
+void stream_advance() {
+    if (!g_st.running || g_st.paused) return;
+    const uint64_t per = sector_cycles();
+    if (per == 0) return; /* timing model off; see the READ and STAT cases */
+    const uint32_t cap = stream_capacity();
+    if (g_st.buffered >= cap) {
+        /* Full ring: the drive holds off and picks up again once a read
+         * frees room, one sector time later. */
+        g_st.next_arrival = rt_clock_now() + per;
+        return;
+    }
+    const uint64_t now = rt_clock_now();
+    if (now < g_st.next_arrival) return;
+    const uint64_t arrived = (now - g_st.next_arrival) / per + 1;
+    const uint64_t room = (uint64_t)cap - g_st.buffered;
+    if (arrived >= room) {
+        g_st.buffered = cap;
+        g_st.next_arrival = now + per;
+    } else {
+        g_st.buffered += (uint32_t)arrived;
+        g_st.next_arrival += arrived * per;
     }
 }
 
@@ -309,26 +452,122 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
     /* CdvdStCmd_t: 1 START 2 READ 3 STOP 4 SEEK 5 INIT 6 STAT 7 PAUSE
      * 8 RESUME 9 SEEKF (ps2sdk ncmd.c). */
     static const char* names[] = {"?", "START", "READ", "STOP", "SEEK", "INIT", "STAT", "PAUSE", "RESUME", "SEEKF"};
-    rt_log("cdvd", "ncmd fno=0x09 sceCdSt%s(lbn=%u n=%u buf=0x%08x)",
-        cmd < 10 ? names[cmd] : "?", lbn, nsectors, buf);
+    const char* name = cmd < 10 ? names[cmd] : "?";
+    /* READ logs its own line below, with what it handed over. Every other
+     * command keeps the one-line-per-command form. */
+    if (cmd != 2) {
+        rt_log("cdvd", "ncmd fno=0x09 sceCdSt%s(lbn=%u n=%u buf=0x%08x)", name, lbn, nsectors, buf);
+    }
     uint32_t result = 1;
     switch (cmd) {
+        case 5: /* INIT */
+            /* sceCdStInit(bufmax, bankmax, iop_buf) is staged as
+             * readStreamData[0]=bufmax, [1]=bankmax, [2]=buf (ps2sdk
+             * ee/rpc/cdvd/src/ncmd.c sceCdStInit calling sceCdStream), so on
+             * this packet the lbn field carries the ring size in sectors and
+             * the nsectors field the bank count. Neither is a disc position. */
+            g_st = StreamState{};
+            g_st.inited = true;
+            g_st.bufmax = lbn;
+            g_st.bankmax = nsectors;
+            g_st.iop_buf = buf;
+            rt_log("cdvd", "stream ring: %u sectors (%u KB) in %u banks at IOP 0x%06x; "
+                           "first sector %.1f ms after a seek, then one every %.2f ms",
+                g_st.bufmax, g_st.bufmax * 2, g_st.bankmax, g_st.iop_buf,
+                (double)seek_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
+                (double)sector_cycles() * 1000.0 / (double)RT_BUSCLK_HZ);
+            break;
         case 1: case 4: case 9: /* START / SEEK / SEEKF */
-            g_stream_lsn = lbn;
+            g_st.running = true;
+            g_st.paused = false;
+            g_st.pos = lbn;
+            g_st.buffered = 0;
+            g_st.next_arrival = rt_clock_now() + seek_cycles();
             break;
         case 2: { /* READ nsectors at the stream position */
-            static std::vector<uint8_t> stream_buf;
-            stream_buf.resize((size_t)nsectors * 2048);
-            uint32_t i = rt_iso_read_sectors(g_stream_lsn, nsectors, stream_buf.data());
-            if (i) rt_gwrite_bytes(buf, stream_buf.data(), (size_t)i * 2048);
-            g_stream_lsn += i;
+            if (!g_st.running) {
+                /* No START/SEEK is live, so there is nothing to hand over.
+                 * The EE library short-circuits this case itself (ps2sdk
+                 * sceCdStRead returns 0 when streamStatus is 0, before the
+                 * RPC), so seeing it here means the stream state machine
+                 * here and the game's disagree. Loud, not sampled. */
+                rt_log("cdvd", "sceCdStREAD with no stream running (n=%u): returning 0", nsectors);
+            }
+            stream_advance();
+            const bool paced = sector_cycles() != 0;
+            uint32_t give = nsectors;
+            if (paced && give > g_st.buffered) give = g_st.buffered;
+            else if (!paced && !g_st.running) give = 0;
+            uint32_t i = 0;
+            if (give) {
+                static std::vector<uint8_t> stream_buf;
+                stream_buf.resize((size_t)give * 2048);
+                i = rt_iso_read_sectors(g_st.pos, give, stream_buf.data());
+                if (i) rt_gwrite_bytes(buf, stream_buf.data(), (size_t)i * 2048);
+                if (i < give) {
+                    /* The stream ran off the end of the disc. Loud, not
+                     * sampled: with a correct position this cannot happen. */
+                    rt_log("cdvd", "stream read short at lbn %u: %u of %u sectors on the disc (%u total)",
+                        g_st.pos, i, give, rt_iso_total_sectors());
+                }
+                g_st.pos += i;
+                /* Unpaced (ICORECOMP_CDVD_MBPS=0) the ring is not tracked,
+                 * so there is nothing to take out of it. */
+                g_st.buffered -= paced ? i : 0;
+            }
             result = i; /* sectors read; high half = error (0) */
+            /* Not sampled. The loader polls this once a field while it
+             * waits, so a stalled load prints one line per field; that line
+             * is the only view of why it is waiting and it paces itself. */
+            rt_log("cdvd", "ncmd fno=0x09 sceCdStREAD(lbn=%u n=%u buf=0x%08x) "
+                           "delivered %u of %u (buffered %u/%u), next lbn %u",
+                lbn, nsectors, buf, i, nsectors, g_st.buffered, g_st.bufmax, g_st.pos);
             break;
         }
-        case 6: /* STAT: 0 = buffer fully available */
-            result = 0;
+        case 3: /* STOP: the ring is discarded.
+                 * Non-zero is success here: the game latches sceCdGetError
+                 * when this returns 0 (decomp ios/cdvd.c func_001331D8 and
+                 * func_00131560). Same for START, whose 0 return makes
+                 * func_00131480 latch the error. */
+            g_st.running = false;
+            g_st.paused = false;
+            g_st.buffered = 0;
             break;
-        default: /* STOP / INIT / PAUSE / RESUME: success */
+        case 6: /* STAT */
+            /* A sector count, not a flag. ps2sdk
+             * common/include/libcdvd-common.h lines 611-615 document it as
+             *   "get stream read status
+             *    @return number of sectors read if successful, 0 otherwise"
+             * and the game settles it: the movie player is the only caller
+             * of sceCdStStat in the binary (decomp
+             * asm/nonmatchings/src/stage_orient/OtherStagePositionGet.s
+             * lines 29-42, a splat file-split artifact holding the ito/mpeg
+             * main loop) and it uses the result as a signed threshold: the
+             * call is followed immediately by a set-on-less-than against 32,
+             * asking whether fewer than 32 sectors are buffered, weighed
+             * against the 0x10000 bytes it is about to request, printing
+             * "movie pause" and freezing the movie for 30 fields when the
+             * ring is that low. Answering a flat 0, which is what this
+             * runtime used to do, means that branch is taken on every
+             * iteration. It is never compared to zero and never subtracted. */
+            stream_advance();
+            result = sector_cycles() == 0 ? g_st.bufmax : g_st.buffered;
+            break;
+        case 7: /* PAUSE: arrival freezes where it is */
+            if (g_st.running && !g_st.paused) {
+                stream_advance();
+                g_st.paused = true;
+                g_st.paused_at = rt_clock_now();
+            }
+            break;
+        case 8: /* RESUME: the schedule shifts by the time spent paused */
+            if (g_st.paused) {
+                const uint64_t now = rt_clock_now();
+                if (now > g_st.paused_at) g_st.next_arrival += now - g_st.paused_at;
+                g_st.paused = false;
+            }
+            break;
+        default:
             break;
     }
     if (recv_size >= 4) wr32(recv, 0, result);
@@ -447,23 +686,44 @@ void svc_diskready(uint32_t fno, const uint8_t* send, uint32_t send_size,
 
 /* ---- 0x80000003: iopheap ------------------------------------------------- */
 
-/* Bump allocator over a reserved span of the virtual IOP RAM. Real
- * allocations matter here: the EE stages data into these buffers with
- * SifSetDma and later asks IOP-side services to consume them. Protocol per
- * ps2sdk ee/kernel/src/iopheap.c: fno 1 alloc {u32 size}->{u32 addr},
- * fno 2 free {u32 addr}->{u32 result}. */
-/* Above the minted RPC staging buffers (rpc.cpp kBufBase 0x1C0000 + up to 32
- * services * 0x4000 = 0x240000). 0x200000 overlapped the sndn2 service's
- * staging buffer with the game's first sound-bank iopheap allocation. */
-constexpr uint32_t kIopHeapBase = 0x00240000u;
-constexpr uint32_t kIopHeapEnd = RT_IOP_RAM_SIZE - 0x10000u;
-uint32_t g_iop_heap_ptr = kIopHeapBase;
+/* sceSifAllocIopHeap / sceSifFreeIopHeap. Protocol per ps2sdk
+ * ee/kernel/src/iopheap.c: fno 1 alloc {u32 size}->{u32 addr}, fno 2 free
+ * {u32 addr}->{u32 result}.
+ *
+ * Real allocations matter here: the EE stages data into these buffers with
+ * SifSetDma and later asks IOP-side services to consume them, and the
+ * addresses are not opaque to the game (the MPEG helper rejects any IOP
+ * address above 0x1FFFFF, decomp src/cod/vendor_258CC0.c func_0025E050).
+ *
+ * On hardware the IOP side of this is AllocSysMemory(SMEM_LOW, size, 0):
+ * lowest-address-first fit, 256-byte granularity, out of the RAM left above
+ * the loaded modules, and FreeSysMemory really releases the block. This
+ * models the same behaviour over the span below. The base address is a
+ * runtime choice, not a measured fact: the hardware base depends on which
+ * IOP modules this title loads and that layout is not known here. The 2 MB
+ * ceiling is a hardware fact. The full IOP address map is in rpc.h. */
+constexpr uint32_t kIopHeapBase = 0x00090000u;
+constexpr uint32_t kIopHeapEnd = RT_IOP_RAM_SIZE;
+constexpr uint32_t kIopHeapGran = 256u;
 
-/* Live allocations, so a transfer aimed at one can be checked against its
- * real extent. Without this a disc read that asks for more than the buffer
- * holds walks straight through whatever the game allocated next. */
-struct IopAlloc { uint32_t addr, size; };
-IopAlloc g_iop_allocs[64];
+static_assert(RT_SIF_IOP_CMDBUF < kIopHeapBase,
+    "the sifcmd command buffer sits inside the iopheap heap");
+
+/* Live blocks, kept sorted by address. This is the allocator's whole state:
+ * free space is whatever no live block covers, so a free coalesces with its
+ * neighbours by construction and the freed space is immediately reusable as
+ * part of a larger gap.
+ *
+ * It is also the record a transfer aimed at one of these buffers is checked
+ * against. Without it a disc read that asks for more than the buffer holds
+ * walks straight through whatever the game allocated next.
+ *
+ * `size` is what the game asked for and `span` is that rounded up to the
+ * allocation granularity: placement uses span, the overrun checks use the
+ * size the game actually asked for. */
+struct IopAlloc { uint32_t addr, size, span; };
+constexpr int kMaxIopAllocs = 64;
+IopAlloc g_iop_allocs[kMaxIopAllocs];
 int g_iop_alloc_count = 0;
 
 /* Bytes from `addr` to the end of the allocation containing it, or 0 when
@@ -478,33 +738,116 @@ uint32_t iop_alloc_room(uint32_t addr) {
     return 0;
 }
 
+/* Heap the blocks actually occupy, granularity rounding included. */
+uint32_t iop_heap_live() {
+    uint32_t live = 0;
+    for (int i = 0; i < g_iop_alloc_count; ++i) live += g_iop_allocs[i].span;
+    return live;
+}
+
+uint32_t iop_heap_largest_free() {
+    uint32_t best = 0;
+    uint32_t cursor = kIopHeapBase;
+    for (int i = 0; i < g_iop_alloc_count; ++i) {
+        const IopAlloc& a = g_iop_allocs[i];
+        if (a.addr - cursor > best) best = a.addr - cursor;
+        cursor = a.addr + a.span;
+    }
+    if (kIopHeapEnd - cursor > best) best = kIopHeapEnd - cursor;
+    return best;
+}
+
+void iop_heap_dump() {
+    rt_log("iopheap", "live block list: %d blocks, %u bytes",
+        g_iop_alloc_count, iop_heap_live());
+    for (int i = 0; i < g_iop_alloc_count; ++i) {
+        rt_log("iopheap", "  block %d: 0x%06x size %u (span %u)",
+            i, g_iop_allocs[i].addr, g_iop_allocs[i].size, g_iop_allocs[i].span);
+    }
+}
+
+/* Lowest-address first fit, the AllocSysMemory(SMEM_LOW) rule. Returns 0
+ * (NULL) when nothing fits, which is what the EE library hands the game. */
+uint32_t iop_heap_alloc(uint32_t size) {
+    if (size == 0) {
+        /* What the IOP kernel returns for a zero-byte AllocSysMemory is not
+         * verified here, and the game never asks for one. */
+        rt_log("iopheap", "WARNING: alloc(0) requested; the IOP kernel's answer to a "
+            "zero-byte allocation is unverified. Returning NULL.");
+        return 0;
+    }
+    if (g_iop_alloc_count >= kMaxIopAllocs) {
+        iop_heap_dump();
+        rt_fatal("iopheap", rt_sched_current_ctx(),
+            "live block table full (%d blocks) allocating %u bytes: another block "
+            "cannot be tracked, and returning an untracked address would silently "
+            "disable the transfer bounds checks that depend on this list",
+            kMaxIopAllocs, size);
+    }
+    uint32_t span = (size + (kIopHeapGran - 1)) & ~(kIopHeapGran - 1);
+    uint32_t cursor = kIopHeapBase;
+    int slot = -1;
+    for (int i = 0; i < g_iop_alloc_count; ++i) {
+        const IopAlloc& a = g_iop_allocs[i];
+        if (a.addr - cursor >= span) { slot = i; break; }
+        cursor = a.addr + a.span;
+    }
+    if (slot < 0) {
+        if (kIopHeapEnd - cursor < span) return 0;
+        slot = g_iop_alloc_count;
+    }
+    for (int i = g_iop_alloc_count; i > slot; --i) g_iop_allocs[i] = g_iop_allocs[i - 1];
+    g_iop_allocs[slot] = IopAlloc{cursor, size, span};
+    ++g_iop_alloc_count;
+    return cursor;
+}
+
+/* 0 on success. -1 when `addr` is not the base of a live block: the IOP
+ * returns a failure for an invalid block, and iopheap.c passes the IOP
+ * result straight back. The exact failure constant is unverified here (no
+ * ps2sdk tree to read), so -1 is the reported value. */
+int iop_heap_free(uint32_t addr) {
+    for (int i = 0; i < g_iop_alloc_count; ++i) {
+        if (g_iop_allocs[i].addr != addr) continue;
+        for (int j = i; j + 1 < g_iop_alloc_count; ++j) g_iop_allocs[j] = g_iop_allocs[j + 1];
+        --g_iop_alloc_count;
+        return 0;
+    }
+    return -1;
+}
+
 void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
                  uint8_t* recv, uint32_t recv_size) {
     switch (fno) {
         case 1: { /* alloc */
             uint32_t size = send_size >= 4 ? rd32(send, 0) : 0;
-            uint32_t aligned = (size + 0xFF) & ~0xFFu;
-            uint32_t addr = 0;
-            if (g_iop_heap_ptr + aligned <= kIopHeapEnd) {
-                addr = g_iop_heap_ptr;
-                g_iop_heap_ptr += aligned;
-            }
-            if (addr && g_iop_alloc_count < 64) {
-                g_iop_allocs[g_iop_alloc_count++] = IopAlloc{addr, size};
-            }
+            uint32_t addr = iop_heap_alloc(size);
             if (recv_size >= 4) wr32(recv, 0, addr);
-            rt_log("iopheap", "alloc(%u) -> 0x%06x (%u bytes of virtual IOP heap left)",
-                size, addr, kIopHeapEnd - g_iop_heap_ptr);
-            if (!addr) {
+            rt_log("iopheap", "alloc(%u) -> 0x%06x (live %u bytes, largest free %u)",
+                size, addr, iop_heap_live(), iop_heap_largest_free());
+            if (!addr && size) {
                 rt_log("iopheap", "WARNING: virtual IOP heap exhausted (%u byte request)", size);
+                /* Once per run: enough to see a leak, not enough to bury the
+                 * log if the game retries in a loop. */
+                static bool dumped = false;
+                if (!dumped) { dumped = true; iop_heap_dump(); }
             }
             break;
         }
-        case 2: /* free: bump allocator never reclaims; report success */
-            if (recv_size >= 4) wr32(recv, 0, 0);
-            rt_log("iopheap", "free(0x%06x) -> 0 (bump allocator, not reclaimed)",
-                send_size >= 4 ? rd32(send, 0) : 0);
+        case 2: { /* free */
+            uint32_t addr = send_size >= 4 ? rd32(send, 0) : 0;
+            int result = iop_heap_free(addr);
+            if (recv_size >= 4) wr32(recv, 0, (uint32_t)result);
+            if (result == 0) {
+                rt_log("iopheap", "free(0x%06x) -> 0 (live %u bytes)", addr, iop_heap_live());
+            } else {
+                rt_log("iopheap", "WARNING free(0x%06x) -> -1: not the base of a live block. "
+                    "The game does not do this on hardware, so either an address was "
+                    "corrupted or a block was freed twice.", addr);
+                iop_heap_dump();
+            }
             break;
+        }
         default:
             if (recv_size >= 4) wr32(recv, 0, (uint32_t)-1);
             rt_log("iopheap", "WARNING fno=%u NOT MODELED (send_size=%u): returned -1",

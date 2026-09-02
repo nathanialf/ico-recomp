@@ -6,6 +6,7 @@
 #include "../runtime.h"
 #include "../ui/ui.h"
 #include "settings.h"
+#include "stick_shape.h"
 
 #include <cmath>
 #include <cstdio>
@@ -197,6 +198,10 @@ unsigned g_tables_gen = 0;
 
 bool g_rumble_suppressed_logged = false;
 
+/* Cleared when the toggle goes back off, so a later re-enable says so again;
+ * the line is worth one log per enable, not one per field. */
+bool g_gate_expand_logged = false;
+
 /* Resolves one stored name for a keyboard slot, falling back to the compiled
  * default with a named log line. Never returns "no binding" quietly: if even
  * the default fails to resolve, that is this build's table and SDL
@@ -376,6 +381,20 @@ void sdl_poll() {
         Sint16 ry = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY);
         apply_deadzone(cfg.input.left_deadzone, &lx, &ly);
         apply_deadzone(cfg.input.right_deadzone, &rx, &ry);
+
+        /* Left stick only. The camera stick goes through the same
+         * gate-divided magnitude in the game, but the toggle is scoped to
+         * movement by decision; the right stick stays as retail. */
+        if (cfg.gameplay.run_any_direction) {
+            if (!g_gate_expand_logged) {
+                g_gate_expand_logged = true;
+                rt_log("input", "gameplay.run_any_direction is on; the left stick is pre-scaled by"
+                    " the game's octagonal-gate divisor so a full tilt runs in every direction");
+            }
+            rt_stick_gate_expand(&lx, &ly);
+        } else {
+            g_gate_expand_logged = false;
+        }
 
         /* Keyboard sticks win only while deflected. */
         if (s.lx == 0x80) s.lx = axis_to_u8(lx);

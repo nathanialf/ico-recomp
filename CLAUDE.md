@@ -59,7 +59,11 @@ Changing these headers invalidates generated code. Do it deliberately.
 ## Settings and UI
 
 - Host-side only: no setting alters a value the game supplied. Widescreen and
-  game speed are out of scope by decision, not by omission.
+  game speed are out of scope by decision, not by omission. `gameplay.*` keys
+  are the one class that reshapes an input before the game ever reads it:
+  they are opt-in, default off, and touch only what the virtual pad reports
+  to the guest. They never patch guest code and never alter a value the game
+  itself computed.
 - For every settings key with an environment-variable twin, the environment
   wins over `settings.json`, logged at startup, so every existing script and
   CI invocation keeps behaving exactly as it did before settings.json

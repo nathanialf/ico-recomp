@@ -223,6 +223,7 @@ int main() {
         CHECK(s.debug.fps_limit_hz == 59.94);
         CHECK(s.input.keyboard[RT_KB_CROSS] == "X");
         CHECK(s.input.gamepad[RT_GP_L2] == "lefttrigger+");
+        CHECK(s.gameplay.run_any_direction == false);
         CHECK(rt_settings_save());
         CHECK(std::filesystem::exists(path));
         CHECK(!std::filesystem::exists(path + ".tmp"));
@@ -243,6 +244,7 @@ int main() {
         m.debug.fps_limit_hz = 0.0;
         m.display.render_scale = 4;
         m.input.keyboard[RT_KB_MENU] = "F2";
+        m.gameplay.run_any_direction = true;
         rt_settings_commit();
 
         rt_settings_init();
@@ -253,6 +255,7 @@ int main() {
         CHECK(s.debug.fps_limit_hz == 0.0);
         CHECK(s.display.render_scale == 4);
         CHECK(s.input.keyboard[RT_KB_MENU] == "F2");
+        CHECK(s.gameplay.run_any_direction == true);
     }
     { /* 8. unknown-key preservation across load/save */
         std::string path = scratch + "/unknown.json";
@@ -260,6 +263,7 @@ int main() {
             "{\n"
             "  \"version\": 1,\n"
             "  \"display\": {\"foo\": 42},\n"
+            "  \"gameplay\": {\"bar\": \"keep me\"},\n"
             "  \"custom_section\": {\"x\": 1}\n"
             "}\n");
         set_env("ICORECOMP_SETTINGS", path.c_str());
@@ -267,6 +271,8 @@ int main() {
         CHECK(rt_settings_save());
         std::string text = read_file(path);
         CHECK(text.find("\"foo\"") != std::string::npos);
+        CHECK(text.find("\"bar\"") != std::string::npos);
+        CHECK(text.find("keep me") != std::string::npos);
         CHECK(text.find("custom_section") != std::string::npos);
     }
     { /* 9. bad value isolation: one field falls back, the rest loads */
@@ -564,6 +570,34 @@ int main() {
         set_env("ICORECOMP_SETTINGS", path.c_str());
         rt_settings_init();
         CHECK(rt_settings().input.left_deadzone == 0.95f);
+    }
+    { /* 28. display.render_scale: 2 was retired when high-resolution scanout
+       * stopped being a separate setting, so it is out of the allowed set
+       * {1, 4, 8, 16} and keeps the default like any other bad value. A
+       * hires_scanout key left in the file is an unknown key: kept across a
+       * save, and it changes nothing. */
+        std::string path = scratch + "/render_scale2.json";
+        write_file(path,
+            "{\n"
+            "  \"version\": 1,\n"
+            "  \"display\": {\"render_scale\": 2, \"hires_scanout\": true},\n"
+            "  \"audio\": {\"master_volume\": 55}\n"
+            "}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().display.render_scale == 1);
+        CHECK(rt_settings().audio.master_volume == 55);
+        CHECK(rt_settings_save());
+        CHECK(read_file(path).find("hires_scanout") != std::string::npos);
+
+        /* And the same value arriving through the menu path reverts at
+         * commit rather than reaching the backend. */
+        rt_settings_mutable().display.render_scale = 8;
+        rt_settings_commit(false);
+        CHECK(rt_settings().display.render_scale == 8);
+        rt_settings_mutable().display.render_scale = 2;
+        rt_settings_commit(false);
+        CHECK(rt_settings().display.render_scale == 8);
     }
 
     unset_env("ICORECOMP_SETTINGS");

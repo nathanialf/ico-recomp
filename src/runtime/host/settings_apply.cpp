@@ -17,8 +17,7 @@
  *                                       touches the swapchain, so it applies
  *                                       from rt_settings_apply_pending() at
  *                                       the field boundary, never here
- *   display.render_scale,
- *   display.hires_scanout        warm  queued the same way, applied via
+ *   display.render_scale         warm  queued the same way, applied via
  *                                       rt_pgs_set_render_scale
  *   display.remember_window_size hot   read fresh by host/window.cpp's
  *                                       resize handler on every resize
@@ -28,17 +27,23 @@
  *                                       from its own refresh, at the field
  *                                       boundary. Nothing to push from here
  *
+ *   gameplay.run_any_direction   hot   read fresh by sdl_poll
+ *                                       (host/input.cpp) every field, which
+ *                                       reshapes the left stick pair it is
+ *                                       about to report; nothing to push here
+ *
  *   debug.verbose                hot   rt_log_set_verbose, unless
  *                                       ICORECOMP_VERBOSE is set (log.cpp
  *                                       parses a spec once; it does not
  *                                       poll the struct)
  *
- * Everything else outside display (audio.*, input.*, the rest of debug.*,
- * launcher.*) needs no applier: those consumers read rt_settings() fresh on
- * every use (pace_period_seconds in gspriv.cpp, sdl_submit in audio.cpp,
- * rt_prof_field in prof.h), and launcher.* is cold for the current run by
- * design. Milestone 6 (the settings menu) added no applier for that reason:
- * every control it exposes outside display.* was already read fresh.
+ * Everything else outside display (audio.*, input.*, gameplay.*, the rest
+ * of debug.*, launcher.*) needs no applier: those consumers read
+ * rt_settings() fresh on every use (pace_period_seconds in gspriv.cpp,
+ * sdl_submit in audio.cpp, rt_prof_field in prof.h), and launcher.* is cold
+ * for the current run by design. Milestone 6 (the settings menu) added no
+ * applier for that reason: every control it exposes outside display.* was
+ * already read fresh.
  *
  * Every rt_pgs_* call is guarded on rt_gs_parallel_handle() != nullptr: a
  * dump-only run, a headless live run, or a build with no paraLLEl-GS backend
@@ -80,7 +85,7 @@ uint32_t filter_to_pgs(RtFilter f) {
     return f == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
 }
 
-/* Warm queue: display.present and display.render_scale/hires_scanout touch
+/* Warm queue: display.present and display.render_scale touch
  * the swapchain or the GS interface's in-flight state, so they wait for
  * rt_settings_apply_pending() at the field boundary (hw/gspriv.cpp) instead
  * of applying from inside rt_settings_apply, which can run from UI code at
@@ -90,7 +95,6 @@ struct PendingApply {
     uint32_t present_mode_value = 0;
     bool render_scale = false;
     uint32_t render_scale_factor = 0;
-    uint32_t render_scale_hires = 0;
 } g_pending;
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */
@@ -143,11 +147,9 @@ void rt_settings_apply(const RtSettings& before, const RtSettings& now) {
         }
     }
 
-    if (before.display.render_scale != now.display.render_scale ||
-        before.display.hires_scanout != now.display.hires_scanout) {
+    if (before.display.render_scale != now.display.render_scale) {
         g_pending.render_scale = true;
         g_pending.render_scale_factor = (uint32_t)now.display.render_scale;
-        g_pending.render_scale_hires = now.display.hires_scanout ? 1u : 0u;
     }
 #endif
 }
@@ -174,7 +176,7 @@ void rt_settings_apply_pending() {
     }
     if (g_pending.render_scale) {
         g_pending.render_scale = false;
-        rt_pgs_set_render_scale(pgs, g_pending.render_scale_factor, g_pending.render_scale_hires);
+        rt_pgs_set_render_scale(pgs, g_pending.render_scale_factor);
     }
 #endif
 }

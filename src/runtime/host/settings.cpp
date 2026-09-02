@@ -158,7 +158,11 @@ constexpr EnumEntry kFilterNames[] = {
     {"nearest", (int)RtFilter::Nearest},
 };
 
-constexpr int kRenderScales[] = {1, 2, 4, 8, 16};
+/* 2x is deliberately not offered: SuperSampling::X2 only doubles the
+ * vertical sampling rate (parallel-gs gs_interface.cpp), and the renderer
+ * drops a high-resolution scanout request when either axis has no extra
+ * samples (gs_renderer.cpp), so 2x can never scale the picture. */
+constexpr int kRenderScales[] = {1, 4, 8, 16};
 
 template <size_t N>
 const char* enum_name(const EnumEntry (&table)[N], int value) {
@@ -369,7 +373,7 @@ void map_bind_section(const RtJson* sec, const char* dotted_parent, const BindDe
 
 void map_from_dom(const RtJson& dom, RtSettings* out) {
     log_unknown_keys(dom, "", [](const std::string& k) {
-        return is_one_of(k, {"version", "display", "audio", "input", "debug", "launcher"});
+        return is_one_of(k, {"version", "display", "audio", "input", "gameplay", "debug", "launcher"});
     });
 
     if (const RtJson* d = dom.find("display")) {
@@ -378,7 +382,7 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
         } else {
             log_unknown_keys(*d, "display", [](const std::string& k) {
                 return is_one_of(k, {"mode", "window_width", "window_height", "remember_window_size",
-                    "present", "fit", "filter", "render_scale", "hires_scanout", "show_fps"});
+                    "present", "fit", "filter", "render_scale", "show_fps"});
             });
             load_enum(d->find("mode"), "display.mode", kDisplayModeNames, (int*)&out->display.mode);
             load_int_range(d->find("window_width"), "display.window_width", 320, 16384, &out->display.window_width);
@@ -388,10 +392,12 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             load_enum(d->find("fit"), "display.fit", kFitNames, (int*)&out->display.fit);
             load_enum(d->find("filter"), "display.filter", kFilterNames, (int*)&out->display.filter);
             load_int_set(d->find("render_scale"), "display.render_scale", kRenderScales, std::size(kRenderScales), &out->display.render_scale);
-            load_bool(d->find("hires_scanout"), "display.hires_scanout", &out->display.hires_scanout);
-            if (out->display.hires_scanout && out->display.render_scale < 4) {
-                rt_log("settings", "settings: display.hires_scanout is set but display.render_scale is %d;"
-                    " hires scanout stays inert below 4x (value kept)", out->display.render_scale);
+            if (d->find("hires_scanout")) {
+                /* Retired key. It is not in the known-key list above, so it is
+                 * also reported by log_unknown_keys and kept in the file across
+                 * a save; this line says why it no longer does anything. */
+                rt_log("settings", "settings: display.hires_scanout is no longer a setting;"
+                    " display.render_scale 4 and up now requests high-resolution scanout");
             }
             load_bool(d->find("show_fps"), "display.show_fps", &out->display.show_fps);
         }
@@ -423,6 +429,17 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             load_float_range(i->find("right_deadzone"), "input.right_deadzone", 0.0, 0.95, false, &out->input.right_deadzone);
             load_float_range(i->find("trigger_threshold"), "input.trigger_threshold", 0.0, 1.0, true, &out->input.trigger_threshold);
             load_bool(i->find("rumble"), "input.rumble", &out->input.rumble);
+        }
+    }
+
+    if (const RtJson* g = dom.find("gameplay")) {
+        if (g->type != RtJson::Type::Object) {
+            rt_log("settings", "settings: \"gameplay\" is not an object (section kept as defaults)");
+        } else {
+            log_unknown_keys(*g, "gameplay", [](const std::string& k) {
+                return is_one_of(k, {"run_any_direction"});
+            });
+            load_bool(g->find("run_any_direction"), "gameplay.run_any_direction", &out->gameplay.run_any_direction);
         }
     }
 
@@ -488,7 +505,6 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     d.set("fit", RtJson::make_string(enum_name(kFitNames, (int)s.display.fit)));
     d.set("filter", RtJson::make_string(enum_name(kFilterNames, (int)s.display.filter)));
     d.set("render_scale", RtJson::make_number(s.display.render_scale));
-    d.set("hires_scanout", RtJson::make_bool(s.display.hires_scanout));
     d.set("show_fps", RtJson::make_bool(s.display.show_fps));
 
     RtJson& a = get_or_make_object(dom, "audio");
@@ -502,6 +518,9 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     in.set("right_deadzone", RtJson::make_number(s.input.right_deadzone));
     in.set("trigger_threshold", RtJson::make_number(s.input.trigger_threshold));
     in.set("rumble", RtJson::make_bool(s.input.rumble));
+
+    RtJson& g = get_or_make_object(dom, "gameplay");
+    g.set("run_any_direction", RtJson::make_bool(s.gameplay.run_any_direction));
 
     RtJson& dbg = get_or_make_object(dom, "debug");
     dbg.set("verbose", RtJson::make_string(s.debug.verbose));
@@ -854,14 +873,9 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
         if (cur->display.render_scale == allowed) rs_ok = true;
     }
     if (!rs_ok) {
-        rt_log("settings", "settings: display.render_scale = %d is not one of {1, 2, 4, 8, 16}; reverted to %d",
+        rt_log("settings", "settings: display.render_scale = %d is not one of {1, 4, 8, 16}; reverted to %d",
             cur->display.render_scale, prev.display.render_scale);
         cur->display.render_scale = prev.display.render_scale;
-    }
-
-    if (cur->display.hires_scanout && cur->display.render_scale < 4) {
-        rt_log("settings", "settings: display.hires_scanout is set but display.render_scale is %d;"
-            " hires scanout stays inert below 4x", cur->display.render_scale);
     }
 
     validate_binds(cur->input.keyboard, prev.input.keyboard, kKeyboardBinds, RT_KB_COUNT,

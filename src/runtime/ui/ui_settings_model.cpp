@@ -106,7 +106,6 @@ struct UiSettingsMirror {
     std::string fit;
     std::string filter;
     std::string render_scale;
-    bool hires_scanout = false;
     bool show_fps = false;
 
     /* audio */
@@ -131,6 +130,9 @@ struct UiSettingsMirror {
      * false, so "is there a message" has to be its own variable. */
     std::string rebind_status;
     bool has_rebind_status = false;
+
+    /* gameplay */
+    bool run_any_direction = false;
 
     /* debug */
     std::string verbose;
@@ -386,8 +388,11 @@ void settings_to_mirror() {
     g_m.present = name_of(kPresentModes, (int)s.display.present);
     g_m.fit = name_of(kFits, (int)s.display.fit);
     g_m.filter = name_of(kFilters, (int)s.display.filter);
+    /* Unlike window_size, this select needs no entry for a value the file
+     * holds: settings.cpp accepts only kRenderScales ({1, 4, 8, 16}), which
+     * is exactly the option list in menu.rml, so a retired 2 in the file is
+     * rejected at load and never reaches the mirror. */
     g_m.render_scale = fmt("%d", s.display.render_scale);
-    g_m.hires_scanout = s.display.hires_scanout;
     g_m.show_fps = s.display.show_fps;
 
     g_m.master_volume = s.audio.master_volume;
@@ -419,6 +424,8 @@ void settings_to_mirror() {
         g_m.gamepad_binds[i].capturing = false;
     }
 
+    g_m.run_any_direction = s.gameplay.run_any_direction;
+
     g_m.verbose = s.debug.verbose;
     g_m.log_file = s.debug.log_file;
     g_m.profile_fields = fmt("%d", s.debug.profile_fields);
@@ -446,7 +453,6 @@ void mirror_to_settings() {
 
     parse_size_field(g_m.window_size, &s.display.window_width, &s.display.window_height);
     parse_int_field(g_m.render_scale, "display.render_scale", &s.display.render_scale);
-    s.display.hires_scanout = g_m.hires_scanout;
     s.display.show_fps = g_m.show_fps;
 
     s.audio.master_volume = g_m.master_volume;
@@ -456,6 +462,8 @@ void mirror_to_settings() {
     s.input.right_deadzone = g_m.right_deadzone;
     s.input.trigger_threshold = g_m.trigger_threshold;
     s.input.rumble = g_m.rumble;
+
+    s.gameplay.run_any_direction = g_m.run_any_direction;
 
     s.debug.verbose = g_m.verbose;
     s.debug.log_file = g_m.log_file;
@@ -558,7 +566,6 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("fit", &g_m.fit);
     c.Bind("filter", &g_m.filter);
     c.Bind("render_scale", &g_m.render_scale);
-    c.Bind("hires_scanout", &g_m.hires_scanout);
     c.Bind("show_fps", &g_m.show_fps);
 
     c.Bind("master_volume", &g_m.master_volume);
@@ -605,6 +612,8 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("gamepad_binds", &g_m.gamepad_binds);
     c.Bind("rebind_status", &g_m.rebind_status);
     c.Bind("has_rebind_status", &g_m.has_rebind_status);
+
+    c.Bind("run_any_direction", &g_m.run_any_direction);
 
     c.Bind("verbose", &g_m.verbose);
     c.Bind("log_file", &g_m.log_file);

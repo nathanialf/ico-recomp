@@ -66,11 +66,15 @@ constexpr uint64_t kBusyRetry = 512;
 constexpr uint32_t kRpcPacketSize = 64;
 
 /* Minted virtual-IOP addresses. Server structs and per-service receive
- * buffers live in otherwise-unused IOP RAM well away from the 0xBD000
- * command buffer. */
-constexpr uint32_t kServerBase = 0x001A0000u;
+ * buffers sit below the sifcmd command buffer and the iopheap heap; the
+ * whole IOP address map is documented in rpc.h. kMaxServices is bounded by
+ * that map rather than by the service list: 17 services register today, and
+ * 24 x kBufStride is what fits between low memory and the command buffer.
+ * Overflowing it is a fatal in rt_rpc_register_service, never a silently
+ * dropped service. */
+constexpr uint32_t kServerBase = 0x00070000u;
 constexpr uint32_t kServerStride = 0x80;
-constexpr uint32_t kBufBase = 0x001C0000u;
+constexpr uint32_t kBufBase = 0x00010000u;
 constexpr uint32_t kBufStride = 0x4000; /* 16 KB staging per service */
 
 uint8_t g_iop_ram[RT_IOP_RAM_SIZE];
@@ -87,9 +91,14 @@ struct Service {
     uint64_t calls = 0;
 };
 
-constexpr int kMaxServices = 32;
+constexpr int kMaxServices = 24;
 Service g_services[kMaxServices];
 int g_service_count = 0;
+
+static_assert(kBufBase + uint32_t(kMaxServices) * kBufStride <= kServerBase,
+    "RPC staging buffers run into the minted server structs");
+static_assert(kServerBase + uint32_t(kMaxServices) * kServerStride <= RT_SIF_IOP_CMDBUF,
+    "minted server structs run into the sifcmd command buffer");
 
 struct Delivery {
     enum class Kind { CmdPacket, FreeEePkt } kind;

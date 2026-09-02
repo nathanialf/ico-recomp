@@ -8,6 +8,7 @@
  *                reference)
  *   intc.cpp     INTC/DMAC handler registries + delivery, GS CSR/IMR shadow
  *   timers.cpp   EE timers T0-T3 driven by the virtual clock
+ *   alarms.cpp   EE kernel alarms (SetAlarm/ReleaseAlarm) on the same clock
  *   ../sif/sif.cpp SIF register file, SifSetDma recording, entry into the
  *                RPC layer
  *   ../sif/rpc.cpp sifrpc protocol HLE (virtual IOP RAM, service registry,
@@ -45,6 +46,15 @@ constexpr uint64_t RT_BUSCLK_HZ = 147456000ull;
 constexpr uint64_t RT_CYCLES_PER_FIELD = 2460060ull;
 /* Vertical blank ~22 lines of a 262.5-line field. */
 constexpr uint64_t RT_CYCLES_VBLANK = 206184ull;
+/* One NTSC H-blank in bus cycles. Both the timers' HBLNK prescale and the
+ * EE kernel's alarm clock count these. Derived from the field timeline
+ * (262.5 lines per field): 2460060 * 2 / 525 = 9371 cycles, so
+ * 147456000 / 9371 = 15735.7 Hz against the NTSC line rate of 15734.26 Hz,
+ * the difference being the rounding of the field length. Deriving it from
+ * the field rather than from 147456000 / 15734.26 = 9372 keeps one clock
+ * authority: the alarm clock, the H-blank timers and the vblank timeline
+ * all count the same line. */
+constexpr uint64_t RT_CYCLES_PER_HBLANK = RT_CYCLES_PER_FIELD * 2 / 525;
 
 uint64_t rt_clock_now();
 /* Advances virtual time; raises due timeline events (vblank INTC bits, timer
@@ -57,6 +67,8 @@ uint64_t rt_timers_next_event();
 void rt_timers_run_due();
 uint64_t rt_sif_next_event();
 void rt_sif_run_due();
+uint64_t rt_alarms_next_event();
+void rt_alarms_run_due();
 
 /* Called by mmio.cpp on every MMIO access: small clock advance so guest
  * poll loops make time progress, then pending-interrupt delivery. */
@@ -144,6 +156,14 @@ int rt_dmac_remove_handler(int ch, int hid);
 int rt_dmac_enable(int ch);
 int rt_dmac_disable(int ch);
 
+/* Run a guest function the way the kernel runs an interrupt handler: a
+ * zeroed context, a0/a1/a2 as given, the $gp recorded when the handler was
+ * registered, the dedicated interrupt stack, and the clean-exit ra
+ * sentinel so a plain `jr $31` return lands back here. Returns $v0. Used by
+ * INTC/DMAC dispatch and by alarms.cpp. */
+uint32_t rt_intc_run_handler(uint32_t vram, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t gp,
+                             int32_t sp_delta = 0);
+
 void rt_intc_raise(int cause);
 void rt_dmac_raise(int ch);
 /* Dispatch pending INTC/DMAC handlers on the interrupt context, then check
@@ -167,6 +187,19 @@ void rt_gs_put_imr(uint64_t v);
 void rt_timers_init();
 bool rt_timers_mmio_read(uint32_t addr, uint32_t* out);
 bool rt_timers_mmio_write(uint32_t addr, uint32_t v);
+
+/* ---- alarms (alarms.cpp) ------------------------------------------------ */
+
+/* SetAlarm/ReleaseAlarm. `time` is in H-blank ticks; `gp` is the caller's
+ * $gp, restored for the handler call. rt_alarm_set returns the alarm id or
+ * -1 when the table is full; rt_alarm_release returns the id or -1 when it
+ * is not armed. Both i-variants behave identically. */
+int rt_alarm_set(uint32_t time, uint32_t handler, uint32_t arg, uint32_t gp);
+int rt_alarm_release(int id);
+/* True when an alarm came due and its handler has not run yet. Alarm
+ * handlers are dispatched from rt_intc_deliver(), not from rt_clock_tick. */
+bool rt_alarms_pending();
+void rt_alarms_dispatch_pending();
 
 /* ---- SIF (../sif/sif.cpp) ----------------------------------------------- */
 
