@@ -66,7 +66,9 @@ typedef struct RC_ALIGN(16) Vu1State {
     uint32_t xtop;       /* quadword address given by VIF1 TOPS at MSCAL */
     uint32_t itop;
     uint32_t pc;         /* entry offset in bytes into micro mem; set by MSCAL/MSCNT */
-    uint8_t  mem[16384]; /* VU1 data memory, 16-byte aligned */
+    uint8_t  mem[16384]; /* VU1 data memory. The struct is 16-byte aligned but
+                          * this member sits at offset 604, so mem itself is
+                          * only 4-byte aligned; use unaligned loads/stores. */
 } Vu1State;
 
 /* Full EE guest context. One per guest thread. Generated code receives a

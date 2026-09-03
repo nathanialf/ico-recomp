@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -74,6 +75,9 @@ struct RtPgs {
     uint64_t read_priv(uint32_t offset);
     uint32_t vsync(unsigned field);
     void report_stats();
+    /* See rt_pgs_present_timings in gs_parallel_api.h. Reading clears. */
+    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
+                         uint64_t* present_ns, uint64_t* fields);
 
     /* Window control / event pump inversion (shim 3); see gs_parallel_api.h. */
     void* window_handle();
@@ -254,9 +258,37 @@ private:
     std::unique_ptr<Vulkan::WSI> m_wsi;
 #endif
     Vulkan::Device* m_device = nullptr; /* whichever of the above is live */
+    /* Vulkan pipeline cache persistence (gs_parallel_present.cpp). The
+     * standalone paraLLEl-GS build turns Granite's own cache file handling
+     * off (GRANITE_VULKAN_SYSTEM_HANDLES), so without these two calls every
+     * run compiles every pipeline from scratch: about three seconds of the
+     * first field window on the EE thread, and a synchronous compile for
+     * any variant first met mid-run. The file lives in cache/ next to the
+     * executable (SDL_GetBasePath), which is writable for the packaged
+     * layout this port ships and is not for a system-wide install: the
+     * store there logs and gives up rather than failing the run. A stale or
+     * foreign file is rejected by Granite's own checks, never the driver's,
+     * and the load starts from an empty cache when that happens. */
+    void pipeline_cache_load();
+    void pipeline_cache_store();
+    std::string m_pipeline_cache_path;
     std::unique_ptr<ParallelGS::GSInterface> m_iface;
     const char* m_screenshot_path = nullptr;
     uint64_t m_vsyncs = 0;
+
+    /* Present-path timings since the host last read them (vsync stamps
+     * them, present_timings clears them). Three steady_clock pairs per
+     * field, which is nothing next to the work they bracket.
+     *
+     * Plain integers, not atomics, because vsync and present_timings are
+     * both called from the host's EE thread today (gs/gs_threaded.cpp
+     * drains its ring inline). They have to become atomics on the day that
+     * ring gets a worker thread, since vsync would then write them while
+     * the profiler reads and clears them. */
+    uint64_t m_flush_ns = 0;
+    uint64_t m_scanout_ns = 0;
+    uint64_t m_present_ns = 0;
+    uint64_t m_timing_fields = 0;
     bool m_transfer_since_vsync = false;
     bool m_wsi_active = false;
     bool m_window_closed = false;

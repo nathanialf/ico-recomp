@@ -11,18 +11,18 @@
  *   display.mode                 hot   rt_window_apply_mode (SDL fullscreen
  *                                       + notify_resize)
  *   display.window_width/height  hot   rt_window_apply_mode, same call
- *   display.fit, display.filter  hot   rt_pgs_set_presentation (only stores;
- *                                       safe any time between frames)
- *   display.raster               hot   rt_pgs_set_raster (only stores; the
- *                                       next vsync reads it)
- *   display.deinterlace          hot   rt_pgs_set_deinterlace (only stores;
+ *   display.fit, display.filter  hot   GsBackend::set_presentation (only
+ *                                       stores; safe any time between frames)
+ *   display.raster               hot   GsBackend::set_raster (only stores;
  *                                       the next vsync reads it)
- *   display.present              warm  queued; rt_pgs_set_present_mode
+ *   display.deinterlace          hot   GsBackend::set_deinterlace (only
+ *                                       stores; the next vsync reads it)
+ *   display.present              warm  queued; GsBackend::set_present_mode
  *                                       touches the swapchain, so it applies
  *                                       from rt_settings_apply_pending() at
  *                                       the field boundary, never here
  *   display.render_scale         warm  queued the same way, applied via
- *                                       rt_pgs_set_render_scale
+ *                                       GsBackend::set_render_scale
  *   display.remember_window_size hot   read fresh by host/window.cpp's
  *                                       resize handler on every resize
  *                                       event; nothing to push here
@@ -49,16 +49,26 @@
  * applier for that reason: every control it exposes outside display.* was
  * already read fresh.
  *
- * Every rt_pgs_* call is guarded on rt_gs_parallel_handle() != nullptr: a
- * dump-only run, a headless live run, or a build with no paraLLEl-GS backend
- * at all all have no window/renderer to push these into, and window.cpp's
- * rt_window_apply_mode / rt_gs_parallel_handle stub already make the hot
- * window path a safe no-op in exactly those cases.
+ * These three go through the GS backend (gs/gs_backend.h) rather than
+ * calling the paraLLEl-GS library on rt_gs_parallel_handle() directly, which
+ * is what they used to do. The backend is about to become a command ring
+ * with a worker thread on the far end (gs/gs_threaded.cpp): a call that
+ * skips it would be invisible to the ring and so would arrive out of order
+ * against the GIF and priv traffic it has to stay ordered against. The dump
+ * backend's defaults for all three are no-ops, so a dump-only run behaves as
+ * it did when the guard below excluded it.
+ *
+ * The guard is rt_gs_backend_if_created() != nullptr rather than
+ * rt_gs_backend(): a settings change that lands before rt_hw_init() has
+ * nothing to push into, and this file must not be what builds the backend
+ * (see gs_backend.h). window.cpp's rt_window_apply_mode already makes the
+ * hot window path a safe no-op when there is no window.
  */
 #include "settings.h"
 
 #include "window.h"
 
+#include "../gs/gs_backend.h"
 #include "../runtime.h"
 
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
@@ -145,15 +155,15 @@ void rt_settings_apply(const RtSettings& before, const RtSettings& now) {
     }
 
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (pgs && (before.display.fit != now.display.fit || before.display.filter != now.display.filter)) {
-        rt_pgs_set_presentation(pgs, fit_to_pgs(now.display.fit), filter_to_pgs(now.display.filter));
+    GsBackend* gs = rt_gs_backend_if_created();
+    if (gs && (before.display.fit != now.display.fit || before.display.filter != now.display.filter)) {
+        gs->set_presentation(fit_to_pgs(now.display.fit), filter_to_pgs(now.display.filter));
     }
-    if (pgs && before.display.raster != now.display.raster) {
-        rt_pgs_set_raster(pgs, raster_to_pgs(now.display.raster));
+    if (gs && before.display.raster != now.display.raster) {
+        gs->set_raster(raster_to_pgs(now.display.raster));
     }
-    if (pgs && before.display.deinterlace != now.display.deinterlace) {
-        rt_pgs_set_deinterlace(pgs, deinterlace_to_pgs(now.display.deinterlace));
+    if (gs && before.display.deinterlace != now.display.deinterlace) {
+        gs->set_deinterlace(deinterlace_to_pgs(now.display.deinterlace));
     }
 
     if (before.display.present != now.display.present) {
@@ -186,20 +196,20 @@ void rt_settings_apply_pending() {
     rt_settings_flush_save_if_due();
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
     if (!g_pending.present_mode && !g_pending.render_scale) return;
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) {
-        /* Nothing to apply to (headless or no live backend); drop rather
+    GsBackend* gs = rt_gs_backend_if_created();
+    if (!gs) {
+        /* Nothing to apply to (the backend does not exist yet); drop rather
          * than carry stale requests forward indefinitely. */
         g_pending = {};
         return;
     }
     if (g_pending.present_mode) {
         g_pending.present_mode = false;
-        rt_pgs_set_present_mode(pgs, g_pending.present_mode_value);
+        gs->set_present_mode(g_pending.present_mode_value);
     }
     if (g_pending.render_scale) {
         g_pending.render_scale = false;
-        rt_pgs_set_render_scale(pgs, g_pending.render_scale_factor);
+        gs->set_render_scale(g_pending.render_scale_factor);
     }
 #endif
 }

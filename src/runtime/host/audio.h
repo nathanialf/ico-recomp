@@ -26,6 +26,15 @@
 
 constexpr uint32_t RT_AUDIO_RATE = 48000;
 
+/* The audio cushion: frames of sound held ahead of the device, which is
+ * both the prime size at device open (host/audio.cpp) and the depth the
+ * frame pacer steers the queue back to (hw/gspriv.cpp pace_field). 4800
+ * frames is 100 ms at 48 kHz, six NTSC fields of mix. The two uses have to
+ * be the same number: the pacer's target is what the prime fills, and the
+ * pacer will run unpaced to repay at most this much missing audio after a
+ * stall. Host-side pacing only; no guest-visible value depends on it. */
+constexpr uint32_t RT_AUDIO_CUSHION_FRAMES = 4800;
+
 /* Idempotent. Called lazily by the engine on the first rendered buffer. */
 void rt_audio_init();
 
@@ -46,6 +55,11 @@ int rt_audio_queued_frames();
  * wall time this is the true playback rate: above the device rate the sound
  * plays fast, below it the device starves. */
 uint64_t rt_audio_window_frames();
+
+/* Frames handed to the device since startup, never cleared. The pacer
+ * compares two readings a field apart to know whether the sound task fed
+ * the device at all in between (hw/gspriv.cpp pace_field). */
+uint64_t rt_audio_total_frames();
 
 /* Window statistics for the profile report, cleared on read: minimum,
  * mean and maximum queue depth in frames, plus the number of submits that

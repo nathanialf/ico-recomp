@@ -17,8 +17,17 @@
  * Unknown ICORECOMP_GS values are fatal (loud failure beats silent
  * wrongness). ICORECOMP_GS=parallel|both without the parallel-gs build
  * (see CMakeLists.txt, ICORECOMP_HAVE_PARALLEL_GS) is fatal too.
+ *
+ * Whichever of the three is built is then wrapped in gs_threaded.cpp's
+ * ThreadedBackend, which encodes every call into the GS command ring and
+ * (today) replays it inline. ICORECOMP_GS_THREAD=0 leaves the wrapper out
+ * and hands out the inner backend directly. That is a developer bisect
+ * switch for "is the ring responsible for this?", not a user-facing choice,
+ * so it is an environment variable only and has no settings.json twin.
  */
 #include "gs_backend.h"
+
+#include "gs_threaded.h"
 
 #include "runtime.h"
 
@@ -61,6 +70,40 @@ public:
         m_live->report_stats();
         m_dump->report_stats();
     }
+
+    /* Only the live backend has a present path; the dump writer has none. */
+    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
+                         uint64_t* present_ns, uint64_t* fields) override {
+        m_live->present_timings(flush_ns, scanout_ns, present_ns, fields);
+    }
+
+    /* Presentation and overlay control: the live backend only. The dump
+     * writer records the GS command stream, and none of these are part of
+     * it; they are window and compositor state. Its GsBackend defaults are
+     * no-ops, so calling through would be harmless but misleading. */
+    void set_presentation(uint32_t fit, uint32_t filter) override {
+        m_live->set_presentation(fit, filter);
+    }
+
+    void set_present_mode(uint32_t mode) override { m_live->set_present_mode(mode); }
+    void set_render_scale(uint32_t factor) override { m_live->set_render_scale(factor); }
+    void set_raster(uint32_t raster) override { m_live->set_raster(raster); }
+    void set_deinterlace(uint32_t deinterlace) override { m_live->set_deinterlace(deinterlace); }
+
+    uint32_t overlay_texture_create(const uint8_t* rgba8, uint32_t width,
+                                    uint32_t height) override {
+        return m_live->overlay_texture_create(rgba8, width, height);
+    }
+
+    void overlay_texture_destroy(uint32_t texture) override {
+        m_live->overlay_texture_destroy(texture);
+    }
+
+    void overlay_set_frame(const RtPgsOverlayFrame* frame) override {
+        m_live->overlay_set_frame(frame);
+    }
+
+    uint32_t present_ui() override { return m_live->present_ui(); }
 
 private:
     GsBackend* m_live;
@@ -141,10 +184,24 @@ bool rt_gs_backend_selects_live() {
 #endif
 }
 
+GsBackend* rt_gs_backend_if_created() {
+    return g_backend;
+}
+
 GsBackend* rt_gs_backend() {
     if (!g_backend) {
-        g_backend = make_backend(std::getenv("ICORECOMP_GS"),
-                                 std::getenv("ICORECOMP_GS_DUMP"));
+        GsBackend* inner = make_backend(std::getenv("ICORECOMP_GS"),
+                                        std::getenv("ICORECOMP_GS_DUMP"));
+        const char* thread = std::getenv("ICORECOMP_GS_THREAD");
+        if (thread && std::strcmp(thread, "0") == 0) {
+            rt_log("gs", "ICORECOMP_GS_THREAD=0: GS calls go straight to the backend, "
+                         "no command ring");
+            g_backend = inner;
+        } else {
+            rt_log("gs", "GS command ring active (gs_threaded.cpp, drained inline); "
+                         "set ICORECOMP_GS_THREAD=0 to bypass it");
+            g_backend = rt_gs_make_threaded_backend(inner);
+        }
         std::atexit(backend_atexit);
     }
     return g_backend;

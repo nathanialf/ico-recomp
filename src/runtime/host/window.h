@@ -22,7 +22,17 @@
 /* Opaque handle to the live backend, defined in gs_parallel_api.h (the
  * MIT/LGPL C ABI boundary). Forward-declared here rather than pulling that
  * header in for every window.h includer; window.cpp includes it for the
- * rt_pgs_* calls it makes. */
+ * rt_pgs_* calls it makes.
+ *
+ * Everything that changes what the GS renders or presents now goes through
+ * GsBackend (gs/gs_backend.h) so the GS command ring in gs/gs_threaded.cpp
+ * sees it in order. The three calls window.cpp still makes on this handle
+ * are the exceptions, and stay that way: rt_pgs_window_handle is a pointer
+ * read, and rt_pgs_notify_quit and rt_pgs_notify_resize set a flag the
+ * library reads at its next frame. None of them is a GS command, none of
+ * them may block, and the reentrancy contract above requires them to work
+ * from inside WSI::begin_frame, which is exactly where a ring record could
+ * not be drained. */
 struct RtPgs;
 
 /* The live backend's RtPgs*, or nullptr when there is none (dump backend,

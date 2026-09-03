@@ -11,9 +11,21 @@
 #include "gs_interface.hpp"
 #include "gs_readback.h"
 
+#include <chrono>
 #include <cstring>
 
 namespace {
+
+/* Present-path timings, reported to the host through
+ * rt_pgs_present_timings. The host's profiler bills the whole vsync hook to
+ * one "present" bucket and cannot see inside this library, so the split
+ * between renderer flush, scanout and swapchain present is measured here. */
+using PgsProfClock = std::chrono::steady_clock;
+
+uint64_t elapsed_ns(PgsProfClock::time_point since) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        PgsProfClock::now() - since).count();
+}
 
 /* Scanout aspect ratio.
  *
@@ -217,7 +229,10 @@ uint32_t RtPgs::vsync(unsigned field) {
     const bool presented = m_transfer_since_vsync;
     m_transfer_since_vsync = false;
 
+    ++m_timing_fields;
+    const auto t_flush = PgsProfClock::now();
     m_iface->flush();
+    m_flush_ns += elapsed_ns(t_flush);
 
     ParallelGS::VSyncInfo info = {};
     /* The phase is the vertical position the field in VRAM was drawn for,
@@ -645,7 +660,9 @@ uint32_t RtPgs::vsync(unsigned field) {
     info.dst_stage = VK_PIPELINE_STAGE_2_BLIT_BIT;
     info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
 
+    const auto t_scanout = PgsProfClock::now();
     ParallelGS::ScanoutResult scanout = m_iface->vsync(info);
+    m_scanout_ns += elapsed_ns(t_scanout);
 
     /* Logged here rather than in present() so headless runs report it too,
      * and once per geometry change so a mode switch is visible without
@@ -987,7 +1004,9 @@ uint32_t RtPgs::vsync(unsigned field) {
             m_held_scanout = {};
             m_held_aspect = 0.0;
         }
+        const auto t_present = PgsProfClock::now();
         present(*to_present, present_aspect);
+        m_present_ns += elapsed_ns(t_present);
     }
 #endif
     if (m_screenshot_path && scanout.image) {

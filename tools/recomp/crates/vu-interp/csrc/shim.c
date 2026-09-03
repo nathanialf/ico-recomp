@@ -176,3 +176,93 @@ uint32_t x_qwaddr(uint32_t qw) { return rc_vu1_qwaddr(qw); }
 uint32_t x_hash(const uint8_t* bytes, uint32_t len) {
     return rc_vu1_hash(bytes, len);
 }
+
+/* ---- scalar twins, for the helper equivalence test -----------------------
+ * recomp_ops.h keeps every VU1 lane helper twice: the branch-free SSE2 form
+ * under the public name and the original one-lane-at-a-time body under a
+ * _scalar suffix. tests/helpers.rs calls both through these exports and
+ * requires them to agree bit for bit, so the vector rewrite is checked
+ * against the semantics it claims to preserve rather than against itself.
+ * On a target without SSE2 the two names are the same code and the test
+ * still passes, trivially; x_sse2_active says which case ran. */
+
+int x_sse2_active(void) {
+#ifdef RC_VU_SSE2
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void x_write_scalar(Vu1State* vu, int fd, int mask, const uint8_t* p) {
+    rc_u128 v;
+    memcpy(&v, p, 16);
+    rc_vu1_write_scalar(vu, fd, mask, v);
+}
+void x_fmac_calc_scalar(const Vu1State* vu, int kind, int fs, int ft, int sel,
+                        int mask, uint32_t* mac_out, uint8_t* out) {
+    rc_u128 r = rc_vu1_fmac_calc_scalar(vu, kind, fs, ft, sel, mask, mac_out);
+    memcpy(out, &r, 16);
+}
+void x_commit_vf_scalar(Vu1State* vu, int fd, int mask, const uint8_t* p,
+                        uint32_t mac) {
+    rc_u128 r;
+    memcpy(&r, p, 16);
+    rc_vu1_commit_vf_scalar(vu, fd, mask, r, mac);
+}
+void x_commit_acc_scalar(Vu1State* vu, int mask, const uint8_t* p, uint32_t mac) {
+    rc_u128 r;
+    memcpy(&r, p, 16);
+    rc_vu1_commit_acc_scalar(vu, mask, r, mac);
+}
+void x_maxmin_calc_scalar(const Vu1State* vu, int is_min, int fs, int ft,
+                          int sel, uint8_t* out) {
+    rc_u128 r = rc_vu1_maxmin_calc_scalar(vu, is_min, fs, ft, sel);
+    memcpy(out, &r, 16);
+}
+void x_abs_calc_scalar(const Vu1State* vu, int fs, uint8_t* out) {
+    rc_u128 r = rc_vu1_abs_calc_scalar(vu, fs);
+    memcpy(out, &r, 16);
+}
+void x_ftoi_calc_scalar(const Vu1State* vu, int shift, int fs, uint8_t* out) {
+    rc_u128 r = rc_vu1_ftoi_calc_scalar(vu, shift, fs);
+    memcpy(out, &r, 16);
+}
+void x_itof_calc_scalar(const Vu1State* vu, int shift, int fs, uint8_t* out) {
+    rc_u128 r = rc_vu1_itof_calc_scalar(vu, shift, fs);
+    memcpy(out, &r, 16);
+}
+uint32_t x_clip_calc_scalar(const Vu1State* vu, int fs, int ft) {
+    return rc_vu1_clip_calc_scalar(vu, fs, ft);
+}
+void x_sq_scalar(Vu1State* vu, int fs, int mask, uint32_t qw) {
+    rc_vu1_sq_scalar(vu, fs, mask, qw);
+}
+
+/* ---- MXCSR control, for the FTZ/DAZ pass of the equivalence test --------
+ * The runtime sets FTZ (MXCSR bit 15) and DAZ (bit 6) on every
+ * guest-executing thread (src/runtime/main.cpp), so the mode the helpers
+ * actually run in is not the host default a `cargo test` process starts
+ * with. tests/helpers.rs runs the corpus sweep once in each mode; both the
+ * SSE2 and the scalar form are driven under whatever MXCSR is in force, so
+ * the comparison stays like for like either way. x_set_ftz_daz returns the
+ * previous MXCSR for x_set_mxcsr to restore. On a target without SSE2
+ * there is no MXCSR and both are no-ops. */
+
+uint32_t x_set_ftz_daz(void) {
+#ifdef RC_VU_SSE2
+    unsigned int prev = _mm_getcsr();
+    _mm_setcsr(prev | 0x8000u | 0x0040u);
+    return (uint32_t)prev;
+#else
+    return 0u;
+#endif
+}
+
+void x_set_mxcsr(uint32_t v) {
+#ifdef RC_VU_SSE2
+    _mm_setcsr((unsigned int)v);
+#else
+    (void)v;
+#endif
+}

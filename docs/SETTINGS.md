@@ -235,6 +235,21 @@ turns off, so a later re-enable logs again.
 | profile_fields | int | [0, 100000]; 0 disables the profiler | 180 | hot | `ICORECOMP_PROFILE` |
 | fps_limit_hz | double | 0, or [1, 1000]; 0 disables pacing | 59.94 | hot | `ICORECOMP_FPS_LIMIT` |
 
+Each profile summary ends with a `fields:` line: the longest host field
+interval in the window, how many fields ran over 20 ms and over 50 ms, how
+many were catch-up fields (fields the limiter did not hold back, because the
+audio debt had already put the deadline in the past or because the queue held
+less than one field of mix), and the longest single disc read. A `longest
+field` line under it breaks that field down by bucket, largest first, which
+is what separates a GPU wait (present, gs) from a host read (disc) or a decode
+(ipu) when one field stalls. Both lines measure fields between consecutive
+profiler boundaries, so a field's own pacing sleep is billed to the field
+after it. Where a backend has a present path, a `present flush / scanout / present_frame` line under it
+names three spans inside the `present` bucket, so a field lost to the
+swapchain and a field lost to the renderer can be told apart. The bucket table
+above them is an average over the whole window, which is the wrong shape for a
+stutter; these are the extremes in it.
+
 ### launcher
 
 | key | type | allowed / range | default | apply | env override |
@@ -500,6 +515,19 @@ a real, untouched controller would produce, not a fabricated one. Pausing
 the simulation while the menu is up is out of scope for v1, because the
 frame pacer is locked to the audio device's clock and pausing it cleanly is
 its own piece of work.
+
+That lock works off a 100 ms cushion (`RT_AUDIO_CUSHION_FRAMES`, 4800 frames
+at 48 kHz): the audio device is primed with that much silence at open, and
+the pacer steers the queue back to that depth. After a stall the pacer does
+not throw the lost time away. It treats the frames the device is short of
+the cushion as a debt and runs fields unpaced until exactly that much audio
+has been put back, which is at most six fields of guest time, then resumes
+normal pacing. It never waits at all while the queue holds less than one
+field of mix and the sound task is still feeding the device. The cushion
+is also the audio latency: sound plays 100 ms behind the field that mixed
+it, up from 50 ms, a deliberate trade for absorbing stalls up to that long
+without a gap. This is host-side pacing only: it decides when a field is
+produced and changes no value the game supplied.
 
 Scripted runs (`ICORECOMP_INPUT_SCRIPT`) never bring the menu up at all:
 `main.cpp` skips `rt_ui_init()` entirely when that variable is set, so a

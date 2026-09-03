@@ -72,7 +72,7 @@ namespace {
 
 constexpr uint32_t kVuDataBytes = 16384;
 constexpr uint32_t kVuDataQw = kVuDataBytes / 16;
-constexpr uint32_t kWindowSkew = 12; /* (16 - offsetof(Vu1State, mem) % 16) % 16 */
+constexpr uint32_t kWindowSkew = 12; /* offsetof(Vu1State, mem) % 16 */
 
 uint8_t* g_window = nullptr;  /* 64 KB guest-visible window base */
 Vu1State* g_vu1 = nullptr;
@@ -346,12 +346,12 @@ extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
     static const bool geom = rt_verbose("geom");
     if (geom) rt_geom_note_clip(vu->clip, g_bound_hash);
     uint32_t addr = qw_addr & (kVuDataQw - 1);
+    const uint32_t start_addr = addr;
 
     /* Walk GIF tags to find the packet end (EOP), handling the 16 KB wrap.
-     * Collect into a scratch buffer so the backend sees one contiguous
-     * packet. */
-    static std::vector<uint8_t> buf;
-    buf.clear();
+     * Only the total quadword count is needed here; the bytes themselves
+     * are fetched once, after the length is known, below. */
+    uint32_t total_qw = 0;
     bool eop = false;
     for (uint32_t guard = 0; !eop && guard < kVuDataQw; ++guard) {
         const uint8_t* tag = vu->mem + (size_t)addr * 16;
@@ -372,19 +372,55 @@ extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
             rt_log("vu1", "xgkick: malformed GIF tag at qw 0x%x (len %u qw), truncating packet", addr, len);
             break;
         }
-        for (uint32_t q = 0; q < len; ++q) {
-            const uint8_t* src = vu->mem + (size_t)((addr + q) & (kVuDataQw - 1)) * 16;
-            buf.insert(buf.end(), src, src + 16);
-        }
+        total_qw += len;
         addr = (addr + len) & (kVuDataQw - 1);
     }
-    if (!eop && is_pow2(g_xgkicks)) {
-        rt_log("vu1", "xgkick #%" PRIu64 ": no EOP within VU1 data memory, packet dropped", g_xgkicks);
+    if (!eop) {
+        /* The tag walk never reached EOP, so the packet has no known
+         * extent and there is nothing defined to submit. Drop it every
+         * time; only the log line is sampled, because a stream that
+         * produces one malformed packet produces them by the thousand. */
+        if (is_pow2(g_xgkicks)) {
+            rt_log("vu1", "xgkick #%" PRIu64 ": no EOP within VU1 data memory, packet dropped", g_xgkicks);
+        }
         return;
     }
     if (is_pow2(g_xgkicks)) {
-        rt_log("vu1", "xgkick #%" PRIu64 ": qw_addr=0x%x -> PATH1 packet of %zu qw",
-            g_xgkicks, qw_addr, buf.size() / 16);
+        rt_log("vu1", "xgkick #%" PRIu64 ": qw_addr=0x%x -> PATH1 packet of %u qw",
+            g_xgkicks, qw_addr, total_qw);
     }
-    if (!buf.empty()) rt_gif_submit(0, buf.data(), (uint32_t)(buf.size() / 16));
+    if (total_qw == 0) return;
+    if (total_qw > kVuDataQw) {
+        /* Cannot happen for any real packet (VU1 data memory itself only
+         * holds kVuDataQw quadwords), but variable tag lengths mean the
+         * address walk is not guaranteed to land back on start_addr before
+         * this could in principle be exceeded. Guard the fixed packet
+         * buffer below rather than overflow it silently. */
+        rt_log("vu1", "xgkick #%" PRIu64 ": packet of %u qw exceeds VU1 data memory, dropped",
+            g_xgkicks, total_qw);
+        return;
+    }
+
+    /* The packet is always copied into this buffer before it is handed
+     * on, even when it does not wrap. Vu1State::mem sits at struct offset
+     * 604 (see recomp_context.h), so vu->mem + qw * 16 is 12 mod 16, and
+     * paraLLEl-GS's gif_transfer reads the buffer it is given through
+     * GIFTagBits and uint64_t pointers, which need 8-byte alignment.
+     * Submitting straight out of data memory would hand every backend a
+     * misaligned packet; the copy is what makes the pointer 16-byte
+     * aligned, on every backend, with or without the threaded wrapper and
+     * its ring. It also keeps the packet contiguous across the 16 KB
+     * wrap, which is why the wrapping case needs two memcpy calls (the
+     * head up to the end of data memory, then the tail from the start)
+     * where the common case needs one. */
+    alignas(16) static uint8_t packet_buf[kVuDataQw * 16];
+    if (start_addr + total_qw <= kVuDataQw) {
+        std::memcpy(packet_buf, vu->mem + (size_t)start_addr * 16, (size_t)total_qw * 16);
+    } else {
+        const uint32_t head_qw = kVuDataQw - start_addr;
+        const uint32_t tail_qw = total_qw - head_qw;
+        std::memcpy(packet_buf, vu->mem + (size_t)start_addr * 16, (size_t)head_qw * 16);
+        std::memcpy(packet_buf + (size_t)head_qw * 16, vu->mem, (size_t)tail_qw * 16);
+    }
+    rt_gif_submit(0, packet_buf, total_qw);
 }

@@ -108,19 +108,25 @@ constexpr uint32_t kMaxQueuedBytes = RT_AUDIO_RATE * 2 * sizeof(float);
 /* Frames of silence held ahead of the device. The device starts consuming
  * the moment it is resumed and a mix only arrives when the game issues its
  * sndn2 flush, so without a cushion that gap is an immediate underrun and
- * every later hitch has nothing to absorb it. */
-constexpr uint32_t kPrimeFrames = RT_AUDIO_RATE / 20; /* 50 ms */
+ * every later hitch has nothing to absorb it.
+ *
+ * The size is RT_AUDIO_CUSHION_FRAMES, the same constant hw/gspriv.cpp's
+ * pace_field uses as its target queue depth, so the prime lands the queue
+ * exactly where the pacer wants to hold it. This is a host-side pacing
+ * decision: it changes when the host produces a field, never a value the
+ * game supplied or computed. */
+constexpr uint32_t kPrimeFrames = RT_AUDIO_CUSHION_FRAMES;
 
 /* Called once, at device open, and never again while the run continues.
  * Re-priming a queue that has run empty would be worse than the gap it
  * tries to cover: hw/gspriv.cpp's pace_field makes this queue the master
- * clock and steers the field period by its depth against a 2400-frame
- * target, so pushing 2400 frames of silence in behind a starving queue
- * puts the depth back on target and the limiter stops correcting, while
- * the silence itself is spliced ahead of the real mix as an audible gap
- * and a permanent 50 ms shift that stacks on every repeat. A submit that
- * finds the queue empty is counted in the underrun stat instead, and the
- * profile block's queue-depth line reports it. */
+ * clock and steers the field period by its depth against a
+ * RT_AUDIO_CUSHION_FRAMES target, so pushing a full cushion of silence in
+ * behind a starving queue puts the depth back on target and the limiter
+ * stops correcting, while the silence itself is spliced ahead of the real
+ * mix as an audible gap and a permanent 100 ms shift that stacks on every
+ * repeat. A submit that finds the queue empty is counted in the underrun
+ * stat instead, and the profile block's queue-depth line reports it. */
 void prime_cushion() {
     if (!g_sdl_stream) return;
     static float silence[kPrimeFrames * 2] = {0.0f};
@@ -160,7 +166,8 @@ void sdl_open() {
     prime_cushion();
     SDL_ResumeAudioStreamDevice(g_sdl_stream);
     rt_log("audio", "SDL3 audio stream open (driver=%s, 48000 Hz stereo f32, "
-                    "50 ms primed)", SDL_GetCurrentAudioDriver());
+                    "%.0f ms primed)", SDL_GetCurrentAudioDriver(),
+        1000.0 * (double)kPrimeFrames / (double)RT_AUDIO_RATE);
 }
 
 /* Queue-depth telemetry. The sink previously reported only the overrun
@@ -229,6 +236,8 @@ uint64_t g_total_frames = 0;
 } // namespace
 
 uint64_t g_window_frames_submitted = 0;
+
+uint64_t rt_audio_total_frames() { return g_total_frames; }
 
 uint64_t rt_audio_window_frames() {
     uint64_t v = g_window_frames_submitted;

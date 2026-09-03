@@ -104,6 +104,20 @@ namespace {
  * are never paced. */
 using PaceClock = std::chrono::steady_clock;
 
+/* Field-boundary diagnostics for the profile summary (prof.h's
+ * RtGsFieldProf). Counted only while the instrument is on and cleared by
+ * the read, so each window's numbers describe that window alone. The
+ * bucket table is an average; a stutter is one field, and only the
+ * extremes show it.
+ *
+ * g_catch_up_fields counts fields that ran without waiting, which is not
+ * the same as fields that repaid something: with the queue at the cushion
+ * the deficit is zero and any field that merely overran its period is
+ * counted too. It is a "the limiter did not hold this field back" count,
+ * and a steady stream of them means the host is not making the field
+ * rate. */
+uint32_t g_catch_up_fields = 0;
+
 double pace_period_seconds() {
     if (std::getenv("ICORECOMP_MAX_VBLANKS")) return 0.0;
 
@@ -130,6 +144,11 @@ double pace_period_seconds() {
 }
 
 void pace_field() {
+    /* The settings read stays outside the zone below. pace_period_seconds
+     * re-reads rt_settings() every field so debug.fps_limit_hz is hot, and
+     * the "limit" bucket is read as the headroom this port has left, so
+     * settings work billed to it would be read as slack that does not
+     * exist. */
     const double period = pace_period_seconds();
     if (period <= 0.0) return;
     RT_PROF_ZONE(RT_PROF_LIMIT);
@@ -150,28 +169,82 @@ void pace_field() {
      * overruns (a drop). Nudging the field period by the queue depth makes
      * the audio device the master clock, which is what it has to be, since
      * a gap in sound is far more audible than a field arriving 0.2 ms late.
-     * Gentle gain, hard clamp: this must never become a speed control. */
+     * Gentle gain, hard clamp: this must never become a speed control.
+     *
+     * One read of the queue serves both users below: the steady-state
+     * nudge here, and the debt bound after it. */
+    const int queued = rt_audio_queued_frames();
     auto adjusted = step;
-    {
-        const int queued = rt_audio_queued_frames();
-        if (queued >= 0) {
-            /* Target a few fields of cushion. 800 frames is one field. */
-            constexpr double kTargetFrames = 2400.0;
-            double err = (kTargetFrames - (double)queued) / kTargetFrames;
-            if (err > 1.0) err = 1.0;
-            if (err < -1.0) err = -1.0;
-            /* Queue below target -> produce sooner (shorter period). */
-            double scale = 1.0 - 0.05 * err;
-            adjusted = std::chrono::duration_cast<PaceClock::duration>(step * scale);
-        }
+    if (queued >= 0) {
+        constexpr double kTargetFrames = (double)RT_AUDIO_CUSHION_FRAMES;
+        double err = (kTargetFrames - (double)queued) / kTargetFrames;
+        if (err > 1.0) err = 1.0;
+        if (err < -1.0) err = -1.0;
+        /* Queue below target -> produce sooner (shorter period). */
+        double scale = 1.0 - 0.05 * err;
+        adjusted = std::chrono::duration_cast<PaceClock::duration>(step * scale);
     }
     deadline += adjusted;
-    /* Fell far behind (a load spike, or the host simply cannot keep up).
-     * Resync rather than accumulate debt and then sprint to catch up. */
-    if (now > deadline + std::chrono::milliseconds(100)) {
+
+    /* Bound the debt, do not discard it.
+     *
+     * The audio queue is the master clock, so the debt this pacer owes is
+     * exactly the audio the device is missing: RT_AUDIO_CUSHION_FRAMES less
+     * whatever is queued, and never more than the cushion itself. The port
+     * mixes one field of audio per guest sndn2 flush, so the only way to
+     * put those frames back is to run fields sooner than the field rate.
+     *
+     * The previous rule snapped the deadline to now whenever it was more
+     * than 100 ms behind, which threw the debt away at exactly the moment
+     * it was largest: the queue was empty, the pacer believed it was on
+     * time, and it went back to sleeping a full period per field while the
+     * 5 percent nudge refilled the cushion at 40 frames a field. Measured
+     * on the Windows logs, routine single stalls are already larger than
+     * the cushion that was being refilled that slowly.
+     *
+     * So the deadline floors at now minus the deficit instead. Fields then
+     * run unpaced until the device has been repaid what it is owed, and no
+     * further: the deficit shrinks as the queue refills, the floor rises
+     * with it, and normal pacing resumes on its own. The sprint is bounded
+     * by the cushion, six fields of guest time, because the deficit can
+     * never exceed it. With no device (rt_audio_queued_frames() returns
+     * -1) there is no queue to repay and no clock to lock to, so that case
+     * simply resyncs to now once it is more than one period behind. The
+     * tolerance there used to be 100 ms; one period is what a run with no
+     * audio wants, because there is no debt for a sprint to put back and
+     * carrying the overrun forward only makes the next field late too.
+     *
+     * All of this is host-side pacing. It decides when a field is produced
+     * and changes no value the game supplied or computed. */
+    /* Below one field of mix (800 frames at 48 kHz) the device is within a
+     * field of running dry, so there is nothing to wait for at all. Only
+     * while the sound task is actually feeding the device, though: the mix
+     * arrives with the guest's sndn2 flush, and if that task stalls (a
+     * blocking load) while vblanks keep coming, the queue drains to zero
+     * and stays there. Skipping the wait then would free-run the port at
+     * full speed for as long as the stall lasts, with no audio to repay.
+     * The debt bound above still covers that case on its own: it settles
+     * back into normal pacing within six fields. */
+    constexpr int kFieldFrames = 800;
+    static uint64_t last_total_frames = 0;
+    const uint64_t total_frames = rt_audio_total_frames();
+    const bool fed = total_frames != last_total_frames;
+    last_total_frames = total_frames;
+    const bool starving = fed && queued >= 0 && queued < kFieldFrames;
+    if (queued >= 0) {
+        double missing = (double)RT_AUDIO_CUSHION_FRAMES - (double)queued;
+        if (missing < 0.0) missing = 0.0;
+        if (missing > (double)RT_AUDIO_CUSHION_FRAMES) missing = (double)RT_AUDIO_CUSHION_FRAMES;
+        const auto deficit = std::chrono::duration_cast<PaceClock::duration>(
+            std::chrono::duration<double>(missing / (double)RT_AUDIO_RATE));
+        if (deadline < now - deficit) deadline = now - deficit;
+    } else if (now > deadline + step) {
         deadline = now;
-        return;
     }
+    /* A catch-up field is one that runs without waiting: the deadline is
+     * already past once the debt is applied, or the queue is starving. */
+    if (g_rt_prof_on && (starving || now >= deadline)) ++g_catch_up_fields;
+    if (starving) return;
     /* Sleep the bulk, spin the tail. Even at 1 ms timer resolution a
      * Windows sleep routinely overshoots by about a millisecond, and there
      * is under a millisecond of slack in a field, so an overshoot every
@@ -226,6 +299,27 @@ void note_field() {
 void rt_gs_field_stats(double* fields_per_second, double* field_ms) {
     if (fields_per_second) *fields_per_second = g_stat_fps;
     if (field_ms) *field_ms = g_stat_field_ms;
+}
+
+/* See prof.h. One read fills the struct and clears every window counter,
+ * the same contract as rt_clock_sources, so a report that prints nothing
+ * still resets. The present decomposition comes from the GS backend
+ * (gs_backend.h present_timings); backends with no present path leave it
+ * at zero and the summary drops that sub-line. */
+extern "C" void rt_gs_field_prof(RtGsFieldProf* out) {
+    if (!out) return;
+    *out = RtGsFieldProf{};
+    out->catch_up = g_catch_up_fields;
+    g_catch_up_fields = 0;
+    /* rt_gs_backend_if_created(), not rt_gs_backend(): a profile report must
+     * never be the call that builds the backend, which would open the Vulkan
+     * device and the window from inside the instrument (see gs_backend.h).
+     * With no backend the three present counters stay zero and the summary
+     * drops that sub-line. */
+    if (GsBackend* be = rt_gs_backend_if_created()) {
+        be->present_timings(&out->flush_ns, &out->scanout_ns,
+                            &out->present_ns, &out->present_fields);
+    }
 }
 
 void rt_gs_vsync_hook(unsigned field) {

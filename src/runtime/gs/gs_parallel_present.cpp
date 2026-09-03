@@ -12,9 +12,13 @@
 #include "gs_pgs_context.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <vector>
 
 #ifdef ICORECOMP_PGS_SDL
 
@@ -196,6 +200,119 @@ void RtPgs::set_render_scale(uint32_t factor) {
          factor >= 4 ? "requested" : "off");
 }
 
+/* Pipeline cache file. The payload is whatever Granite's Device serializes
+ * on this host, and there are two shapes of it (vulkan/device.cpp): the
+ * legacy one, pipelineCacheUUID + a hash of the payload + the
+ * vkGetPipelineCacheData blob, and, on a driver with VK_KHR_pipeline_binary,
+ * PipelineCache's own format (vulkan/pipeline_cache.cpp). Both are checked
+ * by Granite, not by the driver, and the two are not interchangeable, so a
+ * file written by one shape and read by the other is rejected. The legacy
+ * path rejects softly (it logs and creates a fresh cache); the binary path
+ * rejects by returning false out of init_pipeline_cache, which is why the
+ * load below retries with an empty payload rather than treating a failure as
+ * "no cache this run". init_pipeline_cache is called even when there is no
+ * file: with GRANITE_VULKAN_SYSTEM_HANDLES off the device otherwise never
+ * creates a cache object at all, and there would be nothing to store at
+ * exit. */
+void RtPgs::pipeline_cache_load() {
+    if (!m_device) return;
+    std::vector<uint8_t> blob;
+#ifdef ICORECOMP_PGS_SDL
+    if (const char* base = SDL_GetBasePath()) {
+        /* SDL3 owns this string; it is not freed (SDL_GetBasePath in SDL2
+         * was the one that had to be). */
+        m_pipeline_cache_path = std::string(base) + "cache/pipeline_cache.bin";
+    }
+#endif
+    if (!m_pipeline_cache_path.empty()) {
+        std::ifstream in(m_pipeline_cache_path, std::ios::binary);
+        if (in) {
+            blob.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+    }
+    bool ok = blob.empty() ? m_device->init_pipeline_cache(nullptr, 0)
+                           : m_device->init_pipeline_cache(blob.data(), blob.size());
+    if (!ok && !blob.empty()) {
+        /* The stored payload was rejected outright: a file from a driver
+         * with a different cache shape, or a truncated one. Start empty
+         * rather than run with no cache object, and let the store at exit
+         * replace the file. */
+        logf("paraLLEl-GS: pipeline cache: %s rejected by Granite; starting from an empty cache "
+             "and rewriting it at exit", m_pipeline_cache_path.c_str());
+        blob.clear();
+        ok = m_device->init_pipeline_cache(nullptr, 0);
+    }
+    if (!ok) {
+        /* No cache object exists, so there is nothing to serialize either:
+         * clear the path so the store at exit does not read an uninitialized
+         * cache and overwrite a good file with it. */
+        logf("paraLLEl-GS: pipeline cache: the device would not create one; pipelines compile "
+             "uncached this run and no file is written");
+        m_pipeline_cache_path.clear();
+        return;
+    }
+    if (blob.empty()) {
+        logf("paraLLEl-GS: pipeline cache: none at %s; every pipeline compiles from scratch this run "
+             "and the cache is written at exit",
+             m_pipeline_cache_path.empty() ? "(no base path)" : m_pipeline_cache_path.c_str());
+    } else {
+        logf("paraLLEl-GS: pipeline cache: %zu bytes read from %s (a UUID or hash mismatch is "
+             "reported by Granite above and means a fresh cache)",
+             blob.size(), m_pipeline_cache_path.c_str());
+    }
+}
+
+void RtPgs::pipeline_cache_store() {
+    if (!m_device || m_pipeline_cache_path.empty()) return;
+    const size_t size = m_device->get_pipeline_cache_size();
+    if (size == 0) {
+        logf("paraLLEl-GS: pipeline cache: nothing to store");
+        return;
+    }
+    std::vector<uint8_t> blob(size);
+    if (!m_device->get_pipeline_cache_data(blob.data(), blob.size())) {
+        logf("paraLLEl-GS: pipeline cache: vkGetPipelineCacheData failed; not stored");
+        return;
+    }
+    std::error_code ec;
+    const std::filesystem::path path(m_pipeline_cache_path);
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        logf("paraLLEl-GS: pipeline cache: cannot create %s (%s); not stored",
+             path.parent_path().string().c_str(), ec.message().c_str());
+        return;
+    }
+    /* Write beside, then rename over: a run killed mid-write leaves the
+     * previous cache intact rather than a truncated file. */
+    const std::filesystem::path tmp = path.string() + ".tmp";
+    {
+        /* Closed explicitly and checked after: an ofstream that fails while
+         * flushing in its destructor reports nothing, and the partial file
+         * would then be renamed over a good cache. Any failure removes the
+         * temporary rather than leaving it beside the cache. */
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        bool wrote = bool(out);
+        if (wrote) {
+            out.write(reinterpret_cast<const char*>(blob.data()), (std::streamsize)blob.size());
+            out.close();
+            wrote = bool(out);
+        }
+        if (!wrote) {
+            logf("paraLLEl-GS: pipeline cache: write to %s failed; not stored", tmp.string().c_str());
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        logf("paraLLEl-GS: pipeline cache: rename to %s failed (%s); not stored",
+             path.string().c_str(), ec.message().c_str());
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    logf("paraLLEl-GS: pipeline cache: %zu bytes written to %s", blob.size(), path.string().c_str());
+}
+
 void RtPgs::init_headless() {
     RtGsContextResult ctx = rt_gs_make_pgs_context();
     if (!ctx.context) {
@@ -210,6 +327,7 @@ void RtPgs::init_headless() {
     m_headless_device->set_context(*m_headless_context);
     m_headless_device->init_frame_contexts(4);
     m_device = m_headless_device.get();
+    pipeline_cache_load();
     logf("paraLLEl-GS: headless Vulkan device (no display or ICORECOMP_GS_HEADLESS=1); "
          "set ICORECOMP_GS_SCREENSHOT=/path/out.ppm to capture the scanout");
 }
@@ -285,6 +403,7 @@ void RtPgs::init_windowed() {
     m_wsi = std::move(wsi);
     m_device = &m_wsi->get_device();
     m_wsi_active = true;
+    pipeline_cache_load();
 }
 
 void RtPgs::present(const ParallelGS::ScanoutResult& scanout, double aspect) {

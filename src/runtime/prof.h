@@ -69,6 +69,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -141,6 +142,26 @@ inline uint64_t g_window_ns = 0;    /* stamp the current report window opened */
 inline uint64_t g_fields = 0;       /* fields since the profile started */
 inline uint64_t g_window_fields = 0;
 inline unsigned g_every = 180;
+
+/* Per-field decomposition of the window's longest field. The bucket table
+ * averages over the window and cannot say what one 200 ms field was doing;
+ * this keeps the bucket deltas of the worst field seen since the last
+ * report. g_field_snap is g_ns at the previous field boundary.
+ *
+ * The boundary is wherever rt_prof_field is called, and hw/gspriv.cpp calls
+ * it before pace_field, so a field's own pacing wait lands in the "limit"
+ * bucket of the field after it. A worst field whose largest bucket is
+ * "limit" is reporting the sleep that preceded it, not a stall inside it. */
+inline uint64_t g_field_snap[RT_PROF_COUNT] = {0};
+inline bool g_field_snap_valid = false;
+inline uint64_t g_worst_field[RT_PROF_COUNT] = {0};
+inline uint64_t g_worst_field_total = 0;
+/* Field length distribution from the same boundary, so the "fields:" line
+ * and the "longest field" breakdown under it describe the same fields. A
+ * field here runs from one rt_prof_field call to the next, which is the
+ * previous field's pacing sleep plus this field's work. */
+inline uint32_t g_fields_over_20ms = 0;
+inline uint32_t g_fields_over_50ms = 0;
 
 inline uint64_t now_ns() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -290,6 +311,35 @@ extern "C" void rt_clock_sources(uint64_t* backedge, uint64_t* mmio, uint64_t* i
 extern "C" void rt_vu1_prof_report(double fields);
 extern "C" void rt_geom_prof_report(double fields);
 
+/* Field-boundary stall diagnostics for the summary's "fields:" line. The
+ * bucket table is an average over a whole window, which is exactly the
+ * wrong shape for a stutter: one field lost to a stall is invisible in it.
+ * These are the extremes instead, filled and cleared by one read, the same
+ * contract as rt_clock_sources.
+ *
+ *   catch_up            fields that ran without waiting: the deadline was
+ *                       already past once the audio debt was applied, or
+ *                       the queue held less than one field of mix
+ *                       (hw/gspriv.cpp pace_field). Not the same as fields
+ *                       that repaid something; with the queue at the
+ *                       cushion there is no debt and a field that merely
+ *                       overran its period is counted too.
+ *   flush/scanout/present_ns, present_fields
+ *                       the GS backend's present path split three ways,
+ *                       summed over the fields it covers; zero when the
+ *                       backend has no present path to report
+ *
+ * Implemented in hw/gspriv.cpp; rt_disc_prof_max_ms in iso/iso9660.cpp. */
+struct RtGsFieldProf {
+    uint32_t catch_up;
+    uint64_t flush_ns;
+    uint64_t scanout_ns;
+    uint64_t present_ns;
+    uint64_t present_fields;
+};
+extern "C" void rt_gs_field_prof(RtGsFieldProf* out);
+extern "C" double rt_disc_prof_max_ms(void);
+
 inline void rt_prof_report() {
     using namespace rt_prof_detail;
     const uint64_t t = now_ns();
@@ -349,6 +399,47 @@ inline void rt_prof_report() {
     rt_vu1_prof_report(fields);
     rt_geom_prof_report(fields);
 
+    /* The worst field in the window, and the present path it spent that
+     * time in. Read unconditionally so the counters clear even on a window
+     * with no fields in it. */
+    {
+        RtGsFieldProf fp = {};
+        rt_gs_field_prof(&fp);
+        const double disc_ms = rt_disc_prof_max_ms();
+        rt_log("prof", "  fields: longest %.1f ms, %u over 20 ms, %u over 50 ms;"
+                       " %u catch-up fields (ran without waiting);"
+                       " longest disc read %.1f ms",
+            (double)g_worst_field_total / 1e6, (unsigned)g_fields_over_20ms,
+            (unsigned)g_fields_over_50ms, (unsigned)fp.catch_up, disc_ms);
+        if (g_worst_field_total > 0) {
+            /* Where the longest field went, largest buckets first. This is
+             * the line that separates a GPU wait (present, gs) from a
+             * host read (disc) or a decode (ipu) when a field stalls. */
+            int worder[RT_PROF_COUNT];
+            for (int i = 0; i < RT_PROF_COUNT; ++i) worder[i] = i;
+            std::sort(worder, worder + RT_PROF_COUNT,
+                      [](int a, int b) { return g_worst_field[a] > g_worst_field[b]; });
+            char line[256];
+            int len = std::snprintf(line, sizeof line, "    longest field %.1f ms:",
+                                    (double)g_worst_field_total / 1e6);
+            for (int i = 0; i < RT_PROF_COUNT && i < 5 && len < (int)sizeof line; ++i) {
+                const int z = worder[i];
+                if (g_worst_field[z] == 0) break;
+                len += std::snprintf(line + len, sizeof line - (size_t)len, " %s %.1f",
+                                     kName[z], (double)g_worst_field[z] / 1e6);
+            }
+            rt_log("prof", "%s", line);
+        }
+        if (fp.present_fields) {
+            const double pf = (double)fp.present_fields;
+            rt_log("prof", "    present flush %.3f ms/field  scanout %.3f ms/field"
+                           "  present_frame %.3f ms/field",
+                (double)fp.flush_ns / 1e6 / pf,
+                (double)fp.scanout_ns / 1e6 / pf,
+                (double)fp.present_ns / 1e6 / pf);
+        }
+    }
+
     /* Audio device queue. An empty queue is a click; this is the number
      * that says whether choppy sound is starvation or something else. */
     {
@@ -389,7 +480,12 @@ inline void rt_prof_report() {
     for (int i = 0; i < RT_PROF_COUNT; ++i) {
         g_ns[i] = 0;
         g_calls[i] = 0;
+        g_worst_field[i] = 0;
     }
+    g_worst_field_total = 0;
+    g_fields_over_20ms = 0;
+    g_fields_over_50ms = 0;
+    g_field_snap_valid = false; /* g_ns just restarted; the next delta is void */
     g_window_fields = 0;
     g_last_ns = now_ns();
     g_window_ns = g_last_ns;
@@ -445,6 +541,27 @@ inline void rt_prof_field() {
     }
 #endif
     if (!g_rt_prof_on) return;
+    {
+        /* Close the field: bill the open zone up to now, then take the
+         * per-bucket deltas since the previous boundary and keep them if
+         * this was the longest field of the window so far. */
+        using namespace rt_prof_detail;
+        const uint64_t t = now_ns();
+        g_ns[g_cur] += t - g_last_ns;
+        g_last_ns = t;
+        if (g_field_snap_valid) {
+            uint64_t total = 0;
+            for (int i = 0; i < RT_PROF_COUNT; ++i) total += g_ns[i] - g_field_snap[i];
+            if (total > g_worst_field_total) {
+                g_worst_field_total = total;
+                for (int i = 0; i < RT_PROF_COUNT; ++i) g_worst_field[i] = g_ns[i] - g_field_snap[i];
+            }
+            if (total > 20000000ull) ++g_fields_over_20ms;
+            if (total > 50000000ull) ++g_fields_over_50ms;
+        }
+        for (int i = 0; i < RT_PROF_COUNT; ++i) g_field_snap[i] = g_ns[i];
+        g_field_snap_valid = true;
+    }
     ++rt_prof_detail::g_fields;
     if (++rt_prof_detail::g_window_fields >= rt_prof_detail::g_every) rt_prof_report();
 }

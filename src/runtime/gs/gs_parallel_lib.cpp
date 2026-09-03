@@ -193,6 +193,10 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
 
 RtPgs::~RtPgs() {
     if (m_device) m_device->wait_idle();
+    /* Every pipeline this run created is in the device's cache now; store
+     * it before the device members below take the VkPipelineCache with
+     * them. */
+    pipeline_cache_store();
     /* The overlay's images are declared after the device members and would
      * be destroyed after them by the member order alone, but m_wsi.reset()
      * / m_headless_device.reset() below destroy the device first, and an
@@ -320,4 +324,16 @@ uint64_t RtPgs::read_priv(uint32_t offset) {
 void RtPgs::report_stats() {
     logf("paraLLEl-GS: %llu vsyncs rendered (%s)",
          (unsigned long long)m_vsyncs, m_wsi_active ? "windowed" : "headless");
+}
+
+void RtPgs::present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
+                            uint64_t* present_ns, uint64_t* fields) {
+    if (flush_ns) *flush_ns = m_flush_ns;
+    if (scanout_ns) *scanout_ns = m_scanout_ns;
+    if (present_ns) *present_ns = m_present_ns;
+    if (fields) *fields = m_timing_fields;
+    m_flush_ns = 0;
+    m_scanout_ns = 0;
+    m_present_ns = 0;
+    m_timing_fields = 0;
 }

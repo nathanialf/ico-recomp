@@ -92,7 +92,39 @@ std::string toml_lookup(const char* path, const char* section, const char* key) 
     return "";
 }
 
+/* Longest single disc read in the profile window, in milliseconds, for the
+ * summary's "fields:" line (prof.h). A read that blocks on a cold file or a
+ * network share is one of the few things that can stall a field outright,
+ * and the "disc" bucket's average hides it.
+ *
+ * No clock reading of its own: the disc zone already stamps the clock at
+ * its edges, so the timer reads the zone's own exclusive nanosecond
+ * counter either side of it. Two things have to hold for that difference
+ * to be the read and nothing else. Declaration order: the timer is
+ * constructed before the zone and therefore destroyed after it, which is
+ * the only order in which the zone has already billed the read by the time
+ * the difference is taken. And no enclosing RT_PROF_DISC zone: the opening
+ * value is read before RT_PROF_ZONE runs, so an outer disc zone would have
+ * its own accumulated time billed into the counter by that entry and land
+ * in this read's total. Neither function below is called from inside the
+ * other, and nothing else opens a disc zone. */
+double g_disc_max_ms = 0.0;
+
+struct DiscReadTimer {
+    bool on = g_rt_prof_on;
+    uint64_t start = 0;
+    DiscReadTimer() { if (on) start = rt_prof_zone_ns(RT_PROF_DISC); }
+    ~DiscReadTimer() {
+        if (!on) return;
+        const double ms = (double)(rt_prof_zone_ns(RT_PROF_DISC) - start) / 1e6;
+        if (ms > g_disc_max_ms) g_disc_max_ms = ms;
+    }
+    DiscReadTimer(const DiscReadTimer&) = delete;
+    DiscReadTimer& operator=(const DiscReadTimer&) = delete;
+};
+
 bool read_raw_sector(uint32_t lsn, uint8_t out[2048]) {
+    DiscReadTimer disc_timer;
     RT_PROF_ZONE(RT_PROF_DISC);
     if (!g_disc || lsn >= g_total_sectors) return false;
     long long pos = (long long)lsn * g_sector_size + g_data_offset;
@@ -402,6 +434,13 @@ bool probe_and_mount(bool fatal, std::string* err) {
 
 } // namespace
 
+/* See prof.h: reading clears, so each window reports its own worst read. */
+extern "C" double rt_disc_prof_max_ms(void) {
+    const double ms = g_disc_max_ms;
+    g_disc_max_ms = 0.0;
+    return ms;
+}
+
 bool rt_iso_mounted() { return g_disc != nullptr; }
 uint32_t rt_iso_sector_size() { return g_sector_size; }
 uint32_t rt_iso_total_sectors() { return g_total_sectors; }
@@ -411,6 +450,7 @@ bool rt_iso_read_sector(uint32_t lsn, uint8_t out[2048]) {
 }
 
 uint32_t rt_iso_read_sectors(uint32_t lsn, uint32_t count, uint8_t* out) {
+    DiscReadTimer disc_timer;
     RT_PROF_ZONE(RT_PROF_DISC);
     if (!g_disc || count == 0) return 0;
     if (lsn >= g_total_sectors) return 0;

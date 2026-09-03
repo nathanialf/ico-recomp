@@ -1,9 +1,12 @@
 /* ui/ui.cpp: RmlUi bring-up, the per-field tick, and visibility.
  *
  * See ui.h for the module's rules. The two that shape this file:
- *   - rt_ui_tick is the only place that may call the rt_pgs_overlay_*
- *     entry points, because it is the only one guaranteed to run between
- *     frames (rt_gs_vsync_hook, before the backend's vsync()).
+ *   - rt_ui_tick is the only place that may call the overlay entry points,
+ *     because it is the only one guaranteed to run between frames
+ *     (rt_gs_vsync_hook, before the backend's vsync()). They now go through
+ *     GsBackend (rt_gs_backend()->overlay_*) rather than straight to the
+ *     paraLLEl-GS library, so the GS command ring sees them in order with
+ *     the guest's GIF traffic; see the wrappers below.
  *   - a failure anywhere in rt_ui_init disables the UI and returns false.
  *     It is never fatal: the port must still run the game with no menu.
  */
@@ -13,6 +16,7 @@
 
 #include "ui_internal.h"
 
+#include "../gs/gs_backend.h"
 #include "../host/settings.h"
 #include "../host/window.h"
 #include "../runtime.h"
@@ -28,6 +32,46 @@ namespace rtui {
 UiState g_ui;
 
 /* ---- overlay backend wrappers ------------------------------------------- */
+
+/* Anything that changes what the GS renders or presents goes through the GS
+ * backend (gs/gs_backend.h) rather than calling the paraLLEl-GS library on
+ * rt_gs_parallel_handle() directly, which is what these did before. The
+ * backend is becoming a command ring with a worker thread on the far end
+ * (gs/gs_threaded.cpp), and a call that skips it would be invisible to the
+ * ring and so would land out of order against the guest's own GIF traffic.
+ *
+ * No ICORECOMP_HAVE_PARALLEL_GS guard is needed for these: GsBackend's
+ * defaults are no-ops returning 0, which is exactly what the dump backend
+ * and a build with no live backend want, and it is what these stubs
+ * returned. rt_gs_backend() never has to create the backend from here
+ * either: rt_hw_init() builds it, and main.cpp runs that before rt_ui_init()
+ * on both of its orderings.
+ *
+ * Three things stay direct because none of them is a GS command: the SDL
+ * window handle, the surface size and the present mode the library resolved
+ * at create time. The first two are main-thread reads the UI lays itself out
+ * from; sending a query through the ring would mean blocking on the consumer
+ * for a value only this thread can change. */
+
+uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height) {
+    return rt_gs_backend()->overlay_texture_create(rgba8, width, height);
+}
+
+void backend_texture_destroy(uint32_t texture) {
+    rt_gs_backend()->overlay_texture_destroy(texture);
+}
+
+void backend_set_frame(const RtPgsOverlayFrame* frame) {
+    rt_gs_backend()->overlay_set_frame(frame);
+}
+
+uint32_t backend_present_ui() {
+    return rt_gs_backend()->present_ui();
+}
+
+void backend_set_present_mode(uint32_t mode) {
+    rt_gs_backend()->set_present_mode(mode);
+}
 
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
 
@@ -47,28 +91,6 @@ void backend_surface_size(uint32_t* width, uint32_t* height) {
     if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_surface_size(pgs, width, height);
 }
 
-uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height) {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    return pgs ? rt_pgs_overlay_texture_create(pgs, rgba8, width, height) : 0;
-}
-
-void backend_texture_destroy(uint32_t texture) {
-    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_overlay_texture_destroy(pgs, texture);
-}
-
-void backend_set_frame(const RtPgsOverlayFrame* frame) {
-    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_overlay_set_frame(pgs, frame);
-}
-
-uint32_t backend_present_ui() {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    return pgs ? rt_pgs_present_ui(pgs) : 0;
-}
-
-void backend_set_present_mode(uint32_t mode) {
-    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_set_present_mode(pgs, mode);
-}
-
 uint32_t backend_present_mode() {
     return rt_gs_parallel_present_mode();
 }
@@ -82,14 +104,6 @@ uint32_t backend_present_mode() {
 bool backend_window_live() { return false; }
 void* backend_window_handle() { return nullptr; }
 void backend_surface_size(uint32_t* width, uint32_t* height) { *width = 0; *height = 0; }
-uint32_t backend_texture_create(const uint8_t*, uint32_t, uint32_t) { return 0; }
-void backend_texture_destroy(uint32_t) {}
-void backend_set_frame(const RtPgsOverlayFrame*) {}
-/* 0 is "nothing presented and the window did not close" (no RT_PGS_VSYNC_*
- * bit set), which is what rt_pgs_present_ui itself returns headless. The
- * launcher never spins on it: it refuses to run without a live window. */
-uint32_t backend_present_ui() { return 0; }
-void backend_set_present_mode(uint32_t) {}
 uint32_t backend_present_mode() { return 0; }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */

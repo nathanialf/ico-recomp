@@ -285,6 +285,51 @@ public:
         rt_pgs_report_stats(m_pgs);
     }
 
+    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
+                         uint64_t* present_ns, uint64_t* fields) override {
+        rt_pgs_present_timings(m_pgs, flush_ns, scanout_ns, present_ns, fields);
+    }
+
+    /* Presentation and overlay control (gs_backend.h). These used to be
+     * called on rt_gs_parallel_handle() straight from host/settings_apply.cpp
+     * and ui/ui.cpp, which put them outside the GS call stream. They come
+     * through the backend now so the command ring sees them in order with
+     * the GIF and priv traffic they have to stay ordered against. */
+    void set_presentation(uint32_t fit, uint32_t filter) override {
+        rt_pgs_set_presentation(m_pgs, fit, filter);
+    }
+
+    void set_present_mode(uint32_t mode) override {
+        rt_pgs_set_present_mode(m_pgs, mode);
+    }
+
+    void set_render_scale(uint32_t factor) override {
+        rt_pgs_set_render_scale(m_pgs, factor);
+    }
+    void set_raster(uint32_t raster) override { rt_pgs_set_raster(m_pgs, raster); }
+    void set_deinterlace(uint32_t deinterlace) override { rt_pgs_set_deinterlace(m_pgs, deinterlace); }
+
+    uint32_t overlay_texture_create(const uint8_t* rgba8, uint32_t width,
+                                    uint32_t height) override {
+        return rt_pgs_overlay_texture_create(m_pgs, rgba8, width, height);
+    }
+
+    void overlay_texture_destroy(uint32_t texture) override {
+        rt_pgs_overlay_texture_destroy(m_pgs, texture);
+    }
+
+    void overlay_set_frame(const RtPgsOverlayFrame* frame) override {
+        rt_pgs_overlay_set_frame(m_pgs, frame);
+    }
+
+    /* Window closure is not handled here, unlike vsync() above: the launcher
+     * loop (ui/ui_launcher.cpp) reads the RT_PGS_VSYNC_* bits itself and
+     * shuts down its own way. Passing the mask through unchanged is what
+     * ui.cpp's wrapper did before. */
+    uint32_t present_ui() override {
+        return rt_pgs_present_ui(m_pgs);
+    }
+
 private:
     RtPgs* m_pgs = nullptr;
 };

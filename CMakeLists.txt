@@ -81,6 +81,7 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/hw/geomcheck.cpp
     src/runtime/gs/gs_dumpwriter.cpp
     src/runtime/gs/gs_select.cpp
+    src/runtime/gs/gs_threaded.cpp
 )
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
@@ -200,6 +201,55 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-ipu-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
+# ---- VIF1 UNPACK selftest -------------------------------------------------
+#
+# Differential test of the UNPACK rewrite in hw/vif1.cpp. That file keeps
+# the implementation it replaced as exec_unpack_reference, compiled in only
+# under ICORECOMP_VIF1_SELFTEST, and this binary runs randomised UNPACK
+# commands through both from identical state and compares VU1 data memory
+# byte for byte. It links vif1.cpp against stubs for the runtime services
+# (log, VU1 state, GIF, DMAC diagnostics), so no scheduler, no GS backend
+# and no disc image. See src/runtime/hw/vif1_selftest.cpp.
+add_executable(icorecomp-vif1-selftest
+    src/runtime/hw/vif1.cpp
+    src/runtime/hw/vif1_selftest.cpp
+)
+target_include_directories(icorecomp-vif1-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+# ICORECOMP_HAVE_SETTINGS is deliberately absent: this target includes
+# prof.h transitively but does not link settings.cpp, same as the IPU
+# selftest above.
+target_compile_definitions(icorecomp-vif1-selftest PRIVATE ICORECOMP_VIF1_SELFTEST)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-vif1-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# ---- GS command ring selftest ---------------------------------------------
+#
+# Round-trip check of gs/gs_threaded.cpp's ThreadedBackend: the same
+# randomised GsBackend call sequence is played into a recording backend
+# directly and into a second one through the ring, and the two recordings
+# must match byte for byte. That is the check behind "an ICORECOMP_GS=dump
+# run writes identical output with and without the wrapper", which cannot be
+# run here (it needs a disc, a GPU and a display). Links gs_threaded.cpp
+# against stubs for rt_log/rt_fatal, so no GS library, no SDL and no runtime
+# services. See src/runtime/gs/gs_ring_selftest.cpp.
+add_executable(icorecomp-gsring-selftest
+    src/runtime/gs/gs_threaded.cpp
+    src/runtime/gs/gs_ring_selftest.cpp
+)
+target_include_directories(icorecomp-gsring-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+# ICORECOMP_HAVE_SETTINGS is deliberately absent, same as the IPU and VIF1
+# selftests: nothing here links host/settings.cpp.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-gsring-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
 # ---- title logo selftest --------------------------------------------------
 #
 # Standalone check of the launcher's title image (ui/title_logo.cpp): mounts
@@ -252,8 +302,22 @@ if(EXISTS "${GENERATED_DIR}")
             ${GENERATED_DIR}
             ${GENERATED_DIR}/..
         )
+        # -ffp-contract=off: the VU0 macro-mode FMAC helpers this code
+        # calls (rc_vu_fmac kinds madd and msub, rc_vu_opmula and
+        # rc_vu_opmsub in recomp_ops.h) are written as a separate multiply
+        # and add because that is what the hardware does, rounding the
+        # product to single precision before the add. Letting the host
+        # contract them into an FMA keeps the product at full width and
+        # changes the result. The COP1 multiply-add family (madd.s and
+        # friends) is not in this binary's census, so it is not a reason
+        # here. Same flag as the VU1 object library below; remove it only
+        # together with an ISA change that makes fusion correct.
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-            target_compile_options(generated PRIVATE -fno-strict-aliasing)
+            target_compile_options(generated PRIVATE -fno-strict-aliasing -ffp-contract=off)
+        elseif(MSVC)
+            # /fp:precise still permits FMA contraction on recent MSVC;
+            # /fp:contract- (VS2022+) forbids it, matching -ffp-contract=off.
+            target_compile_options(generated PRIVATE /fp:precise /fp:contract-)
         endif()
 
         target_link_libraries(icorecomp-runtime PRIVATE generated)

@@ -27,6 +27,14 @@
 #include <string.h>
 #include "recomp_api.h"
 
+/* SSE2 is baseline on x86-64, so the VU1 lane helpers below have a
+ * branch-free four-lane form there and keep the scalar form as the build
+ * everywhere else. No -march flag is needed to reach it. */
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define RC_VU_SSE2 1
+#include <emmintrin.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -789,13 +797,6 @@ RC_INLINE rc_u128 rc_vu1_src(const Vu1State* vu, int ft, int sel) {
     return s;
 }
 
-RC_INLINE void rc_vu1_write(Vu1State* vu, int fd, int mask, rc_u128 v) {
-    if (fd == 0) return;
-    int i;
-    for (i = 0; i < 4; i++)
-        if (mask & (8 >> i)) vu->vf[fd].u32x[i] = v.u32x[i];
-}
-
 RC_INLINE void rc_vu1_flags_commit(Vu1State* vu, uint32_t mac) {
     uint32_t st = vu->status & 0xFF0u;
     vu->mac = mac & 0xFFFFu;
@@ -807,11 +808,33 @@ RC_INLINE void rc_vu1_flags_commit(Vu1State* vu, uint32_t mac) {
     vu->status = st;
 }
 
+/* ---- VU1 lane helpers: scalar reference bodies --------------------------
+ * These are the original one-lane-at-a-time implementations, unchanged in
+ * behaviour. They serve three purposes. They are the build on targets
+ * without SSE2, where the public helper names below forward straight to
+ * them. They are the reference the equivalence test
+ * (tools/recomp/crates/vu-interp/tests/helpers.rs) compares the vector
+ * forms against, exported side by side through csrc/shim.c. And they are
+ * the readable statement of the semantics: the vector code is an
+ * optimisation of these, never a redefinition of them.
+ *
+ * The lane-level primitives rc_vu_in, rc_vu_flagres, rc_vu_maxbits,
+ * rc_vu_minbits and rc_vu_ftoi1 in the VU0 section above stay untouched;
+ * they remain the definition of the number model for both VUs. */
+
+RC_INLINE void rc_vu1_write_scalar(Vu1State* vu, int fd, int mask, rc_u128 v) {
+    if (fd == 0) return;
+    int i;
+    for (i = 0; i < 4; i++)
+        if (mask & (8 >> i)) vu->vf[fd].u32x[i] = v.u32x[i];
+}
+
 /* FMAC compute without state writes. kind: 0 add, 1 sub, 2 mul, 3 madd,
  * 4 msub. The caller commits via rc_vu1_commit_vf/rc_vu1_commit_acc after
  * the bundle's lower half has executed. */
-RC_INLINE rc_u128 rc_vu1_fmac_calc(const Vu1State* vu, int kind, int fs,
-                                   int ft, int sel, int mask, uint32_t* mac) {
+RC_INLINE rc_u128 rc_vu1_fmac_calc_scalar(const Vu1State* vu, int kind, int fs,
+                                          int ft, int sel, int mask,
+                                          uint32_t* mac) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     rc_u128 b = rc_vu1_src(vu, ft, sel);
     rc_u128 r;
@@ -837,14 +860,14 @@ RC_INLINE rc_u128 rc_vu1_fmac_calc(const Vu1State* vu, int kind, int fs,
     return r;
 }
 
-RC_INLINE void rc_vu1_commit_vf(Vu1State* vu, int fd, int mask, rc_u128 r,
-                                uint32_t mac) {
+RC_INLINE void rc_vu1_commit_vf_scalar(Vu1State* vu, int fd, int mask,
+                                       rc_u128 r, uint32_t mac) {
     rc_vu1_flags_commit(vu, mac);
-    rc_vu1_write(vu, fd, mask, r);
+    rc_vu1_write_scalar(vu, fd, mask, r);
 }
 
-RC_INLINE void rc_vu1_commit_acc(Vu1State* vu, int mask, rc_u128 r,
-                                 uint32_t mac) {
+RC_INLINE void rc_vu1_commit_acc_scalar(Vu1State* vu, int mask, rc_u128 r,
+                                        uint32_t mac) {
     rc_vu1_flags_commit(vu, mac);
     int i;
     for (i = 0; i < 4; i++)
@@ -852,8 +875,8 @@ RC_INLINE void rc_vu1_commit_acc(Vu1State* vu, int mask, rc_u128 r,
 }
 
 /* vmax/vmini family: no flags. Committed with rc_vu1_write. */
-RC_INLINE rc_u128 rc_vu1_maxmin_calc(const Vu1State* vu, int is_min, int fs,
-                                     int ft, int sel) {
+RC_INLINE rc_u128 rc_vu1_maxmin_calc_scalar(const Vu1State* vu, int is_min,
+                                            int fs, int ft, int sel) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     rc_u128 b = rc_vu1_src(vu, ft, sel);
     rc_u128 r;
@@ -864,7 +887,7 @@ RC_INLINE rc_u128 rc_vu1_maxmin_calc(const Vu1State* vu, int is_min, int fs,
     return r;
 }
 
-RC_INLINE rc_u128 rc_vu1_abs_calc(const Vu1State* vu, int fs) {
+RC_INLINE rc_u128 rc_vu1_abs_calc_scalar(const Vu1State* vu, int fs) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     rc_u128 r;
     int i;
@@ -872,7 +895,7 @@ RC_INLINE rc_u128 rc_vu1_abs_calc(const Vu1State* vu, int fs) {
     return r;
 }
 
-RC_INLINE rc_u128 rc_vu1_ftoi_calc(const Vu1State* vu, int shift, int fs) {
+RC_INLINE rc_u128 rc_vu1_ftoi_calc_scalar(const Vu1State* vu, int shift, int fs) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     rc_u128 r;
     int i;
@@ -880,7 +903,7 @@ RC_INLINE rc_u128 rc_vu1_ftoi_calc(const Vu1State* vu, int shift, int fs) {
     return r;
 }
 
-RC_INLINE rc_u128 rc_vu1_itof_calc(const Vu1State* vu, int shift, int fs) {
+RC_INLINE rc_u128 rc_vu1_itof_calc_scalar(const Vu1State* vu, int shift, int fs) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     rc_u128 r;
     int i;
@@ -891,7 +914,7 @@ RC_INLINE rc_u128 rc_vu1_itof_calc(const Vu1State* vu, int shift, int fs) {
 
 /* CLIPw.xyz judgment; the caller stores the result into vu->clip when the
  * bundle commits. */
-RC_INLINE uint32_t rc_vu1_clip_calc(const Vu1State* vu, int fs, int ft) {
+RC_INLINE uint32_t rc_vu1_clip_calc_scalar(const Vu1State* vu, int fs, int ft) {
     rc_u128 a = rc_vu1_vf(vu, fs);
     float w = fabsf(rc_vu_in(rc_vu1_vf(vu, ft).f32x[3]));
     uint32_t j = 0;
@@ -903,6 +926,305 @@ RC_INLINE uint32_t rc_vu1_clip_calc(const Vu1State* vu, int fs, int ft) {
     }
     return ((vu->clip << 6) | j) & 0xFFFFFFu;
 }
+
+#ifdef RC_VU_SSE2
+
+/* ---- VU1 lane helpers: SSE2 forms ---------------------------------------
+ * The same semantics on all four lanes at once with no data-dependent
+ * branches. Bit-identical to the scalar bodies above, which the
+ * equivalence test enforces over an exhaustive corpus plus tens of
+ * millions of random patterns per family.
+ *
+ * Why these are exact and not merely close:
+ *  - addps/subps/mulps/divps round each lane exactly as the scalar
+ *    addss/subss/mulss/divss do. MXCSR is never written here, so the
+ *    rounding mode and the runtime's FTZ+DAZ (main.cpp) apply identically
+ *    to both paths.
+ *  - -ffp-contract=off is load-bearing. madd and msub must round the
+ *    product to single precision before the add, exactly as the scalar
+ *    `acc + x * y` does; contraction into an FMA would keep the product at
+ *    full width and change the result. The CMake target for generated/vu1,
+ *    vu-interp's build.rs and tests/differential.rs all pass it (MSVC:
+ *    /fp:contract-).
+ *  - cvttps2dq truncates toward zero like a C float-to-int cast and is
+ *    unaffected by the rounding mode.
+ *  - Everything in the sanitize, clamp, flush, mac and max/min paths is
+ *    integer compare and bitwise select, so NaN and infinity encodings
+ *    sitting in vf registers are handled by the same rules the scalar
+ *    code applies to their bit patterns.
+ *
+ * Lanes not selected by the dest mask are computed and then discarded.
+ * That is safe: the runtime unmasks no MXCSR exception (main.cpp sets
+ * FTZ and DAZ only), so an unselected lane cannot trap, and the MXCSR
+ * sticky exception bits are not part of the guest state.
+ *
+ * Loads and stores use the unaligned forms. Vu1State is RC_ALIGN(16) so
+ * vf and acc really are 16-byte aligned, but VU1 data memory (mem) begins
+ * at an offset that is only 4-byte aligned, and movups on an aligned
+ * address costs nothing on any part with SSE2 worth targeting. */
+
+/* Reverse a 4-bit lane set. _mm_movemask_ps puts SSE lane i at bit i,
+ * while the dest mask and every mac nibble put lane 0 (x) at bit 3. */
+RC_INLINE int rc_vu_rev4(int m) {
+    return ((m & 1) << 3) | ((m & 2) << 1) | ((m & 4) >> 1) | ((m & 8) >> 3);
+}
+
+/* All-ones in each lane the dest mask selects. Folds to a constant when
+ * the mask is a compile-time constant, which it is at every call site the
+ * emitter generates. */
+RC_INLINE __m128i rc_vu_lanes(int mask) {
+    const __m128i bits = _mm_set_epi32(1, 2, 4, 8); /* lane 0 is x, mask 0x8 */
+    return _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(mask), bits), bits);
+}
+
+RC_INLINE __m128i rc_vu_loadu(const void* p) {
+    return _mm_loadu_si128((const __m128i*)p);
+}
+RC_INLINE void rc_vu_storeu(void* p, __m128i v) {
+    _mm_storeu_si128((__m128i*)p, v);
+}
+
+/* rc_vu_in on four lanes: exponent 0 reads as signed zero, exponent 255
+ * reads as sign | FMAX, anything else passes through unchanged. */
+RC_INLINE __m128 rc_vu_in_ps(__m128 v) {
+    const __m128i exp = _mm_set1_epi32(0x7F800000);
+    const __m128i sgn = _mm_set1_epi32((int)0x80000000u);
+    const __m128i fmax = _mm_set1_epi32((int)RC_PS2_FMAX_BITS);
+    __m128i b = _mm_castps_si128(v);
+    __m128i e = _mm_and_si128(b, exp);
+    __m128i is_max = _mm_cmpeq_epi32(e, exp);
+    __m128i is_zero = _mm_cmpeq_epi32(e, _mm_setzero_si128());
+    __m128i special = _mm_or_si128(is_max, is_zero);
+    /* Ordinary lanes keep b; special lanes keep the sign only, and
+     * exponent-255 lanes then gain the FMAX exponent and mantissa. */
+    return _mm_castsi128_ps(
+        _mm_or_si128(_mm_andnot_si128(special, b),
+                     _mm_or_si128(_mm_and_si128(b, sgn),
+                                  _mm_and_si128(is_max, fmax))));
+}
+
+/* rc_vu_flagres on four lanes. Returns the clamped and flushed results and
+ * ORs the mac bits of the selected lanes into *mac. mac layout: bits
+ * 15..12 O, 11..8 U, 7..4 S, 3..0 Z, each nibble holding x in its MSB. Z
+ * and S are read off the clamped result, as in the scalar body: an
+ * overflow lane is never zero, an underflow lane always is, and both keep
+ * the sign of the unclamped value. */
+RC_INLINE __m128i rc_vu_flagres_ps(uint32_t* mac, int mask, __m128 v) {
+    const __m128i exp = _mm_set1_epi32(0x7F800000);
+    const __m128i sgn = _mm_set1_epi32((int)0x80000000u);
+    const __m128i fmax = _mm_set1_epi32((int)RC_PS2_FMAX_BITS);
+    const __m128i mant = _mm_set1_epi32(0x007FFFFF);
+    __m128i zero = _mm_setzero_si128();
+    __m128i b = _mm_castps_si128(v);
+    __m128i e = _mm_and_si128(b, exp);
+    __m128i is_o = _mm_cmpeq_epi32(e, exp);
+    /* underflow: exponent 0 with a nonzero mantissa. Disjoint from is_o. */
+    __m128i is_u = _mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(b, mant), zero),
+                                    _mm_cmpeq_epi32(e, zero));
+    __m128i special = _mm_or_si128(is_o, is_u);
+    __m128i r = _mm_or_si128(_mm_andnot_si128(special, b),
+                             _mm_or_si128(_mm_and_si128(b, sgn),
+                                          _mm_and_si128(is_o, fmax)));
+    __m128i is_z = _mm_cmpeq_epi32(_mm_andnot_si128(sgn, r), zero);
+    int o = rc_vu_rev4(_mm_movemask_ps(_mm_castsi128_ps(is_o))) & mask;
+    int u = rc_vu_rev4(_mm_movemask_ps(_mm_castsi128_ps(is_u))) & mask;
+    int s = rc_vu_rev4(_mm_movemask_ps(_mm_castsi128_ps(r))) & mask;
+    int z = rc_vu_rev4(_mm_movemask_ps(_mm_castsi128_ps(is_z))) & mask;
+    *mac |= ((uint32_t)o << 12) | ((uint32_t)u << 8) | ((uint32_t)s << 4)
+            | (uint32_t)z;
+    return r;
+}
+
+RC_INLINE __m128 rc_vu1_vf_ps(const Vu1State* vu, int n) {
+    if (n != 0) return _mm_castsi128_ps(rc_vu_loadu(&vu->vf[n]));
+    return _mm_castsi128_ps(_mm_set_epi32(0x3F800000, 0, 0, 0)); /* vf00 */
+}
+
+RC_INLINE __m128 rc_vu1_src_ps(const Vu1State* vu, int ft, int sel) {
+    if (sel == RC_VU_SRC_VEC) return rc_vu1_vf_ps(vu, ft);
+    if (sel == RC_VU_SRC_Q) return _mm_set1_ps(vu->q);
+    if (sel == RC_VU1_SRC_I) return _mm_set1_ps(vu->i);
+    {
+        __m128 v = rc_vu1_vf_ps(vu, ft);
+        switch (sel & 3) {
+        case 0: return _mm_shuffle_ps(v, v, 0x00);
+        case 1: return _mm_shuffle_ps(v, v, 0x55);
+        case 2: return _mm_shuffle_ps(v, v, 0xAA);
+        default: return _mm_shuffle_ps(v, v, 0xFF);
+        }
+    }
+}
+
+RC_INLINE void rc_vu1_write(Vu1State* vu, int fd, int mask, rc_u128 v) {
+    if (fd == 0) return;
+    if (mask == 0xF) {
+        rc_vu_storeu(&vu->vf[fd], rc_vu_loadu(&v));
+        return;
+    }
+    {
+        __m128i lm = rc_vu_lanes(mask);
+        rc_vu_storeu(&vu->vf[fd],
+                     _mm_or_si128(_mm_and_si128(lm, rc_vu_loadu(&v)),
+                                  _mm_andnot_si128(lm, rc_vu_loadu(&vu->vf[fd]))));
+    }
+}
+
+RC_INLINE rc_u128 rc_vu1_fmac_calc(const Vu1State* vu, int kind, int fs,
+                                   int ft, int sel, int mask, uint32_t* mac) {
+    __m128 x = rc_vu_in_ps(rc_vu1_vf_ps(vu, fs));
+    __m128 y = rc_vu_in_ps(rc_vu1_src_ps(vu, ft, sel));
+    __m128 v;
+    rc_u128 r;
+    switch (kind) {
+    case 0: v = _mm_add_ps(x, y); break;
+    case 1: v = _mm_sub_ps(x, y); break;
+    case 2: v = _mm_mul_ps(x, y); break;
+    case 3:
+        v = _mm_add_ps(rc_vu_in_ps(_mm_castsi128_ps(rc_vu_loadu(&vu->acc))),
+                       _mm_mul_ps(x, y));
+        break;
+    default:
+        v = _mm_sub_ps(rc_vu_in_ps(_mm_castsi128_ps(rc_vu_loadu(&vu->acc))),
+                       _mm_mul_ps(x, y));
+        break;
+    }
+    /* Unselected lanes read back as zero, as in the scalar body, which
+     * leaves the zero-initialised result quadword alone for them. */
+    rc_vu_storeu(&r, _mm_and_si128(rc_vu_flagres_ps(mac, mask, v),
+                                   rc_vu_lanes(mask)));
+    return r;
+}
+
+RC_INLINE void rc_vu1_commit_vf(Vu1State* vu, int fd, int mask, rc_u128 r,
+                                uint32_t mac) {
+    rc_vu1_flags_commit(vu, mac);
+    rc_vu1_write(vu, fd, mask, r);
+}
+
+RC_INLINE void rc_vu1_commit_acc(Vu1State* vu, int mask, rc_u128 r,
+                                 uint32_t mac) {
+    __m128i lm = rc_vu_lanes(mask);
+    rc_vu1_flags_commit(vu, mac);
+    rc_vu_storeu(&vu->acc,
+                 _mm_or_si128(_mm_and_si128(lm, rc_vu_loadu(&r)),
+                              _mm_andnot_si128(lm, rc_vu_loadu(&vu->acc))));
+}
+
+/* Sign-magnitude ordering key: key(a) = a ^ ((a >> 31) & 0x7FFFFFFF).
+ * Negatives map to large-magnitude negative signed words, so one signed
+ * compare orders the whole number line the way rc_vu_maxbits/minbits do,
+ * including minus zero below plus zero and the NaN and infinity
+ * encodings, which those rules order by their bits alone. key is a
+ * bijection, so equal keys mean equal bits and ties are not observable. */
+RC_INLINE __m128i rc_vu_smkey(__m128i a) {
+    return _mm_xor_si128(
+        a, _mm_and_si128(_mm_srai_epi32(a, 31), _mm_set1_epi32(0x7FFFFFFF)));
+}
+
+RC_INLINE rc_u128 rc_vu1_maxmin_calc(const Vu1State* vu, int is_min, int fs,
+                                     int ft, int sel) {
+    __m128i a = _mm_castps_si128(rc_vu1_vf_ps(vu, fs));
+    __m128i b = _mm_castps_si128(rc_vu1_src_ps(vu, ft, sel));
+    __m128i ka = rc_vu_smkey(a);
+    __m128i kb = rc_vu_smkey(b);
+    /* max keeps a when key(a) > key(b), min when key(a) < key(b). */
+    __m128i take_a = is_min ? _mm_cmpgt_epi32(kb, ka) : _mm_cmpgt_epi32(ka, kb);
+    rc_u128 r;
+    rc_vu_storeu(&r, _mm_or_si128(_mm_and_si128(take_a, a),
+                                  _mm_andnot_si128(take_a, b)));
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_abs_calc(const Vu1State* vu, int fs) {
+    rc_u128 r;
+    rc_vu_storeu(&r, _mm_and_si128(_mm_castps_si128(rc_vu1_vf_ps(vu, fs)),
+                                   _mm_set1_epi32(0x7FFFFFFF)));
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_ftoi_calc(const Vu1State* vu, int shift, int fs) {
+    __m128 g = _mm_mul_ps(rc_vu_in_ps(rc_vu1_vf_ps(vu, fs)),
+                          _mm_set1_ps((float)(1 << shift)));
+    /* cvttps2dq returns 0x80000000 for every out-of-range input, which is
+     * already what rc_vu_ftoi1 returns on the negative side (g < -2^31,
+     * -inf included, and g == -2^31 exactly converts in range to the same
+     * value). Only the positive side differs: rc_vu_ftoi1 saturates to
+     * 0x7FFFFFFF for g >= 2^31, +inf included. rc_vu_in leaves nothing but
+     * finite values and a finite times a positive power of two is never a
+     * NaN, so the compare has no NaN case to answer for. */
+    __m128i sat = _mm_castps_si128(_mm_cmpge_ps(g, _mm_set1_ps(2147483648.0f)));
+    rc_u128 r;
+    rc_vu_storeu(&r, _mm_or_si128(_mm_and_si128(sat, _mm_set1_epi32(0x7FFFFFFF)),
+                                  _mm_andnot_si128(sat, _mm_cvttps_epi32(g))));
+    return r;
+}
+
+RC_INLINE rc_u128 rc_vu1_itof_calc(const Vu1State* vu, int shift, int fs) {
+    rc_u128 r;
+    /* cvtdq2ps rounds by MXCSR exactly as the scalar cvtsi2ss does, and
+     * the divisor is a power of two, so the division is exact and cannot
+     * produce a denormal from an integer source. */
+    rc_vu_storeu(&r, _mm_castps_si128(_mm_div_ps(
+                         _mm_cvtepi32_ps(_mm_castps_si128(rc_vu1_vf_ps(vu, fs))),
+                         _mm_set1_ps((float)(1 << shift)))));
+    return r;
+}
+
+RC_INLINE uint32_t rc_vu1_clip_calc(const Vu1State* vu, int fs, int ft) {
+    const __m128 absm = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    const __m128 sgnm = _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u));
+    __m128 a = rc_vu_in_ps(rc_vu1_vf_ps(vu, fs));
+    __m128 t = rc_vu_in_ps(rc_vu1_vf_ps(vu, ft));
+    __m128 w = _mm_and_ps(_mm_shuffle_ps(t, t, 0xFF), absm);
+    /* -w by sign flip. w is never a NaN after rc_vu_in, so the compares
+     * answer exactly as the scalar > and < do, and w == +0 gives -0,
+     * against which < behaves the same as against +0. */
+    __m128 nw = _mm_xor_ps(w, sgnm);
+    /* x, y and z only; w is not judged. Each lane contributes greater-than
+     * at bit 2i and less-than at bit 2i+1. */
+    int gt = _mm_movemask_ps(_mm_cmpgt_ps(a, w)) & 7;
+    int lt = _mm_movemask_ps(_mm_cmplt_ps(a, nw)) & 7;
+    uint32_t j = (uint32_t)(((gt & 1) | ((gt & 2) << 1) | ((gt & 4) << 2))
+                            | ((((lt & 1) | ((lt & 2) << 1) | ((lt & 4) << 2)))
+                               << 1));
+    return ((vu->clip << 6) | j) & 0xFFFFFFu;
+}
+
+#else /* no SSE2: the scalar bodies are the implementation */
+
+RC_INLINE void rc_vu1_write(Vu1State* vu, int fd, int mask, rc_u128 v) {
+    rc_vu1_write_scalar(vu, fd, mask, v);
+}
+RC_INLINE rc_u128 rc_vu1_fmac_calc(const Vu1State* vu, int kind, int fs,
+                                   int ft, int sel, int mask, uint32_t* mac) {
+    return rc_vu1_fmac_calc_scalar(vu, kind, fs, ft, sel, mask, mac);
+}
+RC_INLINE void rc_vu1_commit_vf(Vu1State* vu, int fd, int mask, rc_u128 r,
+                                uint32_t mac) {
+    rc_vu1_commit_vf_scalar(vu, fd, mask, r, mac);
+}
+RC_INLINE void rc_vu1_commit_acc(Vu1State* vu, int mask, rc_u128 r,
+                                 uint32_t mac) {
+    rc_vu1_commit_acc_scalar(vu, mask, r, mac);
+}
+RC_INLINE rc_u128 rc_vu1_maxmin_calc(const Vu1State* vu, int is_min, int fs,
+                                     int ft, int sel) {
+    return rc_vu1_maxmin_calc_scalar(vu, is_min, fs, ft, sel);
+}
+RC_INLINE rc_u128 rc_vu1_abs_calc(const Vu1State* vu, int fs) {
+    return rc_vu1_abs_calc_scalar(vu, fs);
+}
+RC_INLINE rc_u128 rc_vu1_ftoi_calc(const Vu1State* vu, int shift, int fs) {
+    return rc_vu1_ftoi_calc_scalar(vu, shift, fs);
+}
+RC_INLINE rc_u128 rc_vu1_itof_calc(const Vu1State* vu, int shift, int fs) {
+    return rc_vu1_itof_calc_scalar(vu, shift, fs);
+}
+RC_INLINE uint32_t rc_vu1_clip_calc(const Vu1State* vu, int fs, int ft) {
+    return rc_vu1_clip_calc_scalar(vu, fs, ft);
+}
+
+#endif /* RC_VU_SSE2 */
 
 /* Q pipeline. See the model note at the top of this section. */
 RC_INLINE void rc_vu1_q_commit(Vu1State* vu) {
@@ -957,13 +1279,33 @@ RC_INLINE rc_u128 rc_vu1_lq(const Vu1State* vu, uint32_t qw) {
     return v;
 }
 
-RC_INLINE void rc_vu1_sq(Vu1State* vu, int fs, int mask, uint32_t qw) {
+RC_INLINE void rc_vu1_sq_scalar(Vu1State* vu, int fs, int mask, uint32_t qw) {
     uint32_t a = rc_vu1_qwaddr(qw);
     rc_u128 v = rc_vu1_vf(vu, fs);
     int i;
     for (i = 0; i < 4; i++)
         if (mask & (8 >> i)) memcpy(vu->mem + a + 4u * (uint32_t)i, &v.u32x[i], 4);
 }
+
+#ifdef RC_VU_SSE2
+/* Every SQ site the emitter produces for the retail programs writes the
+ * full quadword, so that is the case worth a single store. A partial mask
+ * stays on the scalar path: blending would turn it into a read-modify-write
+ * of words the store must not touch, and the win is not there to pay for
+ * the question. */
+RC_INLINE void rc_vu1_sq(Vu1State* vu, int fs, int mask, uint32_t qw) {
+    if (mask != 0xF) {
+        rc_vu1_sq_scalar(vu, fs, mask, qw);
+        return;
+    }
+    rc_vu_storeu(vu->mem + rc_vu1_qwaddr(qw),
+                 _mm_castps_si128(rc_vu1_vf_ps(vu, fs)));
+}
+#else
+RC_INLINE void rc_vu1_sq(Vu1State* vu, int fs, int mask, uint32_t qw) {
+    rc_vu1_sq_scalar(vu, fs, mask, qw);
+}
+#endif
 
 /* ILW/ILWR: one word lane selected by the (single-bit) dest mask; the vi
  * register receives the low 16 bits. */

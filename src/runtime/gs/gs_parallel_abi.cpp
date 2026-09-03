@@ -53,6 +53,11 @@ void rt_pgs_report_stats(RtPgs* pgs) {
     pgs->report_stats();
 }
 
+void rt_pgs_present_timings(RtPgs* pgs, uint64_t* flush_ns, uint64_t* scanout_ns,
+                            uint64_t* present_ns, uint64_t* fields) {
+    pgs->present_timings(flush_ns, scanout_ns, present_ns, fields);
+}
+
 void* rt_pgs_window_handle(RtPgs* pgs) {
     return pgs->window_handle();
 }

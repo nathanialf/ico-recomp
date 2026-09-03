@@ -2,9 +2,10 @@
  *
  * Fed synchronously with 32-bit words from three sources: DMA ch1 payload
  * (dmac.cpp), TTE tag-word transfers (words 2-3 of each source-chain tag),
- * and direct FIFO stores to 0x10005000. Commands may split across feeds;
- * payload words are buffered until a command is complete, then the command
- * executes atomically.
+ * and direct FIFO stores to 0x10005000. A command whose whole payload is
+ * inside one feed call executes straight out of the caller's buffer; one
+ * that splits across feed calls has its payload buffered until it is
+ * complete. Either way the command executes atomically.
  *
  * Effects:
  *   UNPACK        writes VU1 data memory (rt_vu1_state()->mem), with
@@ -87,7 +88,208 @@ uint32_t sext16(uint16_t v, bool usn) { return usn ? v : (uint32_t)(int32_t)(int
 
 /* ---- UNPACK ------------------------------------------------------------- */
 
-void exec_unpack(Vif1& v) {
+/* Payload bytes one input vector occupies, and the unit
+ * unpack_words_needed sizes the payload in: V4-5 is 16 bits whatever VN
+ * says, every other format is (VN+1) fields of 32 >> VL bits. Every
+ * format is a whole number of bytes, so no rounding is lost here. */
+uint32_t unpack_vector_bytes(uint32_t vn, uint32_t vl) {
+    return (vl == 3) ? 2u : (vn + 1) * (4u >> vl);
+}
+
+/* Lanes a decoded vector provides. S-xx broadcasts its single field over
+ * all four, V4-5 always expands to four, every other format gives VN+1.
+ * Lanes past this are the "the mask says data and the format gave none"
+ * case the counter below records. */
+uint32_t unpack_lanes(uint32_t vn, uint32_t vl) {
+    return (vn == 0 || vl == 3) ? 4u : vn + 1;
+}
+
+/* Vectors an UNPACK reads out of the payload, the count
+ * unpack_words_needed sizes the payload from. */
+uint32_t unpack_input_vectors(uint32_t num, uint32_t cl, uint32_t wl) {
+    if (wl <= cl) return num;
+    const uint32_t rem = num % wl;
+    return (num / wl) * cl + (rem < cl ? rem : cl);
+}
+
+/* Fields written with no source data behind them, whole run. Hardware
+ * writes indeterminate data there; this model writes 0 and samples a log
+ * line at every power of two, which is what the counter is for. */
+uint64_t g_missing_field_data = 0;
+
+void note_missing_field(uint32_t cmd, uint32_t f) {
+    if (is_pow2(++g_missing_field_data)) {
+        rt_log("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
+            cmd, f, g_missing_field_data);
+    }
+}
+
+/* Bulk form of note_missing_field for the unmasked path, where the pattern
+ * is fixed: each of `count` vectors writes lanes `lanes`..3 with no source
+ * data, in ascending lane order. Produces the same counter values and the
+ * same sampled lines as one call per field, without a branch per field. */
+void note_missing_field_run(uint32_t cmd, uint32_t lanes, uint32_t count) {
+    if (lanes >= 4 || count == 0) return;
+    const uint32_t per = 4 - lanes;
+    const uint64_t start = g_missing_field_data;
+    const uint64_t end = start + (uint64_t)count * per;
+    g_missing_field_data = end;
+    uint64_t p = 1;
+    while (p != 0 && p <= start) p <<= 1;
+    for (; p != 0 && p <= end; p <<= 1) {
+        rt_log("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
+            cmd, lanes + (uint32_t)((p - start - 1) % per), p);
+    }
+}
+
+/* Decodes one input vector into four lanes. Lanes the format does not
+ * provide are left at 0, which is what the caller writes for them when the
+ * mask selects data. src must have unpack_vector_bytes(vn, vl) readable
+ * bytes; exec_unpack guarantees that by padding a short payload. */
+inline void decode_vector(const uint8_t* src, uint32_t vn, uint32_t vl, bool usn, uint32_t out[4]) {
+    if (vl == 3) { /* V4-5, and the S-5 spelling that broadcasts lane 0 */
+        uint16_t h;
+        std::memcpy(&h, src, 2);
+        out[0] = (uint32_t)(h & 0x1F) << 3;
+        if (vn == 0) {
+            out[1] = out[2] = out[3] = out[0];
+            return;
+        }
+        out[1] = (uint32_t)((h >> 5) & 0x1F) << 3;
+        out[2] = (uint32_t)((h >> 10) & 0x1F) << 3;
+        out[3] = (uint32_t)((h >> 15) & 1) << 7;
+        return;
+    }
+    const uint32_t nf = vn + 1;
+    switch (vl) {
+        case 0:
+            std::memcpy(out, src, (size_t)nf * 4);
+            break;
+        case 1:
+            for (uint32_t f = 0; f < nf; ++f) {
+                uint16_t h;
+                std::memcpy(&h, src + f * 2, 2);
+                out[f] = sext16(h, usn);
+            }
+            break;
+        default:
+            for (uint32_t f = 0; f < nf; ++f) out[f] = sext8(src[f], usn);
+            break;
+    }
+    if (vn == 0) out[1] = out[2] = out[3] = out[0];
+    else for (uint32_t f = nf; f < 4; ++f) out[f] = 0;
+}
+
+/* Unmasked, STMOD 0, no filling: n input vectors into n consecutive
+ * quadwords, no wrap inside the run (fill_block splits for that). Every
+ * lane is a data lane, so lanes the format does not provide are written as
+ * 0 exactly as the masked path writes them. */
+inline void fill_run(uint32_t* d, const uint8_t* src, uint32_t n, uint32_t vn, uint32_t vl, bool usn) {
+    if (n == 0) return;
+    if (vl == 3) { /* V4-5 */
+        for (uint32_t i = 0; i < n; ++i, d += 4) {
+            uint16_t h;
+            std::memcpy(&h, src + (size_t)i * 2, 2);
+            const uint32_t a = (uint32_t)(h & 0x1F) << 3;
+            if (vn == 0) {
+                d[0] = d[1] = d[2] = d[3] = a;
+                continue;
+            }
+            d[0] = a;
+            d[1] = (uint32_t)((h >> 5) & 0x1F) << 3;
+            d[2] = (uint32_t)((h >> 10) & 0x1F) << 3;
+            d[3] = (uint32_t)((h >> 15) & 1) << 7;
+        }
+        return;
+    }
+    if (vn == 0) { /* S-32/S-16/S-8: one field broadcast over four lanes */
+        for (uint32_t i = 0; i < n; ++i, d += 4) {
+            uint32_t w;
+            if (vl == 0) {
+                std::memcpy(&w, src + (size_t)i * 4, 4);
+            } else if (vl == 1) {
+                uint16_t h;
+                std::memcpy(&h, src + (size_t)i * 2, 2);
+                w = sext16(h, usn);
+            } else {
+                w = sext8(src[i], usn);
+            }
+            d[0] = d[1] = d[2] = d[3] = w;
+        }
+        return;
+    }
+    const uint32_t nf = vn + 1; /* 2, 3 or 4 provided lanes */
+    if (vl == 0) {
+        if (nf == 4) { /* V4-32: the hot case, one copy for the whole run */
+            std::memcpy(d, src, (size_t)n * 16);
+            return;
+        }
+        /* V3-32 and V2-32: the provided lanes copied, the rest zeroed. */
+        const size_t keep = (size_t)nf * 4;
+        for (uint32_t i = 0; i < n; ++i, d += 4, src += keep) {
+            std::memcpy(d, src, keep);
+            for (uint32_t f = nf; f < 4; ++f) d[f] = 0;
+        }
+        return;
+    }
+    if (vl == 1) { /* 16-bit fields */
+        if (nf == 4) {
+            for (uint32_t i = 0; i < n; ++i, d += 4, src += 8) {
+                uint16_t h[4];
+                std::memcpy(h, src, 8);
+                d[0] = sext16(h[0], usn);
+                d[1] = sext16(h[1], usn);
+                d[2] = sext16(h[2], usn);
+                d[3] = sext16(h[3], usn);
+            }
+            return;
+        }
+        const size_t stride = (size_t)nf * 2;
+        for (uint32_t i = 0; i < n; ++i, d += 4, src += stride) {
+            for (uint32_t f = 0; f < nf; ++f) {
+                uint16_t h;
+                std::memcpy(&h, src + f * 2, 2);
+                d[f] = sext16(h, usn);
+            }
+            for (uint32_t f = nf; f < 4; ++f) d[f] = 0;
+        }
+        return;
+    }
+    /* vl == 2: 8-bit fields */
+    if (nf == 4) {
+        for (uint32_t i = 0; i < n; ++i, d += 4, src += 4) {
+            d[0] = sext8(src[0], usn);
+            d[1] = sext8(src[1], usn);
+            d[2] = sext8(src[2], usn);
+            d[3] = sext8(src[3], usn);
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < n; ++i, d += 4, src += nf) {
+        for (uint32_t f = 0; f < nf; ++f) d[f] = sext8(src[f], usn);
+        for (uint32_t f = nf; f < 4; ++f) d[f] = 0;
+    }
+}
+
+/* One contiguous run of the unmasked path, split at the 1024-quadword end
+ * of data memory. qw is already masked and n is at most 256, so a run
+ * crosses the wrap at most once. */
+inline void fill_block(uint8_t* mem, uint32_t qw, const uint8_t* src, uint32_t n,
+                       uint32_t vn, uint32_t vl, bool usn) {
+    uint32_t first = kVuQw - qw;
+    if (first > n) first = n;
+    fill_run(reinterpret_cast<uint32_t*>(mem + (size_t)qw * 16), src, first, vn, vl, usn);
+    if (first < n) {
+        const size_t stride = unpack_vector_bytes(vn, vl);
+        fill_run(reinterpret_cast<uint32_t*>(mem), src + (size_t)first * stride,
+            n - first, vn, vl, usn);
+    }
+}
+
+/* pay/paywords is the command's payload: a span into the feeding buffer
+ * when the whole command arrived in one feed call, otherwise the straddle
+ * vector. */
+void exec_unpack(Vif1& v, const uint32_t* pay, uint32_t paywords) {
     const uint32_t code = v.code;
     const uint32_t cmd = (code >> 24) & 0x7F;
     const uint32_t vn = (cmd >> 2) & 3;
@@ -114,8 +316,167 @@ void exec_unpack(Vif1& v) {
         rt_log("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
     }
 
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(v.payload.data());
-    const uint32_t nbytes = (uint32_t)v.payload.size() * 4;
+    /* Source bytes. A payload shorter than the format needs read as zeroes
+     * field by field; padding a copy up front keeps that result without a
+     * bounds check on every field. The feed path always delivers exactly
+     * unpack_words_needed words, so this only fires for a direct call. */
+    const uint32_t vecbytes = unpack_vector_bytes(vn, vl);
+    const uint32_t needbytes = unpack_input_vectors(num, cl, wl) * vecbytes;
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pay);
+    const uint32_t nbytes = paywords * 4;
+    if (nbytes < needbytes) {
+        static uint8_t padded[256 * 16]; /* 256 vectors of at most 16 bytes */
+        if (nbytes) std::memcpy(padded, bytes, nbytes);
+        std::memset(padded + nbytes, 0, needbytes - nbytes);
+        bytes = padded;
+    }
+
+    Vu1State* vu = rt_vu1_state();
+    const uint32_t lanes = unpack_lanes(vn, vl);
+
+    if (!masked && v.mode == 0 && !filling) {
+        /* No mask, no STMOD offset, and every write cycle takes input, so
+         * each block of WL vectors lands in WL consecutive quadwords and
+         * the whole command is a handful of contiguous runs. CL == WL is
+         * the degenerate case where the blocks join into one run, which is
+         * what ICO's STCYCL=0x0101 streams are. */
+        const uint32_t step = (cl == wl) ? num : wl;
+        uint32_t done = 0;
+        uint32_t block = addr;
+        while (done < num) {
+            uint32_t n = num - done;
+            if (n > step) n = step;
+            fill_block(vu->mem, block & (kVuQw - 1), bytes + (size_t)done * vecbytes,
+                n, vn, vl, usn);
+            done += n;
+            block = (block + cl) & (kVuQw - 1);
+        }
+        note_missing_field_run(cmd, lanes, num);
+    } else {
+        /* Masking, an STMOD offset or filling cycles. The four mask
+         * selectors per cycle are unpacked once instead of per field per
+         * vector, and the destination comes from a running (cycle, block
+         * base) pair rather than a division by WL per vector. Only cycles
+         * 0..3 have mask bits; cycle 3's selectors cover every later
+         * cycle, so four plans cover any WL. */
+        uint8_t op[4][4];
+        for (uint32_t c = 0; c < 4; ++c) {
+            for (uint32_t f = 0; f < 4; ++f) {
+                op[c][f] = masked ? (uint8_t)((v.mask >> (c * 8 + f * 2)) & 3) : 0;
+            }
+        }
+        const uint32_t colv[4] = {v.col[0], v.col[1], v.col[2], v.col[3]};
+        const uint32_t mode = v.mode;
+
+        uint32_t last_data[4] = {0, 0, 0, 0}; /* buffered input for filling cycles */
+        uint32_t cursor = 0;                  /* byte cursor into the payload */
+        uint32_t cycle = 0;                   /* k % wl, kept as a counter */
+        uint32_t block = addr;                /* addr + (k / wl) * cl */
+        uint32_t lin = addr;                  /* addr + k, filling mode */
+
+        for (uint32_t k = 0; k < num; ++k) {
+            const bool has_input = !filling || cycle < cl;
+            uint32_t data[4];
+            uint32_t nfields;
+            if (has_input) {
+                decode_vector(bytes + cursor, vn, vl, usn, data);
+                cursor += vecbytes;
+                nfields = lanes;
+                /* Only a filling cycle ever reads this back. */
+                if (filling) std::memcpy(last_data, data, sizeof(data));
+            } else {
+                std::memcpy(data, last_data, sizeof(data));
+                nfields = 4;
+            }
+
+            /* Skipping mode: after WL writes, skip to the next CL
+             * boundary. Filling mode: consecutive. */
+            const uint32_t qw = filling ? (lin & (kVuQw - 1)) : ((block + cycle) & (kVuQw - 1));
+            uint32_t* dst = reinterpret_cast<uint32_t*>(vu->mem + (size_t)qw * 16);
+
+            const uint32_t mcycle = cycle < 3 ? cycle : 3;
+            for (uint32_t f = 0; f < 4; ++f) {
+                uint32_t out;
+                switch (op[mcycle][f]) {
+                    case 0: {
+                        if (f >= nfields) {
+                            /* Field not provided by this format and not
+                             * masked: hardware writes indeterminate data.
+                             * Write 0, loud once in a while. */
+                            note_missing_field(cmd, f);
+                            out = 0;
+                            break;
+                        }
+                        out = data[f];
+                        if (mode == 1) {
+                            out += v.row[f];
+                        } else if (mode == 2) {
+                            out += v.row[f];
+                            v.row[f] = out;
+                        } else if (mode == 3) {
+                            static uint64_t n = 0;
+                            if (is_pow2(++n)) rt_log("vif1", "UNPACK with undefined STMOD=3; treating as 0 [#%" PRIu64 "]", n);
+                        }
+                        break;
+                    }
+                    case 1: out = v.row[f]; break;
+                    case 2: out = colv[mcycle]; break;
+                    default: continue; /* 3: write-protected */
+                }
+                dst[f] = out;
+            }
+
+            ++lin;
+            if (++cycle == wl) {
+                cycle = 0;
+                block += cl;
+            }
+        }
+    }
+
+    ++v.unpacks;
+    if (rt_trace() || is_pow2(v.unpacks)) {
+        rt_log("vif1", "UNPACK #%" PRIu64 " cmd=0x%02x addr=0x%x num=%u flg=%d usn=%d cl=%u wl=%u mode=%u masked=%d",
+            v.unpacks, cmd, addr, num, flg ? 1 : 0, usn ? 1 : 0, cl, wl, v.mode, masked ? 1 : 0);
+    }
+}
+
+#ifdef ICORECOMP_VIF1_SELFTEST
+/* The implementation exec_unpack above replaced, kept verbatim as the
+ * differential oracle for hw/vif1_selftest.cpp and compiled only into that
+ * target. The only edit is the payload source: it read v.payload directly,
+ * where the command now carries a span. Its sampled-log counters are its
+ * own statics, so a reference run and a fast run do not share them; the
+ * selftest compares data memory and the row register, not log output. */
+void exec_unpack_reference(Vif1& v, const uint32_t* pay, uint32_t paywords) {
+    const uint32_t code = v.code;
+    const uint32_t cmd = (code >> 24) & 0x7F;
+    const uint32_t vn = (cmd >> 2) & 3;
+    const uint32_t vl = cmd & 3;
+    const bool masked = (cmd & 0x10) != 0;
+    const bool usn = (code >> 14) & 1;
+    const bool flg = (code >> 15) & 1;
+    uint32_t num = (code >> 16) & 0xFF;
+    if (num == 0) num = 256;
+    uint32_t addr = code & 0x3FF;
+    if (flg) addr = (addr + v.tops) & 0x3FF;
+
+    uint32_t cl = v.cl, wl = v.wl;
+    if (wl == 0) wl = 256;
+    if (cl == 0 && wl > cl) {
+        /* CL=0 with filling would consume no input at all; loud and clamp. */
+        static uint64_t n = 0;
+        if (is_pow2(++n)) rt_log("vif1", "UNPACK with CL=0 (STCYCL=0x%02x%02x); clamping CL to 1", v.wl, v.cl);
+        cl = 1;
+    }
+    const bool filling = wl > cl;
+    static uint64_t fill_uses = 0;
+    if (filling && is_pow2(++fill_uses)) {
+        rt_log("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
+    }
+
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pay);
+    const uint32_t nbytes = paywords * 4;
     uint32_t cursor = 0; /* byte cursor into payload */
 
     Vu1State* vu = rt_vu1_state();
@@ -226,8 +587,12 @@ void exec_unpack(Vif1& v) {
             v.unpacks, cmd, addr, num, flg ? 1 : 0, usn ? 1 : 0, cl, wl, v.mode, masked ? 1 : 0);
     }
 }
+#endif /* ICORECOMP_VIF1_SELFTEST */
 
-/* Payload words required for an UNPACK before it can execute. */
+/* Payload words required for an UNPACK before it can execute. The vector
+ * count and the bytes each vector occupies are the same two rules
+ * exec_unpack reads the payload with, so both come from the same helpers:
+ * a payload sized here and consumed there cannot drift apart. */
 uint32_t unpack_words_needed(const Vif1& v, uint32_t code) {
     const uint32_t cmd = (code >> 24) & 0x7F;
     const uint32_t vn = (cmd >> 2) & 3;
@@ -237,17 +602,9 @@ uint32_t unpack_words_needed(const Vif1& v, uint32_t code) {
     uint32_t cl = v.cl, wl = v.wl;
     if (wl == 0) wl = 256;
     if (cl == 0) cl = 1;
-    uint32_t input_vectors;
-    if (wl > cl) {
-        input_vectors = (num / wl) * cl;
-        uint32_t rem = num % wl;
-        input_vectors += rem < cl ? rem : cl;
-    } else {
-        input_vectors = num;
-    }
-    uint32_t bits_per_vector = (vl == 3) ? 16 : (vn + 1) * (32u >> vl);
-    uint64_t total_bits = (uint64_t)input_vectors * bits_per_vector;
-    return (uint32_t)((total_bits + 31) / 32);
+    const uint64_t total_bytes =
+        (uint64_t)unpack_input_vectors(num, cl, wl) * unpack_vector_bytes(vn, vl);
+    return (uint32_t)((total_bytes + 3) / 4);
 }
 
 /* Mnemonic for a VIFcode command field, for the diagnostic dump only. */
@@ -326,6 +683,76 @@ void dump_alloc_header(uint32_t payload_addr) {
 
 /* ---- command execution -------------------------------------------------- */
 
+/* MPG upload deferral.
+ *
+ * vif1.cpp is the only caller of rt_vu1_micro_written, and that call does
+ * two things: it marks the upload dirty, which makes the next MSCAL rehash
+ * micro memory, and it moves vu1rt's upload extent, which is the length
+ * that hash covers. When an MPG writes bytes that are already resident the
+ * first is pure waste, but the second is still owed, so the notification is
+ * deferred rather than dropped.
+ *
+ * g_micro_notified_len mirrors vu1rt's g_upload_len (same rule, applied to
+ * the calls actually made). g_micro_deferred_len, when nonzero, is the end
+ * of a run of MPG segments starting at offset 0 whose bytes all matched
+ * what was resident and whose notification has not been made. The run is
+ * settled at the next MSCAL: if it ends where the last notified upload
+ * ended, vu1rt's extent is already right and nothing is owed; otherwise the
+ * notification is made after all. A segment that does not match, or does
+ * not continue the run, flushes it first.
+ *
+ * Not reset by VIF1_FBRST: these mirror vu1rt state, which a VIF1 reset
+ * does not touch. */
+uint32_t g_micro_notified_len = 0;
+uint32_t g_micro_deferred_len = 0;
+uint64_t g_mpg_deferred = 0;
+
+/* One call for the whole deferred run leaves the same extent behind as the
+ * per-segment calls would have: the first segment starts the extent at its
+ * own length and each later one continues it, so both end at the run
+ * length, and neither reaches vu1rt's out-of-order branch. */
+void micro_flush_deferred() {
+    if (g_micro_deferred_len == 0) return;
+    rt_vu1_micro_written(0, g_micro_deferred_len);
+    g_micro_notified_len = g_micro_deferred_len;
+    g_micro_deferred_len = 0;
+}
+
+void micro_settle_deferred() {
+    if (g_micro_deferred_len == 0) return;
+    if (g_micro_deferred_len == g_micro_notified_len) {
+        /* Same bytes and the same extent as the upload vu1rt last hashed:
+         * a rehash could only return the hash already bound. */
+        g_micro_deferred_len = 0;
+        return;
+    }
+    micro_flush_deferred();
+}
+
+/* Writes one MPG segment into micro memory, or establishes that it is
+ * already there and defers the notification. */
+void micro_note_upload(uint32_t dst, uint32_t bytes, const uint32_t* pay) {
+    uint8_t* micro = rt_vu1_micro();
+    const bool same = std::memcmp(micro + dst, pay, bytes) == 0;
+    const bool continues = (dst == 0) || (g_micro_deferred_len != 0 && dst == g_micro_deferred_len);
+    if (same && continues) {
+        g_micro_deferred_len = dst + bytes;
+        ++g_mpg_deferred;
+        return;
+    }
+    micro_flush_deferred();
+    std::memcpy(micro + dst, pay, bytes);
+    rt_vu1_micro_written(dst, bytes);
+    /* Same rule as rt_vu1_micro_written applies to g_upload_len. */
+    if (dst == 0) {
+        g_micro_notified_len = bytes;
+    } else if (dst == g_micro_notified_len) {
+        g_micro_notified_len = dst + bytes;
+    } else if (dst + bytes > g_micro_notified_len) {
+        g_micro_notified_len = dst + bytes;
+    }
+}
+
 /* Starting or continuing a microprogram: MSCAL, MSCALF and MSCNT.
  *
  * All three latch TOP from TOPS and flip the double buffer, MSCNT
@@ -339,6 +766,9 @@ void dump_alloc_header(uint32_t payload_addr) {
  * instruction precisely because they are fetching a new buffer. So a
  * continuation needs the same buffer swap a start does. */
 void mscal_common(Vif1& v, uint32_t pc_bytes, const char* how) {
+    /* Settle any MPG run held back by micro_note_upload before the hash
+     * this MSCAL may take. */
+    micro_settle_deferred();
     ++v.mscals;
     v.top = v.tops;
     v.itop = v.itops;
@@ -347,7 +777,10 @@ void mscal_common(Vif1& v, uint32_t pc_bytes, const char* how) {
     rt_vu1_mscal(pc_bytes, v.top, v.itop, how);
 }
 
-void exec_command(Vif1& v) {
+/* pay/paywords is the command's payload, either a span into the buffer
+ * rt_vif1_feed was called with or the straddle vector; null and 0 for a
+ * command that has no payload. */
+void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
     const uint32_t code = v.code;
     const uint32_t cmd = (code >> 24) & 0x7F;
     const uint32_t imm = code & 0xFFFF;
@@ -359,7 +792,7 @@ void exec_command(Vif1& v) {
     }
 
     if ((cmd & 0x60) == 0x60) {
-        exec_unpack(v);
+        exec_unpack(v, pay, paywords);
         return;
     }
 
@@ -384,9 +817,9 @@ void exec_command(Vif1& v) {
         case 0x14: mscal_common(v, (uint32_t)imm * 8, "MSCAL"); break;
         case 0x15: mscal_common(v, (uint32_t)imm * 8, "MSCALF"); break;
         case 0x17: mscal_common(v, rt_vu1_state()->pc, "MSCNT"); break;
-        case 0x20: v.mask = v.payload[0]; break; /* STMASK */
-        case 0x30: for (int i = 0; i < 4; ++i) v.row[i] = v.payload[i]; break; /* STROW */
-        case 0x31: for (int i = 0; i < 4; ++i) v.col[i] = v.payload[i]; break; /* STCOL */
+        case 0x20: v.mask = pay[0]; break; /* STMASK */
+        case 0x30: for (int i = 0; i < 4; ++i) v.row[i] = pay[i]; break; /* STROW */
+        case 0x31: for (int i = 0; i < 4; ++i) v.col[i] = pay[i]; break; /* STCOL */
         case 0x4A: { /* MPG */
             uint32_t num = (code >> 16) & 0xFF;
             if (num == 0) num = 256;
@@ -396,25 +829,58 @@ void exec_command(Vif1& v) {
                 rt_log("vif1", "MPG target [0x%x, 0x%x) exceeds micro memory; clamping", dst, dst + bytes);
                 bytes = 16384 - dst;
             }
-            std::memcpy(rt_vu1_micro() + dst, v.payload.data(), bytes);
-            rt_vu1_micro_written(dst, bytes);
+            /* ICO cycles the same small set of microprograms and
+             * re-uploads them repeatedly within a field, so most MPGs
+             * write bytes that are already resident. (The rate was
+             * estimated during an earlier design pass, not measured here;
+             * the deferral does not depend on the number, only on the
+             * pattern.) When the bytes are already resident, the copy
+             * changes nothing and the upload notification can be held
+             * back: rt_vu1_micro_written exists only to mark the upload
+             * dirty so the next MSCAL rehashes micro memory, and a rehash
+             * of bytes that did not change can only return the hash that
+             * is already bound. What the notification also does is move
+             * vu1rt's upload extent, so the skip is a deferral, not a
+             * drop: micro_note_upload settles the run at the next MSCAL
+             * and notifies after all if the extent would end anywhere but
+             * where the last notified upload did. See the note above
+             * micro_flush_deferred. */
+            micro_note_upload(dst, bytes, pay);
             ++v.mpgs;
-            /* Sampled like DIRECT below. ICO re-uploads its five microprograms
-             * around 35 times per field, so logging every one costs more
-             * frame time than the rest of the runtime's logging together,
-             * and says nothing the sampled line does not. */
+            /* Sampled like DIRECT below: MPG is one of the most frequent
+             * VIFcodes in a field and a line per upload says nothing the
+             * sampled line does not. */
             if (rt_trace() || is_pow2(v.mpgs)) {
-                rt_log("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x", v.mpgs, num, dst);
+                rt_log("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x (%" PRIu64 " uploads so far were already resident)",
+                    v.mpgs, num, dst, g_mpg_deferred);
             }
             break;
         }
         case 0x50: case 0x51: { /* DIRECT / DIRECTHL */
             ++v.directs;
-            uint32_t qw = (uint32_t)v.payload.size() / 4;
+            uint32_t qw = paywords / 4;
             if (rt_trace() || is_pow2(v.directs)) {
                 rt_log("vif1", "DIRECT%s #%" PRIu64 ": %u qw to GIF PATH2", cmd == 0x51 ? "HL" : "", v.directs, qw);
             }
-            rt_gif_submit(1, reinterpret_cast<const uint8_t*>(v.payload.data()), qw);
+            /* The old code always handed on a std::vector<uint32_t>
+             * buffer, so PATH2 consumers have only ever seen a payload at
+             * an operator new alignment. A DIRECT payload starts on a
+             * quadword boundary in the VIF FIFO, so a span into the feed
+             * buffer is normally aligned too, but nothing in the feed
+             * interface guarantees it: keep the guarantee rather than
+             * assume the GS backend tolerates an unaligned quadword
+             * stream. */
+            const uint32_t* data = pay;
+            if ((reinterpret_cast<uintptr_t>(data) & 15) != 0) {
+                static std::vector<uint32_t> aligned;
+                static uint64_t n = 0;
+                if (is_pow2(++n)) {
+                    rt_log("vif1", "DIRECT payload is not quadword aligned in the feed buffer; copying [#%" PRIu64 "]", n);
+                }
+                aligned.assign(pay, pay + paywords);
+                data = aligned.data();
+            }
+            rt_gif_submit(1, reinterpret_cast<const uint8_t*>(data), qw);
             break;
         }
         default:
@@ -459,6 +925,9 @@ uint32_t words_needed(const Vif1& v, uint32_t code) {
 
 } // namespace
 
+/* payload= is the words buffered for a command whose payload straddles
+ * feed calls. A command that arrived whole executes off a span into the
+ * caller's buffer and leaves that counter at 0. */
 void rt_vif1_dump_state() {
     const Vif1& v = g_vif;
     rt_log("vif1",
@@ -505,32 +974,61 @@ void rt_vif1_dump_state() {
     }
 }
 
+/* The callers pass a contiguous buffer that outlives the call: dmac.cpp
+ * gathers each ch1 transfer into one scratch vector before feeding it, and
+ * the FIFO path below passes the four words of a 128-bit store. So a
+ * command whose whole payload is already in `words` is executed straight
+ * out of that buffer and never copied. Only a command that straddles feed
+ * calls goes through v.payload, and that copy is one bulk insert per feed
+ * call rather than a push_back per word. */
 void rt_vif1_feed(const uint32_t* words, uint32_t count, uint32_t guest_addr) {
     RT_PROF_ZONE(RT_PROF_VIF1);
     Vif1& v = g_vif;
-    for (uint32_t i = 0; i < count; ++i) {
-        if (!v.pending) {
-            v.code = words[i];
-            v.need_words = words_needed(v, v.code);
-            ++v.cmds;
-            /* Scratchpad addresses keep bit 31; the word offset only ever
-             * touches the low bits. */
-            v.cur_addr = guest_addr == RT_VIF1_ADDR_NONE ? RT_VIF1_ADDR_NONE : guest_addr + i * 4;
-            v.recent[(v.cmds - 1) % 32] = {v.code, v.cur_addr, v.cmds, v.need_words};
-            if (v.need_words == 0) {
-                v.payload.clear();
-                exec_command(v);
-            } else {
-                v.pending = true;
-                v.payload.clear();
-                v.payload.reserve(v.need_words);
-            }
-        } else {
-            v.payload.push_back(words[i]);
+    uint32_t i = 0;
+    while (i < count) {
+        if (v.pending) {
+            const uint32_t want = v.need_words - (uint32_t)v.payload.size();
+            const uint32_t avail = count - i;
+            const uint32_t take = want < avail ? want : avail;
+            v.payload.insert(v.payload.end(), words + i, words + i + take);
+            i += take;
             if ((uint32_t)v.payload.size() == v.need_words) {
                 v.pending = false;
-                exec_command(v);
+                exec_command(v, v.payload.data(), v.need_words);
             }
+            continue;
+        }
+
+        v.code = words[i];
+        v.need_words = words_needed(v, v.code);
+        ++v.cmds;
+        /* Scratchpad addresses keep bit 31; the word offset only ever
+         * touches the low bits. */
+        v.cur_addr = guest_addr == RT_VIF1_ADDR_NONE ? RT_VIF1_ADDR_NONE : guest_addr + i * 4;
+        v.recent[(v.cmds - 1) % 32] = {v.code, v.cur_addr, v.cmds, v.need_words};
+        ++i;
+
+        if (v.need_words == 0) {
+            v.payload.clear();
+            exec_command(v, nullptr, 0);
+            continue;
+        }
+        /* Held in a local so the loop's advance does not depend on
+         * v.need_words surviving exec_command, which the payload span
+         * itself already depends on. */
+        const uint32_t need = v.need_words;
+        const uint32_t avail = count - i;
+        if (avail >= need) {
+            /* Whole payload is in this feed call: hand over a span. */
+            v.payload.clear();
+            exec_command(v, words + i, need);
+            i += need;
+        } else {
+            v.pending = true;
+            v.payload.clear();
+            v.payload.reserve(need);
+            v.payload.insert(v.payload.end(), words + i, words + count);
+            i = count;
         }
     }
 }
@@ -609,3 +1107,47 @@ bool rt_vif_mmio_write(uint32_t addr, uint32_t v) {
             return false;
     }
 }
+
+
+#ifdef ICORECOMP_VIF1_SELFTEST
+/* ---- selftest hooks (hw/vif1_selftest.cpp) ------------------------------
+ *
+ * Compiled only into icorecomp-vif1-selftest. They give the differential
+ * test direct access to the register state exec_unpack reads and to both
+ * implementations of it, so a case can be run twice from identical state.
+ */
+void rt_vif1_selftest_reset() {
+    g_vif = Vif1();
+}
+
+void rt_vif1_selftest_set_regs(uint32_t cl, uint32_t wl, uint32_t mask, uint32_t mode,
+                               const uint32_t row[4], const uint32_t col[4], uint32_t tops) {
+    g_vif.cl = cl;
+    g_vif.wl = wl;
+    g_vif.mask = mask;
+    g_vif.mode = mode;
+    for (int i = 0; i < 4; ++i) {
+        g_vif.row[i] = row[i];
+        g_vif.col[i] = col[i];
+    }
+    g_vif.tops = tops;
+}
+
+void rt_vif1_selftest_get_row(uint32_t row[4]) {
+    for (int i = 0; i < 4; ++i) row[i] = g_vif.row[i];
+}
+
+int rt_vif1_selftest_pending() {
+    return g_vif.pending ? 1 : 0;
+}
+
+uint32_t rt_vif1_selftest_words_needed(uint32_t code) {
+    return words_needed(g_vif, code);
+}
+
+void rt_vif1_selftest_unpack(uint32_t code, const uint32_t* pay, uint32_t words, int reference) {
+    g_vif.code = code;
+    if (reference) exec_unpack_reference(g_vif, pay, words);
+    else exec_unpack(g_vif, pay, words);
+}
+#endif /* ICORECOMP_VIF1_SELFTEST */

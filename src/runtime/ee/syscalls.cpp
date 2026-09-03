@@ -11,7 +11,7 @@
  * basis.
  *
  * Policy (CLAUDE.md): any number not in this table is a fatal log with a
- * register dump. Every distinct (number, args) signature is logged once,
+ * register dump. Every distinct (number, a0) signature is logged once,
  * then on power-of-two repeats. ICORECOMP_TRACE=1 logs every call.
  */
 #include "kernel.h"
@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
-#include <unordered_map>
 
 namespace {
 
@@ -510,17 +509,55 @@ struct Table {
 
 const Table g_table;
 
-/* Once-per-distinct-signature logging with power-of-two fold. */
-std::unordered_map<uint64_t, uint64_t> g_sig_counts;
+/* Once-per-distinct-signature logging with power-of-two fold. The
+ * signature key is (syscall num, a0) only: a0 is the thread id or
+ * semaphore id for every thread and sema syscall, the one argument that
+ * actually distinguishes one caller from another. a1..a3 are left out of
+ * the key on purpose, they carry whatever the caller left in those
+ * registers (loop counters, stack pointers) and differ on almost every
+ * call, which used to make nearly every call its own signature. The
+ * register values are still printed in the log line itself.
+ *
+ * The table is a fixed-size open-addressed set so logging never
+ * allocates and never grows unbounded on this hot path. The probe is
+ * bounded as well as the table: an unbounded linear probe would walk all
+ * kSigTableSize slots on every syscall once the table filled, which is a
+ * worse hot path than the map this replaced. A signature that finds
+ * neither an empty nor a matching slot within kSigProbeLimit falls back to
+ * a plain per-num counter, and that fallback is noted once per number. */
+constexpr size_t kSigTableSize = 1024;
+constexpr size_t kSigProbeLimit = 16;
+struct SigSlot {
+    uint64_t key = 0;   // 0 means empty; a live key is never allowed to hash to 0
+    uint64_t count = 0;
+};
+SigSlot g_sig_table[kSigTableSize];
+uint64_t g_sig_fallback_counts[256];
+bool g_sig_fallback_warned[256];
 
-bool should_log(int32_t num, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) {
+bool should_log(int32_t num, uint32_t a0) {
     if (rt_trace()) return true;
     uint64_t h = (uint64_t)(uint32_t)num;
     h = h * 0x9E3779B97F4A7C15ull ^ a0;
-    h = h * 0x9E3779B97F4A7C15ull ^ a1;
-    h = h * 0x9E3779B97F4A7C15ull ^ a2;
-    h = h * 0x9E3779B97F4A7C15ull ^ a3;
-    uint64_t& n = g_sig_counts[h];
+    h ^= h >> 32;
+    if (h == 0) h = 1;
+    size_t start = (size_t)(h % kSigTableSize);
+    for (size_t probe = 0; probe < kSigProbeLimit; ++probe) {
+        SigSlot& slot = g_sig_table[(start + probe) % kSigTableSize];
+        if (slot.key == 0 || slot.key == h) {
+            slot.key = h;
+            ++slot.count;
+            return (slot.count & (slot.count - 1)) == 0;
+        }
+    }
+    uint8_t fkey = (uint8_t)(uint32_t)(num < 0 ? -num : num);
+    if (!g_sig_fallback_warned[fkey]) {
+        g_sig_fallback_warned[fkey] = true;
+        rt_log("syscall", "signature table crowded (%zu entries, %zu probes), syscall %d falls back "
+                          "to a per-num counter",
+            kSigTableSize, kSigProbeLimit, num);
+    }
+    uint64_t& n = g_sig_fallback_counts[fkey];
     ++n;
     return (n & (n - 1)) == 0;
 }
@@ -547,7 +584,7 @@ void rt_syscall(R5900Context* ctx) {
             "unknown syscall number %d (0x%x, table key 0x%02x), a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%08x",
             num, (uint32_t)num, key, a.a0, a.a1, a.a2, a.a3, (uint32_t)ctx->r[31].u64x[0]);
     }
-    if (should_log(num, a.a0, a.a1, a.a2, a.a3)) {
+    if (should_log(num, a.a0)) {
         rt_log("syscall", "%s%s(a0=0x%x, a1=0x%x, a2=0x%x, a3=0x%x) thread=%d ra=0x%08x%s",
             a.ivariant && e.name[0] != 'i' && e.name[0] != '_' ? "i:" : "", e.name,
             a.a0, a.a1, a.a2, a.a3, rt_thread_current_id(), (uint32_t)ctx->r[31].u64x[0],

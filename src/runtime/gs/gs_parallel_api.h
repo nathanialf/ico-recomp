@@ -118,6 +118,15 @@ RT_GS_API uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field);
 
 RT_GS_API void rt_pgs_report_stats(RtPgs* pgs);
 
+/* Present-path timings for the host's profiler: nanoseconds accumulated in
+ * the renderer flush, the scanout and the swapchain present since the
+ * previous call, and the number of vsyncs they cover. Reading clears them.
+ * The host reports per profile window and cannot see inside the library, so
+ * the split has to cross the ABI. Any pointer may be NULL. */
+RT_GS_API void rt_pgs_present_timings(RtPgs* pgs, uint64_t* flush_ns,
+                                      uint64_t* scanout_ns, uint64_t* present_ns,
+                                      uint64_t* fields);
+
 /* Window control and event-pump inversion (shim 3). The exe owns the only
  * SDL_PollEvent loop (host/window.cpp); these let it drive the window the
  * library created without the library polling SDL itself. */
