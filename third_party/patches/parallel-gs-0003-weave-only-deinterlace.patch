@@ -1,0 +1,56 @@
+From e68e66ea53bcf2c64e115426e7344465f97370a6 Mon Sep 17 00:00:00 2001
+From: Nathanial Fine <nathanial.fine@gmail.com>
+Date: Thu, 3 Sep 2026 01:57:29 +0000
+Subject: [PATCH] Add VSyncInfo::weave_only for known field pairs
+
+weave_only binds field 0 and field 1 to both texture pairs of the FastMAD
+pass. With uField2 == uField0 and uField3 == uField1 every luma difference in
+weave.frag is zero, bob_factor is 0, and the mix returns the previous field
+verbatim, so the shipped shader performs a pure weave. No shader changes,
+and the SPIR-V bank needs no regeneration.
+
+A pure weave is right when the caller knows the two fields are the even and
+odd rows of one progressive picture. On interlaced video, where the two
+fields are 1/60 s apart, it reproduces the source's comb on motion; the
+caller decides.
+---
+ gs/gs_interface.hpp | 7 +++++++
+ gs/gs_renderer.cpp  | 6 +++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 9f05da8..a805094 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -195,6 +195,13 @@ struct VSyncInfo
+ 	// If using interlaced, defer any attempt to deinterlace and just return the raw output as-is with phase information.
+ 	// User is responsible for deinterlacing in whatever way is appropriate.
+ 	bool skip_deinterlace;
++
++	// Weave the two most recent fields without the FastMAD motion test: every output row
++	// not in the current field is the previous field's row. Right for a caller that knows
++	// the two fields are the even and odd rows of one progressive picture; on interlaced
++	// video, where the two fields are 1/60 s apart, it reproduces the source's comb on
++	// motion. Ignored unless deinterlacing runs.
++	bool weave_only;
+ };
+ 
+ struct GSOptions
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index cad982f..b04ae32 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -5125,8 +5125,12 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd,
+ 
+ 	cmd.push_constants(&push, 0, sizeof(push));
+ 
++	// With uField2 == uField0 and uField3 == uField1, every luma difference in weave.frag is
++	// zero, so bob_factor is 0 and the mix returns the previous field verbatim. The shipped
++	// shader then performs a pure weave and the SPIR-V bank (shaders/slangmosh.hpp) needs no
++	// regeneration.
+ 	for (int i = 0; i < 4; i++)
+-		cmd.set_texture(0, i, vsync_last_fields[i]->get_view());
++		cmd.set_texture(0, i, vsync_last_fields[vsync.weave_only ? (i & 1) : i]->get_view());
+ 
+ 	cmd.checkpoint("fastmad");
+ 	cmd.draw(3);

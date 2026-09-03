@@ -38,6 +38,13 @@ patch files here.
    submodule is pristine again. The configure step re-applies the patch.
 5. Configure a fresh build directory and check the
    `icorecomp: applied <patch>` status line.
+6. Keep each patch's hunks at least three unchanged lines away from every
+   other patch's hunks. The "already applied" test is a per-patch
+   `git apply --reverse --check` against a tree that carries all of them,
+   and a later patch that inserts inside an earlier patch's context lines
+   makes that check fail, so the next configure in the same build directory
+   stops with a fatal instead of skipping. Check by applying all patches and
+   running the reverse check for each one.
 
 ## Current patches
 
@@ -86,3 +93,69 @@ movie at (0,0) 720x240 in a 640x224 frame from the same DX and DY.
 
 Scope: reporting only. No existing caller renders anything differently, and
 nothing outside the new assignments is touched. Applies on top of 0001.
+
+### parallel-gs-0003-weave-only-deinterlace.patch
+
+`VSyncInfo` gains `weave_only`. When set, `GSRenderer::fastmad_deinterlace`
+binds the two most recent fields to both texture pairs
+(`vsync_last_fields[i & 1]` instead of `vsync_last_fields[i]`).
+
+Why: the ICO attract movie decodes a 720x480 picture and splits it on the GS
+into an even-row field buffer and an odd-row field buffer (decomp `../ico`,
+`ito/mpeg` mv_sub `func_0023E890`: a point sampled 2:1 vertical sprite with V
+starting at 0.5 or 1.5), displayed on alternate fields. A pure weave gives
+that pair back as the picture the IPU decoded. Measured afterwards: the movie
+is interlaced video (a decoded I frame shows comb teeth on moving figures
+inside one picture), so the weave reproduces that comb; the runtime exposes
+it as `display.deinterlace = weave` for comparison and defaults to bob.
+
+Scope: one texture binding index. With `uField2 == uField0` and
+`uField3 == uField1` every luma difference in `weave.frag` is zero,
+`bob_factor` is 0, and the mix returns the previous field verbatim, so the
+shipped shader weaves without change and the SPIR-V bank
+(`shaders/slangmosh.hpp`) needs no regeneration. Ignored unless deinterlacing
+runs. Applies on top of 0002.
+
+### parallel-gs-0004-grow-mode-area-to-circuits.patch
+
+`VSyncInfo` gains `grow_mode_area_to_circuits` and
+`ignore_display_buffer_offset`. With the first, `GSRenderer::vsync` grows
+`mode_width` and `mode_height` to contain every enabled CRTC window, just
+after the horizontal adaptation and before the merged image is created. With
+the second, the two `sample_crtc_circuit` calls receive a copy of DISPFB with
+DBX and DBY zeroed, so each circuit is read from its buffer's origin; the
+register state itself is untouched.
+
+Why: a display window larger than the mode area is cropped to it. The ICO
+attract movie programs a 720x240-per-field window from the same DX 636 /
+DY 50 as gameplay's 640x224 area, so 80 columns and 16 lines per field are
+cut. With the flag the frame becomes 720x240 and the whole window survives.
+
+ICO reads the movie's 720x480 picture from DBX 36 / DBY 12, which puts the
+picture's own black borders (40/38 columns, 8/17 rows, measured from a decoded
+I frame) flush against the top and right of the window; read from the origin
+the picture sits centred inside its borders. Together the two flags are the
+runtime's `display.raster = window` mode.
+
+Scope: the merged image, `result.mode_*`, `result.internal_*` and the
+deinterlace output, all of which derive from `mode_width` and `mode_height`
+after the insertion point, plus the DISPFB copy handed to the sampler. `real_mode_width`, captured before the adaptation
+and used for extwrite, is left alone. Windows starting left of or above the
+mode area are not handled; they still crop. Applies on top of 0003.
+
+### parallel-gs-0005-skip-deinterlace-dst-layout.patch
+
+`GSRenderer::vsync` adds the barrier the `skip_deinterlace` path was
+missing: after the circuit merge the merged field sits in
+`READ_ONLY_OPTIMAL` waiting for a deinterlace pass, and only
+`fastmad_deinterlace` moved its output to the caller's `dst_layout`. With
+`skip_deinterlace` set the pass does not run, so `ScanoutResult.image` came
+back in the wrong layout and scope while the result promised `dst_layout`.
+
+Why: the runtime's `display.deinterlace = bob` presents the raw field itself
+and blits it as a transfer source, which is what `dst_layout` asks for.
+Blitting from an image left in `READ_ONLY_OPTIMAL` is invalid Vulkan usage.
+
+Scope: one `image_barrier` in the else branch of the deinterlace decision,
+taken only when deinterlacing would have run. The non-interlaced path already
+did the equivalent. Applies on top of 0004.

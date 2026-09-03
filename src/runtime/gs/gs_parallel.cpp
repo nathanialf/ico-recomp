@@ -202,7 +202,8 @@ RtPgsCreateOptions resolve_create_options() {
         }
     }
 
-    /* fit/filter/render_scale have no env twin: straight from settings. */
+    /* fit/filter/render_scale/raster/deinterlace have no env twin: straight
+     * from settings. */
     switch (s.display.fit) {
     case RtFit::IntegerScale: opts.fit = RT_PGS_FIT_INTEGER; break;
     case RtFit::Stretch: opts.fit = RT_PGS_FIT_STRETCH; break;
@@ -210,6 +211,13 @@ RtPgsCreateOptions resolve_create_options() {
     }
     opts.filter = s.display.filter == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
     opts.render_scale = (uint32_t)s.display.render_scale;
+    opts.raster = s.display.raster == RtRaster::Window ? RT_PGS_RASTER_WINDOW : RT_PGS_RASTER_CRT;
+    switch (s.display.deinterlace) {
+    case RtDeinterlace::Bob: opts.deinterlace = RT_PGS_DEINTERLACE_BOB; break;
+    case RtDeinterlace::Weave: opts.deinterlace = RT_PGS_DEINTERLACE_WEAVE; break;
+    case RtDeinterlace::Adaptive: opts.deinterlace = RT_PGS_DEINTERLACE_ADAPTIVE; break;
+    default: opts.deinterlace = RT_PGS_DEINTERLACE_BOB; break;
+    }
     /* No env twin either. 0 would mean "the shim's own 640x480 fallback"
      * (see RtPgsCreateOptions in gs_parallel_api.h), which is not what the
      * settings default to: display.window_width/height are 1280x960

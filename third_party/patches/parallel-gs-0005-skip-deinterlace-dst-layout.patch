@@ -1,0 +1,42 @@
+From e722c4f65d0abe3befea4fb1bc71bdc6f632ad53 Mon Sep 17 00:00:00 2001
+From: Nathanial Fine <nathanial.fine@gmail.com>
+Date: Thu, 3 Sep 2026 02:31:09 +0000
+Subject: [PATCH] Return the merged field in dst_layout when skip_deinterlace
+ is set
+
+After the circuit merge pass the merged image is transitioned to
+READ_ONLY_OPTIMAL whenever a deinterlace pass is expected
+(need_intermediate_pass), and only fastmad_deinterlace moves its output to
+the caller's dst_layout. With VSyncInfo::skip_deinterlace the pass does not
+run, so the caller received the field still in READ_ONLY_OPTIMAL and
+FRAGMENT_SHADER scope while ScanoutResult promised dst_layout. A caller that
+blits from it, as ICO's per-field (bob) presentation does, then blits from an
+image in the wrong layout.
+
+Add the missing barrier on the skip path. The non-interlaced path already
+did the equivalent.
+---
+ gs/gs_renderer.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index e979198..5578b08 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -5105,6 +5105,16 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 	{
+ 		for (auto &field : vsync_last_fields)
+ 			field.reset();
++
++		if (should_deinterlace)
++		{
++			// skip_deinterlace: the merged field was left in READ_ONLY_OPTIMAL for the
++			// deinterlace pass that is not going to run. Hand it back in the layout the
++			// caller asked for, the way the non-interlaced path does above.
++			cmd.image_barrier(*merged, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, info.dst_layout,
++			                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
++			                  info.dst_stage, info.dst_access);
++		}
+ 	}
+ 
+ 	cmd.end_region();

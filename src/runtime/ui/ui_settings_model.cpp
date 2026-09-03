@@ -104,6 +104,8 @@ struct UiSettingsMirror {
     std::vector<UiOptionRow> window_sizes;
     std::string present;
     std::string fit;
+    std::string raster;
+    std::string deinterlace;
     std::string filter;
     std::string render_scale;
     bool show_fps = false;
@@ -197,6 +199,15 @@ constexpr EnumName kFits[] = {
     {"letterbox", (int)RtFit::Letterbox},
     {"integer", (int)RtFit::IntegerScale},
     {"stretch", (int)RtFit::Stretch},
+};
+constexpr EnumName kRasters[] = {
+    {"crt", (int)RtRaster::Crt},
+    {"window", (int)RtRaster::Window},
+};
+constexpr EnumName kDeinterlaces[] = {
+    {"adaptive", (int)RtDeinterlace::Adaptive},
+    {"bob", (int)RtDeinterlace::Bob},
+    {"weave", (int)RtDeinterlace::Weave},
 };
 constexpr EnumName kFilters[] = {
     {"linear", (int)RtFilter::Linear},
@@ -384,6 +395,8 @@ void settings_to_mirror() {
     refresh_window_sizes();
     g_m.present = name_of(kPresentModes, (int)s.display.present);
     g_m.fit = name_of(kFits, (int)s.display.fit);
+    g_m.raster = name_of(kRasters, (int)s.display.raster);
+    g_m.deinterlace = name_of(kDeinterlaces, (int)s.display.deinterlace);
     g_m.filter = name_of(kFilters, (int)s.display.filter);
     /* Unlike window_size, this select needs no entry for a value the file
      * holds: settings.cpp accepts only kRenderScales ({1, 4, 8, 16}), which
@@ -443,6 +456,8 @@ void mirror_to_settings() {
     if (value_of(kDisplayModes, g_m.display_mode, "display.mode", &e)) s.display.mode = (RtDisplayMode)e;
     if (value_of(kPresentModes, g_m.present, "display.present", &e)) s.display.present = (RtPresentMode)e;
     if (value_of(kFits, g_m.fit, "display.fit", &e)) s.display.fit = (RtFit)e;
+    if (value_of(kRasters, g_m.raster, "display.raster", &e)) s.display.raster = (RtRaster)e;
+    if (value_of(kDeinterlaces, g_m.deinterlace, "display.deinterlace", &e)) s.display.deinterlace = (RtDeinterlace)e;
     if (value_of(kFilters, g_m.filter, "display.filter", &e)) s.display.filter = (RtFilter)e;
 
     parse_size_field(g_m.window_size, &s.display.window_width, &s.display.window_height);
@@ -556,6 +571,8 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("window_size", &g_m.window_size);
     c.Bind("present", &g_m.present);
     c.Bind("fit", &g_m.fit);
+    c.Bind("raster", &g_m.raster);
+    c.Bind("deinterlace", &g_m.deinterlace);
     c.Bind("filter", &g_m.filter);
     c.Bind("render_scale", &g_m.render_scale);
     c.Bind("show_fps", &g_m.show_fps);

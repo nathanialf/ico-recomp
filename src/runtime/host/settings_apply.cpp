@@ -13,6 +13,10 @@
  *   display.window_width/height  hot   rt_window_apply_mode, same call
  *   display.fit, display.filter  hot   rt_pgs_set_presentation (only stores;
  *                                       safe any time between frames)
+ *   display.raster               hot   rt_pgs_set_raster (only stores; the
+ *                                       next vsync reads it)
+ *   display.deinterlace          hot   rt_pgs_set_deinterlace (only stores;
+ *                                       the next vsync reads it)
  *   display.present              warm  queued; rt_pgs_set_present_mode
  *                                       touches the swapchain, so it applies
  *                                       from rt_settings_apply_pending() at
@@ -81,6 +85,19 @@ uint32_t fit_to_pgs(RtFit f) {
     }
 }
 
+uint32_t raster_to_pgs(RtRaster r) {
+    return r == RtRaster::Window ? RT_PGS_RASTER_WINDOW : RT_PGS_RASTER_CRT;
+}
+
+uint32_t deinterlace_to_pgs(RtDeinterlace d) {
+    switch (d) {
+    case RtDeinterlace::Bob: return RT_PGS_DEINTERLACE_BOB;
+    case RtDeinterlace::Weave: return RT_PGS_DEINTERLACE_WEAVE;
+    case RtDeinterlace::Adaptive: return RT_PGS_DEINTERLACE_ADAPTIVE;
+    default: return RT_PGS_DEINTERLACE_BOB;
+    }
+}
+
 uint32_t filter_to_pgs(RtFilter f) {
     return f == RtFilter::Nearest ? RT_PGS_FILTER_NEAREST : RT_PGS_FILTER_LINEAR;
 }
@@ -131,6 +148,12 @@ void rt_settings_apply(const RtSettings& before, const RtSettings& now) {
     RtPgs* pgs = rt_gs_parallel_handle();
     if (pgs && (before.display.fit != now.display.fit || before.display.filter != now.display.filter)) {
         rt_pgs_set_presentation(pgs, fit_to_pgs(now.display.fit), filter_to_pgs(now.display.filter));
+    }
+    if (pgs && before.display.raster != now.display.raster) {
+        rt_pgs_set_raster(pgs, raster_to_pgs(now.display.raster));
+    }
+    if (pgs && before.display.deinterlace != now.display.deinterlace) {
+        rt_pgs_set_deinterlace(pgs, deinterlace_to_pgs(now.display.deinterlace));
     }
 
     if (before.display.present != now.display.present) {

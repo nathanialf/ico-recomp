@@ -38,7 +38,8 @@ namespace {
  * horizontally and letterboxed the result inside the window.
  *
  * The image's own size is no better a source: force_deinterlace runs
- * fastmad_deinterlace, so result.image comes back 512x448 here while
+ * fastmad_deinterlace, so result.image comes back 512x448 here (512x224,
+ * the raw field, for a movie field under display.deinterlace bob) while
  * internal/mode stay 512x224. Vertical sampling doubled, screen area did not.
  *
  * double_strike (240p) needs no correction here. The note in gs_renderer.cpp
@@ -68,10 +69,12 @@ constexpr double kModeDisplayAspect = 4.0 / 3.0;
  * before the game enables a circuit, PMODE EN1 and EN2 are both 0, the
  * expression fell back to DISPLAY1, which ICO never writes, and MAGH read 0,
  * so the clock/MAGH scale came out 4 instead of 0.8 and divided the answer by
- * 4. The mode fraction below has no such dependency, and it is correct again
- * now that the scanout keeps the fixed active area as the mode area. Any
- * future move back to a MAGH form has to answer "which circuit, and what if
- * none is enabled" first. */
+ * 4. The mode fraction below has no such dependency and is right whenever
+ * the frame is the fixed mode area, which is display.raster crt. Window mode
+ * grows the frame to the display window and derives that window's aspect
+ * from DW and DH in RtPgs::vsync, on the circuit PMODE enables, and only once
+ * a circuit is enabled and the frame equals its rect, which is the answer to
+ * "which circuit, and what if none is enabled". */
 
 double scanout_display_aspect(const ParallelGS::ScanoutResult& s) {
     /* Two mode families this constant does NOT describe, neither reachable
@@ -86,7 +89,12 @@ double scanout_display_aspect(const ParallelGS::ScanoutResult& s) {
      *    them apart and would silently squeeze such a picture by 25%. It never
      *    sees one: rt_gs_program_crt (hw/gspriv.cpp) is the only writer of
      *    SMODE1 and calls rt_fatal on any SetGsCrt mode that is not NTSC or
-     *    PAL. Anyone lifting that fatal has to derive the aspect here first. */
+     *    PAL. Anyone lifting that fatal has to derive the aspect here first.
+     *
+     * A frame grown to hold an oversized window (grow_mode_area_to_circuits)
+     * is not a third family: on the merge path the internal size still
+     * equals the mode size, the two fractions below cancel, this returns
+     * kModeDisplayAspect, and the window is presented at 4:3. */
     static_assert(!kScanoutOverscan, "kModeDisplayAspect assumes the non-overscan mode area");
     if (!s.mode_width || !s.mode_height || !s.internal_width || !s.internal_height) return 0.0;
     return kModeDisplayAspect
@@ -252,16 +260,15 @@ uint32_t RtPgs::vsync(unsigned field) {
      * (gs_renderer.cpp:4177 only assigns it when alternative_sampling, which
      * is INT && !FFMD).
      *
-     * (Renderer line numbers in this file are the submodule with
-     * third_party/patches/parallel-gs-0001-full-pixel-raster-snap.patch
-     * applied and nothing else. 0001 inserts 17 lines at gs_renderer.cpp:2609,
-     * so a citation below that point is the pristine number plus 17. The
-     * configure step also applies
-     * parallel-gs-0002-report-scanout-placement.patch, which inserts 9 further
-     * lines at 4790, so a configured tree reads 9 higher than these numbers
-     * from there down. The gs_interface.hpp citations are pristine: neither
-     * patch touches that header. 0002 does add to gs_renderer.hpp at line 50,
-     * which nothing here cites by number yet.)
+     * (Renderer line numbers in this file are the pinned submodule commit
+     * with third_party/patches/parallel-gs-0001-full-pixel-raster-snap.patch
+     * applied and nothing else: 0001 inserts 17 lines at gs_renderer.cpp:2609,
+     * so a citation below that point is the pristine number plus 17. A
+     * configured tree also carries 0002 through 0005 and reads higher below
+     * each of their insertion points (gs_renderer.cpp: 0004 at 4590 and 4648,
+     * 0004 again at 4739, 0002 at 4790, 0005 near 5064, 0003 near 5125;
+     * gs_interface.hpp: 0004 at 184, 0003 at 197; gs_renderer.hpp: 0002 at
+     * 50). The patch files are the translation table.)
      *
      * The two therefore agree, both landing on merged row m = source row m+1,
      * exactly when phase equals the helper's argument: argument 0 needs the
@@ -430,31 +437,79 @@ uint32_t RtPgs::vsync(unsigned field) {
     info.overscan = kScanoutOverscan;
     /* Placement rule.
      *
-     * The output frame is the area the renderer models as visible for the
-     * video mode: for non-overscan NTSC that is 640 raster pixels by 224 lines
-     * per field starting at raster (159, 25), which in DISPLAY units is 2560
-     * clocks from clock 636 and 448 lines from line 50 (clock divider 4,
-     * gs_registers.hpp:723). Measured, ICO's gameplay window is exactly that:
-     * DW+1 2560, DH+1 448, DX 636, DY 50. The attract movie programs DW+1 2880
-     * and DH+1 480 from the same DX 636 and DY 50, so it shares the top left
-     * corner and runs 320 clocks further right and 32 lines further down.
+     * The crt frame (RT_PGS_RASTER_CRT, display.raster crt) is the area
+     * the renderer models as visible for the video mode: for non-overscan
+     * NTSC that is 640 raster pixels by 224 lines per field starting at
+     * raster (159, 25), which in DISPLAY units is 2560 clocks from clock 636
+     * and 448 lines from line 50 (clock divider 4, gs_registers.hpp:723).
+     * Measured, ICO's gameplay window is exactly that: DW+1 2560, DH+1 448,
+     * DX 636, DY 50, MAGH 4. The attract movie programs DW+1 2880, DH+1 480,
+     * MAGH 3 from the same DX 636 and DY 50, which is 720 pixels by 240
+     * lines per field: it shares the top left corner and runs 320 clocks
+     * (80 pixels) further right and 32 lines (16 lines per field) further
+     * down. Both windows come out of the SDK sceGsSetDefDispEnv equivalent
+     * func_00241CB0 in the decomp, with dx=dy=0 at every call site.
      *
-     * What a TV does with that excess is not established here, and this file
-     * does not claim it is hidden. A real NTSC active line is nearer 710
-     * raster pixels than 640, so the 80 columns the frame drops are not all
-     * outside what a set shows; 640x224 is the renderer's safe area, not the
-     * analog active area. So the position taken, in one place and shared with
-     * the crop lines below, is: the frame is the renderer's non-overscan mode
-     * area, which is what this shim asks for by asking for nothing; the movie
-     * is cropped against it, which is a known divergence and is logged as one;
-     * and whether to present the overscan area instead (info.overscan, a
-     * 712x240 mode area, which needs kModeDisplayAspect re-derived first) is
-     * not established, so nothing is changed on its own.
+     * In crt the movie is cropped against that frame rather than fitted to
+     * it, so it keeps gameplay's origin and scale: 640x224 is what the
+     * renderer models the mode as showing, and how much of the 80 columns a
+     * real set would have shown behind its own overscan is a property of the
+     * set, not of this file. The left and top of the picture are not the
+     * frame's doing anyway: the movie's DISPFB2 carries DBX 36, DBY 12
+     * (func_0023E578, called from func_00101C80.s:138-143 with 720, 480, 36,
+     * 12), so on hardware the CRTC never reads the picture's left 36 columns
+     * or top 24 rows at all. That is the game's own overscan allowance. What
+     * the 640x224 frame takes off on top of that is the right 80 columns and
+     * the bottom 16 lines per field.
      *
-     * Fitting the movie to the frame is not the answer either: it moves the
-     * movie's origin away from gameplay's, which is the one thing the raster
-     * fixes. The placement lines below report where each window actually
-     * landed, so all of this stays checkable from a log. */
+     * RT_PGS_RASTER_WINDOW (display.raster window), the default, does two
+     * things. It grows
+     * the frame until it contains every enabled CRTC window instead of
+     * cropping on the right and bottom, and it reads each circuit from
+     * DBX = DBY = 0 instead of from the buffer offset the game programmed.
+     * For the movie that means the whole 720 by 480 buffer the display
+     * window points into is presented from its own origin, at 4:3 (see
+     * scanout_display_aspect), which is what PCSX2 shows by default.
+     *
+     * With the read offset ignored, the picture is framed by its own black
+     * borders rather than by the frame or by DBX/DBY. Measured off a decoded
+     * I frame, the picture carries 40 blank columns on the left and 38 on
+     * the right, 8 blank rows on top and 17 on the bottom, so the content
+     * sits centred within a pixel horizontally and about four rows above
+     * centre vertically. Read at DBX 36, DBY 12 instead, the same content is
+     * flush against the top and the right of the frame, which is what the
+     * game's own overscan allowance is for on a set that cuts those edges
+     * off and what window mode would otherwise show as a picture pushed into
+     * the top right corner.
+     *
+     * DBX/DBY is the one game-supplied value this mode overrides, and it is
+     * a host presentation choice, not an accuracy fix. It is the default
+     * because the user chose it after seeing both modes on the running movie
+     * (2026-09-03); crt is one menu step away, and the raster log line names
+     * the override (rt_pgs_raster_log_text) so a log always says which frame
+     * ran. Gameplay is unaffected either way: its window fits the frame and
+     * its DISPFB carries DBX 0, DBY 0.
+     *
+     * Fitting the movie to the frame is not on offer in either mode: it
+     * moves the movie's origin away from gameplay's and rescales a picture
+     * the game sized itself. The placement lines below report where each
+     * window actually landed, so all of this stays checkable from a log. */
+    info.grow_mode_area_to_circuits = m_opts.raster == RT_PGS_RASTER_WINDOW;
+    info.ignore_display_buffer_offset = m_opts.raster == RT_PGS_RASTER_WINDOW;
+    /* The override, named at the moment it happens and not only at startup:
+     * once per distinct non-zero (DBX, DBY) pair on the circuit the CRTC
+     * reads, so a log shows which game values window mode discarded. */
+    if (info.ignore_display_buffer_offset) {
+        const auto& pv = m_iface->get_priv_register_state();
+        const auto& fb = pv.pmode.EN2 ? pv.dispfb2 : pv.dispfb1;
+        const uint32_t pair = (uint32_t(fb.DBX) << 16) | uint32_t(fb.DBY);
+        if ((fb.DBX || fb.DBY) && pair != m_dbxy_ignored_logged) {
+            m_dbxy_ignored_logged = pair;
+            logf("paraLLEl-GS: raster window: circuit%u DISPFB DBX %u DBY %u ignored,"
+                 " the buffer is read from its origin (display.raster)",
+                 pv.pmode.EN2 ? 2u : 1u, (unsigned)fb.DBX, (unsigned)fb.DBY);
+        }
+    }
     /* Asked for at 4x and up, which is the minimum the renderer documents
      * (gs_interface.hpp:186-192) and the minimum its scanout path enforces:
      * gs_renderer.cpp:4256-4262 drops the request when either sampling axis
@@ -510,29 +565,80 @@ uint32_t RtPgs::vsync(unsigned field) {
      * (gs_renderer.cpp:5045), and fastmad_deinterlace runs
      * shaders/weave.frag over the last four fields at double height.
      *
-     * That filter is not a pure weave, and the difference decides how much of
-     * the movie is actually reconstructed. Rows where (y & 1) == phase are the
-     * current field taken as-is. Row 0 and the last row are the previous field
-     * taken as-is. Every other row is
+     * That filter is not a pure weave. weave.frag (FastMAD) keeps the rows
+     * where (y & 1) == phase from the current field, keeps row 0 and the
+     * last row from the previous field, and makes every other row
      * mix(previous field, 0.5 * (the current field's two neighbouring rows),
-     * bob_factor) with bob_factor = smoothstep(0.04, 0.06, diff), where diff
-     * is a luma difference between fields of the same parity. So still content
-     * weaves and gives the whole picture back, and moving content is bobbed
-     * from the current field alone: line doubled, at the field's vertical
-     * detail rather than the frame's.
+     * smoothstep(0.04, 0.06, diff)), where diff is a luma difference against
+     * the field two back. Whether that motion test is the right one for the
+     * movie is a property of the source, not of how the game splits it.
+     *
+     * The split itself is settled. The decoder uploads the 720x480 decoded
+     * frame to VRAM and then draws a point sampled 2:1 vertical sprite with
+     * V starting at 0.5 (to FBP 0) or 1.5 (to FBP 96), dropping alternate
+     * rows, so FBP 0 holds that frame's even rows and FBP 96 its odd rows
+     * (func_0023E890 in the decomp). The two newest fields are the two row
+     * sets of one decoded picture.
+     *
+     * What that does not settle is whether they are one moment, and measured
+     * they are not: a decoded I frame of this movie shows comb teeth on
+     * moving figures inside the single picture, so its even and odd rows
+     * were captured about 1/60 s apart. The MPEG source is interlaced video.
+     * The field pair is two moments, not one picture, and a pure weave of
+     * the pair reproduces the source's own comb on anything that moves. An
+     * earlier revision of this comment claimed the opposite, that a pure
+     * weave was exact for this content; the comb inside one picture is the
+     * measurement that says it is not.
+     *
+     * So the composition is a host choice with no single right answer, which
+     * is display.deinterlace, read fresh every field just below. Bob is the
+     * default: the user compared all three on the running movie (2026-09-03)
+     * and chose it. Adaptive asks the renderer for nothing special: FastMAD weaves
+     * the still parts and bobs the moving parts, and for a source whose
+     * fields really are 1/60 s apart in both directions there is nothing
+     * wrong with the field it compares against. Motion then runs at the
+     * field rate, 59.94 Hz, which is what the source carries.
      *
      * Declining hires still follows. The alternative is field_aware_rendering
      * on buffers whose sub-samples are all equal, which reconstructs nothing
-     * at all and only shifts alternate fields by a merged row. FastMAD weaves
-     * the still parts and holds the moving parts steady, which is strictly
-     * more of the decoded picture. The same info.phase drives it, so the
-     * derivation above serves both paths unchanged.
+     * at all and only shifts alternate fields by a merged row. The same
+     * info.phase drives the deinterlace path, so the derivation above serves
+     * both paths unchanged.
      *
      * m_hires_from_copy is that test, carried from the phase derivation:
      * the copy wrote this buffer, or a DISPFB flip pointed at it. It is not a
      * setting and not a heuristic on content; it is which producer the field
      * that is being scanned out came from. */
     info.high_resolution_scanout = m_opts.render_scale >= 4 && m_hires_from_copy;
+    /* display.deinterlace, read fresh every field so a change from the menu
+     * applies at the next one. Both flags are ignored unless the renderer
+     * deinterlaces at all, so a high-resolution scanout is unaffected by all
+     * three modes.
+     *
+     *   adaptive  neither flag: FastMAD as described above.
+     *   bob       skip_deinterlace, so the renderer returns the field itself
+     *             with its phase and composes nothing. present_frame stretches
+     *             it to the frame height and offsets it by the half line the
+     *             field sits at, which is what a CRT does with it. Movie
+     *             fields only, like weave below: a field the display copy
+     *             produced is one of two resamples of a single rendered frame
+     *             (gameplay at render scale 1), and FastMAD gives the whole
+     *             448-row frame back for those, so the setting never halves
+     *             gameplay's vertical detail. The first field after a switch
+     *             into weave weaves with itself for one frame, because the
+     *             renderer's field ring was reset while skipping; cosmetic.
+     *   weave     weave_only, and only for a field the movie produced (the
+     *             same producer test as the hires decision above: a DISPFB
+     *             flip with no display copy behind it). The renderer binds
+     *             the two newest fields to all four FastMAD inputs, so diff
+     *             is zero, the motion term drops out and every row is the
+     *             weave of the current field with the previous one. Kept
+     *             because it is the only mode that shows all 480 source rows
+     *             of a still picture at once; on moving figures it shows the
+     *             source's comb. */
+    const uint32_t deinterlace_mode = m_opts.deinterlace;
+    info.skip_deinterlace = deinterlace_mode == RT_PGS_DEINTERLACE_BOB && !m_hires_from_copy;
+    info.weave_only = deinterlace_mode == RT_PGS_DEINTERLACE_WEAVE && !m_hires_from_copy;
     /* Both consumers of the scanout image here (swapchain blit, screenshot
      * readback) want a transfer source. */
     info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -544,7 +650,39 @@ uint32_t RtPgs::vsync(unsigned field) {
     /* Logged here rather than in present() so headless runs report it too,
      * and once per geometry change so a mode switch is visible without
      * spamming every field. */
-    const double aspect = scanout_display_aspect(scanout);
+    double aspect = scanout_display_aspect(scanout);
+    /* Window mode: the frame is the display window itself, so the mode
+     * fraction above, which describes the fixed 4:3 area, no longer
+     * describes it. The window's raster aspect follows from the registers
+     * the game programmed: DW+1 clocks against the 2560 clocks and DH+1
+     * frame lines against the 448 lines of the NTSC 4:3 area the crt frame
+     * stands for. Gameplay (2560 x 448) gives 4:3 exactly; the movie
+     * (2880 x 480) gives 1.4, which keeps its pixels the same size as
+     * gameplay's: its 642 content columns span 2568 clocks, the width of the
+     * gameplay picture, so the title screen and the movie share one scale.
+     * Presenting the grown frame at 4:3 instead (what PCSX2 does) squeezes
+     * the movie 4.8 percent horizontally. Applied only when the frame is the
+     * circuit's own window (mode equals the circuit rect), and only for
+     * NTSC, the one CMOD this game's US disc runs; anything else keeps the
+     * 4:3 answer and says so once. */
+    if (m_opts.raster == RT_PGS_RASTER_WINDOW && scanout.image) {
+        const auto& pv = m_iface->get_priv_register_state();
+        const unsigned c = pv.pmode.EN2 ? 1u : 0u;
+        const auto& dp = c ? pv.display2 : pv.display1;
+        if (scanout.circuit_enabled[c] &&
+            scanout.circuit_width[c] == scanout.internal_width &&
+            scanout.circuit_height[c] == scanout.internal_height) {
+            if (pv.smode1.CMOD == 2u) {
+                const double clocks = double(dp.DW) + 1.0;
+                const double lines = (double(dp.DH) + 1.0) * (pv.smode2.INT ? 1.0 : 2.0);
+                aspect = kModeDisplayAspect * (clocks / 2560.0) * (448.0 / lines);
+            } else if (!m_window_aspect_cmod_logged) {
+                m_window_aspect_cmod_logged = true;
+                logf("paraLLEl-GS: raster window: display aspect for CMOD %u is not derived here;"
+                     " presenting the window at %.4f", (unsigned)pv.smode1.CMOD, aspect);
+            }
+        }
+    }
     /* A non-null image always carries non-zero mode and internal dimensions,
      * so an all-zero m_aspect_log_geom already means "nothing logged yet". */
     /* The super-sampling rate and the renderer's own high-resolution answer
@@ -552,12 +690,13 @@ uint32_t RtPgs::vsync(unsigned field) {
      * once. scanout.high_resolution_scanout is the result flag: the renderer
      * declines the request on its own for some scanout configurations, and
      * this is the only place that shows whether it actually engaged. */
-    const uint32_t geom[7] = {
+    const uint32_t geom[8] = {
         scanout.internal_width, scanout.internal_height,
         scanout.mode_width, scanout.mode_height,
         scanout.interlaced ? 1u : 0u,
         m_opts.render_scale,
         scanout.high_resolution_scanout ? 1u : 0u,
+        deinterlace_mode,
     };
     /* The derived geometry is not the whole story: a display setup can change
      * DX, DW, MAGH, DBY or the window height without moving internal or mode,
@@ -581,11 +720,12 @@ uint32_t RtPgs::vsync(unsigned field) {
              * assigned should_deinterlace, so it describes what happened to
              * this result, not what the source mode was. */
             logf("paraLLEl-GS: scanout internal %ux%u, mode %ux%u, deinterlaced=%s"
-                 " -> display aspect %.4f; ss=%ux hires=%s",
+                 " -> display aspect %.4f; ss=%ux hires=%s deint=%s",
                  scanout.internal_width, scanout.internal_height,
                  scanout.mode_width, scanout.mode_height,
                  scanout.interlaced ? "yes" : "no", aspect,
-                 m_opts.render_scale, scanout.high_resolution_scanout ? "yes" : "no");
+                 m_opts.render_scale, scanout.high_resolution_scanout ? "yes" : "no",
+                 rt_pgs_deinterlace_name(deinterlace_mode));
             /* The placement, hand checkable against the raster: DW+1 clocks
              * from DX and DH+1 lines from DY are what the game asked for, and
              * the lines-per-field figure beside them is that DH+1 reduced to
@@ -737,8 +877,15 @@ uint32_t RtPgs::vsync(unsigned field) {
     }
 
 #ifdef ICORECOMP_PGS_SDL
-    /* The attract movie's two buffers are the two halves of one picture, not
-     * two pictures.
+    /* Weave mode only (display.deinterlace weave). The attract movie's two
+     * buffers are the two row sets of one decoded picture, so weaving them
+     * is a composition of a whole picture, and a whole picture is worth
+     * holding for the field that does not complete one. Adaptive and bob
+     * compose or present per field and hold nothing.
+     *
+     * The measurement above stands over this whole comment: the picture the
+     * pair composes is itself two moments 1/60 s apart, so what is held is a
+     * complete pair, not a progressive frame.
      *
      * func_0023EE28 (../ico asm/nonmatchings/ito/mpeg/mv_sub/func_0023EE28.s)
      * runs a three state machine over one decoded picture: at .L0023EEBC,
@@ -757,11 +904,11 @@ uint32_t RtPgs::vsync(unsigned field) {
      * of the movie). A top half and bottom half split would therefore
      * interleave two vertically squashed copies of the picture on the CRT,
      * which is not an image; the even lines in A and the odd lines in B is
-     * the only assignment that is one. So it is a true field pair and a weave
-     * is the composition, which is what declining high-resolution scanout
-     * already asks the renderer for.
+     * the only assignment that is one. So it is a true field pair, and in
+     * weave mode a weave of the pair is the composition, which is what
+     * declining high-resolution scanout already asks the renderer for.
      *
-     * What was left is the pairing. fastmad_deinterlace weaves the current
+     * What is left in that mode is the pairing. fastmad_deinterlace weaves the current
      * scanout with the previous one (gs_renderer.cpp:5047-5062), and the
      * previous one is the other half of the same picture only on the field
      * that completed the pair. On the other field it is the second half of
@@ -774,13 +921,17 @@ uint32_t RtPgs::vsync(unsigned field) {
      * the field the DISPFB write happened in; see the derivation on
      * info.phase). So a new composition is presented on phase 1 and the phase
      * 0 field repeats it. The result is the movie's own 29.97 picture rate
-     * with both halves of each picture and no cross picture weave, which is
-     * what the CRT integrates over the two fields.
+     * with both row sets of each picture and no cross picture weave. That is
+     * the whole of what weave mode offers: every source row of a picture at
+     * once, at the picture rate, with the source's own comb wherever the two
+     * row sets are 1/60 s apart. Adaptive and bob both run at the field rate
+     * instead and hold nothing.
      *
      * Only the deinterlaced movie path is affected: a field whose picture came
      * from the display copy, or any field the renderer scanned out at high
      * resolution, presents its own composition exactly as before. */
-    const bool movie_field_pair = scanout.image && scanout.interlaced &&
+    const bool movie_field_pair = deinterlace_mode == RT_PGS_DEINTERLACE_WEAVE &&
+                                  scanout.image && scanout.interlaced &&
                                   !scanout.high_resolution_scanout && !m_hires_from_copy;
     const ParallelGS::ScanoutResult* to_present = &scanout;
     double present_aspect = aspect;
@@ -819,8 +970,12 @@ uint32_t RtPgs::vsync(unsigned field) {
                          (unsigned long long)m_vsyncs, (unsigned long long)n);
                 }
             }
-        } else if (scanout.image && m_held_scanout.image) {
-            /* Dropped only for a real field from the other producer. A field
+        } else if (m_held_scanout.image &&
+                   (scanout.image || deinterlace_mode != RT_PGS_DEINTERLACE_WEAVE)) {
+            /* Dropped for a real field from the other producer, and for any
+             * field at all once the mode is no longer weave: nothing repeats
+             * the pair in adaptive or bob, so holding the image there would
+             * only retain a Vulkan image no one reads. Within weave, a field
              * the renderer produced no image for keeps the pair, because
              * clearing it would leave the next movie field with nothing to
              * repeat and it would compose across two pictures instead.
@@ -839,7 +994,10 @@ uint32_t RtPgs::vsync(unsigned field) {
         /* Raw scanout pixels, deliberately NOT aspect-corrected: this file is
          * the regression baseline for rendering, so it has to stay a function
          * of the GS output alone and byte-comparable against a gs-replay dump.
-         * It is therefore not the shape the game has on screen (512x448 here
+         * It is therefore not the shape the game has on screen (512x448 here,
+         * or the raw 720x240 field for a movie field under bob, so a movie
+         * screenshot depends on display.deinterlace; gameplay does not, since
+         * bob and weave are movie-only) (512x448 here
          * against a 4:3 display); the display aspect for the same frame is in
          * the "display aspect" log line above.
          *

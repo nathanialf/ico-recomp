@@ -59,6 +59,18 @@ typedef struct RtPgs RtPgs;
 #define RT_PGS_FIT_STRETCH   2u
 #define RT_PGS_FILTER_LINEAR  0u
 #define RT_PGS_FILTER_NEAREST 1u
+/* Output frame: crt is the renderer's own visible area for the video mode and
+ * crops any window that overruns it; window grows the frame until it holds
+ * every enabled CRTC window. See the placement rule in gs_parallel_scanout.cpp. */
+#define RT_PGS_RASTER_CRT    0u
+#define RT_PGS_RASTER_WINDOW 1u
+/* How an interlaced scanout becomes one output frame: adaptive weaves the
+ * still parts and bobs the moving parts (the renderer's FastMAD filter), bob
+ * presents each field on its own at its own raster position, weave always
+ * pairs the two newest fields. See RtPgs::vsync in gs_parallel_scanout.cpp. */
+#define RT_PGS_DEINTERLACE_ADAPTIVE 0u
+#define RT_PGS_DEINTERLACE_BOB      1u
+#define RT_PGS_DEINTERLACE_WEAVE    2u
 
 /* Startup options resolved by the host (settings.json with environment
  * variables taking precedence). Extend at the end only. */
@@ -76,6 +88,8 @@ typedef struct RtPgsCreateOptions {
      * fallback is not the host's default: display.window_width/height
      * default to 1280x960 (settings.h), and the host always passes them. */
     uint32_t window_width, window_height;
+    uint32_t raster;         /* RT_PGS_RASTER_* */
+    uint32_t deinterlace;    /* RT_PGS_DEINTERLACE_* */
 } RtPgsCreateOptions;
 
 /* Creates the live backend. Never returns NULL: unrecoverable setup errors
@@ -83,7 +97,8 @@ typedef struct RtPgsCreateOptions {
  * host->fatal. `host` is copied; the pointed-to struct need not outlive the
  * call. `opts` may be NULL, meaning the pre-settings defaults (present mode
  * from ICORECOMP_GS_PRESENT as before this struct existed, letterbox,
- * linear filtering, render scale 1); otherwise it is
+ * linear filtering, render scale 1, and the same raster window and
+ * deinterlace bob defaults settings.h carries); otherwise it is
  * copied and the caller resolved it (settings.json with environment
  * variables taking precedence -- see gs_parallel.cpp). */
 RT_GS_API RtPgs* rt_pgs_create(const RtPgsHost* host, const RtPgsCreateOptions* opts);
@@ -126,6 +141,12 @@ RT_GS_API void  rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode);
 /* Presentation of the final scanout only (fit + filter); takes effect at
  * the next present. Safe between frames; fatal from pump_events. */
 RT_GS_API void  rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filter);
+/* Output frame the scanout is built at (RT_PGS_RASTER_*); takes effect at
+ * the next vsync. Between frames only; fatal from pump_events. */
+RT_GS_API void  rt_pgs_set_raster(RtPgs* pgs, uint32_t raster);
+/* Deinterlace mode for an interlaced scanout (RT_PGS_DEINTERLACE_*); takes
+ * effect at the next vsync. Between frames only; fatal from pump_events. */
+RT_GS_API void  rt_pgs_set_deinterlace(RtPgs* pgs, uint32_t deinterlace);
 /* Retunes super-sampling in flight (dynamic_super_sampling was set at
  * init). Between frames only; fatal mid-frame. Invalid factor is fatal
  * (host validates). High-resolution scanout follows the factor: requested

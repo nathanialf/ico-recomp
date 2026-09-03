@@ -35,6 +35,24 @@
 #include <unordered_map>
 #include <vector>
 
+/* One phrase per mode, shared by the startup lines in gs_parallel_lib.cpp and
+ * the live changes in gs_parallel_present.cpp, so a log reads the same
+ * whether the value came from settings.json or from the menu. */
+inline const char* rt_pgs_raster_log_text(uint32_t raster) {
+    return raster == RT_PGS_RASTER_WINDOW
+        ? "window (display.raster): frame grows to the display window,"
+          " DBX/DBY read offset ignored"
+        : "crt (display.raster): the renderer's mode area, a window past it is cropped";
+}
+
+inline const char* rt_pgs_deinterlace_name(uint32_t mode) {
+    switch (mode) {
+    case RT_PGS_DEINTERLACE_BOB: return "bob";
+    case RT_PGS_DEINTERLACE_WEAVE: return "weave";
+    default: return "adaptive";
+    }
+}
+
 /* The opaque instance behind RtPgs*. Method bodies moved intact from the
  * pre-C-ABI gs_parallel.cpp ParallelBackend; behavior changes are limited to
  * host-callback logging and reporting window closure instead of exiting. */
@@ -64,6 +82,8 @@ struct RtPgs {
     void surface_size(uint32_t* width, uint32_t* height);
     void set_present_mode(uint32_t mode);
     void set_presentation(uint32_t fit, uint32_t filter);
+    void set_raster(uint32_t raster);
+    void set_deinterlace(uint32_t deinterlace);
     void set_render_scale(uint32_t factor);
 
     /* Overlay rendering (milestone 4); see gs_parallel_api.h. Works headless
@@ -248,10 +268,11 @@ private:
      * instead of taking effect. */
     bool m_in_frame = false;
     /* Last (internal w, internal h, mode w, mode h, deinterlaced,
-     * render scale, high-resolution scanout) whose aspect was logged, so a
-     * geometry or scale change is visible in the log without spamming every
-     * field. Kept in the same order the geom[] literal in vsync() builds. */
-    uint32_t m_aspect_log_geom[7] = {};
+     * render scale, high-resolution scanout, deinterlace mode) whose aspect
+     * was logged, so a geometry, scale or mode change is visible in the log
+     * without spamming every field. Kept in the same order the geom[]
+     * literal in vsync() builds. */
+    uint32_t m_aspect_log_geom[8] = {};
     /* Fields still owed a "crtc field" line. Armed at construction, re-armed
      * whenever the scanout geometry line above fires, and re-armed once on the
      * first field that takes the DISPFB branch of the phase derivation, so a
@@ -315,11 +336,13 @@ private:
      * the change log into a per-field log. */
     unsigned m_dispfb_geom_log_left = 8;
     uint64_t m_dispfb_changes = 0;
-    /* The attract movie's field pair, held between vsyncs. Its two buffers are
-     * the two halves of one 29.97 fps picture and the pair is only complete on
-     * the field that uploaded the second half, so the other field presents
-     * this copy instead of a composition that pairs halves of two different
-     * pictures. See the derivation in RtPgs::vsync. */
+    /* The attract movie's field pair, held between vsyncs, in
+     * display.deinterlace weave only. Its two buffers are the even and odd
+     * rows of one decoded 29.97 fps picture (two moments 1/60 s apart, the
+     * source being interlaced video) and the pair is only complete on the
+     * field that uploaded the second half, so the other field presents this
+     * copy instead of a composition that pairs rows of two different
+     * pictures. Adaptive and bob hold nothing. See RtPgs::vsync. */
     ParallelGS::ScanoutResult m_held_scanout = {};
     double m_held_aspect = 0.0;
     uint64_t m_pair_repeats = 0;
@@ -333,6 +356,11 @@ private:
      * lines, since a change detector on its own is not a bound. */
     uint32_t m_crop_logged_dh = 0;
     uint32_t m_crop_logged_dw = 0;
+    /* Last non-zero (DBX << 16 | DBY) that window mode reported as ignored,
+     * so the line fires once per distinct pair rather than per field. */
+    uint32_t m_dbxy_ignored_logged = 0;
+    /* Once-only: window mode on a CMOD whose window aspect is not derived. */
+    bool m_window_aspect_cmod_logged = false;
     unsigned m_crop_log_left = 8;
     bool m_copy_ofy_logged = false;   /* the once-only calibration line */
     unsigned m_copy_ofy_search_left = 600; /* fields spent looking before saying so */

@@ -1,0 +1,115 @@
+From 71638bafb9df86d9510aaf1763c53606cb003ae0 Mon Sep 17 00:00:00 2001
+From: Nathanial Fine <nathanial.fine@gmail.com>
+Date: Thu, 3 Sep 2026 01:48:14 +0000
+Subject: [PATCH] Add VSyncInfo::grow_mode_area_to_circuits and
+ ignore_display_buffer_offset
+
+A CRTC window wider or taller than the mode area is cropped to the mode
+area, because the merged output frame is allocated from mode_width and
+mode_height. When the caller wants the whole window instead,
+grow_mode_area_to_circuits grows the frame to contain every enabled window.
+
+ICO measured: the attract movie programs a 720x240-per-field window from the
+same DX 636 / DY 50 as gameplay's 640x224 area. Without the flag the window
+is cropped to 640x224. With it the frame becomes 720x240.
+
+The growth happens before the merged image is created, so the merged image,
+the reported mode and internal sizes, and the deinterlace output all follow.
+real_mode_width, used for extwrite, keeps the mode area's own width.
+Windows starting left of or above the mode area still crop.
+
+ignore_display_buffer_offset samples each circuit with DISPFB DBX and DBY
+treated as 0, so the whole buffer window is scanned out from its origin. ICO
+reads the movie's 720x480 picture from DBX 36 / DBY 12, which puts the
+picture's own black borders flush against the top and right of the window;
+from the origin the picture sits centred inside its borders. The register
+values are not modified.
+---
+ gs/gs_interface.hpp | 13 +++++++++++++
+ gs/gs_renderer.cpp  | 35 +++++++++++++++++++++++++++++++++--
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 8d7f781..1aa4d23 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -184,6 +184,19 @@ struct VSyncInfo
+ 	// This will look funny if the game is constantly changing vertical scanout resolution.
+ 	bool raw_circuit_scanout;
+ 
++	// When set, the merged output frame is enlarged to contain every enabled CRTC window,
++	// instead of cropping windows that extend past the mode area on the right or bottom.
++	// A window that fits is unaffected. Negative offsets, that is windows starting left of
++	// or above the mode area, are not handled; they still crop.
++	bool grow_mode_area_to_circuits;
++
++	// When set, each circuit is sampled from its frame buffer's origin, that is with DISPFB
++	// DBX and DBY treated as 0, so the whole buffer window is scanned out instead of the part
++	// the game offset into it. Meant together with grow_mode_area_to_circuits for a
++	// "show the whole display buffer" presentation. The register values themselves are not
++	// changed; anti_blur and the log lines still see what the game wrote.
++	bool ignore_display_buffer_offset;
++
+ 	// When using SSAA, attempt to scan out a higher resolution image based on the super samples.
+ 	// This only works well if the game is rendering 3D geometry directly to the frame buffer which is used to scanout.
+ 	// Some games blit the real framebuffer to scanout location using textures, which will lose the SSAA information necessary to scanout,
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index b04ae32..e979198 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4590,7 +4590,13 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 				image_info.height *= 2;
+ 			}
+ 			circuit1 = device->create_image(image_info);
+-			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, promoted1);
++			DISPFBBits fb = priv.dispfb1;
++			if (info.ignore_display_buffer_offset)
++			{
++				fb.DBX = 0;
++				fb.DBY = 0;
++			}
++			sample_crtc_circuit(cmd, *circuit1, fb, rect, super_samples, promoted1);
+ 			device->set_name(*circuit1, "Circuit1");
+ 		}
+ 
+@@ -4648,7 +4654,13 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 				image_info.height *= 2;
+ 			}
+ 			circuit2 = device->create_image(image_info);
+-			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, promoted2);
++			DISPFBBits fb = priv.dispfb2;
++			if (info.ignore_display_buffer_offset)
++			{
++				fb.DBX = 0;
++				fb.DBY = 0;
++			}
++			sample_crtc_circuit(cmd, *circuit2, fb, rect, super_samples, promoted2);
+ 			device->set_name(*circuit2, "Circuit2");
+ 		}
+ 
+@@ -4738,6 +4750,25 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		}
+ 	}
+ 
++	if (info.grow_mode_area_to_circuits)
++	{
++		// This is the frame the merged image and the deinterlace output are allocated from,
++		// the image_info assignment below and fastmad_deinterlace's height * 2, so growing it
++		// here is sufficient. real_mode_width, used for extwrite, is deliberately left alone.
++		for (int i = 0; i < 2; i++)
++		{
++			if (crtc_rects[i].extent.width == 0 || crtc_rects[i].extent.height == 0)
++				continue;
++
++			mode_width = std::max<uint32_t>(
++					mode_width,
++					uint32_t(std::max<int32_t>(0, crtc_rects[i].offset.x)) + crtc_rects[i].extent.width);
++			mode_height = std::max<uint32_t>(
++					mode_height,
++					uint32_t(std::max<int32_t>(0, crtc_rects[i].offset.y)) + crtc_rects[i].extent.height);
++		}
++	}
++
+ 	ScanoutResult result = {};
+ 	result.mode_width = mode_width;
+ 	result.mode_height = mode_height;

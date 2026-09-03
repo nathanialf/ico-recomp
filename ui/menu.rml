@@ -101,6 +101,25 @@
 				</div>
 
 				<div class="control">
+					<div class="control-label">Display area</div>
+					<select data-value="raster" data-event-change="apply()">
+						<option value="crt">CRT area</option>
+						<option value="window">Full window</option>
+					</select>
+					<div class="hint">full window: everything the game programs for display, as PCSX2 shows it; the attract movie is shown whole, from its buffer origin, without the game's read offset</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Deinterlace</div>
+					<select data-value="deinterlace" data-event-change="apply()">
+						<option value="adaptive">Adaptive</option>
+						<option value="bob">Bob</option>
+						<option value="weave">Weave</option>
+					</select>
+					<div class="hint">adaptive: weave still parts, bob moving parts; bob: each field on its own, as a CRT shows it; weave: pair the two fields, combs on interlaced video. bob and weave apply to the movie; gameplay fields are always composed adaptively</div>
+				</div>
+
+				<div class="control">
 					<div class="control-label">Filter</div>
 					<select data-value="filter" data-event-change="apply()">
 						<option value="linear">Linear</option>

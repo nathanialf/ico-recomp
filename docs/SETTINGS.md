@@ -62,6 +62,8 @@ than calling them cold.
 | remember_window_size | bool | - | true | hot | - |
 | present | enum | `mailbox`, `fifo`, `immediate` | `mailbox` | warm | `ICORECOMP_GS_PRESENT` |
 | fit | enum | `letterbox`, `integer`, `stretch` | `letterbox` | hot | - |
+| raster | enum | `crt`, `window` | `window` | hot | - |
+| deinterlace | enum | `adaptive`, `bob`, `weave` | `bob` | hot | - |
 | filter | enum | `linear`, `nearest` | `linear` | hot | - |
 | render_scale | int, one of a set | 1, 4, 8, 16 | 1 | warm | - |
 | show_fps | bool | - | false | hot | - |
@@ -377,14 +379,97 @@ The renderer can still decline the request for some scanout configurations;
 the `hires=` field on the `scanout internal` log line reports what it
 actually did, per scanout geometry change.
 
+`display.raster` selects the output frame the scanout is built at, which is
+a separate question from how many samples go into it. `crt` is
+the area paraLLEl-GS models as visible for the video mode: 640 pixels by 224
+lines per field for non-overscan NTSC, at DISPLAY clock 636 and line 50. ICO's
+gameplay window is exactly that rectangle (DW+1 2560, DH+1 448, MAGH 4). The
+attract movie is not: it programs DW+1 2880, DH+1 480, MAGH 3 from the same
+corner, which is 720 pixels by 240 lines per field, so 80 columns on the right
+and 16 lines per field at the bottom fall outside the frame and are cropped.
+How much of them a television would have shown behind its own overscan is a
+property of the set, not of this port.
+
+The left and the top of the movie's picture are cropped by the game itself,
+not by the frame. Its `DISPFB2` carries DBX 36, DBY 12, so the CRTC starts
+reading 36 columns in and 12 lines per field down: the picture's left 36
+columns and top 24 rows are never displayed on hardware either. That is the
+game's own overscan allowance.
+
+`window`, the default, asks the renderer to grow the frame until it contains every enabled
+CRTC window instead of cropping on the right and bottom, and to read each
+circuit from DBX 0, DBY 0 rather than from the offset the game programmed. So
+the frame is the whole 720x480 buffer the movie's display window points into,
+from its own origin. It is presented at the window's own raster aspect,
+derived from the registers: DW+1 clocks against the 2560 clocks and DH+1
+lines against the 448 lines of the NTSC 4:3 area, which is 4:3 for gameplay
+and 1.4 for the movie. That keeps the movie's pixels the same size as
+gameplay's (its 642 content columns span 2568 clocks, the width of the
+gameplay picture), at the cost of a thin letterbox in a 4:3 window. PCSX2
+stretches the same window to 4:3 instead, a 4.8 percent horizontal squeeze.
+The picture is then framed by its own black borders: measured off a decoded
+frame, 40 blank columns on the left and 38 on the right, 8 blank rows on top
+and 17 on the bottom, so the content sits centred within a pixel horizontally
+and about four rows above centre vertically.
+
+Ignoring DBX/DBY is the one place any setting in this document overrides a
+value the game supplied, and it is a presentation register rather than
+anything the game reads back. It is stated here rather than hidden, it is
+the default because it was chosen on the running movie against `crt`, which
+stays one menu step away, and the `raster window (display.raster)`
+startup line names it. Without it, the same content is flush against the top
+and the right of the grown frame, because DBX 36 / DBY 12 is the game's own
+overscan allowance and a frame that shows the whole buffer has no overscan to
+spend it on. Gameplay is unaffected in either mode: its window fits the frame
+and its `DISPFB` carries DBX 0, DBY 0.
+
+`window` is a presentation choice and not a correction in the other direction
+too: it moves the movie's origin relative to gameplay's, which is what `crt`
+keeps.
+
+`display.deinterlace` decides how the two fields of an interlaced scanout
+become one output frame. It matters for the attract movie, whose MPEG is
+interlaced video: the game splits each decoded 720x480 picture into an
+even-row field buffer and an odd-row field buffer and flips `DISPFB2.FBP`
+between them once per field, and the two row sets of one decoded picture were
+themselves captured about 1/60 s apart (a decoded I frame shows comb teeth on
+moving figures inside the single picture). The field pair is two moments, not
+one still frame.
+
+- `adaptive` is the renderer's own FastMAD filter: still parts
+  are woven with the previous field and give back the full vertical
+  resolution, moving parts come from the current field alone. Motion runs at
+  the field rate.
+- `bob`, the default, presents each field on its own (the movie's fields; see below), stretched to the frame height and
+  offset by the half raster line the field sits at, which is what a CRT does
+  with it. Full field-rate motion, half the vertical detail, and the shimmer
+  bob always has on fine horizontal detail.
+- `weave` pairs the two newest fields with no motion test. It is the
+  only mode that shows all 480 source rows of a still picture at once, and on
+  moving figures it reproduces the source's own comb.
+
+`bob` and `weave` act on the movie's fields only: a field the game's own
+display copy produced (gameplay and the title menu at render scale 1) is one
+of two resamples of a single rendered frame, and the adaptive filter gives
+that whole 448-row frame back, so those fields are always composed
+adaptively whatever the setting says. The first field after switching into
+`weave` is woven with itself, one frame, because the renderer's field history
+was reset while it was skipped.
+
+None of the three applies when the renderer scans out at high resolution
+(`display.render_scale` 4 and up on a buffer the game drew into), because
+that path is not deinterlaced at all. The mode in force is on the `scanout
+internal` log line as `deint=`.
+
 The window or fullscreen display size (`display.mode`,
 `display.window_width`/`window_height`) is a separate, independent setting:
 it is only the surface the finished scanout is fitted into, using
 `display.fit` (letterbox, integer scale, or stretch) and `display.filter`
-(linear or nearest). Neither of these settings, nor any other setting in
-this document, changes a value the game itself supplied. There is no
-widescreen option and no game-speed option; both are out of scope for this
-port by design.
+(linear or nearest). Neither of these settings changes a value the game
+itself supplied, and neither does any other setting in this document except
+`display.raster=window`, which ignores the DBX/DBY read offset as described
+above and says so in its log line. There is no widescreen option and no
+game-speed option; both are out of scope for this port by design.
 
 The default is 1280x960, which is 640x480 doubled. Both are 4:3, the aspect
 this backend presents at, so the window opens with no letterbox either way.
@@ -724,7 +809,9 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `no longer a setting` | the file still holds a retired key (`display.hires_scanout`, `input.trigger_threshold` or `input.rumble`); the line names it and what replaced it |
 | `super-sampling` | the render scale the paraLLEl-GS backend was created with, whether super-sampled textures are on, and whether it asked for high-resolution scanout |
 | `render scale applied live` | a render scale change from the menu reached the backend |
-| `scanout internal` | the scanout geometry; its `ss=` and `hires=` fields are the super-sampling rate in force and whether the renderer actually scanned out at high resolution |
+| `(display.raster)` | which output frame the scanout is built at, `crt` or `window`, and in `window` that the DBX/DBY read offset is ignored (section 6); logged at startup and again on every change from the menu |
+| `(display.deinterlace)` | how an interlaced scanout is composed, `adaptive`, `bob` or `weave` (section 6); logged at startup and again on every change from the menu |
+| `scanout internal` | the scanout geometry; its `ss=`, `hires=` and `deint=` fields are the super-sampling rate in force, whether the renderer actually scanned out at high resolution, and the `display.deinterlace` mode the field was composed with |
 | `profiling on:` | the frame-time profiler is active, and how often it reports |
 | `RenderInterface::` | a stylesheet under `ui/` used something the overlay renderer cannot draw |
 | `title logo:` | the launcher's title image: a cache hit, or each step of building one from the disc, with timings (section 8) |

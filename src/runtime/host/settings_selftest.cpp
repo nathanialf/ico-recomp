@@ -600,6 +600,44 @@ int main() {
         CHECK(rt_settings().display.render_scale == 8);
     }
 
+    { /* 29. display.raster: "crt" (the non-default) loads and round-trips
+       * through a save, and an unrecognised value keeps the window default
+       * without failing the rest of the load. */
+        std::string path = scratch + "/raster.json";
+        write_file(path, "{\"version\": 1, \"display\": {\"raster\": \"crt\"}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().display.raster == RtRaster::Crt);
+        CHECK(rt_settings_save());
+        CHECK(read_file(path).find("\"raster\": \"crt\"") != std::string::npos);
+
+        std::string bad = scratch + "/rasterbad.json";
+        write_file(bad, "{\"version\": 1, \"display\": {\"raster\": \"bogus\", \"show_fps\": true}}\n");
+        set_env("ICORECOMP_SETTINGS", bad.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().display.raster == RtRaster::Window);
+        CHECK(rt_settings().display.show_fps);
+    }
+
+    { /* 30. display.deinterlace: "weave" (a non-default) loads and
+       * round-trips through a save, and an unrecognised value keeps the bob
+       * default without failing the rest of the load. */
+        std::string path = scratch + "/deinterlace.json";
+        write_file(path, "{\"version\": 1, \"display\": {\"deinterlace\": \"weave\"}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().display.deinterlace == RtDeinterlace::Weave);
+        CHECK(rt_settings_save());
+        CHECK(read_file(path).find("\"deinterlace\": \"weave\"") != std::string::npos);
+
+        std::string bad = scratch + "/deinterlacebad.json";
+        write_file(bad, "{\"version\": 1, \"display\": {\"deinterlace\": \"bogus\", \"show_fps\": true}}\n");
+        set_env("ICORECOMP_SETTINGS", bad.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().display.deinterlace == RtDeinterlace::Bob);
+        CHECK(rt_settings().display.show_fps);
+    }
+
     unset_env("ICORECOMP_SETTINGS");
     std::printf("settings-selftest: all checks passed\n");
     return 0;

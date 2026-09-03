@@ -137,6 +137,29 @@ void RtPgs::set_presentation(uint32_t fit, uint32_t filter) {
     m_opts.filter = filter;
 }
 
+void RtPgs::set_raster(uint32_t raster) {
+    if (m_in_frame) {
+        fatalf("paraLLEl-GS: rt_pgs_set_raster called while a frame is in flight;"
+               " settings must apply at the field boundary");
+    }
+    /* Only stores; RtPgs::vsync reads m_opts.raster fresh every field, so
+     * this takes effect at the next vsync with no further action. */
+    m_opts.raster = raster;
+    logf("paraLLEl-GS: raster %s", rt_pgs_raster_log_text(raster));
+}
+
+void RtPgs::set_deinterlace(uint32_t deinterlace) {
+    if (m_in_frame) {
+        fatalf("paraLLEl-GS: rt_pgs_set_deinterlace called while a frame is in flight;"
+               " settings must apply at the field boundary");
+    }
+    /* Only stores; RtPgs::vsync reads m_opts.deinterlace fresh every field,
+     * so this takes effect at the next vsync with no further action. */
+    m_opts.deinterlace = deinterlace;
+    logf("paraLLEl-GS: deinterlace %s (display.deinterlace)",
+         rt_pgs_deinterlace_name(deinterlace));
+}
+
 void RtPgs::set_render_scale(uint32_t factor) {
     if (m_in_frame) {
         fatalf("paraLLEl-GS: rt_pgs_set_render_scale called while a frame is in flight;"
@@ -330,7 +353,13 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
              * derives from, so a tall narrow window must shrink n rather
              * than let the derived width spill past the backbuffer edge
              * (a negative blit offset is not a valid Vulkan region). */
-            const int scanout_h = int(scanout.image->get_height());
+            /* A raw field under display.deinterlace bob is half the frame
+             * height; the integer step is still the frame's, so the step is
+             * doubled for it and the picture keeps the same set of sizes in
+             * every mode. */
+            const int image_h = int(scanout.image->get_height());
+            const bool raw_field = scanout.interlaced && image_h == int(scanout.internal_height);
+            const int scanout_h = raw_field ? 2 * image_h : image_h;
             int n = scanout_h > 0 ? bb_h / scanout_h : 0;
             if (aspect > 0.0) {
                 while (n >= 1 && std::lround(double(n * scanout_h) * aspect) > bb_w) --n;
@@ -367,8 +396,56 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
             }
         }
 
-        const int x0 = (bb_w - dst_w) / 2;
-        const int y0 = (bb_h - dst_h) / 2;
+        int x0 = (bb_w - dst_w) / 2;
+        int y0 = (bb_h - dst_h) / 2;
+
+        /* Bob (display.deinterlace bob): the renderer returned the field
+         * itself instead of a composition, so this blit is the bob. The
+         * vertical stretch to dst_h with the linear filter is the line
+         * doubling; what is left is where the field sits on the raster.
+         *
+         * A CRT draws the odd field one raster line below the even one, which
+         * is the same convention weave.frag uses when it composes: rows where
+         * (y & 1) == phase come from the current field. So phase 1 moves down
+         * half a frame line and phase 0 up half a line, in output pixels
+         * dst_h / (4 * field rows). Without it both fields land on the same
+         * rows and bob is a 30 Hz vertical judder of the whole picture.
+         *
+         * The test is the image height: a composed frame is twice
+         * internal_height (fastmad_deinterlace, gs_renderer.cpp), a
+         * high-resolution scanout is twice it as well, and only the raw field
+         * skip_deinterlace returns is equal to it. At 960 output lines the
+         * shift is one or two pixels.
+         *
+         * The rect has to stay inside the backbuffer (a negative blit offset
+         * is not a valid Vulkan region). A picture that already fills the
+         * window vertically, which is the default 4:3 window and every
+         * display.fit=stretch window, has no room for the offset, so the
+         * picture gives up one shifted row's worth of height at the top and
+         * the bottom (two or three pixels at 960 lines, kept at the same
+         * aspect) rather than drawing both fields on the same rows, which is
+         * a 30 Hz judder of the whole picture. Logged once with the numbers. */
+        if (scanout.interlaced && scanout.image->get_height() == scanout.internal_height) {
+            const int shift = int(std::lround((double(scanout.interlace_phase) - 0.5) * double(dst_h)
+                                              / (2.0 * double(scanout.image->get_height()))));
+            const int room = shift < 0 ? -shift : shift;
+            if (!(y0 - room >= 0 && y0 + room + dst_h <= bb_h) && room > 0) {
+                const int old_w = dst_w, old_h = dst_h;
+                dst_h -= 2 * room;
+                if (aspect > 0.0) dst_w = int(std::lround(dst_h * aspect));
+                x0 = (bb_w - dst_w) / 2;
+                y0 = (bb_h - dst_h) / 2;
+                static bool logged_bob_room = false;
+                if (!logged_bob_room) {
+                    logged_bob_room = true;
+                    logf("paraLLEl-GS: display.deinterlace=bob: destination %dx%d fills the %dx%d window"
+                         " vertically; shrunk to %dx%d so the half-line field offset of %d pixel(s) fits",
+                         old_w, old_h, bb_w, bb_h, dst_w, dst_h, room);
+                }
+            }
+            y0 += shift;
+        }
+
         const VkFilter filter = m_opts.filter == RT_PGS_FILTER_NEAREST
             ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         cmd->blit_image(backbuffer, *scanout.image,

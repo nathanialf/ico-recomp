@@ -19,6 +19,8 @@
 enum class RtDisplayMode { Windowed, FullscreenDesktop, FullscreenExclusive };
 enum class RtPresentMode { Mailbox, Fifo, Immediate };
 enum class RtFit        { Letterbox, IntegerScale, Stretch };
+enum class RtRaster     { Crt, Window };
+enum class RtDeinterlace { Adaptive, Bob, Weave };
 enum class RtFilter     { Linear, Nearest };
 
 /* Rebindable keyboard slots; order is the JSON schema order under
@@ -56,6 +58,16 @@ struct RtSettings {
         bool remember_window_size = true;
         RtPresentMode present = RtPresentMode::Mailbox;
         RtFit fit = RtFit::Letterbox;
+        /* Output frame the scanout is built at: Crt is the renderer's
+         * visible area for the video mode, which crops a window that
+         * overruns it (ICO's attract movie); Window grows the frame to hold
+         * the whole window. Presentation only, see docs/SETTINGS.md. */
+        RtRaster raster = RtRaster::Window;
+        /* How the two fields of an interlaced scanout become one output
+         * frame: Adaptive weaves the still parts and bobs the moving parts,
+         * Bob shows each field on its own, Weave always pairs the two newest
+         * fields. Presentation only, see docs/SETTINGS.md. */
+        RtDeinterlace deinterlace = RtDeinterlace::Bob;
         RtFilter filter = RtFilter::Linear;
         /* 1/4/8/16, paraLLEl-GS SuperSampling. 4 and up also request
          * high-resolution scanout; there is no separate setting for it. */

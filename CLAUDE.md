@@ -58,7 +58,11 @@ Changing these headers invalidates generated code. Do it deliberately.
 
 ## Settings and UI
 
-- Host-side only: no setting alters a value the game supplied. Widescreen and
+- Host-side only: no setting alters a value the game supplied, with one
+  documented exception: `display.raster = window` (the default) reads the
+  display buffer from its origin, ignoring the DISPFB DBX/DBY offset, so the
+  attract movie's whole 720x480 picture is shown; `crt` keeps the hardware
+  read offset and crop. See docs/SETTINGS.md section 6. Widescreen and
   game speed are out of scope by decision, not by omission. `gameplay.*` keys
   are the one class that reshapes an input before the game ever reads it:
   they are opt-in, default off, and touch only what the virtual pad reports

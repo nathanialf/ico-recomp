@@ -77,6 +77,14 @@ void rt_pgs_set_presentation(RtPgs* pgs, uint32_t fit, uint32_t filter) {
     pgs->set_presentation(fit, filter);
 }
 
+void rt_pgs_set_raster(RtPgs* pgs, uint32_t raster) {
+    pgs->set_raster(raster);
+}
+
+void rt_pgs_set_deinterlace(RtPgs* pgs, uint32_t deinterlace) {
+    pgs->set_deinterlace(deinterlace);
+}
+
 void rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor) {
     pgs->set_render_scale(factor);
 }

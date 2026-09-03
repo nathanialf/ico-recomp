@@ -153,6 +153,15 @@ constexpr EnumEntry kFitNames[] = {
     {"integer", (int)RtFit::IntegerScale},
     {"stretch", (int)RtFit::Stretch},
 };
+constexpr EnumEntry kRasterNames[] = {
+    {"crt", (int)RtRaster::Crt},
+    {"window", (int)RtRaster::Window},
+};
+constexpr EnumEntry kDeinterlaceNames[] = {
+    {"adaptive", (int)RtDeinterlace::Adaptive},
+    {"bob", (int)RtDeinterlace::Bob},
+    {"weave", (int)RtDeinterlace::Weave},
+};
 constexpr EnumEntry kFilterNames[] = {
     {"linear", (int)RtFilter::Linear},
     {"nearest", (int)RtFilter::Nearest},
@@ -382,7 +391,8 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
         } else {
             log_unknown_keys(*d, "display", [](const std::string& k) {
                 return is_one_of(k, {"mode", "window_width", "window_height", "remember_window_size",
-                    "present", "fit", "filter", "render_scale", "show_fps"});
+                    "present", "fit", "filter", "raster", "deinterlace", "render_scale",
+                    "show_fps"});
             });
             load_enum(d->find("mode"), "display.mode", kDisplayModeNames, (int*)&out->display.mode);
             load_int_range(d->find("window_width"), "display.window_width", 320, 16384, &out->display.window_width);
@@ -390,6 +400,8 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             load_bool(d->find("remember_window_size"), "display.remember_window_size", &out->display.remember_window_size);
             load_enum(d->find("present"), "display.present", kPresentNames, (int*)&out->display.present);
             load_enum(d->find("fit"), "display.fit", kFitNames, (int*)&out->display.fit);
+            load_enum(d->find("raster"), "display.raster", kRasterNames, (int*)&out->display.raster);
+            load_enum(d->find("deinterlace"), "display.deinterlace", kDeinterlaceNames, (int*)&out->display.deinterlace);
             load_enum(d->find("filter"), "display.filter", kFilterNames, (int*)&out->display.filter);
             load_int_set(d->find("render_scale"), "display.render_scale", kRenderScales, std::size(kRenderScales), &out->display.render_scale);
             if (d->find("hires_scanout")) {
@@ -511,6 +523,8 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     d.set("remember_window_size", RtJson::make_bool(s.display.remember_window_size));
     d.set("present", RtJson::make_string(enum_name(kPresentNames, (int)s.display.present)));
     d.set("fit", RtJson::make_string(enum_name(kFitNames, (int)s.display.fit)));
+    d.set("raster", RtJson::make_string(enum_name(kRasterNames, (int)s.display.raster)));
+    d.set("deinterlace", RtJson::make_string(enum_name(kDeinterlaceNames, (int)s.display.deinterlace)));
     d.set("filter", RtJson::make_string(enum_name(kFilterNames, (int)s.display.filter)));
     d.set("render_scale", RtJson::make_number(s.display.render_scale));
     d.set("show_fps", RtJson::make_bool(s.display.show_fps));

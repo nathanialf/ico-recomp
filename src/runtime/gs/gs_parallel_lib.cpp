@@ -98,6 +98,8 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
         m_opts.fit = RT_PGS_FIT_LETTERBOX;
         m_opts.filter = RT_PGS_FILTER_LINEAR;
         m_opts.render_scale = 1;
+        m_opts.raster = RT_PGS_RASTER_WINDOW;
+        m_opts.deinterlace = RT_PGS_DEINTERLACE_BOB;
     }
 
     if (!env_is_1("ICORECOMP_VVL")) {
@@ -178,6 +180,15 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
          m_opts.render_scale,
          gs_opts.super_sampled_textures ? "on" : "off",
          m_opts.render_scale >= 4 ? "requested" : "off");
+    /* The output frame the scanout is built at. Not visible in any other
+     * line, and it decides whether a window wider or taller than the mode
+     * area (ICO's attract movie) is cropped or presented whole, so a log
+     * from a user has to say which one ran. */
+    logf("paraLLEl-GS: raster %s", rt_pgs_raster_log_text(m_opts.raster));
+    /* Same reason as the raster line: an interlaced scanout can reach the
+     * window three different ways and none of the other lines say which. */
+    logf("paraLLEl-GS: deinterlace %s (display.deinterlace)",
+         rt_pgs_deinterlace_name(m_opts.deinterlace));
 }
 
 RtPgs::~RtPgs() {
