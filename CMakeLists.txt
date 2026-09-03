@@ -452,7 +452,7 @@ if(ICORECOMP_PARALLEL_GS)
         set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
         set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
         # The launcher's disc picker (src/runtime/ui/ui_launcher.cpp) needs
-        # SDL_ShowOpenFileDialog, and its credits link needs SDL_OpenURL.
+        # SDL_ShowOpenFileDialog, and its footer credit link needs SDL_OpenURL.
         # Only SDL_DIALOG is an option in this SDL revision (its CMakeLists
         # declares the Dialog subsystem through define_sdl_subsystem, default
         # ON); it is set here so a future default flip cannot quietly remove

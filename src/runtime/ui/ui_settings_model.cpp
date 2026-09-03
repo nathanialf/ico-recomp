@@ -116,11 +116,8 @@ struct UiSettingsMirror {
     /* input */
     float left_deadzone = 0.0f;
     float right_deadzone = 0.0f;
-    float trigger_threshold = 0.25f;
     std::string left_deadzone_text;
     std::string right_deadzone_text;
-    std::string trigger_threshold_text;
-    bool rumble = true;
     std::vector<UiBindRow> keyboard_binds;
     std::vector<UiBindRow> gamepad_binds;
     /* Inline result of the last capture or commit: a reject reason, a
@@ -401,11 +398,8 @@ void settings_to_mirror() {
 
     g_m.left_deadzone = s.input.left_deadzone;
     g_m.right_deadzone = s.input.right_deadzone;
-    g_m.trigger_threshold = s.input.trigger_threshold;
     g_m.left_deadzone_text = fmt("%.2f", (double)s.input.left_deadzone);
     g_m.right_deadzone_text = fmt("%.2f", (double)s.input.right_deadzone);
-    g_m.trigger_threshold_text = fmt("%.2f", (double)s.input.trigger_threshold);
-    g_m.rumble = s.input.rumble;
 
     /* Rebuilt rather than patched: a commit can revert a binding (the menu
      * key colliding with a pad slot, a duplicate), and the pane has to show
@@ -460,8 +454,6 @@ void mirror_to_settings() {
 
     s.input.left_deadzone = g_m.left_deadzone;
     s.input.right_deadzone = g_m.right_deadzone;
-    s.input.trigger_threshold = g_m.trigger_threshold;
-    s.input.rumble = g_m.rumble;
 
     s.gameplay.run_any_direction = g_m.run_any_direction;
 
@@ -574,11 +566,8 @@ bool settings_model_init(Rml::Context* context) {
 
     c.Bind("left_deadzone", &g_m.left_deadzone);
     c.Bind("right_deadzone", &g_m.right_deadzone);
-    c.Bind("trigger_threshold", &g_m.trigger_threshold);
     c.Bind("left_deadzone_text", &g_m.left_deadzone_text);
     c.Bind("right_deadzone_text", &g_m.right_deadzone_text);
-    c.Bind("trigger_threshold_text", &g_m.trigger_threshold_text);
-    c.Bind("rumble", &g_m.rumble);
 
     /* Same registration order as the binding rows below: the struct, then
      * the array of it, then the Bind. The window size select is a data-for

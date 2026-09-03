@@ -36,8 +36,8 @@
  *          Enter             start        Backspace  select
  *
  *      and, on the pad, the SDL3 gamepad layout (south=cross east=circle
- *      west=square north=triangle, both triggers as L2/R2 past
- *      input.trigger_threshold).
+ *      west=square north=triangle, both triggers as L2/R2, pressed past
+ *      a raw axis value of 8192 of 32767).
  *
  * Both providers can be inactive (headless, no script): every port then
  * reports "no controller" and sif/pad.cpp presents an empty port.
@@ -109,9 +109,9 @@ void rt_input_poll(uint64_t field);
 bool rt_input_get(int port, RtPadState* out);
 
 /* Actuator (rumble) values from the game: small motor 0/1, big motor
- * 0..255. Forwarded to SDL gamepad rumble when that provider is active and
- * rt_settings().input.rumble is true; always recorded for the log, so a run
- * with rumble switched off still shows what the game asked for. */
+ * 0..255. Forwarded to SDL gamepad rumble whenever that provider is active,
+ * and recorded for the log on every change, so the log shows what the game
+ * asked for. */
 void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor);
 
 #endif /* ICORECOMP_HOST_INPUT_H */

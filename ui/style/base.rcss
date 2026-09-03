@@ -5,7 +5,8 @@
  * scissored regions. No border-radius, box-shadow, gradients, filters,
  * container opacity or clip masks: each of those reaches a RenderInterface
  * function that is not implemented in this build and logs a line saying so.
- * The one transform in the document is the rotated bracket label.
+ * The two transforms in the documents are the rotated bracket label and
+ * the scale a checkbox animates through as it is checked.
  *
  * Sizes are in dp, not px. The context's density-independent pixel ratio is
  * set from the surface height against the 640x480 baseline (ui.cpp), so the
@@ -21,13 +22,13 @@
  * Two families, one rule: JetBrains Mono carries everything a value is read
  * out of (labels, controls, values, hints, taglines, the footer, the fps
  * readout), Playfair Display carries names and titles (nav names, section
- * titles, the launcher title, the credits byline). Both are loaded in
- * ui.cpp, which disables the UI if either is missing.
+ * titles, the launcher title). Both are loaded in ui.cpp, which disables
+ * the UI if either is missing.
  *
  * Column widths are derived from the longest string each column can hold,
  * at the mono advance of 0.6em plus that rule's letter-spacing. The three
- * that decide a width are "Right stick right" (binding slot), "Trigger
- * threshold" (control label) and "Fullscreen (exclusive)" (select value).
+ * that decide a width are "Right stick right" (binding slot), "Right stick
+ * deadzone" (control label) and "Fullscreen (exclusive)" (select value).
  *
  * Overflow: anything whose text is not bounded by this file (a settings
  * path, a disc path, a binding name, a version string) either wraps or is
@@ -44,7 +45,7 @@
  *   hairlines #1a1a1a  #262626  #525252
  *   type      #333333  #404040  #525252  #737373  #a3a3a3  #d4d4d4
  *             #e5e5e5  #f9fafb
- *   accent    #bfff00 (a control that is on)
+ *   accent    #22c55e (a control that is on)
  *   warning   #d4a000 on #2d2000, border #4d3800
  */
 
@@ -68,38 +69,53 @@ span {
 
 /* ---- menu shell --------------------------------------------------------- */
 
+/* The body is a plain block: both of its children are positioned against
+ * its edges rather than stacked in a flex column, so the shell's height is
+ * definite and the footer is pinned to the window instead of following the
+ * content. The insets that were this element's padding are now the shell's
+ * and the footer's own. */
 body.menu {
 	width: 100%;
 	height: 100%;
 	box-sizing: border-box;
-	padding: 12dp 14dp;
-	display: flex;
-	flex-direction: column;
+	display: block;
 	/* The one translucent surface: the game's scanout stays visible behind
 	 * the panel. The alpha is on the background color, not on the element;
 	 * container opacity would need a render layer. */
 	background-color: rgba(10, 10, 10, 217);
 }
 
+/* Anchored on all four sides, so its height is what the window leaves
+ * between the top inset and the footer rather than whatever its content
+ * adds up to. RmlUi resolves top and bottom together for an absolutely
+ * positioned box (Source/Core/Layout/LayoutDetails.cpp, GetInsetHeight), so
+ * this is a definite height and .pane can take a percentage of it. */
 .shell {
+	position: absolute;
+	top: 12dp;
+	left: 14dp;
+	right: 14dp;
+	bottom: 48dp;
 	display: flex;
 	flex-direction: row;
-	flex-grow: 1;
-	min-height: 0;
 }
 
 /* ---- left navigation column ---------------------------------------------
  *
- * 160dp of the 612dp the body's padding leaves at the baseline: 140dp of
- * buttons, then the 14dp bracket and its 6dp gap. A button's text box is
+ * 160dp of the 612dp the shell spans at the baseline: 140dp of buttons,
+ * then the 14dp bracket and its 6dp gap. A button's text box is
  * 140dp less 9dp of padding either side and 1dp of border, so 120dp, which
  * is 24 characters of the 8dp tagline (8 * (0.6 + 0.02) = 4.96dp each).
  * The longest tagline in the document is 22. A longer one wraps to a
  * second line and the button grows, which is why nothing here is nowrap. */
 
+/* flex-start, not the default stretch: the column is as tall as the button
+ * stack, so the bracket beside it ends level with the last button rather
+ * than running to the bottom of the shell. */
 .nav {
 	display: flex;
 	flex-direction: row;
+	align-self: flex-start;
 	width: 160dp;
 	flex-shrink: 0;
 }
@@ -166,7 +182,9 @@ body.menu {
 
 /* The bracket beside the nav stack: a 1dp vertical line with 1dp caps
  * reaching back toward the buttons, and a label rotated onto the line.
- * Built from nested divs because RCSS has no ::before/::after. */
+ * Built from nested divs because RCSS has no ::before/::after. The 5dp of
+ * margin-bottom cancels the last nav button's own margin, so the bracket
+ * ends on that button's bottom edge. */
 .bracket {
 	display: flex;
 	flex-direction: column;
@@ -176,9 +194,13 @@ body.menu {
 	margin-bottom: 5dp;
 }
 
+/* 6dp starting 5dp to the left of the line, so the cap spans -5dp to +1dp
+ * and covers the line's own 1dp column. A 5dp cap ends where the line
+ * begins, which at a dp ratio of 1 leaves the two sharing no pixel and the
+ * corner open. */
 .bracket-cap {
 	display: block;
-	width: 5dp;
+	width: 6dp;
 	height: 1dp;
 	margin-left: -5dp;
 	background-color: #525252;
@@ -195,19 +217,32 @@ body.menu {
 
 /* Rotated about its own center, so the pre-rotation box is centered on the
  * line with a negative margin of half its width. 70dp holds "Settings" at
- * 8dp mono with 0.1em of letter-spacing (8 * 0.7 = 5.6dp each, 45dp in
- * all) with room to spare; after rotation the box is 14dp across, which is
- * the bracket's width. Nowrap because a wrap here would rotate a second
- * line into the nav column. */
+ * 8dp mono with 0.08em of letter-spacing (8 * 0.68 = 5.44dp each, 44dp in
+ * all) with room to spare. flex-shrink: 0 because the label is a flex item
+ * of the 1dp-wide line: at the default shrink factor RmlUi squeezes the
+ * 70dp box down before the -35dp margin applies, and the rotated box lands
+ * left of the line instead of on it. Nowrap because a wrap here would
+ * rotate a second line into the nav column.
+ *
+ * The mask over the line is the box itself, in #0a0a0a: 70dp long along
+ * the bar against 44dp of text, so the line stops 13dp short of the text at
+ * either end. That gap comes from the width, not from padding, which is why
+ * the padding here is 1dp and not the portfolio's 0.4em: before rotation
+ * that padding sits above and below the text, and after it the same padding
+ * is width across the bar. At 0.4em (3.2dp a side) the rotated box was
+ * 16dp laid across the 14dp column and its black overhung the nav buttons;
+ * at 1dp it is 11.6dp (one 8dp line at line-height 1.2, plus 1dp a side)
+ * and clears the column by 1dp on each side. */
 .bracket-label {
 	display: block;
 	width: 70dp;
+	flex-shrink: 0;
 	margin-left: -35dp;
-	padding: 2dp 0;
+	padding: 1dp 0;
 	background-color: #0a0a0a;
 	text-align: center;
 	text-transform: uppercase;
-	letter-spacing: 0.1em;
+	letter-spacing: 0.08em;
 	font-size: 8dp;
 	color: #525252;
 	white-space: nowrap;
@@ -221,20 +256,31 @@ body.menu {
  * the backstop rather than the mechanism. An open dropdown is not clipped
  * by this: RmlUi gives the select box clip: none (WidgetDropDown.cpp), so
  * it escapes the pane's clip region. At the baseline the pane's content is
- * 434dp wide, less the 5dp scrollbar. */
+ * 434dp wide, less the 6dp scrollbar.
+ *
+ * height: 100% of the shell, which is a definite height because the shell
+ * is anchored top and bottom. Without it the pane is laid out at its
+ * content height, nothing overflows as far as RmlUi is concerned, no
+ * scrollbar is built and the wheel finds no scrollable container
+ * (Element.cpp, GetClosestScrollableContainer). With it, a tab taller than
+ * the shell goes through the block overflow path
+ * (Layout/ContainerBox.cpp, CatchOverflow) and scrolls. */
 
 .pane {
 	display: block;
 	flex-grow: 1;
 	min-width: 0;
+	height: 100%;
 	overflow-x: hidden;
 	overflow-y: auto;
 	padding-left: 14dp;
 	padding-right: 4dp;
 }
 
+/* 6dp and the slider knob's colours: at 5dp in #404040 on #1a1a1a the bar
+ * is there but neither visible at a glance nor easy to grab. */
 scrollbarvertical {
-	width: 5dp;
+	width: 6dp;
 }
 
 scrollbarvertical slidertrack {
@@ -242,13 +288,13 @@ scrollbarvertical slidertrack {
 }
 
 scrollbarvertical sliderbar {
-	width: 5dp;
+	width: 6dp;
 	min-height: 24dp;
-	background-color: #404040;
+	background-color: #525252;
 }
 
 scrollbarvertical sliderbar:hover {
-	background-color: #525252;
+	background-color: #737373;
 }
 
 .section {
@@ -296,8 +342,9 @@ scrollbarvertical sliderbar:hover {
 /* ---- controls -----------------------------------------------------------
  *
  * A label is 9dp mono with 0.05em of letter-spacing, so 5.85dp a character:
- * "Trigger threshold", the longest, is 100dp of the 429dp the pane leaves.
- * Labels therefore never need to wrap, and are not told to. */
+ * "Right stick deadzone", the longest at 20 characters, is 117dp of the
+ * 428dp the pane leaves. Labels therefore never need to wrap, and are not
+ * told to. */
 
 .control {
 	display: block;
@@ -498,15 +545,30 @@ input.checkbox {
 	margin-right: 7dp;
 	background-color: #171717;
 	border: 1dp #262626;
+	transition: background-color 0.15s cubic-in-out, border-color 0.15s cubic-in-out;
 }
 
 input.checkbox:hover {
 	border-color: #404040;
 }
 
+/* The fill and the border cross-fade in both directions; the pop only plays
+ * on the way in, because the animation sits on the :checked rule and RmlUi
+ * starts it when that rule begins to apply (Element.cpp, dirty_animation).
+ * cubic-out and cubic-in-out are the spellings this RmlUi has: its tween
+ * keywords are <family>-<direction> and there is no plain "ease"
+ * (Source/Core/PropertyParserAnimation.cpp). At 11dp a 1.15 scale adds
+ * under 1dp a side, so the box never reaches the label beside it. */
 input.checkbox:checked {
-	background-color: #bfff00;
-	border-color: #bfff00;
+	background-color: #22c55e;
+	border-color: #22c55e;
+	animation: 0.18s cubic-out check-pop;
+}
+
+@keyframes check-pop {
+	from { transform: scale(0.7); }
+	60% { transform: scale(1.15); }
+	to { transform: scale(1.0); }
 }
 
 /* Wraps rather than ellipsizes: the checkbox beside it is the control, and
@@ -622,7 +684,7 @@ input.range sliderbar:active {
 
 /* The row waiting for a key or a button. */
 .bind-name.capturing {
-	color: #bfff00;
+	color: #22c55e;
 }
 
 .bind-button {
@@ -673,18 +735,27 @@ input.range sliderbar:active {
  *
  * Buttons first at their own width, then the settings path taking whatever
  * is left, then the hotkey. Only the path shrinks: it is the one item whose
- * text this file cannot bound, so it is the one that ellipsizes. The row
- * wraps rather than squeezing the path to nothing in a window narrower than
- * the baseline. */
+ * text this file cannot bound, so it is the one that ellipsizes. nowrap
+ * because the row is pinned to the window's bottom edge: a second line
+ * would grow the box downward and off the window, so a narrow window
+ * squeezes the path to its ellipsis instead of wrapping the hotkey below.
+ *
+ * Pinned rather than stacked under the shell, so it sits in the same place
+ * whatever the open tab holds. The box is 30dp tall: one button row (9dp
+ * text at line-height 1.2, 4dp of padding either side and a 1dp border, so
+ * 21dp) under 8dp of padding and the 1dp rule. 12dp up from the bottom,
+ * its top edge is 42dp from it, which the shell's 48dp bottom inset clears
+ * by 6dp. */
 
 .footer {
+	position: absolute;
+	left: 14dp;
+	right: 14dp;
+	bottom: 12dp;
 	display: flex;
 	flex-direction: row;
-	flex-wrap: wrap;
+	flex-wrap: nowrap;
 	align-items: center;
-	flex-shrink: 0;
-	row-gap: 6dp;
-	margin-top: 10dp;
 	padding-top: 8dp;
 	border-top: 1dp #262626;
 }
@@ -854,16 +925,6 @@ body.launcher {
 	overflow: hidden;
 }
 
-.title-tagline {
-	display: block;
-	margin-top: 4dp;
-	font-size: 9dp;
-	text-transform: uppercase;
-	letter-spacing: 0.05em;
-	color: #737373;
-	line-height: 1.3;
-}
-
 .disc-panel {
 	display: block;
 	padding: 10dp 12dp;
@@ -970,13 +1031,24 @@ body.launcher {
 	margin-bottom: 4dp;
 }
 
-/* The build identity, which this file cannot bound. */
+/* The build identity on the left, the author credit on the right. Only the
+ * version line shrinks: it is the one item whose text this file cannot
+ * bound, so it is the one that ellipsizes. */
 .launcher-footer {
-	display: block;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
 	flex-shrink: 0;
 	margin-top: 10dp;
 	padding-top: 8dp;
 	border-top: 1dp #262626;
+}
+
+.footer-version {
+	display: block;
+	flex-grow: 1;
+	flex-shrink: 1;
+	min-width: 0;
 	font-size: 8dp;
 	color: #333333;
 	white-space: nowrap;
@@ -984,70 +1056,64 @@ body.launcher {
 	text-overflow: ellipsis;
 }
 
-/* ---- credits (credits.rml, and the menu's About pane) -------------------- */
-
-body.credits {
-	width: 100%;
-	height: 100%;
-	box-sizing: border-box;
-	padding: 18dp 22dp;
-	display: flex;
-	flex-direction: column;
-	background-color: #0a0a0a;
-}
-
-.credits-shell {
-	display: block;
-	flex-grow: 1;
-	min-height: 0;
-	overflow-x: hidden;
-	overflow-y: auto;
-}
-
-.credits-line {
-	display: block;
-	font-family: "Playfair Display";
-	font-size: 13dp;
-	line-height: 1.3;
-	color: #d4d4d4;
-}
-
 /* Clickable: ui_launcher.cpp hands it to SDL_OpenURL. Focusable too, so a
  * gamepad can reach it. */
-.credits-url {
-	display: block;
-	margin-top: 3dp;
-	font-size: 10dp;
-	color: #a3a3a3;
-	word-break: break-all;
+.credit {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	flex-shrink: 0;
+	margin-left: 12dp;
 	tab-index: auto;
 	nav: auto;
 }
 
-.credits-url:hover,
-.credits-url:focus {
-	color: #bfff00;
-}
-
-.credits-heading {
-	margin-top: 14dp;
-}
-
-/* One credit a line at the baseline, wrapping at a space when the line is
- * longer than the pane. break-word so that the one long token in the list,
- * a font's license file name, breaks rather than running out of the box. */
-.credits-item {
+/* The defnf mark drawn as boxes rather than loaded as an image: the overlay
+ * renderer's LoadTexture is a stub (ui_render.cpp). Four rows of six 2dp
+ * cells, 12dp by 8dp in all; the grid itself is in the comment above the
+ * footer in launcher.rml, decoded there from the one path in
+ * public/images/defnf-logo.svg in ../React-Portfolio. White at 0.7, which
+ * is what the sidebar there draws it at (invert(1) then opacity 0.7), and
+ * 0.9 on hover. The alpha is on the cell colour because container opacity
+ * would need a render layer this build does not have. */
+.defnf-logo {
 	display: block;
-	font-size: 9dp;
-	color: #737373;
-	line-height: 1.5;
-	word-break: break-word;
+	flex-shrink: 0;
+	margin-right: 5dp;
 }
 
-.credits-actions {
+.logo-row {
 	display: flex;
 	flex-direction: row;
-	flex-wrap: wrap;
-	row-gap: 6dp;
-	margin-top: 14dp;
+}
+
+.logo-cell {
+	display: block;
+	width: 2dp;
+	height: 2dp;
+	background-color: transparent;
+}
+
+.logo-cell.on {
+	background-color: rgba(255, 255, 255, 179);
+}
+
+/* #404040 is the portfolio's Copyright colour, one step above the version
+ * stamp beside it. */
+.credit-name {
+	display: block;
+	font-size: 8dp;
+	letter-spacing: 0.05em;
+	color: #404040;
+	white-space: nowrap;
+}
+
+.credit:hover .credit-name,
+.credit:focus .credit-name {
+	color: #a3a3a3;
+}
+
+.credit:hover .logo-cell.on,
+.credit:focus .logo-cell.on {
+	background-color: rgba(255, 255, 255, 230);
 }

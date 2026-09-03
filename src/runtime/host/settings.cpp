@@ -420,15 +420,23 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             rt_log("settings", "settings: \"input\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*i, "input", [](const std::string& k) {
-                return is_one_of(k, {"keyboard", "gamepad", "left_deadzone", "right_deadzone",
-                    "trigger_threshold", "rumble"});
+                return is_one_of(k, {"keyboard", "gamepad", "left_deadzone", "right_deadzone"});
             });
             map_bind_section(i->find("keyboard"), "input.keyboard", kKeyboardBinds, RT_KB_COUNT, out->input.keyboard);
             map_bind_section(i->find("gamepad"), "input.gamepad", kGamepadBinds, RT_GP_COUNT, out->input.gamepad);
             load_float_range(i->find("left_deadzone"), "input.left_deadzone", 0.0, 0.95, false, &out->input.left_deadzone);
             load_float_range(i->find("right_deadzone"), "input.right_deadzone", 0.0, 0.95, false, &out->input.right_deadzone);
-            load_float_range(i->find("trigger_threshold"), "input.trigger_threshold", 0.0, 1.0, true, &out->input.trigger_threshold);
-            load_bool(i->find("rumble"), "input.rumble", &out->input.rumble);
+            /* Retired keys. Neither is in the known-key list above, so both are
+             * also reported by log_unknown_keys and kept in the file across a
+             * save; these lines say what happens instead. */
+            if (i->find("trigger_threshold")) {
+                rt_log("settings", "settings: input.trigger_threshold is no longer a setting;"
+                    " an axis bound to a button is pressed past a compiled-in raw value of 8192 of 32767");
+            }
+            if (i->find("rumble")) {
+                rt_log("settings", "settings: input.rumble is no longer a setting;"
+                    " the host pad motors follow the game's actuator requests");
+            }
         }
     }
 
@@ -516,8 +524,6 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     write_bind_section(&in, "gamepad", kGamepadBinds, RT_GP_COUNT, s.input.gamepad);
     in.set("left_deadzone", RtJson::make_number(s.input.left_deadzone));
     in.set("right_deadzone", RtJson::make_number(s.input.right_deadzone));
-    in.set("trigger_threshold", RtJson::make_number(s.input.trigger_threshold));
-    in.set("rumble", RtJson::make_bool(s.input.rumble));
 
     RtJson& g = get_or_make_object(dom, "gameplay");
     g.set("run_any_direction", RtJson::make_bool(s.gameplay.run_any_direction));
@@ -860,7 +866,6 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
 
     revert_float(&cur->input.left_deadzone, prev.input.left_deadzone, "input.left_deadzone", 0.0, 0.95, false);
     revert_float(&cur->input.right_deadzone, prev.input.right_deadzone, "input.right_deadzone", 0.0, 0.95, false);
-    revert_float(&cur->input.trigger_threshold, prev.input.trigger_threshold, "input.trigger_threshold", 0.0, 1.0, true);
 
     if (!(cur->debug.fps_limit_hz == 0.0 || (cur->debug.fps_limit_hz >= 1.0 && cur->debug.fps_limit_hz <= 1000.0))) {
         rt_log("settings", "settings: debug.fps_limit_hz = %.6g is out of range (must be 0 or [1, 1000]); reverted to %.6g",

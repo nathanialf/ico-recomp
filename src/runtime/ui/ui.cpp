@@ -150,6 +150,38 @@ void apply_surface_size(uint32_t width, uint32_t height) {
     g_ui.context->SetDensityIndependentPixelRatio(density_for(height));
 }
 
+/* The first element carrying a class, or null. menu.rml has one .shell and
+ * one .pane, so there is nothing here to pick between. */
+Rml::Element* first_by_class(Rml::Element* root, const char* class_name) {
+    if (!root) return nullptr;
+    Rml::ElementList found;
+    root->GetElementsByClassName(found, class_name);
+    return found.empty() ? nullptr : found.front();
+}
+
+/* One line each time the menu opens. It answers the question the pane's
+ * bounded height turns on: whether .pane is the height of the shell that
+ * holds it, and, when it is not, which element grew instead. A pane that
+ * scrolls reads back with its scroll height above its client height, which
+ * is the condition RmlUi's wheel handling looks for
+ * (Element.cpp, GetClosestScrollableContainer).
+ *
+ * The figures are RmlUi's, in surface pixels, so at the default 1280x960
+ * window they are twice the dp values in base.rcss. */
+void log_menu_metrics() {
+    Rml::Element* shell = first_by_class(g_ui.menu, "shell");
+    Rml::Element* pane = first_by_class(g_ui.menu, "pane");
+    if (!g_ui.menu || !shell || !pane) {
+        rt_log("ui", "menu heights: no %s in the menu document; this file and menu.rml disagree",
+            !g_ui.menu ? "body" : (!shell ? ".shell" : ".pane"));
+        return;
+    }
+    rt_log("ui", "menu heights: body %.1f, shell %.1f, pane %.1f (client %.1f, scroll %.1f)",
+        double(g_ui.menu->GetOffsetHeight()), double(shell->GetOffsetHeight()),
+        double(pane->GetOffsetHeight()), double(pane->GetClientHeight()),
+        double(pane->GetScrollHeight()));
+}
+
 } // namespace
 
 } // namespace rtui
@@ -243,9 +275,9 @@ bool rt_ui_init() {
         rt_log("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
     }
 
-    /* The launcher's model and its two documents. A failure here costs the
-     * launcher and the credits, not the settings menu, so it is logged
-     * inside and not checked for here. */
+    /* The launcher's model and its document. A failure here costs the
+     * launcher, not the settings menu, so it is logged inside and not
+     * checked for here. */
     launcher_init(g_ui.context, ui_dir);
 
     g_ui.visible = false;
@@ -319,6 +351,15 @@ void rt_ui_tick() {
     }
 
     g_ui.context->Update();
+
+    /* After Update() and never from rt_ui_set_visible: the boxes are laid
+     * out by the context, so heights read at the moment the document is
+     * shown are the previous field's. */
+    if (g_ui.menu_metrics_pending) {
+        g_ui.menu_metrics_pending = false;
+        log_menu_metrics();
+    }
+
     g_ui.render->begin_frame();
     g_ui.context->Render();
 
@@ -372,6 +413,9 @@ void rt_ui_set_visible(bool visible) {
          * launcher is not up, which is every in-game open. */
         launcher_set_covered(true);
         g_ui.menu->Show();
+        /* Read at the next tick, once the context has laid the document
+         * out. */
+        g_ui.menu_metrics_pending = true;
     } else {
 #ifdef ICORECOMP_PGS_SDL
         /* A capture never outlives the menu. That is what keeps
@@ -380,6 +424,7 @@ void rt_ui_set_visible(bool visible) {
         rebind_cancel("the menu closed");
 #endif
         g_ui.menu->Hide();
+        g_ui.menu_metrics_pending = false;
         /* Whatever the launcher had up when the menu opened comes back. */
         launcher_set_covered(false);
         /* Not rt_settings_flush_save() here. This function runs from the

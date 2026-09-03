@@ -219,6 +219,10 @@ struct UiState {
      * menu closes from inside the event pump, and the settings file write
      * belongs at the field boundary. */
     bool flush_save_pending = false;
+    /* Set when the menu is shown, consumed by the next rt_ui_tick after
+     * Context::Update(): the pane and shell heights the log line reports
+     * are only laid out once the context has run. */
+    bool menu_metrics_pending = false;
     /* True while the library holds an overlay frame from us. Drives the one
      * rt_pgs_overlay_set_frame(NULL) that clears the overlay on hide. */
     bool frame_posted = false;
@@ -227,11 +231,8 @@ struct UiState {
     Rml::Context* context = nullptr;
     Rml::ElementDocument* menu = nullptr;
     Rml::ElementDocument* fps = nullptr;
-    /* Both loaded once at init and shown/hidden from ui_launcher.cpp; the
-     * credits document is reachable from the launcher, and the same text is
-     * inline in the menu's About pane. */
+    /* Loaded once at init and shown and hidden from ui_launcher.cpp. */
     Rml::ElementDocument* launcher = nullptr;
-    Rml::ElementDocument* credits = nullptr;
     UiRenderInterface* render = nullptr;
     UiSystemInterface* system = nullptr;
 };
@@ -281,22 +282,20 @@ void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::s
 /* ---- launcher (ui_launcher.cpp) -----------------------------------------
  *
  * The "launcher" data model (separate from "settings": it holds the disc
- * state and the precheck result, none of which is a setting) plus the two
- * documents that read it. Called from rt_ui_init: the model has to exist
- * before launcher.rml is parsed, and both documents load whether or not the
- * launcher gate in main.cpp passed, because the credits are reachable from
- * the in-game menu as well.
+ * state and the precheck result, none of which is a setting) plus the
+ * document that reads it. Called from rt_ui_init: the model has to exist
+ * before launcher.rml is parsed.
  *
  * Returns false, having logged, when the model or launcher.rml could not be
  * created. That disables the launcher (rt_launcher_run then returns true
  * straight away) without disabling the settings menu. */
 bool launcher_init(Rml::Context* context, const std::string& ui_dir);
 
-/* Takes launcher.rml (and the credits, if they are up) down while the
- * settings menu is open on top of them, and puts back exactly what was up
- * when the menu closes. The menu's backdrop is translucent because the
- * game's scanout belongs behind it; over the launcher there is no scanout,
- * only another document, and the two read as one jumbled screen.
+/* Takes launcher.rml down while the settings menu is open on top of it, and
+ * puts it back when the menu closes. The menu's backdrop is translucent
+ * because the game's scanout belongs behind it; over the launcher there is
+ * no scanout, only another document, and the two read as one jumbled
+ * screen.
  *
  * g_ui.launcher_visible stays true throughout: it means "the launcher owns
  * the window", which is still true with the menu over it, and both

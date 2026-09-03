@@ -87,8 +87,6 @@ function of the sound engine alone.
 | gamepad.\<slot\> | string | an SDL gamepad button string, or an axis name with a trailing `+`/`-` for direction (e.g. `lefttrigger+`) | see table below | hot | - |
 | left_deadzone | float | [0, 0.95] | 0.0 | hot | - |
 | right_deadzone | float | [0, 0.95] | 0.0 | hot | - |
-| trigger_threshold | float | (0, 1] | 0.25 | hot | - |
-| rumble | bool | - | true | hot | - |
 
 An unresolvable binding name (a typo, a name from a different SDL version)
 falls back to the compiled-in default for that one slot
@@ -103,16 +101,16 @@ the next poll, the same field it is committed. That includes the menu
 hotkey itself (`ui/ui.cpp` re-resolves it on the same generation check), so
 nothing in this section is cold or warm any more; every row above is hot.
 
-The trigger threshold gates an axis bind's pressed state: the axis reads
-past `trigger_threshold` of full scale, in the bound direction, to count as
-pressed. The default 0.25 gives a raw threshold of 8191.75, and with the
-`>` comparison the code uses, a trigger now counts as pressed at a raw axis
-value of 8192, one unit below where the pre-settings build's hardcoded
-`> 8192` fired (8193). That one-unit difference, out of 32767, is called
-out in the comment above `sdl_poll()`'s trigger check in
-`src/runtime/host/input.cpp` rather than hidden: reproducing 8193 exactly
-would need a threshold of 8192/32767 = 0.2500076, not a number a user can
-type into the menu.
+An axis bind (the `lefttrigger+` / `righttrigger+` defaults for L2 and R2)
+counts as pressed when the raw axis reads past 8192 of 32767 in the bound
+direction, the same `> 8192` check the pre-settings build hardcoded. The
+press point is a compiled-in constant in `sdl_poll()`
+(`src/runtime/host/input.cpp`), not a setting: to the game a trigger is a
+button, and the retail pad reports it as one. The keys
+`input.trigger_threshold` and `input.rumble` from earlier builds are
+retired; a file that still carries them keeps them, unchanged, and the load
+logs each one as retired. Rumble follows the game's own actuator requests,
+which the game asks the player about when a new game starts.
 
 Each stick gets a radial deadzone with remainder rescale: `left_deadzone`
 and `right_deadzone` are the fraction of the stick's radius (0 to 0.95) that
@@ -430,8 +428,8 @@ for that one slot (`ui/ui_rebind.cpp`):
   string.
 - **Gamepad axis**: the next axis pushed past 60% of full travel is stored
   as its SDL axis string with a trailing `+` or `-` recording which
-  direction was pushed (60% is deliberately higher than
-  `trigger_threshold`, so a resting stick on a worn pad cannot be
+  direction was pushed (60% is deliberately higher than the 25% press
+  point an axis bind fires at, so a resting stick on a worn pad cannot be
   mistaken for a deliberate press).
 
 Escape cancels an armed capture without changing anything. A capture that
@@ -502,11 +500,11 @@ The UI uses two faces, both required: a missing one disables the UI, and the
 log names the file that failed.
 
 - Playfair Display (a variable font), `ui/fonts/PlayfairDisplay[wght].ttf`,
-  for names and titles: the nav names, the section titles, the launcher
-  title and the credits byline.
+  for names and titles: the nav names, the section titles and the launcher
+  title.
 - JetBrains Mono, `ui/fonts/JetBrainsMono-Regular.ttf`, for everything a
   value is read out of: labels, controls, values, hints, taglines, the
-  footer and the field-rate readout. Every column width in
+  footer, the footer credit and the field-rate readout. Every column width in
   `ui/style/base.rcss` is derived from this face's 0.6em advance and the
   longest string that column can hold.
 
@@ -579,9 +577,17 @@ The launcher window (`ui/launcher.rml`, model and logic in
   closes the launcher and boots the game, reusing the disc mount and ELF
   read the precheck already did.
 - **Settings**: opens the same in-game menu described in section 7.
-- **Credits**: shows the credits screen (below).
 - **Quit**: closes the process without booting anything.
 - **show-at-startup**: the on-screen checkbox for `launcher.show_at_startup`.
+- **Footer**: the build identity on the left (the running executable's size
+  and modification time, `rt_exe_identity()`), and on the right the credit
+  "Nathanial Fine" behind the defnf mark, which opens `https://defnf.com`
+  through `SDL_OpenURL`. A build with no SDL, or a platform `SDL_OpenURL`
+  cannot hand off to, logs why and shows that in the status line instead of
+  doing nothing. The mark is drawn from plain boxes in the stylesheet,
+  since the overlay renderer draws no file images (see the RCSS subset
+  above). Third-party license notices ship in the package README, not in
+  the window.
 
 ### The title image
 
@@ -698,21 +704,6 @@ presenting frames nothing is producing, since there is no guest clock
 running yet), and the user's present mode from `rt_settings()` is restored
 at hand-off, whether the launcher started the game or the window was
 simply closed.
-
-### Credits
-
-Reachable from the launcher's Credits button and from the in-game menu's
-About pane (`ui/credits.rml`, shown as its own document; the same text is
-inline in the About pane). It lists "Developed by Nathanial Fine", a link
-to `https://defnf.com`, and the "Built with" credits for paraLLEl-GS
-(Arntzen Software, LGPLv3+, loaded as a separate shared library), SDL3
-(zlib license), RmlUi (MIT), FreeType (FreeType License), Playfair Display
-(SIL Open Font License, notice in `ui/fonts/PlayfairDisplay-OFL.txt`) and
-JetBrains Mono (SIL Open Font License, notice in
-`ui/fonts/JetBrainsMono-OFL.txt`). The site link opens through
-`SDL_OpenURL`, the same call the About pane's link uses;
-a build with no SDL, or a platform `SDL_OpenURL` cannot hand off to, logs
-why and shows that in the status line instead of doing nothing.
 
 ## 9. Log lines to look for
 

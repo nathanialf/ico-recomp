@@ -196,8 +196,6 @@ std::vector<PadBind> g_pad_binds;
  * always builds. */
 unsigned g_tables_gen = 0;
 
-bool g_rumble_suppressed_logged = false;
-
 /* Cleared when the toggle goes back off, so a later re-enable says so again;
  * the line is worth one log per enable, not one per field. */
 bool g_gate_expand_logged = false;
@@ -353,23 +351,16 @@ void sdl_poll() {
     }
 
     if (g_gamepad) {
-        /* An axis bind counts as pressed past input.trigger_threshold of full
-         * scale, in the bound direction.
-         *
-         * The pre-settings build hardcoded `> 8192` on the two triggers. The
-         * default threshold 0.25 gives 8191.75, so with the same `>` the
-         * trigger now counts as pressed at a raw axis value of 8192 instead
-         * of 8193: one unit out of 32767, under one LSB of the axis the pad
-         * reports. Reproducing 8193 exactly would need a threshold of
-         * 8192/32767 = 0.2500076, which is not a number a user can type into
-         * the menu, and pinning the default there would make every other
-         * threshold read wrong by the same amount. The one unit is stated
-         * here rather than hidden. */
-        const float press = cfg.input.trigger_threshold * 32767.0f;
+        /* Raw axis value past which an axis bind counts as pressed, in the
+         * bound direction. This is the pre-settings build's hardcoded
+         * `> 8192` on the two triggers. It is not a setting because an axis
+         * bound to a pad slot is a button as far as the game is concerned
+         * (the L2 and R2 defaults are lefttrigger+ and righttrigger+). */
+        constexpr float kTriggerPressRaw = 8192.0f;
         for (const PadBind& b : g_pad_binds) {
             if (b.axis != SDL_GAMEPAD_AXIS_INVALID) {
                 const float v = (float)SDL_GetGamepadAxis(g_gamepad, b.axis) * (float)b.dir;
-                if (v > press) s.buttons |= b.bit;
+                if (v > kTriggerPressRaw) s.buttons |= b.bit;
             } else if (SDL_GetGamepadButton(g_gamepad, b.button)) {
                 s.buttons |= b.bit;
             }
@@ -480,17 +471,6 @@ void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor) {
     }
 #ifdef ICORECOMP_PGS_SDL
     if (g_provider == Provider::Sdl && g_gamepad) {
-        /* input.rumble off suppresses the host motors only. The values the
-         * game wrote are still recorded above, so the log still shows what
-         * the game asked for; nothing the guest sees changes. */
-        if (!rt_settings().input.rumble) {
-            if (!g_rumble_suppressed_logged) {
-                g_rumble_suppressed_logged = true;
-                rt_log("input", "input.rumble is off; the game's actuator values are logged but not"
-                    " sent to the pad");
-            }
-            return;
-        }
         /* Small motor is on/off, big is 0..255; hold until the next update
          * (the game refreshes every frame while rumbling). */
         SDL_RumbleGamepad(g_gamepad,

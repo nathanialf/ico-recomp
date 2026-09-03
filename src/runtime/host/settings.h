@@ -71,8 +71,6 @@ struct RtSettings {
         std::string gamepad[RT_GP_COUNT];    /* SDL gamepad button/axis names */
         float left_deadzone = 0.0f;          /* 0 matches the pre-settings build */
         float right_deadzone = 0.0f;
-        float trigger_threshold = 0.25f;     /* replaces the hardcoded >8192 */
-        bool rumble = true;
     } input;
     struct {
         /* Off reproduces retail stick behaviour. On pre-scales the left

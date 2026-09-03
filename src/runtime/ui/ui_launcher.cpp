@@ -107,11 +107,8 @@ Rml::DataModelHandle g_model;
 bool g_model_valid = false;
 
 /* True while the settings menu is up over the launcher and this document
- * has been hidden for it (launcher_set_covered). The credits flag records
- * what to put back: the menu is reachable from the credits screen only
- * through the launcher behind it, but the state is restored either way. */
+ * has been hidden for it (launcher_set_covered). */
 bool g_covered = false;
-bool g_credits_covered = false;
 
 /* Queued by the callbacks, drained by launcher_tick(). */
 bool g_start_pending = false;
@@ -477,10 +474,6 @@ void on_open_settings(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&
     rt_ui_set_visible(true);
 }
 
-void on_open_credits(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-    if (g_ui.credits) g_ui.credits->Show();
-}
-
 void on_browse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     if (!g_m.browse_available) return;
     show_open_dialog();
@@ -516,22 +509,18 @@ void on_open_url(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& argu
 
 /* ---- plain click listeners ----------------------------------------------
  *
- * credits.rml carries no data model (there is nothing in it to bind), and
- * the menu's About pane is on the "settings" model, which has no business
- * knowing about URLs. Both get their two clickable elements wired here
- * instead.
+ * The footer credit in launcher.rml is on the "launcher" data model, which
+ * holds the disc state and the precheck result and has no business holding
+ * a URL. It gets a plain click listener wired here instead.
  */
 class ClickAction final : public Rml::EventListener {
 public:
-    enum class What { OpenUrl, HideCredits };
+    enum class What { OpenUrl };
     ClickAction(What what, const char* argument) : m_what(what), m_argument(argument ? argument : "") {}
 
     void ProcessEvent(Rml::Event&) override {
         switch (m_what) {
         case What::OpenUrl: open_url(m_argument); break;
-        case What::HideCredits:
-            if (g_ui.credits) g_ui.credits->Hide();
-            break;
         }
     }
 
@@ -543,7 +532,6 @@ private:
 const char kSiteUrl[] = "https://defnf.com";
 
 ClickAction g_open_site(ClickAction::What::OpenUrl, kSiteUrl);
-ClickAction g_hide_credits(ClickAction::What::HideCredits, nullptr);
 
 /* Missing ids are logged rather than ignored: they mean the document and
  * this file disagree, which costs the user a dead-looking link. */
@@ -596,7 +584,6 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     c.BindEventCallback("start", on_start);
     c.BindEventCallback("quit", on_quit);
     c.BindEventCallback("open_settings", on_open_settings);
-    c.BindEventCallback("open_credits", on_open_credits);
     c.BindEventCallback("browse", on_browse);
     c.BindEventCallback("use_path", on_use_path);
     c.BindEventCallback("clear_disc", on_clear_disc);
@@ -632,25 +619,9 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
         return false;
     }
 
-    /* Loaded once here, shown and hidden from the launcher and never
-     * reloaded: a second LoadDocument would leave two copies in the
-     * context. Failing to load it costs the credits screen, not the
-     * launcher. */
-    const std::string credits_path = ui_dir + "/credits.rml";
-    g_ui.credits = context->LoadDocument(credits_path);
-    if (!g_ui.credits) {
-        rt_log("ui", "document %s failed to load; the credits screen is unavailable",
-            credits_path.c_str());
-    }
+    attach_click(g_ui.launcher, "credit-link", &g_open_site);
 
-    attach_click(g_ui.credits, "credits-url", &g_open_site);
-    attach_click(g_ui.credits, "credits-back", &g_hide_credits);
-    /* The same link in the menu's About pane, which is reachable while the
-     * game is running and never goes through credits.rml. */
-    attach_click(g_ui.menu, "about-url", &g_open_site);
-
-    rt_log("ui", "launcher documents loaded: %s%s", launcher_path.c_str(),
-        g_ui.credits ? ", credits.rml" : "");
+    rt_log("ui", "launcher document loaded: %s", launcher_path.c_str());
     return true;
 }
 
@@ -662,13 +633,9 @@ void launcher_set_covered(bool covered) {
     g_covered = covered;
 
     if (covered) {
-        g_credits_covered = g_ui.credits && g_ui.credits->IsVisible();
-        if (g_credits_covered) g_ui.credits->Hide();
         g_ui.launcher->Hide();
     } else {
         g_ui.launcher->Show();
-        if (g_credits_covered && g_ui.credits) g_ui.credits->Show();
-        g_credits_covered = false;
     }
     rt_log("ui", "launcher document %s for the settings menu", covered ? "hidden" : "shown again");
 }
@@ -816,7 +783,6 @@ bool rt_launcher_run() {
         user_present_mode);
 
     g_covered = false;
-    g_credits_covered = false;
     g_ui.launcher_visible = true;
     g_ui.launcher->Show();
 #ifdef ICORECOMP_PGS_SDL
@@ -869,8 +835,6 @@ bool rt_launcher_run() {
     g_ui.launcher->Hide();
     g_ui.launcher_visible = false;
     g_covered = false;
-    g_credits_covered = false;
-    if (g_ui.credits) g_ui.credits->Hide();
 #ifdef ICORECOMP_PGS_SDL
     if (!rt_ui_visible()) menu_set_text_input(false);
 #endif

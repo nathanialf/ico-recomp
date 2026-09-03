@@ -53,9 +53,10 @@ using RebindClock = std::chrono::steady_clock;
 constexpr auto kTimeout = std::chrono::seconds(5);
 
 /* Axis travel that counts as a deliberate deflection during capture. Higher
- * than input.trigger_threshold on purpose: this is "the user meant this
- * axis", not "the trigger is pressed", and a resting stick on a worn pad can
- * sit well off center. */
+ * than the raw press point host/input.cpp uses for a bound axis (8192 of
+ * 32767, about 25%) on purpose: this is "the user meant this axis", not "the
+ * trigger is pressed", and a resting stick on a worn pad can sit well off
+ * center. */
 constexpr float kCaptureAxis = 0.6f * 32767.0f;
 
 enum class State { Idle, Capturing, Accepted };

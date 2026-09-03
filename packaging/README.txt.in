@@ -54,7 +54,7 @@ stick keeps its own settings.
 Press F1 (or Guide on a gamepad) at any time to open the in-game menu.
 The game keeps running behind it. On Windows, and on Linux when the live
 renderer is selected, a launcher window appears at startup first, with a
-disc picker plus Start, Settings and Credits buttons; pass --no-launcher to
+disc picker plus Start, Settings and Quit buttons; pass --no-launcher to
 skip it and boot straight into the game. The menu's Input tab lets you
 remap keys and gamepad buttons to any DS2 button. The Gameplay tab holds
 one toggle, "Run in every stick direction", off by default; off matches

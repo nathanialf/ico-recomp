@@ -34,7 +34,6 @@
 				<img id="title-logo" class="title-logo" src="logo:ico" data-if="logo_available"/>
 				<div class="title-name" data-if="!logo_available">ICO</div>
 			</div>
-			<div class="title-tagline">PlayStation 2 static recompilation</div>
 		</div>
 
 		<div class="disc-panel">
@@ -65,7 +64,6 @@
 		<div class="launcher-actions">
 			<div class="button start-button" data-class-disabled="!can_start" data-event-click="start()">Start</div>
 			<div class="button" data-event-click="open_settings()">Settings</div>
-			<div class="button" data-event-click="open_credits()">Credits</div>
 			<div class="button" data-event-click="quit()">Quit</div>
 		</div>
 
@@ -75,6 +73,34 @@
 		</div>
 	</div>
 
-	<div class="launcher-footer">{{version_line}}</div>
+	<!--
+		The build identity on the left, the author credit on the right. The
+		logo is built from divs rather than an image because the overlay
+		renderer's LoadTexture is a stub (ui_render.cpp). Its cells are the
+		defnf mark from ../React-Portfolio (public/images/defnf-logo.svg): the
+		single path there spans 12 by 8 cells of 200 svg units, which is this
+		6 by 4 grid of 2 by 2 blocks, top row first.
+
+			#..###
+			##.#..
+			#####.
+			#..#..
+
+		The credit opens https://defnf.com: ui_launcher.cpp attaches a plain
+		click listener to this id, because the "launcher" model holds the
+		disc state and has no business holding a URL.
+	-->
+	<div class="launcher-footer">
+		<div class="footer-version">{{version_line}}</div>
+		<div class="credit" id="credit-link">
+			<div class="defnf-logo">
+				<div class="logo-row"><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell"/><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell on"/></div>
+				<div class="logo-row"><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell"/></div>
+				<div class="logo-row"><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell"/></div>
+				<div class="logo-row"><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell"/><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell"/></div>
+			</div>
+			<span class="credit-name">Nathanial Fine</span>
+		</div>
+	</div>
 </body>
 </rml>
