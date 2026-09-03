@@ -1,11 +1,20 @@
 /* host/json.cpp: see json.h for scope and strictness rules. */
 #include "host/json.h"
 
+#include "host/portable.h"
+#include "runtime.h"
+
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -455,4 +464,39 @@ std::string rt_json_write(const RtJson& v) {
     write_value(v, 0, &out);
     out += "\n";
     return out;
+}
+
+bool rt_json_write_file(const std::string& path, const std::string& text) {
+    std::error_code ec;
+    std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+
+    std::string tmp = path + ".tmp";
+    std::FILE* f = rt_fopen_utf8(tmp.c_str(), "wb");
+    if (!f) {
+        rt_log("json", "json: could not open %s for writing: %s", tmp.c_str(), std::strerror(errno));
+        return false;
+    }
+    size_t written = std::fwrite(text.data(), 1, text.size(), f);
+    if (written != text.size()) {
+        rt_log("json", "json: short write to %s: %s", tmp.c_str(), std::strerror(errno));
+        std::fclose(f);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    std::fflush(f);
+#ifdef _WIN32
+    _commit(rt_fileno(f));
+#else
+    fsync(rt_fileno(f));
+#endif
+    std::fclose(f);
+
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        rt_log("json", "json: rename %s -> %s failed: %s", tmp.c_str(), path.c_str(), ec.message().c_str());
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
 }

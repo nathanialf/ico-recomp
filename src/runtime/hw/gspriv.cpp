@@ -17,6 +17,7 @@
 #include "../ee/kernel.h"
 #include "../gs/gs_backend.h"
 #include "../host/audio.h"
+#include "../host/mouse.h"
 #include "../host/portable.h"
 #include "../host/settings.h"
 #include "../host/window.h"
@@ -333,11 +334,20 @@ void rt_gs_vsync_hook(unsigned field) {
      * calls fatal if made mid-frame; this is the one place guaranteed to run
      * between frames every field. rt_ui_tick() follows for the same reason:
      * RmlUi's update and render call the overlay texture and set_frame entry
-     * points, which are between-frames-only too (see ui/ui.h). */
+     * points, which are between-frames-only too (see ui/ui.h).
+     *
+     * rt_mouse_tick() comes last of the four because it reads what the other
+     * three settled: the pump's focus events, the settings the applier just
+     * committed, and whether the overlay now wants input. It is here rather
+     * than in the pump for a mechanical reason, not a technical one: SDL
+     * calls are legal from the pump, but keeping every mode change (here,
+     * relative mouse mode) at the field boundary means the rule "the pump
+     * only records, the field boundary acts" needs no exceptions to check. */
     note_field();
     rt_window_pump();
     rt_settings_apply_pending();
     rt_ui_tick();
+    rt_mouse_tick();
     {
         RT_PROF_ZONE(RT_PROF_PRESENT);
         GsBackend* be = rt_gs_backend();

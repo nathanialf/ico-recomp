@@ -47,11 +47,17 @@ UiState g_ui;
  * either: rt_hw_init() builds it, and main.cpp runs that before rt_ui_init()
  * on both of its orderings.
  *
- * Three things stay direct because none of them is a GS command: the SDL
- * window handle, the surface size and the present mode the library resolved
- * at create time. The first two are main-thread reads the UI lays itself out
+ * Four things stay direct because none of them is a GS command: the SDL
+ * window handle, the surface size, the present mode the library resolved at
+ * create time, and the present rectangle the last present blitted the
+ * scanout into. The first two are main-thread reads the UI lays itself out
  * from; sending a query through the ring would mean blocking on the consumer
- * for a value only this thread can change. */
+ * for a value only this thread can change. The present rectangle is the one
+ * of the four the consumer side writes: present_frame stores it, and it is
+ * read back here on the same thread only because that ring is drained inline
+ * today (gs/gs_select.cpp). The day it gets a worker thread, that read needs
+ * the members behind it to be atomics; gs/gs_parallel_impl.h carries the
+ * same note. */
 
 uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height) {
     return rt_gs_backend()->overlay_texture_create(rgba8, width, height);
@@ -91,6 +97,12 @@ void backend_surface_size(uint32_t* width, uint32_t* height) {
     if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_surface_size(pgs, width, height);
 }
 
+void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                          int32_t* bb_w, int32_t* bb_h) {
+    *x = 0; *y = 0; *w = 0; *h = 0; *bb_w = 0; *bb_h = 0;
+    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_present_rect(pgs, x, y, w, h, bb_w, bb_h);
+}
+
 uint32_t backend_present_mode() {
     return rt_gs_parallel_present_mode();
 }
@@ -104,6 +116,10 @@ uint32_t backend_present_mode() {
 bool backend_window_live() { return false; }
 void* backend_window_handle() { return nullptr; }
 void backend_surface_size(uint32_t* width, uint32_t* height) { *width = 0; *height = 0; }
+void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                          int32_t* bb_w, int32_t* bb_h) {
+    *x = 0; *y = 0; *w = 0; *h = 0; *bb_w = 0; *bb_h = 0;
+}
 uint32_t backend_present_mode() { return 0; }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */
@@ -291,6 +307,11 @@ bool rt_ui_init() {
         rt_log("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
     }
 
+    /* The drawn cursor for the game's own menus, another always-loaded pair.
+     * Failing to load it costs the cursor, not the menu, so it is logged
+     * inside and not checked for here. */
+    ui_menu_cursor_init(g_ui.context, ui_dir);
+
     /* The launcher's model and its document. A failure here costs the
      * launcher, not the settings menu, so it is logged inside and not
      * checked for here. */
@@ -352,11 +373,15 @@ void rt_ui_tick() {
         rt_settings_flush_save();
     }
 
+    /* Before the early-out below, which counts g_ui.cursor_visible: this
+     * call is what sets it. */
+    ui_menu_cursor_tick();
+
     /* The tick renders whenever any document is up: the launcher (which owns
      * the whole window while it is, and draws over an empty backbuffer), the
-     * menu, or the fps readout, which is shown on display.show_fps with
-     * neither of the other two up. */
-    if (!g_ui.visible && !g_ui.fps_visible && !g_ui.launcher_visible) {
+     * menu, the fps readout, or the drawn cursor on the game's own menus. */
+    if (!g_ui.visible && !g_ui.fps_visible && !g_ui.launcher_visible &&
+        !g_ui.cursor_visible) {
         /* Exactly one clear on the way down, keyed on whether anything was
          * drawn last time; never a set_frame call while nothing is up. */
         if (g_ui.frame_posted) {
@@ -388,15 +413,17 @@ void rt_ui_tick() {
     if (frame.cmd_count != 0 && !logged_geometry) {
         logged_geometry = true;
         rt_log("ui", "first overlay frame: %u vertices, %u indices, %u cmds for a %ux%u surface"
-                     " (menu %d, fps %d, launcher %d)",
+                     " (menu %d, fps %d, launcher %d, cursor %d)",
             frame.vertex_count, frame.index_count, frame.cmd_count,
             frame.surface_width, frame.surface_height,
-            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0);
+            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0,
+            g_ui.cursor_visible ? 1 : 0);
     } else if (frame.cmd_count == 0 && !logged_empty) {
         logged_empty = true;
         rt_log("ui", "a document is up but RmlUi produced no geometry this field"
-                     " (menu %d, fps %d, launcher %d)",
-            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0);
+                     " (menu %d, fps %d, launcher %d, cursor %d)",
+            g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0,
+            g_ui.cursor_visible ? 1 : 0);
     }
     if (frame.cmd_count != 0) {
         backend_set_frame(&frame);
@@ -434,9 +461,11 @@ void rt_ui_set_visible(bool visible) {
         g_ui.menu_metrics_pending = true;
     } else {
 #ifdef ICORECOMP_PGS_SDL
-        /* A capture never outlives the menu. That is what keeps
+        /* An armed capture never outlives the menu. That is what keeps
          * rt_ui_wants_input() (and so the neutral pad in host/input.cpp) true
-         * for the whole of a capture: the menu is up for all of it. */
+         * for the whole of a capture: the menu is up for all of it. A capture
+         * that was already accepted is left alone: rebind_tick applies it at
+         * this same field boundary, with the menu closed (ui_rebind.cpp). */
         rebind_cancel("the menu closed");
 #endif
         g_ui.menu->Hide();

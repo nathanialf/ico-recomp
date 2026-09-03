@@ -1,0 +1,49 @@
+<rml>
+<head>
+	<title>Menu cursor</title>
+	<link type="text/rcss" href="style/base.rcss"/>
+</head>
+<!--
+	The drawn cursor for the game's own menus. While the pointer owns the
+	mouse, relative mouse mode stays on and the OS cursor is hidden, so this
+	document is the only thing on screen showing where the pointer is.
+	src/runtime/ui/ui_menu_cursor.cpp shows and hides it and refreshes the
+	model at the field boundary.
+
+	The whole document is pointer-events: none: the mouse buttons belong to
+	guest/menu_nav.cpp while the pointer has them, and an element that
+	swallowed a click would take it from the game's menu.
+
+	.cursor-area is placed on the presented scanout rectangle in percent of
+	the surface, the same space guest/menu_nav.cpp hit-tests in, so the
+	cursor lands where the hit test happens. .cursor-point inside it is a
+	zero-sized box at the cursor position, so both cursors below place
+	themselves in offsets from that one point.
+
+	Two cursors, one shown at a time. The first is the letter I of the game's
+	own wordmark, cut out of the title image built from the disc, turned to a
+	mouse cursor's angle and outlined (src/runtime/ui/cursor_image.cpp). It is
+	served from memory under the "cursor:" scheme, and it is offset by minus
+	its hotspot so the glyph's point lands on the cursor position. The second,
+	shown whenever no image could be built, is two triangles drawn out of
+	borders (see base.rcss): a dark outer one with a lighter inner one over
+	it. Both have their sharp corner at their own top left, which is the point
+	.cursor-point sits on, so the tip is on the cursor either way.
+-->
+<body class="cursor-body" data-model="menucursor">
+	<div class="cursor-area"
+	     data-style-left="present_left" data-style-top="present_top"
+	     data-style-width="present_width" data-style-height="present_height">
+		<div class="cursor-point"
+		     data-style-left="cursor_left" data-style-top="cursor_top">
+			<img class="menu-cursor-image" data-if="image_cursor"
+			     data-attr-src="cursor_src"
+			     data-style-left="image_left" data-style-top="image_top"
+			     data-style-width="image_width" data-style-height="image_height"/>
+			<div class="menu-cursor" data-if="!image_cursor">
+				<div class="menu-cursor-fill"></div>
+			</div>
+		</div>
+	</div>
+</body>
+</rml>

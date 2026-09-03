@@ -46,6 +46,28 @@ enum RtPadBind {
     RT_GP_COUNT
 };
 
+/* Rebindable mouse button slots. The first sixteen entries of RtKeyBind and
+ * RtPadBind in the same order, and no menu slot: the menu hotkey is a key or
+ * a pad button, never a mouse button, because the mouse is what drives the
+ * menu's own pointer. There are no stick slots either; mouse motion is
+ * mouse-look (input.mouse_look), not a bindable slot. */
+enum RtMouseBind {
+    RT_MB_UP, RT_MB_DOWN, RT_MB_LEFT, RT_MB_RIGHT,
+    RT_MB_CROSS, RT_MB_CIRCLE, RT_MB_SQUARE, RT_MB_TRIANGLE,
+    RT_MB_L1, RT_MB_R1, RT_MB_L2, RT_MB_R2, RT_MB_L3, RT_MB_R3,
+    RT_MB_START, RT_MB_SELECT,
+    RT_MB_COUNT
+};
+
+/* Which of the three binding tables a slot index belongs to. Every helper
+ * below that used to take a `bool gamepad` takes one of these. */
+enum RtBindDevice {
+    RT_BIND_KEYBOARD,
+    RT_BIND_GAMEPAD,
+    RT_BIND_MOUSE,
+    RT_BIND_DEVICE_COUNT
+};
+
 struct RtSettings {
     struct {
         RtDisplayMode mode = RtDisplayMode::Windowed;
@@ -81,8 +103,15 @@ struct RtSettings {
     struct {
         std::string keyboard[RT_KB_COUNT];   /* SDL scancode names */
         std::string gamepad[RT_GP_COUNT];    /* SDL gamepad button/axis names */
+        /* host/mouse_names.h names, not SDL strings. Unlike the other two
+         * tables, "" is a legitimate value here and means the slot is
+         * unbound: most mouse slots ship that way. */
+        std::string mouse[RT_MB_COUNT];
         float left_deadzone = 0.0f;          /* 0 matches the pre-settings build */
         float right_deadzone = 0.0f;
+        bool mouse_look = true;
+        float mouse_look_sensitivity = 1.0f; /* [0.05, 20] */
+        bool mouse_look_invert_y = false;
     } input;
     struct {
         /* Off reproduces retail stick behaviour. On pre-scales the left
@@ -200,18 +229,31 @@ const char* rt_settings_path();
 unsigned rt_settings_generation();
 
 /* The compiled-in default binding for one slot, and the JSON key that slot
- * is written under ("cross", "lstick_up", "menu"). `gamepad` selects
- * input.gamepad (RtPadBind slots) over input.keyboard (RtKeyBind slots);
- * an out-of-range slot returns "".
+ * is written under ("cross", "lstick_up", "menu"). `device` selects the
+ * table (RtKeyBind, RtPadBind or RtMouseBind slots); an out-of-range slot or
+ * device returns "".
  *
- * host/input.cpp needs both: when a stored name does not resolve through SDL
- * it falls back to the compiled default for that slot and names the slot in
- * the log line, and it must not carry its own second copy of these tables
- * (the pre-settings hardcoded map drifting out of sync with the JSON is
- * exactly what this milestone removes). ui/ui_rebind.cpp needs them for the
- * same reason. */
-const char* rt_settings_default_binding(bool gamepad, int slot);
-const char* rt_settings_binding_key(bool gamepad, int slot);
+ * A "" default is a real answer for RT_BIND_MOUSE and only for it: every
+ * mouse slot but square and r1 ships unbound. Keyboard and gamepad have no
+ * empty default, so "" from those two still means the slot index was bad.
+ *
+ * host/input.cpp needs both: when a stored name does not resolve it falls
+ * back to the compiled default for that slot and names the slot in the log
+ * line, and it must not carry its own second copy of these tables (the
+ * pre-settings hardcoded map drifting out of sync with the JSON is exactly
+ * what this milestone removes). ui/ui_rebind.cpp needs them for the same
+ * reason. */
+const char* rt_settings_default_binding(RtBindDevice device, int slot);
+const char* rt_settings_binding_key(RtBindDevice device, int slot);
+
+/* The number of slots on one device (RT_KB_COUNT / RT_GP_COUNT /
+ * RT_MB_COUNT), and the index of its menu slot, or -1 when it has none.
+ * Only the mouse has none. Both return the same shape for a bad device as
+ * the two accessors above: 0 slots, no menu slot. Callers that walk a
+ * device's slots go through these rather than switching on the enum
+ * themselves. */
+int rt_settings_bind_slot_count(RtBindDevice device);
+int rt_settings_bind_menu_slot(RtBindDevice device);
 
 /* The message from the last rt_settings_commit() that rejected something and
  * reverted it, or "" when the last commit accepted everything. Cleared at

@@ -10,8 +10,10 @@ P0-P8).
   (`generated/`), symbol lists copied from the decomp repo, disassembly, game
   bytes, and content hashes beyond the two ELF/ROM SHA-1 pins.
   `tools/check_no_rom.sh` runs as a pre-commit hook; it is a mechanical gate.
-  `config/vendor_names.txt` (addr to Sony SDK name facts) is the one approved
-  exception.
+  There are two approved exceptions, both address facts only:
+  `config/vendor_names.txt` (addr to Sony SDK name) and
+  `src/runtime/guest/ico_syms.h` (the guest data addresses the runtime reads
+  and writes for the mouse pointer on the game's menus).
 - The decomp repo `../ico` is read-only input. Paths and SHA-1 pins live in
   `config/recomp.toml`. Never copy its configs or asm into this repo.
 - License hygiene: this repo is MIT. GPL code (PCSX2, ran-j/PS2Recomp) may be
@@ -67,7 +69,17 @@ Changing these headers invalidates generated code. Do it deliberately.
   are the one class that reshapes an input before the game ever reads it:
   they are opt-in, default off, and touch only what the virtual pad reports
   to the guest. They never patch guest code and never alter a value the game
-  itself computed.
+  itself computed. The mouse pointer on the game's own menus
+  (`src/runtime/guest/menu_nav.cpp`) is the one exception, by the user's
+  decision on 2026-09-03: it reads the game's own menu scene objects to
+  find where the current screen's items are on the picture, and hovering
+  one writes the game's own menu selection words, so that the item under
+  the cursor becomes the selected item at once, exactly as the game's own
+  navigation would have left it. Nothing is authored on the host side and
+  there is no rectangle table; every address it reads and writes is listed
+  in `src/runtime/guest/ico_syms.h`. Nothing else in guest memory is
+  written and no guest code is patched; cross, triangle and the wheel stay
+  virtual pad presses.
 - For every settings key with an environment-variable twin, the environment
   wins over `settings.json`, logged at startup, so every existing script and
   CI invocation keeps behaving exactly as it did before settings.json

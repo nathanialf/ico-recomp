@@ -233,6 +233,14 @@ bool raster_title_logo(uint32_t w, uint32_t h, bool first) try {
     }
     if (!ui_render_set_logo(logo.rgba.data(), logo.width, logo.height)) return false;
 
+    /* The same image feeds the drawn cursor on the game's own menus: its
+     * letter I, turned and outlined (ui/cursor_image.h). Cut here rather
+     * than where the cursor is drawn because this is the one place the image
+     * exists, and because doing it now means the cursor is ready before the
+     * game boots instead of costing a field the first time a menu opens.
+     * Never fatal: it logs and leaves the drawn arrow in place. */
+    ui_menu_cursor_build_from_logo(logo.rgba.data(), logo.width, logo.height);
+
     g_logo_px_w = logo.width;
     g_logo_px_h = logo.height;
     ++g_logo_generation;

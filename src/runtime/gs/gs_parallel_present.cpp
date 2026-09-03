@@ -101,6 +101,24 @@ void RtPgs::surface_size(uint32_t* width, uint32_t* height) {
     if (height) *height = h;
 }
 
+void RtPgs::present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                         int32_t* bb_w, int32_t* bb_h) {
+    /* Plain member reads. The members are only written from present_frame,
+     * which today runs on the same thread that calls this (gs/gs_select.cpp
+     * builds the ThreadedBackend with inline_drain true, so the ring is
+     * drained on the host's EE thread), so no frame guard and no
+     * synchronization is needed. That is a fact about today's wiring and not
+     * a structural invariant: the day the ring gets a worker thread these
+     * members have to become atomics, along with the timing members next to
+     * them in gs_parallel_impl.h. */
+    if (x) *x = m_present_x;
+    if (y) *y = m_present_y;
+    if (w) *w = m_present_w;
+    if (h) *h = m_present_h;
+    if (bb_w) *bb_w = m_present_bb_w;
+    if (bb_h) *bb_h = m_present_bb_h;
+}
+
 void RtPgs::set_present_mode(uint32_t mode) {
     if (m_in_frame) {
         fatalf("paraLLEl-GS: rt_pgs_set_present_mode called while a frame is in flight;"
@@ -453,12 +471,13 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
     VkClearValue clear = {};
     cmd->clear_image(backbuffer, clear);
 
+    const int bb_w = int(backbuffer.get_width());
+    const int bb_h = int(backbuffer.get_height());
+
     if (scanout.image) {
         /* Presentation of the already-rendered scanout only: fit and filter
          * decide how it is scaled and sampled into the window backbuffer.
          * Nothing below this point can change what the game rendered. */
-        const int bb_w = int(backbuffer.get_width());
-        const int bb_h = int(backbuffer.get_height());
         int dst_w = bb_w, dst_h = bb_h;
         uint32_t fit = m_opts.fit;
 
@@ -572,7 +591,30 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
                         { 0, 0, 0 },
                         { int(scanout.image->get_width()), int(scanout.image->get_height()), 1 },
                         0, 0, 0, 0, 1, filter);
+
+        /* Record what the blit actually used, for rt_pgs_present_rect. The
+         * store is after the fit has been resolved, so a letterbox fallback
+         * from the integer path is reflected rather than the requested fit. */
+        m_present_x = int32_t(x0);
+        m_present_y = int32_t(y0);
+        m_present_w = int32_t(dst_w);
+        m_present_h = int32_t(dst_h);
+    } else {
+        /* No scanout this field: the backbuffer holds the clear and,
+         * possibly, the overlay. Nothing maps window pixels to guest pixels,
+         * so the rectangle is reported empty. Not the previous field's
+         * rectangle, which no longer describes what is on screen, and not the
+         * whole backbuffer either: a caller mapping a cursor into that would
+         * get a position on a picture the guest never drew. An empty
+         * rectangle is what every reader already treats as "no picture"
+         * (guest/menu_nav.cpp, ui/ui_menu_cursor.cpp both test w and h). */
+        m_present_x = 0;
+        m_present_y = 0;
+        m_present_w = 0;
+        m_present_h = 0;
     }
+    m_present_bb_w = int32_t(bb_w);
+    m_present_bb_h = int32_t(bb_h);
 
     if (!m_overlay_cmds.empty()) {
         /* Overlay pass: draw the retained frame on top of what was just

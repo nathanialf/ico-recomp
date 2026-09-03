@@ -60,6 +60,7 @@
  */
 #include "rpc.h"
 
+#include "../guest/menu_nav.h"
 #include "../host/input.h"
 
 #include <cinttypes>
@@ -185,6 +186,13 @@ void consume_actuators(int port, VirtualPort& vp) {
 
 void pad_field_tick() {
     ++g_field;
+    /* The game's own menu state, read before the pad is polled so the log
+     * line for a field precedes the input that field carried. The read and
+     * the change log run for every input provider; on the SDL provider, with
+     * the settings overlay closed, the same call is also the mouse pointer's
+     * field and may write the two selection words in guest/ico_syms.h
+     * (guest/menu_nav.h). No other provider writes anything. */
+    rt_guest_menu_tick(g_field);
     rt_input_poll(g_field);
     for (uint32_t port = 0; port < kPorts; ++port) {
         VirtualPort& vp = g_port[port];

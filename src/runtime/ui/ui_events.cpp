@@ -296,8 +296,13 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
     /* A capture in progress gets first refusal on everything, ahead of the
      * hotkey and RmlUi: the whole point is that the next key or button the
      * user presses becomes the binding rather than doing what it normally
-     * does. It consumes only keyboard and gamepad events (ui_rebind.cpp), so
-     * the mouse still drives the menu underneath. */
+     * does. Which events it takes follows the device being bound
+     * (ui_rebind.cpp): a keyboard or gamepad capture consumes keyboard and
+     * gamepad events only, so the mouse still drives the menu underneath,
+     * while a mouse capture also consumes motion, buttons and the wheel so
+     * that the press being bound does not click whatever is under the
+     * pointer. rebind_active() also covers the moment after a mouse capture
+     * has ended while the release of the press it accepted is still owed. */
     if (rebind_active() && rebind_handle_sdl_event(e)) return true;
 
     /* The hotkey is looked at whether the menu is up or not, and is consumed

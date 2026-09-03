@@ -62,7 +62,9 @@ set(ICORECOMP_RUNTIME_SOURCES
     src/runtime/sif/sndn2.cpp
     src/runtime/sif/pad.cpp
     src/runtime/sif/mc.cpp
+    src/runtime/guest/menu_nav.cpp
     src/runtime/host/input.cpp
+    src/runtime/host/mouse.cpp
     src/runtime/host/json.cpp
     src/runtime/host/settings.cpp
     src/runtime/host/settings_apply.cpp
@@ -124,6 +126,29 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-settings-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
+# Standalone exercise of the menu pointer (guest/menu_nav.cpp): the screen
+# mapping derived from the game's own scene objects, the "is a menu up"
+# predicate and the press planner, against a stub rt_log and a g_pages array
+# this file's harness maps the two guest tables into. Built without
+# ICORECOMP_PGS_SDL and without ICORECOMP_HAVE_PARALLEL_GS, so no SDL, no
+# window and no GS library: ICORECOMP_MENU_NAV_TEST compiles the cursor
+# injection hook in their place.
+add_executable(icorecomp-menu-nav-selftest
+    src/runtime/guest/menu_nav.cpp
+    src/runtime/guest/menu_nav_selftest.cpp
+)
+target_include_directories(icorecomp-menu-nav-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-menu-nav-selftest PRIVATE
+    ICORECOMP_MENU_NAV_TEST
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-menu-nav-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
 # Standalone exercise of the SgStPcm ring geometry (snd/pcm_stream.h), the
 # interleave the attract movie's audio streams out of the IOP buffer. The
 # subject is header only, so this links nothing: no SDL, no runtime services.
@@ -153,6 +178,21 @@ target_include_directories(icorecomp-stick-shape-selftest PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-stick-shape-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# Standalone exercise of the mouse-to-right-stick mapping behind
+# input.mouse_look (host/mouse_look.h). Header only, so this links nothing
+# either. Its sweep is the evidence that every nonzero mouse delta turns the
+# camera and that a full-rate delta saturates at every angle.
+add_executable(icorecomp-mouse-look-selftest
+    src/runtime/host/mouse_look_selftest.cpp
+)
+target_include_directories(icorecomp-mouse-look-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-mouse-look-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
 target_include_directories(icorecomp-runtime PRIVATE
@@ -256,11 +296,13 @@ endif()
 # the disc image, pulls the three letter meshes and the title animation out of
 # DFDATAS/DATA.DF, reduces them to the wordmark's geometry, rasterises it to a
 # PNG for eyeball verification, and then reads the result back through the
-# cache. Links no RmlUi, no SDL and no GS. The output path is a required
-# argument and must be outside the repository: the PNG it writes is
-# game-derived.
+# cache. It also checks ui/cursor_image.cpp, the menu cursor cut out of that
+# same image, against synthetic glyphs first and the real wordmark after.
+# Links no RmlUi, no SDL and no GS. The output path is a required argument and
+# must be outside the repository: the PNG it writes is game-derived.
 add_executable(icorecomp-title-logo-selftest
     src/runtime/ui/title_logo.cpp
+    src/runtime/ui/cursor_image.cpp
     src/runtime/ui/title_logo_selftest.cpp
     src/runtime/host/inflate.cpp
     src/runtime/iso/iso9660.cpp
@@ -669,8 +711,10 @@ if(ICORECOMP_UI)
         src/runtime/ui/ui_events.cpp
         src/runtime/ui/ui_rebind.cpp
         src/runtime/ui/ui_settings_model.cpp
+        src/runtime/ui/ui_menu_cursor.cpp
         src/runtime/ui/ui_launcher.cpp
         src/runtime/ui/title_logo.cpp
+        src/runtime/ui/cursor_image.cpp
         src/runtime/host/inflate.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)

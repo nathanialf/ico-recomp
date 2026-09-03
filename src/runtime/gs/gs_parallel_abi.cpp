@@ -74,6 +74,11 @@ void rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height) {
     pgs->surface_size(width, height);
 }
 
+void rt_pgs_present_rect(RtPgs* pgs, int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                         int32_t* bb_w, int32_t* bb_h) {
+    pgs->present_rect(x, y, w, h, bb_w, bb_h);
+}
+
 void rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode) {
     pgs->set_present_mode(mode);
 }

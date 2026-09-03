@@ -87,13 +87,21 @@ function of the sound engine alone.
 |---|---|---|---|---|---|
 | keyboard.\<slot\> | string | an `SDL_GetScancodeName` name | see table below | hot | - |
 | gamepad.\<slot\> | string | an SDL gamepad button string, or an axis name with a trailing `+`/`-` for direction (e.g. `lefttrigger+`) | see table below | hot | - |
+| mouse.\<slot\> | string | one of `left`, `right`, `middle`, `x1`, `x2`, `wheelup`, `wheeldown`, or `""` for unbound | see table below | hot | - |
 | left_deadzone | float | [0, 0.95] | 0.0 | hot | - |
 | right_deadzone | float | [0, 0.95] | 0.0 | hot | - |
+| mouse_look | bool | - | true | hot | - |
+| mouse_look_sensitivity | float | [0.05, 20] | 1.0 | hot | - |
+| mouse_look_invert_y | bool | - | false | hot | - |
 
-An unresolvable binding name (a typo, a name from a different SDL version)
-falls back to the compiled-in default for that one slot
-(`rt_settings_default_binding()`), with a log line naming the slot and the
-name that did not resolve; it never falls back to "no binding".
+An unresolvable keyboard or gamepad binding name (a typo, a name from a
+different SDL version) falls back to the compiled-in default for that one
+slot (`rt_settings_default_binding()`), with a log line naming the slot and
+the name that did not resolve; it never falls back to "no binding". The
+mouse is different: `""` is a legitimate value there, meaning the slot is
+unbound, and most mouse slots ship that way. A non-empty mouse name that is
+not one of the seven above logs once and leaves the slot unbound, because
+there is no default worth substituting.
 
 `host/input.cpp` reads every one of these keys, including
 `input.keyboard.menu` and `input.gamepad.menu`: it builds a keyboard table
@@ -130,7 +138,9 @@ Two rules keep one host key or button from being asked to do two things at
 once, both enforced by `validate_binds()` in `settings.cpp` at commit time:
 the menu key must not also name a pad slot (the menu consumes that input
 before the pad ever sees it), and two ordinary slots on the same device must
-not share a name, because one host input cannot press two DS2 buttons.
+not share a name, because one host input cannot press two DS2 buttons. The
+mouse has no menu slot, so only the second rule applies to it, and two
+unbound mouse slots never count as sharing a name.
 
 Both rules revert only the slots that commit changed, whichever side of the
 pair they are: binding the menu key onto an existing pad slot reverts the
@@ -156,7 +166,7 @@ Default keyboard bindings (`kKeyboardBinds`, `settings.cpp`):
 | cross | X | l1 | Q |
 | circle | C | r1 | E |
 | square | Z | l2 | 1 |
-| triangle | V | r2 | 3 |
+| triangle | Space | r2 | 3 |
 | lstick_up | W | l3 | T |
 | lstick_down | S | r3 | Y |
 | lstick_left | A | start | Return |
@@ -179,6 +189,155 @@ Default gamepad bindings (`kGamepadBinds`, `settings.cpp`):
 
 Sticks are not rebindable slots: they map natively from the gamepad's own
 analog axes.
+
+Default mouse bindings (`kMouseBinds`, `settings.cpp`): square = `left`,
+r1 = `right`, every other slot unbound. The names are this runtime's own
+(`host/mouse_names.h`), not SDL strings, and compare case-insensitively.
+Held buttons press their slot for as long as they are held. A wheel bind is
+a pulse: each wheel tick presses its slot for one field and releases it for
+one field, so two ticks are two presses, which is what the game's
+pressed-this-frame detection needs. Nothing is bound to the wheel by
+default on purpose: the game turns D-pad bits into stick motion, so a wheel
+on the D-pad would walk the player. Mouse binds only fire while the window
+has keyboard focus, and they are suspended entirely while the pointer owns
+the mouse (section 10), where left click confirms and right click cancels
+regardless of what the gameplay slots say. Losing focus also clears the
+held state: a button released over another window sends no release event to
+this process, so the bit is forgotten rather than left set to read as a
+press when focus comes back.
+
+### Mouse look
+
+`input.mouse_look` (on by default) feeds mouse motion to the right stick,
+which is ICO's camera stick. While it is on, the window captures the
+pointer in relative mode with the cursor hidden whenever the window has
+focus and the settings menu and launcher are closed; each transition is
+logged as `mouse look: captured` or `mouse look: released` with the reason.
+Focus loss and opening the menu release it, and those are the only two
+things that do.
+
+The game's own menus do not release it. While the pointer owns the mouse
+there (section 10) relative mode stays on and the OS cursor stays hidden;
+the field's motion moves a cursor the overlay draws inside the picture
+instead of the camera stick, which sees no motion at all until the menu is
+gone. The switch each way is logged as `guest menu: pointer takes the
+mouse` and `guest menu: pointer hands the mouse back to mouse look`.
+
+The camera stick is position control in the game, not velocity. Traced
+through the decomp: the camera's stick reader (`func_00189D68`,
+`src/camera-ico2.c`) multiplies the stick's unit vector by the response
+`iosPadGetStick` returns and hands that to `func_00194EC0`, which calls
+`ActSendMail_WithAdditionalData`. The manual camera is two accumulated
+angles that `GetMailAdditionalData` turns into rotations of the camera about
+its target, and the stick sets where those angles should be (full deflection
+is 120 degrees of yaw around the target, the limit `func_00194E28` installs),
+not how fast they should change.
+Each camera update moves them toward that target by at most 2.0 degrees
+while the response is 0.1 or more and 1.5 degrees below it, and by a tenth
+of what remains once inside ten of those steps. So a stick held still holds
+the camera still and off centre, and a released stick is a target of zero
+that the camera walks back to at 45 degrees per second.
+
+Nothing on that path treats a neutral stick as an event. The immediate snap
+back to centre in the code (`ClearMailAdditionalData`) is reached only by a
+mode word, by `func_00153FE8` reading zero, or by a camera set that forbids
+the manual camera, never by the stick reading neutral. There is no timer, no
+release edge and no mode flag: the two angles are the whole state, so a
+single neutral field between two deflected fields resets nothing and costs
+one step of return.
+
+So the mouse drives a virtual stick, not a speed. `RtMouseLookStick`
+(`host/mouse_look.h`, exercised by `icorecomp-mouse-look-selftest`) keeps a
+stick vector `V` on the unit circle and is stepped once per field, motion or
+not, including the catch-up fields after a long frame:
+
+- Each field's accumulated motion moves it: `V += (dx, dy) * sensitivity /
+  160`, scaled back onto the unit circle when that pushes it out, which is
+  the stick's gate. 160 px of drag is full deflection at sensitivity 1: an
+  eighth of the 1280 px default window and 0.2 in of hand travel on an 800
+  dpi mouse, for the 120 degrees of camera offset the game allows.
+  Sensitivity divides that distance: 320 px at 0.5, 80 px at 2.
+- Motion is integrated, so nothing depends on how the pixels landed across
+  field boundaries: 16 fields of 5 px and one field of 80 px reach the same
+  deflection.
+- Dragging and then holding the mouse still leaves `V` where it is, and the
+  camera parks at that offset exactly as it would for a held stick.
+
+The stick vector then becomes the byte pair, shaped for the game's own
+stick chain:
+
+- The radius ramps linearly with `|V|` from a floor of 49 to 122. From the
+  decomp's stick routine (`ios/pad.c`): a radial dead zone of 48, the
+  octagonal-gate divisor `1 + 0.2 * t / 45`, saturation at 120 and a linear
+  response `(mag - 48) / 72`. The floor is the first whole unit past the
+  dead zone and is the same at every angle, so the smallest deflection a
+  drag can leave asks for the same small camera offset (about 0.02 of
+  response, under two degrees) whichever way it points.
+- The camera's stick reader also computes a square dead zone, zeroing the
+  pair when both components are within 0.4 of centre (51.2 units), and then
+  never reads the result: only the radial 48 gates the retail camera, which
+  is what lets the floor be 49 rather than 52 on a cardinal and 73.5 on a
+  diagonal. What remains of that spread is the byte grid, about 1.3 units of
+  the 72 the response spans, printed by check 5 of the selftest.
+- The top is 122 (120 plus the byte rounding margin measured by the
+  selftest, so a fully deflected stick saturates at every angle), and the
+  pair is pre-multiplied by the same octagonal divisor the game is about to
+  apply, so a diagonal reaches the same deflection as a cardinal. Bytes
+  round away from centre; the byte square is the only cap.
+- Mouse up (negative SDL `yrel`) gives a byte below 128, the game's "stick
+  up", unless `mouse_look_invert_y`.
+
+Letting go is the other half. A hand on a mouse stops moving all the time in
+the middle of a drag, so stillness is read in two stages:
+
+- Hold: `RT_MOUSE_LOOK_HOLD_FIELDS`, 15 fields (250 ms), of no motion do not
+  touch `V` at all. The stick stays where the drag left it.
+- Release: after that, `V` walks linearly to centre over
+  `RT_MOUSE_LOOK_RELEASE_FIELDS`, 6 fields (100 ms), and the last of those
+  reports a released stick. The game's own return then walks the camera back
+  at 45 degrees per second. Motion during the release picks up from where it
+  had got to rather than jumping.
+
+So a drag is reported for 20 fields (333 ms) after the last motion. There is
+no exponential average of the delta and there should not be: `V` is an
+integral, so it already does not care how a hand's pixels landed across
+fields, and a filter would only add lag. The stick is centred outright,
+with no release ramp, when capture is lost, when the pointer takes the mouse
+for the game's own menus, and while the settings menu is up.
+
+Neither constant has a settings key yet. `input.mouse_look_hold_ms` (0 to
+1000 ms, default 250) and `input.mouse_look_drag_pixels` (40 to 1000, default
+160) are the two to wire.
+
+Precedence per axis is the keyboard right-stick keys while held, then the
+mouse while its stick is off centre, then the gamepad stick. The delta is
+sampled once per emulated field and discarded while the settings menu is
+up, so nothing accumulates behind the menu and flings the camera on close.
+Scripted runs (`ICORECOMP_INPUT_SCRIPT`) never see the mouse.
+
+### Last device used
+
+The SDL provider tracks which kind of device the player last used, once per
+field, and `rt_input_last_device()` (`host/input.h`) reports it. A held bound
+key, a mouse button, a wheel tick or real pointer motion says keyboard and
+mouse; a held pad button, an axis bind past its press point (raw 8192 of
+32767) or either stick pushed a quarter of the way from centre says
+controller. A field that shows both leaves the answer alone, because there is
+no honest winner between them, and so does a field that shows neither, so it
+names the last device that was unambiguously used rather than the one in a
+hand right now.
+
+It boots as the controller, so a run where nobody touches a mouse never draws
+a cursor, and a scripted run or a build without SDL leaves it there for the
+whole run. Each change is logged as `last device is now the controller` or
+`last device is now keyboard and mouse`.
+
+The one consumer is the drawn cursor on the game's own menus (section 10): it
+is shown only while the last device is keyboard and mouse, on top of the
+conditions that were already there. Nothing else changes with it. A pad press
+hides the arrow, the next mouse motion brings it back, and the pointer's own
+state is untouched in between, so the arrow reappears where the player left
+it rather than where the pad walked to.
 
 ### gameplay
 
@@ -234,6 +393,11 @@ turns off, so a later re-enable logs again.
 | log_file | bool | see section 5 | true | cold | `ICORECOMP_LOG` |
 | profile_fields | int | [0, 100000]; 0 disables the profiler | 180 | hot | `ICORECOMP_PROFILE` |
 | fps_limit_hz | double | 0, or [1, 1000]; 0 disables pacing | 59.94 | hot | `ICORECOMP_FPS_LIMIT` |
+
+`menu_hit_editor` was retired when the pointer on the game's menus started
+reading the game's own scene objects (section 10): there are no hit boxes to
+author. A file that still holds the key keeps it, logs `no longer a setting`
+and does nothing with it.
 
 Each profile summary ends with a `fields:` line: the longest host field
 interval in the window, how many fields ran over 20 ms and over 50 ms, how
@@ -510,7 +674,8 @@ reaches RmlUi or the pad, so it can never collide with a gameplay binding.
 
 The game keeps running while the menu is open. `host/input.cpp`'s SDL
 provider reports a default-constructed pad state instead of sampling the
-real device: no buttons held, both sticks centered. That is the same report
+real device: no buttons held, both sticks centered, and mouse look releases
+the pointer so the menu can be clicked. That is the same report
 a real, untouched controller would produce, not a fabricated one. Pausing
 the simulation while the menu is up is out of scope for v1, because the
 frame pacer is locked to the audio device's clock and pausing it cleanly is
@@ -536,13 +701,24 @@ scripted run's input stays bit-identical to a build with no UI compiled in.
 ### Remapping
 
 The menu's Input tab shows one table of slots per device (keyboard,
-gamepad), each row a DS2 button or stick direction paired with the name
-currently bound to it, plus a Rebind button. Pressing Rebind arms capture
-for that one slot (`ui/ui_rebind.cpp`):
+gamepad, mouse), each row a DS2 button or stick direction paired with the
+name currently bound to it, plus a Rebind button (and, on the mouse, an
+Unbind button that stores `""`). Pressing Rebind arms capture for that one
+slot (`ui/ui_rebind.cpp`):
 
 - **Key**: the next key pressed is stored as its `SDL_GetScancodeName`.
 - **Gamepad button**: the next button pressed is stored as its SDL button
   string.
+- **Mouse button or wheel**: the next mouse button pressed, or the next
+  wheel tick, is stored under its name from the table above. A platform
+  that reports the wheel already inverted (SDL's flipped direction) is
+  un-flipped first, the same rule the gameplay wheel binds are read by, so
+  the stored name is the direction the user scrolled. The click that
+  pressed Rebind itself is never captured: RmlUi fires the click on the
+  release, so the capture only ever sees a fresh press, and the release of
+  the captured press is swallowed so the menu does not act on it. While a
+  mouse capture is armed the pointer is held: motion, buttons and wheel go
+  nowhere else until it ends.
 - **Gamepad axis**: the next axis pushed past 60% of full travel is stored
   as its SDL axis string with a trailing `+` or `-` recording which
   direction was pushed (60% is deliberately higher than the 25% press
@@ -550,7 +726,12 @@ for that one slot (`ui/ui_rebind.cpp`):
   mistaken for a deliberate press).
 
 Escape cancels an armed capture without changing anything. A capture that
-receives no input within five seconds times out the same way. A name that
+receives no input within five seconds times out the same way, and closing
+the menu drops one that is still armed. A capture that was already accepted
+is not dropped by the menu closing: the name is written at the coming field
+boundary whether the menu is still up or not. The two resets and the mouse
+Unbind do drop it, because they are rewriting the same table and applying
+it afterwards would undo them. A name that
 is already in use is rejected without being stored: the status line names
 which slot already holds it, or says it is the menu key, and capture stays
 armed so the user can try something else. An accepted capture is committed
@@ -591,7 +772,8 @@ The drop-down arrow is one consequence of it: RmlUi's own samples draw
 `selectarrow` with `decorator: image(...)`, which this renderer would draw
 as nothing, so `ui/style/base.rcss` makes the arrow out of a zero-sized box
 with a coloured top border and transparent side borders, which RmlUi mitres
-into a triangle.
+into a triangle. The drawn cursor on the game's own menus (section 10) is
+the same trick twice, a dark triangle with a lighter one over it.
 Reaching one of the unimplemented functions is not a crash: each one logs a
 single line the first time it is hit, naming itself
 (`RenderInterface::<Function>`), and the affected element simply draws
@@ -798,6 +980,15 @@ Every step logs under `ui` with its timing: `title logo: cache hit`,
 archive and the three meshes, `title logo: geometry built in`, and `no title
 logo from this disc:` with the reason when it fails.
 
+The same image feeds a second one. The moment it is published, the letter I
+is cut out of it and turned into the cursor the pointer draws on the game's
+own menus (`src/runtime/ui/cursor_image.cpp`, section 10). That happens here,
+where the image exists, rather than where the cursor is drawn, so the cursor
+is ready before the game boots and is re-cut whenever the wordmark is
+re-rasterised for a new window scale. It costs about a millisecond and it is
+never fatal: a failure logs and the cursor stays the arrow drawn out of
+borders.
+
 Any disc a user picks, through Browse or the typed path, is validated
 (mounted and checked for `SCUS_971.13`) before it is written anywhere: only
 a disc that mounts successfully is saved to `settings.json`'s
@@ -825,8 +1016,8 @@ simply closed.
 ## 9. Log lines to look for
 
 These are exact prefixes and phrases, all under the `main`, `settings`,
-`ui`, `launcher`, `gs`, `audio`, or `prof` log components, worth grepping
-`icorecomp.log` for:
+`ui`, `launcher`, `gs`, `audio`, `input`, `guest`, `json` or `prof` log
+components, worth grepping `icorecomp.log` for:
 
 | phrase | meaning |
 |---|---|
@@ -834,7 +1025,7 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `is overridden by` | an environment variable is winning over settings.json for one key |
 | `kept default` | a bad value in the file was rejected; the key stayed at its default |
 | `settings.json.bad` | the file failed to parse and was preserved under this name |
-| `no longer a setting` | the file still holds a retired key (`display.hires_scanout`, `input.trigger_threshold` or `input.rumble`); the line names it and what replaced it |
+| `no longer a setting` | the file still holds a retired key (`display.hires_scanout`, `input.trigger_threshold`, `input.rumble` or `debug.menu_hit_editor`); the line names it and what replaced it |
 | `super-sampling` | the render scale the paraLLEl-GS backend was created with, whether super-sampled textures are on, and whether it asked for high-resolution scanout |
 | `render scale applied live` | a render scale change from the menu reached the backend |
 | `(display.raster)` | which output frame the scanout is built at, `crt` or `window`, and in `window` that the DBX/DBY read offset is ignored (section 6); logged at startup and again on every change from the menu |
@@ -844,8 +1035,338 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `RenderInterface::` | a stylesheet under `ui/` used something the overlay renderer cannot draw |
 | `title logo:` | the launcher's title image: a cache hit, or each step of building one from the disc, with timings (section 8) |
 | `no title logo from this disc:` | the title image could not be built and the launcher kept its text title; the line says why |
+| `menu cursor:` | which cursor the pointer draws on the game's own menus: the letter I cut out of the title image, with its size, hotspot and which end was found to be the point, or `no logo image; drawn arrow` (section 10) |
 | `launcher gate:` | which of the two boot orderings this run took, and why (section 8) |
 | `rebind ` | a capture starting, ending, being accepted or rejected (section 7) |
+| `mouse look: captured` / `mouse look: released` | relative mouse mode was taken or freed, and why (section 2, mouse look); the game's own menus do not free it |
+| `last device is now the controller` / `... keyboard and mouse` | the player picked up the other kind of device (section 2, last device used); the drawn menu cursor follows it |
+| `guest menu: pointer takes the mouse` / `guest menu: pointer hands the mouse back` | the field's mouse motion switched between the drawn cursor on one of the game's menus and the camera stick; the take line says where the drawn cursor is (section 10) |
+| `guest menu: layout ... chain` | the layouts one of the game's menu screens is composed from, and how many selectable items they came to between them; once per screen (section 10) |
+| `guest menu: layout ... item ... rect` | where the pointer put each selectable item of one of the game's menu screens, in fractions of the presented picture; one line per item, once per screen (section 10) |
+| `guest menu: select` | the pointer made the item under the cursor the selected one by writing the game's own selection word (section 10) |
+| `guest menu: the game is swallowing` | the game set its one-frame no-navigation flag `D_00633160` and the pointer deferred its write to the next field; once per run, and expected at a screen change (section 10) |
+| `guest menu: click` | the pointer clicked one of the game's menu items: cross on the item named (section 10) |
 | `previous run's log kept as` | the last run's `icorecomp.log` was renamed to `icorecomp.prev.log` before this run's log was opened |
 | `could not keep the previous run's log` | the rename above failed and why; this run's log overwrote the previous one as before rotation existed |
 | `gameplay.run_any_direction is on` | the left stick is being pre-scaled; a full tilt runs in every direction |
+| `guest menu: layout ... item ... fade ... mcsel ...` | the game's own menu state (layout id, selected item, fade/transition state, memory card selector index) as read out of guest RAM by the host, logged once per change |
+
+## 10. The pointer on the game's menus
+
+ICO's own menus (the title screen's continue or new game choice, the memory
+card check, the ten-slot load grid, the save flow, the vibration question)
+are scene objects driven by the D-pad, cross and triangle; the game has no
+pause menu. Nothing is authored on the host side to point at them. The game
+already holds, in RAM, which screen is up, which items that screen has, and
+where on the picture it draws each of them, so the host reads all three and
+makes the item under the cursor the selected one by writing the game's own
+selection word. Cross, triangle and the wheel are virtual pad presses, the
+same bits a controller would carry. No guest code is patched, and every word
+written is one the game's own navigation writes.
+
+### What the host reads
+
+The words and tables in guest RAM listed in `src/runtime/guest/ico_syms.h`
+(the second approved address-fact exception in CLAUDE.md): the current layout
+id (which menu screen is up), the current item id, the layout fade state, the
+memory card check screen's selector index, the layout table those index into,
+and the scene objects each layout entry's range names.
+`guest/menu_nav.cpp` reads them once per pad field and logs the tuple
+whenever it changes:
+
+    guest menu: layout 0x9 item 0xe fade 2 mcsel 0
+
+Fade 2 is the interactive state: `lt_link_layout` draws a highlight only at
+2 and `lt_switch_layout` applies cross and triangle only at 2. 3 and 5 are
+the two fading states. Gameplay sits at 2 as well, which is why fade alone is
+not the predicate.
+
+### Where an item is on screen
+
+`lt_link_layout` is handed one scene object per frame and draws it from seven
+whole numbers in the object: a width (`+0x48`, or the texture's width at
+`+0x58` when it is zero), a height (`+0x44`, or `+0x54`), a centring flag
+(`+0x40`), and an x and y (`+0x50` and `+0x4C`). Those live in the game's own
+2D layout space, which is 640 by 224 with the origin at the centre of the
+picture: x is `+0x50 - 320`, or `-width/2` when the centring flag is set, and
+y is `+0x4C - 113`. The height fields count half units, which is the shift by
+3 against the width fields' shift by 4.
+
+Those numbers make two boxes half a unit apart. `(x, y)` to
+`(x + w, y + h/2)` is the box the highlight is scattered over. The quad the
+object itself is drawn as adds 8 to the Y and subtracts 8 from the H, both in
+GS 12.4 fixed point, just before `gif_StartPacketPath1`, so it runs from
+`(x, y + 0.5)` to `(x + w, y + h/2)`. The pointer reports the drawn one; half
+a unit is 0.002 of the picture's height, below the resolution of the hit test
+and of the boxes the mapping was calibrated against.
+
+That space maps onto the presented picture without the frame buffer's size
+entering into it. `func_0010FF28`, the sprite emitter this path calls, scales
+every coordinate by the frame buffer's width over 640 and its height over
+224 and adds a base of 2048; the frame's `XYOFFSET` is
+`(2048 - width/2, 2048 - height/2)`, which the GS subtracts. The two cancel,
+and a layout-space `(x, y)` is at
+
+    nx = 0.5 + x / 640      ny = 0.5 + y / 224
+
+of the picture. `guest/menu_nav.cpp` carries the derivation and the decomp
+citations.
+
+Calibration. On the title screen's continue or new game choice (layout 0x9,
+items 0xe and 0xf) the two items were measured by hand on the presented
+picture as x 0.399..0.607, y 0.595..0.685 and x 0.400..0.598, y 0.725..0.821.
+The mapping above, run over that screen's own scene objects, gives
+0.400..0.600 / 0.598..0.688 and 0.400..0.600 / 0.732..0.821: the largest
+disagreement on either axis of either item is 0.007 of the picture.
+`icorecomp-menu-nav-selftest` carries the same check.
+
+Every screen says its rectangles the first time it is interactive, one line
+per item (the layout named is the one that owns the item, see the chain
+below), so a log from a real run can be held against what was on the screen:
+
+    guest menu: layout 0x9 item 0xe rect 0.4000,0.5982,0.6000,0.6875
+    guest menu: layout 0x9 item 0xf rect 0.4000,0.7321,0.6000,0.8214
+
+### A screen is a chain of layouts, not one
+
+`lt_next_layout` does not work on the current layout alone. It walks the
+current layout's parent chain by each entry's `+0x30`, and then, in order:
+runs each ancestor's action function (`+0x20`) and `lt_switch_layout`,
+farthest ancestor first; runs `lt_prev_layout` for the current layout, which
+is what draws its objects; and finally runs `lt_link_layout` over every
+ancestor's whole object range, nearest ancestor first. So every layout in the
+chain is live, every one is drawn, and each keeps its own current item.
+
+A page's items therefore need not belong to the layout id the state word
+reports. The load file select page is the case that forced this: the current
+layout is 0x10, whose own nine objects have no default and no current item,
+and its chain is `0x10 <- 0xb <- 0xd <- 0xc`. The ten save slots (objects
+0x1b..0x24) belong to 0xb (`_la_set_preview_info`), which is where their
+selection word lives and where the custom handler installed in `D_00633164`
+(`exec_layout_texture`, put there by 0x10's own action function) moves it.
+The save file select page 0x1d has the same chain. Several more screens in
+the load and save flow are the same shape: 0x19, 0x2d and 0x2f take their two
+items from 0x17, 0x1f and 0x20 from 0x18, 0x25 from 0x26, 0x15 from 0x17.
+
+The pointer writes the current item of the layout that owns the item under
+the cursor. The item-id mirror `D_00633150` is written only when that layout
+is the current one, because the game loads the mirror from each chain layout
+in turn and the current one is last, so after a frame it holds that one's
+field and nothing else's.
+
+Each screen logs the chain it resolved, once, the first time it is
+interactive, and each rectangle line names the layout that owns the item:
+
+    guest menu: layout 0x10 chain 0x10 <- 0xb <- 0xd <- 0xc: 10 items
+    guest menu: layout 0xb item 0x1b rect 0.3625,0.3080,0.3875,0.3795
+
+### Which items a layout has
+
+A layout entry's scene object range (`+0x00` up to `+0x04`) is everything it
+draws, decoration included. The items are the ones the game's own navigation
+can reach: start from the entry's default item (`+0x28`) and its current item
+(`+0x2C`) and follow the four neighbour links (`+0x2C` right, `+0x30` left,
+`+0x34` down, `+0x38` up), staying inside the range. An object whose `+0x68`
+has bit 1 set is skipped, because `lt_link_layout` returns without drawing
+it, and so is one whose rectangle lands entirely off the picture. Bit 1 is
+the per-frame half of that field: `lt_next_layout` seeds it from bit 0 for
+every object in the chain at the top of each frame, and `func_001B7218` may
+overwrite it for one object mid-frame. A hidden object is still walked
+through, since it can sit between two visible ones.
+
+A layout whose `+0x2C` is negative contributes nothing, even when objects are
+reachable from its default item. That is the game's own gate:
+`lt_next_layout` skips `lt_switch_layout` for such a layout,
+`lt_switch_layout` returns immediately on one, and `lt_link_layout`
+highlights nothing, so writing an item into it would hand it a highlight and
+a navigable selection the game did not have. The chain log line is followed
+by a line naming any layout skipped this way.
+
+The memory card check screen is keyed differently, for the same reason its
+selection word is different: its fifteen card positions are scene objects
+0x158..0x166, reached by `_la_memory_card_check`'s own loop rather than by
+any link, and an item's value there is its selector position 0..14. The
+screen is recognised by its object range covering all fifteen of them, which
+in the retail layout table only layout 0x38 does; it is reached by cross on
+object 0x118 of layout 0x36 (`_la_mcard_error_check`), not from the retail
+load or save flow. Bit 1 of `+0x68` is not tested on those fifteen:
+`_la_memory_card_check` sets bit 0 on all of them and clears it on the one
+its selector names, and `lt_next_layout` copies bit 0 into bit 1, so all but
+the selected read as hidden. Bit 0 itself is general and not that screen's:
+`GetRealModelId(index, flag)` sets it to `flag & 1` on any scene object and
+leaves every other bit alone, and the retail title screen ships items 0xe and
+0xf with it set. Lighting one of fifteen card positions is one use of it, and
+on that screen it says nothing about where the fifteen places are.
+
+### When the pointer owns the mouse
+
+`rt_guest_menu_active()` is true when the reads are valid, the fade state is
+2, and some layout in the current screen's chain has at least one selectable
+item with a rectangle on the picture. Gameplay (layout 0x32) and the pre-title
+cinematic (0x33) both hold fade 2, and the second term excludes them
+structurally rather than by name: the retail layout table gives each an empty
+scene object range, a default and current item of -1 and no parent, so the
+chain is one layout with nothing to reach and no rectangle to derive.
+
+While the predicate is true the pointer owns the mouse: the field's motion,
+buttons and wheel go to the pointer, the camera stick sees no motion, and the
+gameplay mouse bindings are suspended.
+
+Two host-side conditions have to hold as well before the pointer writes or
+hovers anything, and neither of them is about the game. The SDL input
+provider has to be the live one: a run driven by `ICORECOMP_INPUT_SCRIPT` is
+required to stay bit-identical, and one with a window would otherwise have
+the OS cursor moving the game's selection out from under the script. And the
+settings overlay has to be closed: it releases relative mouse mode, so the OS
+cursor lies over the picture, and a drag across the overlay would move the
+selection on the game's menu underneath it. With either shut the field writes
+nothing, hovers nothing, starts no press and drops whatever was queued, the
+same way `host/input.cpp` neutralises the pad while the overlay is up. The
+state read and the change log are not gated, because they write nothing.
+
+One frame belongs to the game whatever the cursor is doing. `D_00633160` is
+a one-frame flag that swallows navigation: while it is non-zero
+`lt_switch_layout` returns at once, `lt_next_layout` skips `lt_switch_layout`
+for every layout in the chain, and `lt_link_layout` draws no highlight;
+`lt_next_layout` clears it on the way out. It is set on the frame a fade
+completes into an interactive screen (`lt_current_property_item`), on a load
+or save page whose preview info is not ready (`_la_set_preview_info`), and by
+the title's `kanbanBoot` setup when there is no save to continue from. The
+pointer's write does not go through `lt_switch_layout`, so it defers for that
+field and takes the hover again on the next one; the one-write-per-hover rule
+keys on the write actually happening.
+
+Relative mouse mode does not change across that boundary. It is on whenever
+mouse look is on, the window has focus and the overlay is closed, which means
+the OS cursor is hidden on the game's menus too, so the pointer carries a
+cursor of its own: a position in the presented picture, moved by the same
+relative motion the camera stick would otherwise have had, clamped to the
+picture so it cannot leave it, and drawn by the overlay (`ui/cursor.rml`)
+with its point on the position the hit test uses. It starts at the centre of
+the picture the first time the pointer takes the mouse and keeps its position
+after that, so a menu left and returned to has the cursor where it was left.
+The two log lines say which happened:
+
+    guest menu: pointer takes the mouse, drawn cursor at centre
+    guest menu: pointer hands the mouse back to mouse look
+
+What it draws is the game's own letter I. `src/runtime/ui/cursor_image.cpp`
+takes the title image the launcher built from the disc (section 8),
+thresholds its alpha, labels the connected components and picks the leftmost
+one that is at least half as tall as the tallest, which on the wordmark is
+the I and never a speck. It finds which end of that glyph is the pointed one
+by comparing the mean number of opaque pixels per row over the top fifth of
+it with the same over the bottom fifth, taking the narrower end, and taking
+the top when the two are within 15 percent of each other. On the retail disc
+the narrow end is the bottom: the wordmark's I is a horn, wide at the top and
+tapering to a point. That end is turned upwards and the glyph's long axis put
+about 22 degrees off vertical, so the point is at the top left and the body
+falls away below it and to the right, which is where a desktop arrow cursor
+sits. The rotation and the scale are one bilinear resample of the
+premultiplied pixels, and one pixel of dilated alpha in `#0a0a0a` goes
+underneath as an outline, so a white glyph reads over a light picture; a disc
+whose letters came out dark gets a light outline instead, decided from the
+mean luminance of the glyph's own pixels.
+
+The result is cut down to what was actually drawn and published in memory
+under the `cursor:` scheme, alongside the title image's `logo:`. Its hotspot,
+the point the tip landed on, is exact rather than rounded: the resample's
+translation is nudged by the fraction of a pixel that puts the tip on a whole
+one. The document offsets the image by minus that hotspot, in dp, so the
+point sits on the cursor position. The glyph's own long axis is 32dp, so with
+the tilt and the outline the image comes out about 30 by 20dp. It is cut at
+the window's density, like the title image, and re-cut when that moves, so it
+is never a scaled copy of a cut made for another window size. One `ui` line
+says what a run is using:
+
+    menu cursor: the logo's I, 82x120 px, hotspot (2,2), tip at the bottom
+
+The arrow built out of borders in `ui/style/base.rcss`, a light triangle over
+a dark one, is what is drawn whenever there is no such image: a disc that
+gave no title image, a GPU upload that failed, or a run that never showed the
+launcher, since that is the only place the title image is built. `menu
+cursor: no logo image; drawn arrow` is the line for it.
+
+Whenever relative mode is not on, which is mouse look turned off and the
+settings menu opened over a game menu, there is no hidden cursor to stand
+in for: the pointer follows the OS cursor's position in the picture instead
+and nothing is drawn over it, so there is never a second arrow next to the
+system one. With mouse look off that is the state for the whole menu, and
+the log says so (`guest menu: pointer takes the mouse, following the system
+cursor`). Everything downstream, the hover and the click, reads whichever
+of the two is answering and does not care which.
+
+### How a click happens
+
+Hovering an item that is not the selected one makes it the selected one at
+once, in a single write, and the game carries on from there as if its own
+navigation had landed on that item. That is a decision of the user's, taken
+on 2026-09-03, and it is the one host feature that writes a value the game
+itself computed; CLAUDE.md records it. What is written, and why that is the
+whole of it:
+
+- On every screen but the memory card check, the word is the current-item
+  field of the layout table entry of the layout that owns the item
+  (`D_0053C020 + layout * 0x38 + 0x2C`), which is the current layout or one
+  of its ancestors in the chain above. The game re-derives the highlight from
+  that field on every frame:
+  `lt_prev_layout` calls `lt_link_layout` once per scene object the layout
+  owns, and `lt_link_layout` draws the highlight sprite for the object whose
+  index equals that field. A D-pad press does nothing more than write it, in
+  `lt_switch_layout`. The item-id mirror `D_00633150` is written alongside,
+  because the game refreshes it from the same field at the top of every frame
+  and a reader in between should see the two agree.
+- On the memory card check screen the word is the selector `D_00274EC0 +
+  0x2C`. That screen's handler `_la_memory_card_check` steps it with LEFT and
+  RIGHT, clamped to 0 and 14, and calls `GetRealModelId` for all fifteen
+  positions every frame to light the selected one, so the selector alone
+  decides the highlight and the layout entry is left alone.
+
+The write happens on the field the cursor enters an item and not again while
+it stays inside it, whatever the game then does with the selection. The load
+grid moving on from an empty save slot to the next occupied one is that case:
+it is the game's own rule, and a pointer that re-wrote every field would
+fight it forever. The line in the log is
+
+    guest menu: select item 0xf on layout 0x9 (was 0xe)
+
+A write that cannot be shown correct does not happen. An item outside the
+layout's own scene object range can never be the highlighted one, so it is
+refused with `guest menu: item 0x25 is outside layout 0xb's items
+0x1b..0x24; not written`, and a selector position outside 0..14 the same
+way. A click that
+needed such a write presses nothing rather than confirming the item the game
+still has selected.
+
+A left click selects the item under the cursor if it is not already selected,
+then presses cross (`guest menu: click item 0x1b on layout 0xb`). The two
+land in the same field, which is the right order: `lt_switch_layout` resolves
+the object cross applies to from the current-item field on entry, before it
+looks at that frame's pad bits, and the pad tick that writes the selection
+runs before the pad frame the game reads. The cross is in that field's bits
+because the click starts the press itself when no press is already in flight,
+rather than leaving it to the next field's tick: the SDL provider runs the
+tick, then the button events, then reads the press bits, all for one field. A
+field of delay would put a whole game frame between the write and the cross,
+and on the load grid the game moves the selection off an empty slot inside
+that frame. A click over no item presses nothing at all: there is no item to
+confirm, and a cross would confirm whatever the game happens to have selected
+elsewhere on the screen.
+
+A right click presses triangle wherever it happens. Each wheel tick presses
+one D-pad step, in the direction the selected object's own links point: LEFT
+and RIGHT when it has a left or a right link, UP and DOWN when it has only an
+up or a down one, and nothing at all when it has none. The direction is read
+off the first layout in the chain that contributed items, which is the one
+the player is steering; the press itself reaches every layout in the chain,
+because the game runs `lt_switch_layout` for each of them. The memory card
+check screen's handler only reads LEFT and RIGHT.
+
+Every press is one field of bits followed by one field of zero, which is the
+edge the game's pressed-this-frame word needs, and goes through the same
+virtual pad as a real controller (`rt_guest_menu_pulse_bits`, OR'ed in by the
+SDL provider only; scripted runs never see it).
+
+One difference from a player's D-pad move: `lt_switch_layout` plays the
+cursor sound only when it applied the move itself, so a hover is silent.
+Playing it would mean calling guest code.

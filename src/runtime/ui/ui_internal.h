@@ -13,6 +13,9 @@
 #ifdef ICORECOMP_UI
 
 #include "../gs/gs_parallel_api.h"
+/* For RtBindDevice, which the binding-table declarations below take.
+ * Runtime-internal and SDL-free, like this header. */
+#include "../host/settings.h"
 
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/ElementDocument.h>
@@ -59,6 +62,12 @@ void backend_set_frame(const RtPgsOverlayFrame* frame);
 /* SDL_Window* as void*, for the window-to-surface coordinate scale in
  * ui_events.cpp. NULL when there is no window. */
 void* backend_window_handle();
+/* The window-backbuffer rectangle the last presented scanout was blitted
+ * into, plus the backbuffer size it was measured against. All zero before
+ * the first present and in a build with no library. The drawn cursor for
+ * the game's own menus is placed on this rectangle. */
+void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                          int32_t* bb_w, int32_t* bb_h);
 
 /* The context's density-independent pixel ratio, derived from the live
  * surface height against the 640x480 design size and clamped to [1, 4] (see
@@ -67,35 +76,55 @@ void* backend_window_handle();
  * implies before the first frame is presented. */
 float ui_density_ratio();
 
-/* ---- the title logo texture scheme --------------------------------------
+/* ---- the in-memory texture schemes ---------------------------------------
  *
- * The launcher's title image is built from the user's disc at run time
- * (ui/title_logo.h) and lives in memory, not in a file. A document names it
- * with this scheme in an `src` attribute; UiSystemInterface::JoinPath passes
- * such a source through untouched and UiRenderInterface::LoadTexture answers
- * it from the published bytes. Nothing else is servable: this build has no
- * file image loader.
+ * Two images are built at run time and live in memory, not in a file: the
+ * launcher's title image, built from the user's disc (ui/title_logo.h), and
+ * the drawn menu cursor cut out of it (ui/cursor_image.h). A document names
+ * one with its scheme in an `src` attribute; UiSystemInterface::JoinPath
+ * passes such a source through untouched and UiRenderInterface::LoadTexture
+ * answers it from the published bytes. Nothing else is servable: this build
+ * has no file image loader.
+ *
+ * The text after the scheme is free: nothing reads it, and the publisher
+ * varies it so that RmlUi, which caches a texture by its source string and
+ * never re-asks for one it has, fetches a re-rasterised image.
  */
 inline constexpr char kLogoScheme[] = "logo:";
+inline constexpr char kCursorScheme[] = "cursor:";
 
-/* Publishes the RGBA8 image the scheme serves. `rgba` is width * height * 4
- * bytes with alpha premultiplied, and is copied. Returns false, having
- * logged, for an empty or zero-sized image.
+/* Publishes the RGBA8 image a scheme serves. `scheme` must be one of the two
+ * above. `rgba` is width * height * 4 bytes with alpha premultiplied, and is
+ * copied. Returns false, having logged, for an unknown scheme or an empty or
+ * zero-sized image.
  *
  * Call this before the flag that puts the element in the document: RmlUi
  * caches a texture load that returned nothing and never asks again. */
+bool ui_render_set_image(const char* scheme, const uint8_t* rgba, uint32_t width, uint32_t height);
+
+/* The title image's spelling of the same call, kept because the launcher is
+ * the older caller and reads better this way. */
 bool ui_render_set_logo(const uint8_t* rgba, uint32_t width, uint32_t height);
 
-/* True once if LoadTexture was asked for the published image and could not
- * hand a texture back, which for the backend means the GPU upload failed.
- * Reading it clears it, and publishing a new image clears it too.
+/* True once if LoadTexture was asked for that scheme's published image and
+ * could not hand a texture back, which for the backend means the GPU upload
+ * failed. Reading it clears it, and publishing a new image clears it too.
  *
  * The raster succeeding says nothing about the upload: the two happen in
  * different places and only this side knows the second answer. Without it a
  * failed upload leaves the document showing an element whose texture is
- * missing, with its text fallback switched off, which is a blank box. The
- * launcher polls this and puts the text back. */
+ * missing, with its fallback switched off, which is a blank box. The
+ * launcher polls the logo's and puts its text title back; the drawn cursor
+ * polls its own and goes back to the arrow built out of borders. */
+bool ui_render_take_image_upload_failure(const char* scheme);
 bool ui_render_take_logo_upload_failure();
+
+/* The bytes a scheme currently serves, or null when nothing is published
+ * under it. Valid until the next ui_render_set_image() for that scheme. The
+ * drawn cursor reads the title image back through this when the window scale
+ * moves, so it can re-cut its glyph at the new density without a second copy
+ * of the image living anywhere. */
+const uint8_t* ui_render_image_bytes(const char* scheme, uint32_t* width, uint32_t* height);
 
 /* ---- render interface ---------------------------------------------------
  *
@@ -209,6 +238,11 @@ struct UiState {
      * anything at all is on screen before it decides to render. The fps
      * document is shown and hidden by settings_model_refresh(). */
     bool fps_visible = false;
+    /* Whether the drawn cursor for the game's own menus is up, mirrored here
+     * for the same reason: the tick has to know whether anything at all is
+     * on screen before it decides to render. ui_menu_cursor_tick() shows and
+     * hides the document. */
+    bool cursor_visible = false;
     /* True for the whole of rt_launcher_run(), from the Show() of
      * launcher.rml to the Hide() that hands off to the game. Like the two
      * flags above it makes the tick render; unlike them it also makes
@@ -233,6 +267,8 @@ struct UiState {
     Rml::ElementDocument* fps = nullptr;
     /* Loaded once at init and shown and hidden from ui_launcher.cpp. */
     Rml::ElementDocument* launcher = nullptr;
+    /* Loaded once at init and shown and hidden from ui_menu_cursor.cpp. */
+    Rml::ElementDocument* cursor = nullptr;
     UiRenderInterface* render = nullptr;
     UiSystemInterface* system = nullptr;
 };
@@ -267,17 +303,22 @@ void settings_model_refresh();
 void settings_model_tick();
 
 /* The Input pane's label for one binding slot ("Cross", "Left stick up",
- * "Menu key"). `gamepad` selects the RtPadBind slots over the RtKeyBind
- * ones. Out of range returns "?". ui_rebind.cpp names the conflicting slot
- * in its inline reject message with this. */
-const char* bind_slot_label(bool gamepad, int slot);
+ * "Menu key"). `device` selects the table. Out of range returns "?".
+ * ui_rebind.cpp names the conflicting slot in its inline reject message
+ * with this. */
+const char* bind_slot_label(RtBindDevice device, int slot);
+
+/* The device's name as the log lines and the pane spell it: "keyboard",
+ * "gamepad", "mouse", or "?" for a value outside the enum. One copy, here,
+ * because both this file's tick and ui_rebind.cpp's log lines need it. */
+const char* bind_device_name(RtBindDevice device);
 
 /* Puts the Input pane into or out of the "waiting for input" state for one
  * slot and sets the inline status line under the binding tables. `active`
  * false ends the capture; `slot` is then ignored and the tables are read
  * back from the settings. `status` is shown as-is and may be empty. Called
  * only from ui_rebind.cpp. */
-void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::string& status);
+void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const std::string& status);
 
 /* ---- launcher (ui_launcher.cpp) -----------------------------------------
  *
@@ -303,6 +344,37 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir);
  * Does nothing when the launcher is not up, which is the in-game case. */
 void launcher_set_covered(bool covered);
 
+/* ---- drawn menu cursor (ui_menu_cursor.cpp) ------------------------------
+ *
+ * The "menucursor" data model and the document that reads it: an arrow drawn
+ * inside the presented picture while the pointer owns the mouse on one of
+ * the game's own menus. Relative mouse mode stays on there, so the OS cursor
+ * is hidden and this is the only cursor on screen. Everything it shows comes
+ * from guest/menu_nav.cpp, and it takes no events.
+ *
+ * Called from rt_ui_init, with the same failure contract as the fps
+ * readout: false, having logged, costs the drawn cursor and nothing else. */
+bool ui_menu_cursor_init(Rml::Context* context, const std::string& ui_dir);
+
+/* Cuts the letter I out of a freshly published title image, turns it into a
+ * cursor (ui/cursor_image.h) and publishes it under kCursorScheme. Called
+ * from wherever the title image is published (raster_title_logo in
+ * ui_launcher.cpp), so the cursor exists from the same moment the logo does,
+ * at the same density, and is re-cut whenever the logo is.
+ *
+ * Never fatal and never partly done: anything that goes wrong logs and
+ * leaves the document with the arrow built out of borders, or with the
+ * previous image if there was one. Safe before ui_menu_cursor_init(): it
+ * only fills the model and publishes bytes. */
+void ui_menu_cursor_build_from_logo(const uint8_t* rgba, uint32_t width, uint32_t height);
+
+/* Shows or hides the document to match "the pointer owns the mouse, relative
+ * mode is on so the OS cursor is hidden, and there is a position to point
+ * with" and, while it is up, refreshes the model. Called from rt_ui_tick
+ * at the field boundary and before the tick's "nothing is up" early-out,
+ * which counts g_ui.cursor_visible. */
+void ui_menu_cursor_tick();
+
 #ifdef ICORECOMP_PGS_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
  * SDL scancode and gamepad button, once, at init. An unresolvable name logs
@@ -321,11 +393,13 @@ void menu_set_text_input(bool enabled);
 
 /* ---- rebind capture (ui_rebind.cpp) -------------------------------------
  *
- * A capture takes over the keyboard and gamepad events while it is up: the
- * pump routes every event here first, ahead of the menu hotkey and RmlUi
- * (rt_ui_handle_sdl_event). Mouse and window events still fall through, so
- * the menu underneath keeps working and the click that started the capture
- * gets its matching release.
+ * A capture takes over the events of the device being bound while it is up:
+ * the pump routes every event here first, ahead of the menu hotkey and
+ * RmlUi (rt_ui_handle_sdl_event). A keyboard or gamepad capture consumes
+ * only keyboard and gamepad events, so the mouse still drives the menu
+ * underneath; a mouse capture also consumes mouse motion, buttons and the
+ * wheel, because the button the user presses has to become the binding
+ * rather than activating whatever it is hovering.
  *
  * The accepted name is written to the settings and committed from
  * rebind_tick(), at the field boundary, for the same reason every other
@@ -334,18 +408,28 @@ void menu_set_text_input(bool enabled);
  * window and the GS library.
  */
 
-/* Starts capturing for one slot. Safe from an event callback: it only sets
- * state and updates the data model. */
-void rebind_begin(bool gamepad, int slot);
+/* Starts capturing for one slot on one device. Safe from an event callback:
+ * it only sets state and updates the data model. */
+void rebind_begin(RtBindDevice device, int slot);
 
 /* True between rebind_begin() and the accept, cancel or timeout that ends
- * the capture. */
+ * the capture, and for as long after an accepted mouse button as its
+ * release is still owed (ui_rebind.cpp swallows that release). The pump
+ * tests this before handing an event to rebind_handle_sdl_event. */
 bool rebind_active();
 
 /* Cancels a capture in progress, if any, with `reason` in the log. Called
- * when the menu closes: a capture never outlives the menu, which is what
- * keeps rt_ui_wants_input() true for the whole of it. */
-void rebind_cancel(const char* reason);
+ * when the menu closes: an armed capture never outlives the menu, which is
+ * what keeps rt_ui_wants_input() true for the whole of one.
+ *
+ * A capture that was already accepted is left alone by default. Its name is
+ * parked for rebind_tick(), which rt_ui_tick calls whether the menu is up or
+ * not, so it is written at the coming field boundary rather than dropped by
+ * a menu that closed in the same field. `drop_accepted` throws it away as
+ * well, and is for the callers that are rewriting the same table underneath
+ * it (the resets and the mouse unbind in ui_settings_model.cpp), where
+ * applying it afterwards would undo what they just did. */
+void rebind_cancel(const char* reason, bool drop_accepted = false);
 
 /* Returns true when the capture consumed the event. */
 bool rebind_handle_sdl_event(const SDL_Event& e);

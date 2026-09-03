@@ -1138,3 +1138,95 @@ body.launcher {
 .credit:focus .logo-cell.on {
 	background-color: rgba(255, 255, 255, 230);
 }
+
+/* ---- the drawn cursor (cursor.rml) ---------------------------------------
+ *
+ * Shown whenever the pointer owns the mouse on one of the game's own menus.
+ * Relative mouse mode is on then, so the OS cursor is hidden and this is the
+ * only cursor on screen: it has to read over whatever the game is drawing
+ * behind it, which is why both forms of it are a light shape with a dark
+ * outline rather than a single flat one.
+ *
+ * The first form is the letter I of the game's own wordmark, cut out of the
+ * title image and turned to a cursor by src/runtime/ui/cursor_image.cpp. It
+ * carries its own outline in its pixels and gets its box and its offset from
+ * the model, in dp, so there is nothing to style here beyond placing it. The
+ * arrow below it is what is drawn when no such image could be built.
+ *
+ * Both triangles are drawn the way the select arrow above is, out of one
+ * border on a zero-sized box: with a 0x0 padding box the two inner corners
+ * of the bottom edge collapse onto the padding box origin, which is the
+ * element's own top left, so a bottom border of height H with a transparent
+ * right border of width W is the triangle (0,H) (W,H) (0,0). The sharp
+ * corner is at the top left, so left/top place the tip.
+ *
+ * The outline is the outer triangle showing past the inner one. The inner
+ * offsets and sizes are the outer triangle inset by 2dp on all three edges
+ * and rounded to whole dp: tip at (2, 7), 15dp tall, 9dp wide. Rounding
+ * leaves the visible outline between about 1.6dp and 2.4dp wide, and the
+ * 9:15 slope within a quarter of a dp of the outer's 14:24 over the whole
+ * of its height.
+ *
+ * 24dp tall is about 24 px at the 640x480 design density, which is what the
+ * dp ratio is 1 at (src/runtime/ui/ui.cpp).
+ */
+
+body.cursor-body {
+	width: 100%;
+	height: 100%;
+	display: block;
+	pointer-events: none;
+}
+
+/* The presented scanout rectangle, placed by the model in percent of the
+ * surface. Absolute, so the cursor inside it resolves its own percentages
+ * against the picture and not against the window. */
+.cursor-area {
+	position: absolute;
+	display: block;
+}
+
+/* The cursor position itself: a zero-sized box the model places in percent
+ * of the rectangle above. Its padding box is that single point, so both
+ * cursors below position themselves in offsets from the point the hit test
+ * uses. */
+.cursor-point {
+	position: absolute;
+	display: block;
+	width: 0dp;
+	height: 0dp;
+}
+
+/* The image cursor. Everything about its box comes from the model: the size
+ * it was cut at, in dp, and a left/top of minus its hotspot, which is what
+ * puts the glyph's point on the cursor point. */
+.menu-cursor-image {
+	position: absolute;
+	display: block;
+}
+
+/* The fallback arrow's outline, at the cursor point. */
+.menu-cursor {
+	position: absolute;
+	display: block;
+	left: 0dp;
+	top: 0dp;
+	width: 0dp;
+	height: 0dp;
+	border-bottom: 24dp #0a0a0a;
+	border-right: 14dp transparent;
+}
+
+/* The fill, over it. Its containing block is the outline's padding box,
+ * which is the zero-sized point at the outline's own top left, so these are
+ * offsets from the tip. */
+.menu-cursor-fill {
+	position: absolute;
+	display: block;
+	left: 2dp;
+	top: 7dp;
+	width: 0dp;
+	height: 0dp;
+	border-bottom: 15dp #f5f5f5;
+	border-right: 9dp transparent;
+}

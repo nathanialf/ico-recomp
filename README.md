@@ -37,6 +37,11 @@ decomp project (`../ico`) with its base ELF extracted. Then:
 builds the translator, translates the game locally, builds the runtime, and
 prints how to run. Windows: see `docs/WINDOWS.md`.
 
+Input is keyboard, gamepad, or keyboard and mouse: mouse look drives the
+camera stick and the mouse can point and click on the game's own menus.
+Every binding and the mouse settings live in the in-game menu (F1) and in
+`settings.json`; see `docs/SETTINGS.md`.
+
 ## Layout
 
 - `include/`: ABI contract between generated code, the reference interpreter,

@@ -14,6 +14,7 @@
  * Exit code 0 = every check passed; 2 on the first failing CHECK.
  */
 #include "host/json.h"
+#include "host/mouse_names.h"
 #include "host/settings.h"
 
 #include <cctype>
@@ -28,15 +29,22 @@
 
 namespace {
 std::string g_base_dir = ".";
+/* Every line rt_log has been handed since the last log_clear(). The
+ * bad-value policy is half log line and half kept value, and a test that
+ * only checks the kept value would pass just as well if the line naming the
+ * key and the range were never emitted. */
+std::string g_log;
 } // namespace
 
 void rt_log(const char* component, const char* fmt, ...) {
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    std::printf("[%s] ", component);
-    std::vprintf(fmt, ap);
-    std::printf("\n");
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    std::printf("[%s] %s\n", component, buf);
+    g_log += buf;
+    g_log += '\n';
 }
 
 const char* rt_base_dir() {
@@ -122,6 +130,14 @@ bool json_equal(const RtJson& a, const RtJson& b) {
         return true;
     }
     return false;
+}
+
+void log_clear() {
+    g_log.clear();
+}
+
+bool log_has(const char* needle) {
+    return g_log.find(needle) != std::string::npos;
 }
 
 std::string nested_arrays(int n) {
@@ -412,16 +428,33 @@ int main() {
         rt_settings_init();
         const RtSettings& s = rt_settings();
         for (int i = 0; i < RT_KB_COUNT; ++i) {
-            CHECK(s.input.keyboard[i] == rt_settings_default_binding(false, i));
-            CHECK(rt_settings_binding_key(false, i)[0] != '\0');
+            CHECK(s.input.keyboard[i] == rt_settings_default_binding(RT_BIND_KEYBOARD, i));
+            CHECK(rt_settings_binding_key(RT_BIND_KEYBOARD, i)[0] != '\0');
         }
         for (int i = 0; i < RT_GP_COUNT; ++i) {
-            CHECK(s.input.gamepad[i] == rt_settings_default_binding(true, i));
-            CHECK(rt_settings_binding_key(true, i)[0] != '\0');
+            CHECK(s.input.gamepad[i] == rt_settings_default_binding(RT_BIND_GAMEPAD, i));
+            CHECK(rt_settings_binding_key(RT_BIND_GAMEPAD, i)[0] != '\0');
         }
-        CHECK(std::string(rt_settings_default_binding(false, RT_KB_COUNT)).empty());
-        CHECK(std::string(rt_settings_default_binding(true, -1)).empty());
-        CHECK(std::string(rt_settings_binding_key(false, RT_KB_COUNT)).empty());
+        for (int i = 0; i < RT_MB_COUNT; ++i) {
+            CHECK(s.input.mouse[i] == rt_settings_default_binding(RT_BIND_MOUSE, i));
+            CHECK(rt_settings_binding_key(RT_BIND_MOUSE, i)[0] != '\0');
+        }
+        CHECK(std::string(rt_settings_default_binding(RT_BIND_KEYBOARD, RT_KB_COUNT)).empty());
+        CHECK(std::string(rt_settings_default_binding(RT_BIND_GAMEPAD, -1)).empty());
+        CHECK(std::string(rt_settings_binding_key(RT_BIND_KEYBOARD, RT_KB_COUNT)).empty());
+        CHECK(std::string(rt_settings_binding_key(RT_BIND_DEVICE_COUNT, 0)).empty());
+
+        /* Slot counts and menu slots come from the same rows, so the callers
+         * that walk a device never switch on the enum themselves. */
+        CHECK(rt_settings_bind_slot_count(RT_BIND_KEYBOARD) == RT_KB_COUNT);
+        CHECK(rt_settings_bind_slot_count(RT_BIND_GAMEPAD) == RT_GP_COUNT);
+        CHECK(rt_settings_bind_slot_count(RT_BIND_MOUSE) == RT_MB_COUNT);
+        CHECK(rt_settings_bind_slot_count(RT_BIND_DEVICE_COUNT) == 0);
+        CHECK(rt_settings_bind_menu_slot(RT_BIND_KEYBOARD) == RT_KB_MENU);
+        CHECK(rt_settings_bind_menu_slot(RT_BIND_GAMEPAD) == RT_GP_MENU);
+        /* The mouse has no menu slot; -1 is what turns rule 1 off for it. */
+        CHECK(rt_settings_bind_menu_slot(RT_BIND_MOUSE) == -1);
+        CHECK(rt_settings_bind_menu_slot(RT_BIND_DEVICE_COUNT) == -1);
     }
     { /* 21. Every default binding is a usable name and unique on its device.
        * Pure string checks: this target links no SDL, so it cannot ask SDL
@@ -600,7 +633,218 @@ int main() {
         CHECK(rt_settings().display.render_scale == 8);
     }
 
-    { /* 29. display.raster: "crt" (the non-default) loads and round-trips
+    { /* 29. compiled-in defaults for the mouse table and the mouse-look
+       * keys, and the mouse_names.h lookup they are spelled with. Two slots
+       * ship bound and the other fourteen ship "": on this one device an
+       * empty slot is a real value, not a name that failed to resolve. */
+        set_env("ICORECOMP_SETTINGS", "-");
+        rt_settings_init();
+        const RtSettings& s = rt_settings();
+        CHECK(s.input.keyboard[RT_KB_TRIANGLE] == "Space");
+        CHECK(s.input.mouse[RT_MB_SQUARE] == "left");
+        CHECK(s.input.mouse[RT_MB_R1] == "right");
+        for (int i = 0; i < RT_MB_COUNT; ++i) {
+            if (i == RT_MB_SQUARE || i == RT_MB_R1) continue;
+            CHECK(s.input.mouse[i].empty());
+        }
+        CHECK(s.input.mouse_look == true);
+        CHECK(s.input.mouse_look_sensitivity == 1.0f);
+        CHECK(s.input.mouse_look_invert_y == false);
+
+        /* The names in the table are the names the file is written with, and
+         * they resolve the way SDL resolves a scancode name: case folded. */
+        RtMouseInput mi = RT_MOUSE_INPUT_COUNT;
+        CHECK(rt_mouse_input_from_name("left", &mi) && mi == RT_MOUSE_LEFT);
+        CHECK(rt_mouse_input_from_name("LEFT", &mi) && mi == RT_MOUSE_LEFT);
+        CHECK(rt_mouse_input_from_name("WheelDown", &mi) && mi == RT_MOUSE_WHEEL_DOWN);
+        CHECK(rt_mouse_input_from_name("x2", &mi) && mi == RT_MOUSE_X2);
+        /* "" is the unbound slot, not an input, and a prefix or a longer
+         * string is not a match either. */
+        CHECK(!rt_mouse_input_from_name("", &mi));
+        CHECK(!rt_mouse_input_from_name("lef", &mi));
+        CHECK(!rt_mouse_input_from_name("leftx", &mi));
+        CHECK(!rt_mouse_input_from_name("mouse1", &mi));
+        for (int i = 0; i < RT_MOUSE_INPUT_COUNT; ++i) {
+            CHECK(rt_mouse_input_from_name(rt_mouse_input_name((RtMouseInput)i), &mi));
+            CHECK(mi == (RtMouseInput)i);
+        }
+        CHECK(std::string(rt_mouse_input_name(RT_MOUSE_INPUT_COUNT)).empty());
+    }
+    { /* 30. the mouse table and the mouse-look keys round trip through a
+       * save and a reload, empty slots included: an unbound slot has to come
+       * back unbound, not back at its compiled default. */
+        std::string path = scratch + "/mouse_roundtrip.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        RtSettings& m = rt_settings_mutable();
+        m.input.mouse[RT_MB_CROSS] = "middle";
+        m.input.mouse[RT_MB_SQUARE] = "";       /* unbind a slot that ships bound */
+        m.input.mouse[RT_MB_L1] = "wheelup";
+        m.input.mouse_look = false;
+        m.input.mouse_look_sensitivity = 2.5f;
+        m.input.mouse_look_invert_y = true;
+        rt_settings_commit();
+        CHECK(std::string(rt_settings_last_reject()).empty());
+
+        std::string text = read_file(path);
+        CHECK(text.find("\"mouse\"") != std::string::npos);
+        CHECK(text.find("wheelup") != std::string::npos);
+        /* Retired: the key is never written out again. */
+        CHECK(text.find("menu_hit_editor") == std::string::npos);
+
+        rt_settings_init();
+        const RtSettings& s = rt_settings();
+        CHECK(s.input.mouse[RT_MB_CROSS] == "middle");
+        CHECK(s.input.mouse[RT_MB_SQUARE].empty());
+        CHECK(s.input.mouse[RT_MB_L1] == "wheelup");
+        CHECK(s.input.mouse[RT_MB_R1] == "right");
+        CHECK(s.input.mouse[RT_MB_TRIANGLE].empty());
+        CHECK(s.input.mouse_look == false);
+        CHECK(s.input.mouse_look_sensitivity == 2.5f);
+        CHECK(s.input.mouse_look_invert_y == true);
+    }
+    { /* 31. a file written before the mouse existed: input.keyboard loads,
+       * and every mouse key comes from the compiled defaults rather than
+       * from an absent section read as empty. */
+        std::string path = scratch + "/kbonly.json";
+        write_file(path, "{\"version\": 1, \"input\": {\"keyboard\": {\"cross\": \"N\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        const RtSettings& s = rt_settings();
+        CHECK(s.input.keyboard[RT_KB_CROSS] == "N");
+        CHECK(s.input.keyboard[RT_KB_TRIANGLE] == "Space");
+        CHECK(s.input.mouse[RT_MB_SQUARE] == "left");
+        CHECK(s.input.mouse[RT_MB_R1] == "right");
+        CHECK(s.input.mouse[RT_MB_CROSS].empty());
+        CHECK(s.input.mouse_look == true);
+        CHECK(s.input.mouse_look_sensitivity == 1.0f);
+    }
+    { /* 32. input.mouse_look_sensitivity: a bad value in the file keeps the
+       * compiled default and says so, and a bad value arriving through the
+       * menu reverts at commit to the previously committed value. */
+        std::string path = scratch + "/sens.json";
+        write_file(path, "{\"version\": 1, \"input\": {\"mouse_look_sensitivity\": 40}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(rt_settings().input.mouse_look_sensitivity == 1.0f);
+        CHECK(log_has("input.mouse_look_sensitivity"));
+        CHECK(log_has("out of range"));
+
+        /* Both ends of the documented range load as themselves. */
+        write_file(path, "{\"version\": 1, \"input\": {\"mouse_look_sensitivity\": 0.05}}\n");
+        rt_settings_init();
+        CHECK(rt_settings().input.mouse_look_sensitivity == 0.05f);
+        write_file(path, "{\"version\": 1, \"input\": {\"mouse_look_sensitivity\": 20}}\n");
+        rt_settings_init();
+        CHECK(rt_settings().input.mouse_look_sensitivity == 20.0f);
+
+        rt_settings_mutable().input.mouse_look_sensitivity = 3.0f;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse_look_sensitivity == 3.0f);
+        rt_settings_mutable().input.mouse_look_sensitivity = 0.0f;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse_look_sensitivity == 3.0f);
+        rt_settings_mutable().input.mouse_look_sensitivity = 25.0f;
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse_look_sensitivity == 3.0f);
+    }
+    { /* 33. the same-device duplicate rule on the mouse, and the exemption
+       * that makes the mouse different: "" is a legitimate value here, so
+       * two unbound slots are not a collision. The mouse has no menu slot,
+       * so rule 1 does not run for it at all. */
+        std::string path = scratch + "/mousedup.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        CHECK(rt_settings().input.mouse[RT_MB_SQUARE] == "left");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+
+        rt_settings_mutable().input.mouse[RT_MB_CROSS] = "left";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse[RT_MB_CROSS].empty());
+        CHECK(rt_settings().input.mouse[RT_MB_SQUARE] == "left");
+        const std::string reject = rt_settings_last_reject();
+        CHECK(reject.find("input.mouse.square") != std::string::npos);
+        CHECK(reject.find("input.mouse.cross") != std::string::npos);
+
+        /* Case only, rejected the same way as on the other two devices. */
+        rt_settings_mutable().input.mouse[RT_MB_CROSS] = "LEFT";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse[RT_MB_CROSS].empty());
+
+        /* Unbinding both shipped slots leaves two empty names, which is not
+         * a duplicate and not a reject. */
+        rt_settings_mutable().input.mouse[RT_MB_SQUARE] = "";
+        rt_settings_mutable().input.mouse[RT_MB_R1] = "";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse[RT_MB_SQUARE].empty());
+        CHECK(rt_settings().input.mouse[RT_MB_R1].empty());
+        CHECK(std::string(rt_settings_last_reject()).empty());
+
+        /* Nothing on the mouse can collide with a menu key, so a name is
+         * only ever checked against the other fifteen mouse slots. */
+        rt_settings_mutable().input.mouse[RT_MB_TRIANGLE] = "middle";
+        rt_settings_mutable().input.keyboard[RT_KB_MENU] = "F1";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.mouse[RT_MB_TRIANGLE] == "middle");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 34. unknown keys under input, in the section itself and inside the
+       * new mouse object: logged by dotted name and kept across a save. */
+        std::string path = scratch + "/unknown_input.json";
+        write_file(path,
+            "{\"version\": 1, \"input\": {\"mouse_looke\": true,"
+            " \"mouse\": {\"nope\": \"left\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(log_has("unknown key \"input.mouse_looke\""));
+        CHECK(log_has("unknown key \"input.mouse.nope\""));
+        CHECK(rt_settings().input.mouse_look == true);
+        CHECK(rt_settings().input.mouse[RT_MB_SQUARE] == "left");
+        CHECK(rt_settings_save());
+        std::string text = read_file(path);
+        CHECK(text.find("mouse_looke") != std::string::npos);
+        CHECK(text.find("nope") != std::string::npos);
+    }
+    { /* 35. reset-to-defaults covers the mouse table and the new keys. */
+        set_env("ICORECOMP_SETTINGS", "-");
+        rt_settings_init();
+        RtSettings& m = rt_settings_mutable();
+        m.input.mouse[RT_MB_SQUARE] = "middle";
+        m.input.mouse[RT_MB_START] = "x1";
+        m.input.mouse_look = false;
+        m.input.mouse_look_sensitivity = 7.0f;
+        m.input.mouse_look_invert_y = true;
+        rt_settings_reset_defaults();
+        const RtSettings& s = rt_settings();
+        CHECK(s.input.mouse[RT_MB_SQUARE] == "left");
+        CHECK(s.input.mouse[RT_MB_R1] == "right");
+        CHECK(s.input.mouse[RT_MB_START].empty());
+        CHECK(s.input.mouse_look == true);
+        CHECK(s.input.mouse_look_sensitivity == 1.0f);
+        CHECK(s.input.mouse_look_invert_y == false);
+        CHECK(s.input.keyboard[RT_KB_TRIANGLE] == "Space");
+    }
+    { /* 36. debug.menu_hit_editor was retired when the pointer on the game's
+       * menus started reading the game's own scene objects. A file that
+       * still holds it says so once, keeps the key across a save, and
+       * changes nothing else in the section. */
+        std::string path = scratch + "/hit_editor.json";
+        write_file(path,
+            "{\n"
+            "  \"version\": 1,\n"
+            "  \"debug\": {\"menu_hit_editor\": true, \"profile_fields\": 90}\n"
+            "}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(log_has("debug.menu_hit_editor is no longer a setting"));
+        CHECK(rt_settings().debug.profile_fields == 90);
+        CHECK(rt_settings_save());
+        CHECK(read_file(path).find("menu_hit_editor") != std::string::npos);
+    }
+    { /* 37. display.raster: "crt" (the non-default) loads and round-trips
        * through a save, and an unrecognised value keeps the window default
        * without failing the rest of the load. */
         std::string path = scratch + "/raster.json";
@@ -619,7 +863,7 @@ int main() {
         CHECK(rt_settings().display.show_fps);
     }
 
-    { /* 30. display.deinterlace: "weave" (a non-default) loads and
+    { /* 38. display.deinterlace: "weave" (a non-default) loads and
        * round-trips through a save, and an unrecognised value keeps the bob
        * default without failing the rest of the load. */
         std::string path = scratch + "/deinterlace.json";

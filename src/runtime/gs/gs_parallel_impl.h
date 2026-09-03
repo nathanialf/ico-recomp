@@ -84,6 +84,8 @@ struct RtPgs {
     void notify_quit();
     void notify_resize();
     void surface_size(uint32_t* width, uint32_t* height);
+    void present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                      int32_t* bb_w, int32_t* bb_h);
     void set_present_mode(uint32_t mode);
     void set_presentation(uint32_t fit, uint32_t filter);
     void set_raster(uint32_t raster);
@@ -299,6 +301,25 @@ private:
      * Vulkan::WSI::set_present_mode would otherwise silently no-op mid-frame
      * instead of taking effect. */
     bool m_in_frame = false;
+    /* The window-backbuffer rectangle the last present blitted the scanout
+     * into, and the backbuffer size it was measured against. Written by
+     * present_frame once the fit is resolved (so an integer fit that fell
+     * back to letterbox reports the letterbox rectangle), read back by
+     * rt_pgs_present_rect. Zero until the first present and while headless.
+     * On a field that presented no scanout image the size is reported as
+     * 0 by 0 with the backbuffer size still filled in: nothing on that field
+     * maps window pixels to guest pixels, and reporting the whole backbuffer
+     * would put the caller's cursor on a picture that is not there.
+     *
+     * Plain integers, not atomics, for the same reason as the timings above:
+     * present_frame and rt_pgs_present_rect both run on the host's EE thread
+     * today (gs/gs_threaded.cpp drains its ring inline, gs/gs_select.cpp
+     * builds the ThreadedBackend with inline_drain true). They have to become
+     * atomics on the day that ring gets a worker thread, since present_frame
+     * would then write them while the host reads them. */
+    int32_t m_present_x = 0, m_present_y = 0;
+    int32_t m_present_w = 0, m_present_h = 0;
+    int32_t m_present_bb_w = 0, m_present_bb_h = 0;
     /* Last (internal w, internal h, mode w, mode h, deinterlaced,
      * render scale, high-resolution scanout, deinterlace mode) whose aspect
      * was logged, so a geometry, scale or mode change is visible in the log

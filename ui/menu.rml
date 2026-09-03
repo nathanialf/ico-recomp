@@ -193,11 +193,12 @@
 				</div>
 
 				<!--
-					Both binding tables come from one array of rows each
-					(keyboard_binds / gamepad_binds in the settings data model),
-					so the row count follows RtKeyBind/RtPadBind rather than a
-					hand-written row per slot. it_index is the slot number the
-					Rebind button hands back to ui_rebind.cpp.
+					All three binding tables come from one array of rows each
+					(keyboard_binds / gamepad_binds / mouse_binds in the settings
+					data model), so the row count follows
+					RtKeyBind/RtPadBind/RtMouseBind rather than a hand-written row
+					per slot. it_index is the slot number the Rebind button hands
+					back to ui_rebind.cpp.
 				-->
 				<div class="section-header">
 					<span class="section-number">03.1</span>
@@ -229,8 +230,60 @@
 					<div class="button" data-event-click="reset_gamepad_binds()">Reset gamepad bindings</div>
 				</div>
 
+				<!--
+					The mouse table is the sixteen DS2 buttons only: it has no
+					stick slots (mouse motion is mouse look, below) and no menu
+					slot. Most slots ship unbound, which the row shows as
+					"unbound" and Unbind puts back.
+				-->
+				<div class="section-header">
+					<span class="section-number">03.3</span>
+					<span class="section-title">Mouse</span>
+				</div>
+				<div class="bind-table">
+					<div class="bind-row" data-for="row : mouse_binds">
+						<span class="bind-slot">{{row.label}}</span>
+						<span class="bind-name" data-class-capturing="row.capturing">{{row.binding}}</span>
+						<div class="bind-button" data-event-click="rebind_mouse(it_index)">Rebind</div>
+						<div class="bind-button" data-event-click="unbind_mouse(it_index)">Unbind</div>
+					</div>
+				</div>
+				<div class="bind-actions">
+					<div class="button" data-event-click="reset_mouse_binds()">Reset mouse bindings</div>
+				</div>
+
+				<div class="section-header">
+					<span class="section-number">03.4</span>
+					<span class="section-title">Mouse look</span>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="mouse_look" data-event-change="apply()"/>
+						<span class="check-label">Mouse look (right stick)</span>
+					</div>
+					<div class="hint">on: mouse motion is reported as right stick deflection. off: the right stick comes from the pad and the stick keys only</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Mouse look sensitivity</div>
+					<div class="range-row">
+						<input type="range" min="0.05" max="20" step="0.05" data-value="mouse_look_sensitivity" data-event-change="apply()"/>
+						<span class="range-value">{{mouse_look_sensitivity_text}}</span>
+					</div>
+					<div class="hint">1.00 is the baseline; higher deflects the stick further for the same movement</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row">
+						<input type="checkbox" data-checked="mouse_look_invert_y" data-event-change="apply()"/>
+						<span class="check-label">Invert mouse Y</span>
+					</div>
+					<div class="hint">flips the vertical direction of mouse look; the horizontal one is unchanged</div>
+				</div>
+
 				<div class="bind-status" data-if="has_rebind_status">{{rebind_status}}</div>
-				<div class="note">Escape cancels a capture; it times out after five seconds. The menu key is never handed to the game.</div>
+				<div class="note">Escape cancels a capture; it times out after five seconds. A mouse capture holds the pointer until it ends, so the menu does not react to the button being bound. The menu key is never handed to the game.</div>
 			</div>
 
 			<div class="section" data-if="active_tab == 'gameplay'">

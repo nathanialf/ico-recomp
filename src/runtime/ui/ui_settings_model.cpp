@@ -62,10 +62,10 @@ namespace rtui {
 
 namespace {
 
-/* One row of a binding table. The Input pane renders both tables with a
- * data-for loop over an array of these rather than binding 41 scalars: a
- * scalar per slot would mean 41 Bind() calls here and 41 hand-written rows
- * in menu.rml, and adding a slot would mean touching both.
+/* One row of a binding table. The Input pane renders all three tables with
+ * a data-for loop over an array of these rather than binding one scalar per
+ * slot: that would mean a Bind() call here and a hand-written row in
+ * menu.rml for each of the 57, and adding a slot would mean touching both.
  *
  * `binding` is the name to show, which is the stored name except while that
  * row is capturing, when it is the prompt. `capturing` drives the row's
@@ -122,6 +122,11 @@ struct UiSettingsMirror {
     std::string right_deadzone_text;
     std::vector<UiBindRow> keyboard_binds;
     std::vector<UiBindRow> gamepad_binds;
+    std::vector<UiBindRow> mouse_binds;
+    bool mouse_look = true;
+    float mouse_look_sensitivity = 1.0f;
+    std::string mouse_look_sensitivity_text;
+    bool mouse_look_invert_y = false;
     /* Inline result of the last capture or commit: a reject reason, a
      * timeout, or "" when there is nothing to say. The bool is what the
      * document tests: an Rml data expression coerces a String to bool
@@ -169,6 +174,13 @@ bool g_apply_pending = false;
 bool g_reset_pending = false;
 bool g_reset_keyboard_binds_pending = false;
 bool g_reset_gamepad_binds_pending = false;
+bool g_reset_mouse_binds_pending = false;
+/* One bit per mouse slot an Unbind button has asked to clear, drained
+ * whole by settings_model_tick(). A set rather than a single slot so that
+ * two Unbind clicks in one field both land; a bitmask rather than a vector
+ * so the event callback allocates nothing. */
+static_assert(RT_MB_COUNT <= 32, "the unbind queue is one bit per mouse slot");
+unsigned g_unbind_mouse_pending = 0;
 
 using ModelClock = std::chrono::steady_clock;
 ModelClock::time_point g_fps_text_at;
@@ -248,6 +260,20 @@ const WindowSizeOption kWindowSizes[] = {
     { 3200, 2400, "3200 x 2400 (5x)" },
     { 3840, 2880, "3840 x 2880 (6x)" },
 };
+
+/* The first sixteen RtKeyBind labels, which is exactly the RtMouseBind
+ * order: the mouse has the DS2 buttons and no stick or menu slots. */
+const char* const kMouseLabels[RT_MB_COUNT] = {
+    "Up", "Down", "Left", "Right",
+    "Cross", "Circle", "Square", "Triangle",
+    "L1", "R1", "L2", "R2", "L3", "R3",
+    "Start", "Select",
+};
+
+/* What the table shows for a mouse slot holding "". The stored value stays
+ * empty; this is display only, because a blank cell reads as a rendering
+ * fault rather than as a slot nobody bound. */
+constexpr const char* kUnboundLabel = "unbound";
 
 const char* const kGamepadLabels[RT_GP_COUNT] = {
     "Up", "Down", "Left", "Right",
@@ -353,6 +379,20 @@ bool parse_double_field(const std::string& text, const char* dotted, double* out
 
 /* ---- mirror <-> settings ------------------------------------------------ */
 
+/* The stored name for one slot, as a pointer into the struct being edited.
+ * The reset and unbind paths below are the only writers here; ui_rebind.cpp
+ * has its own read-only twin over rt_settings(). NULL for a device or slot
+ * outside the tables, which the callers do not produce: the counts come
+ * from rt_settings_bind_slot_count(). */
+std::string* bind_slot_storage(RtSettings& s, RtBindDevice device, int slot) {
+    switch (device) {
+    case RT_BIND_KEYBOARD: return (slot >= 0 && slot < RT_KB_COUNT) ? &s.input.keyboard[slot] : nullptr;
+    case RT_BIND_GAMEPAD:  return (slot >= 0 && slot < RT_GP_COUNT) ? &s.input.gamepad[slot] : nullptr;
+    case RT_BIND_MOUSE:    return (slot >= 0 && slot < RT_MB_COUNT) ? &s.input.mouse[slot] : nullptr;
+    default: return nullptr;
+    }
+}
+
 void set_override(const char* dotted, bool* flag, std::string* text) {
     *flag = rt_settings_overridden(dotted);
     const char* env = rt_settings_env_twin(dotted);
@@ -413,6 +453,10 @@ void settings_to_mirror() {
     g_m.right_deadzone = s.input.right_deadzone;
     g_m.left_deadzone_text = fmt("%.2f", (double)s.input.left_deadzone);
     g_m.right_deadzone_text = fmt("%.2f", (double)s.input.right_deadzone);
+    g_m.mouse_look = s.input.mouse_look;
+    g_m.mouse_look_sensitivity = s.input.mouse_look_sensitivity;
+    g_m.mouse_look_sensitivity_text = fmt("%.2f", (double)s.input.mouse_look_sensitivity);
+    g_m.mouse_look_invert_y = s.input.mouse_look_invert_y;
 
     /* Rebuilt rather than patched: a commit can revert a binding (the menu
      * key colliding with a pad slot, a duplicate), and the pane has to show
@@ -429,6 +473,14 @@ void settings_to_mirror() {
         g_m.gamepad_binds[i].label = kGamepadLabels[i];
         g_m.gamepad_binds[i].binding = s.input.gamepad[i];
         g_m.gamepad_binds[i].capturing = false;
+    }
+    g_m.mouse_binds.resize(RT_MB_COUNT);
+    for (int i = 0; i < RT_MB_COUNT; ++i) {
+        g_m.mouse_binds[i].label = kMouseLabels[i];
+        /* "" is a legal committed value on this device and means the slot
+         * is unbound; the table says so in words. */
+        g_m.mouse_binds[i].binding = s.input.mouse[i].empty() ? kUnboundLabel : s.input.mouse[i];
+        g_m.mouse_binds[i].capturing = false;
     }
 
     g_m.run_any_direction = s.gameplay.run_any_direction;
@@ -469,6 +521,12 @@ void mirror_to_settings() {
 
     s.input.left_deadzone = g_m.left_deadzone;
     s.input.right_deadzone = g_m.right_deadzone;
+    s.input.mouse_look = g_m.mouse_look;
+    s.input.mouse_look_sensitivity = g_m.mouse_look_sensitivity;
+    s.input.mouse_look_invert_y = g_m.mouse_look_invert_y;
+    /* The three binding tables are not written back here. They are display
+     * rows: ui_rebind.cpp and the unbind queue below are the only writers,
+     * and both go through rt_settings_mutable() themselves. */
 
     s.gameplay.run_any_direction = g_m.run_any_direction;
 
@@ -515,40 +573,60 @@ void on_close(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     rt_ui_set_visible(false);
 }
 
-#ifdef ICORECOMP_PGS_SDL
 /* data-for gives the row index as it_index; the document passes it through.
  * A missing or out-of-range argument means the document and this file
  * disagree about the tables, which is worth a line rather than a silent
- * no-op. */
+ * no-op. Outside the SDL guard because the unbind callback below needs it
+ * in every build. */
 int slot_argument(const Rml::VariantList& arguments, int count) {
     const int slot = arguments.size() == 1 ? arguments[0].Get<int>(-1) : -1;
     if (slot < 0 || slot >= count) {
-        rt_log("ui", "settings menu: rebind was asked for slot %d, which is not one of this"
-            " device's 0..%d; the document and ui_settings_model.cpp disagree", slot, count - 1);
+        rt_log("ui", "settings menu: a binding button was pressed for slot %d, which is not one"
+            " of this device's 0..%d; the document and ui_settings_model.cpp disagree",
+            slot, count - 1);
         return -1;
     }
     return slot;
 }
 
+#ifdef ICORECOMP_PGS_SDL
 void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
     const int slot = slot_argument(arguments, RT_KB_COUNT);
-    if (slot >= 0) rebind_begin(false, slot);
+    if (slot >= 0) rebind_begin(RT_BIND_KEYBOARD, slot);
 }
 
 void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
     const int slot = slot_argument(arguments, RT_GP_COUNT);
-    if (slot >= 0) rebind_begin(true, slot);
+    if (slot >= 0) rebind_begin(RT_BIND_GAMEPAD, slot);
+}
+
+void on_rebind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
+    const int slot = slot_argument(arguments, RT_MB_COUNT);
+    if (slot >= 0) rebind_begin(RT_BIND_MOUSE, slot);
 }
 #else
 /* No SDL means no capture: there are no events to capture and no names to
- * resolve. The buttons stay in the document and say so when pressed. */
+ * resolve. The buttons stay in the document and say so when pressed.
+ * Unbind is not among them: clearing a slot is a settings write, not a
+ * capture, and works in a build with no SDL. */
 void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
 }
 void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
 }
+void on_rebind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+}
 #endif
+
+/* Queued, not applied: the commit that follows runs the appliers, which is
+ * the same reason every other control change in this file waits for the
+ * field boundary. */
+void on_unbind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
+    const int slot = slot_argument(arguments, RT_MB_COUNT);
+    if (slot >= 0) g_unbind_mouse_pending |= 1u << slot;
+}
 
 void on_reset_keyboard_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     g_reset_keyboard_binds_pending = true;
@@ -556,6 +634,10 @@ void on_reset_keyboard_binds(Rml::DataModelHandle, Rml::Event&, const Rml::Varia
 
 void on_reset_gamepad_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     g_reset_gamepad_binds_pending = true;
+}
+
+void on_reset_mouse_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    g_reset_mouse_binds_pending = true;
 }
 
 } // namespace
@@ -585,6 +667,10 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("right_deadzone", &g_m.right_deadzone);
     c.Bind("left_deadzone_text", &g_m.left_deadzone_text);
     c.Bind("right_deadzone_text", &g_m.right_deadzone_text);
+    c.Bind("mouse_look", &g_m.mouse_look);
+    c.Bind("mouse_look_sensitivity", &g_m.mouse_look_sensitivity);
+    c.Bind("mouse_look_sensitivity_text", &g_m.mouse_look_sensitivity_text);
+    c.Bind("mouse_look_invert_y", &g_m.mouse_look_invert_y);
 
     /* Same registration order as the binding rows below: the struct, then
      * the array of it, then the Bind. The window size select is a data-for
@@ -616,6 +702,7 @@ bool settings_model_init(Rml::Context* context) {
     }
     c.Bind("keyboard_binds", &g_m.keyboard_binds);
     c.Bind("gamepad_binds", &g_m.gamepad_binds);
+    c.Bind("mouse_binds", &g_m.mouse_binds);
     c.Bind("rebind_status", &g_m.rebind_status);
     c.Bind("has_rebind_status", &g_m.has_rebind_status);
 
@@ -648,20 +735,36 @@ bool settings_model_init(Rml::Context* context) {
     c.BindEventCallback("close_menu", on_close);
     c.BindEventCallback("rebind_keyboard", on_rebind_keyboard);
     c.BindEventCallback("rebind_gamepad", on_rebind_gamepad);
+    c.BindEventCallback("rebind_mouse", on_rebind_mouse);
+    c.BindEventCallback("unbind_mouse", on_unbind_mouse);
     c.BindEventCallback("reset_keyboard_binds", on_reset_keyboard_binds);
     c.BindEventCallback("reset_gamepad_binds", on_reset_gamepad_binds);
+    c.BindEventCallback("reset_mouse_binds", on_reset_mouse_binds);
 
     g_model = c.GetModelHandle();
     g_model_valid = true;
     return true;
 }
 
-const char* bind_slot_label(bool gamepad, int slot) {
-    if (gamepad) return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadLabels[slot] : "?";
-    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardLabels[slot] : "?";
+const char* bind_slot_label(RtBindDevice device, int slot) {
+    switch (device) {
+    case RT_BIND_GAMEPAD: return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadLabels[slot] : "?";
+    case RT_BIND_MOUSE:   return (slot >= 0 && slot < RT_MB_COUNT) ? kMouseLabels[slot] : "?";
+    case RT_BIND_KEYBOARD: return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardLabels[slot] : "?";
+    default: return "?";
+    }
 }
 
-void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::string& status) {
+const char* bind_device_name(RtBindDevice device) {
+    switch (device) {
+    case RT_BIND_KEYBOARD: return "keyboard";
+    case RT_BIND_GAMEPAD:  return "gamepad";
+    case RT_BIND_MOUSE:    return "mouse";
+    default: return "?";
+    }
+}
+
+void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const std::string& status) {
     if (!g_model_valid) return;
 
     /* Start from the stored names either way: ending a capture has to put
@@ -669,10 +772,27 @@ void settings_model_set_rebind(bool active, bool gamepad, int slot, const std::s
      * earlier capture was on. */
     settings_to_mirror();
     if (active) {
-        std::vector<UiBindRow>& rows = gamepad ? g_m.gamepad_binds : g_m.keyboard_binds;
-        if (slot >= 0 && slot < (int)rows.size()) {
-            rows[slot].capturing = true;
-            rows[slot].binding = gamepad ? "press a button or move an axis" : "press a key";
+        std::vector<UiBindRow>* rows = nullptr;
+        const char* prompt = "";
+        switch (device) {
+        case RT_BIND_KEYBOARD:
+            rows = &g_m.keyboard_binds;
+            prompt = "press a key";
+            break;
+        case RT_BIND_GAMEPAD:
+            rows = &g_m.gamepad_binds;
+            prompt = "press a button or move an axis";
+            break;
+        case RT_BIND_MOUSE:
+            rows = &g_m.mouse_binds;
+            prompt = "press a mouse button or turn the wheel";
+            break;
+        default:
+            break;
+        }
+        if (rows && slot >= 0 && slot < (int)rows->size()) {
+            (*rows)[slot].capturing = true;
+            (*rows)[slot].binding = prompt;
         }
     }
     g_m.rebind_status = status;
@@ -701,36 +821,63 @@ void settings_model_tick() {
         g_reset_pending = false;
         g_apply_pending = false;
 #ifdef ICORECOMP_PGS_SDL
-        rebind_cancel("the settings were reset to defaults");
+        rebind_cancel("the settings were reset to defaults", /*drop_accepted=*/true);
 #endif
         rt_settings_reset_defaults();
         rt_settings_commit(false);
         rt_settings_request_save();
         settings_model_refresh();
         rt_log("ui", "settings menu: reset to defaults");
-    } else if (g_reset_keyboard_binds_pending || g_reset_gamepad_binds_pending) {
-        /* One device per tick, keyboard first. Clicking both buttons before
-         * the next field is unlikely but the second click must not be
-         * dropped: the other flag stays set and lands next tick. */
-        const bool gamepad = !g_reset_keyboard_binds_pending;
-        if (gamepad) {
+    } else if (g_reset_keyboard_binds_pending || g_reset_gamepad_binds_pending ||
+               g_reset_mouse_binds_pending) {
+        /* One device per tick, in device order. Clicking more than one of
+         * the three buttons before the next field is unlikely but the later
+         * clicks must not be dropped: the other flags stay set and land on
+         * the ticks after this one. */
+        RtBindDevice device = RT_BIND_KEYBOARD;
+        if (g_reset_keyboard_binds_pending) {
+            g_reset_keyboard_binds_pending = false;
+        } else if (g_reset_gamepad_binds_pending) {
+            device = RT_BIND_GAMEPAD;
             g_reset_gamepad_binds_pending = false;
         } else {
-            g_reset_keyboard_binds_pending = false;
+            device = RT_BIND_MOUSE;
+            g_reset_mouse_binds_pending = false;
         }
 #ifdef ICORECOMP_PGS_SDL
-        rebind_cancel("the bindings for that device were reset");
+        rebind_cancel("the bindings for that device were reset", /*drop_accepted=*/true);
 #endif
         RtSettings& m = rt_settings_mutable();
-        const int count = gamepad ? (int)RT_GP_COUNT : (int)RT_KB_COUNT;
+        const int count = rt_settings_bind_slot_count(device);
         for (int i = 0; i < count; ++i) {
-            std::string* slot = gamepad ? &m.input.gamepad[i] : &m.input.keyboard[i];
-            *slot = rt_settings_default_binding(gamepad, i);
+            std::string* stored = bind_slot_storage(m, device, i);
+            if (stored) *stored = rt_settings_default_binding(device, i);
         }
         rt_settings_commit(false);
         rt_settings_request_save();
         settings_model_refresh();
-        rt_log("ui", "settings menu: %s bindings reset to defaults", gamepad ? "gamepad" : "keyboard");
+        rt_log("ui", "settings menu: %s bindings reset to defaults", bind_device_name(device));
+    } else if (g_unbind_mouse_pending) {
+        /* Every slot the Unbind buttons queued, in one commit. "" is what
+         * an unbound mouse slot holds; the table renders it as "unbound".
+         * The capture goes with it: the refresh below rebuilds every row,
+         * which would otherwise leave a capture armed with nothing on
+         * screen saying so. */
+        const unsigned slots = g_unbind_mouse_pending;
+        g_unbind_mouse_pending = 0;
+#ifdef ICORECOMP_PGS_SDL
+        rebind_cancel("a mouse binding was cleared", /*drop_accepted=*/true);
+#endif
+        RtSettings& m = rt_settings_mutable();
+        for (int i = 0; i < RT_MB_COUNT; ++i) {
+            if (!(slots & (1u << i))) continue;
+            m.input.mouse[i].clear();
+            rt_log("ui", "settings menu: input.mouse.%s unbound",
+                rt_settings_binding_key(RT_BIND_MOUSE, i));
+        }
+        rt_settings_commit(false);
+        rt_settings_request_save();
+        settings_model_refresh();
     } else if (g_apply_pending) {
         g_apply_pending = false;
         mirror_to_settings();

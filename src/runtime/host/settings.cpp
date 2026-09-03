@@ -32,6 +32,7 @@
 #include "runtime.h"
 
 #include "host/json.h"
+#include "host/mouse_names.h"
 #include "host/portable.h"
 #include "host/settings.h"
 
@@ -47,19 +48,16 @@
 #include <initializer_list>
 #include <iterator>
 
-#ifndef _WIN32
-#include <unistd.h>
-#endif
-
 namespace {
 
 /* ---- bind default tables ------------------------------------------------
  *
- * These are SDL_GetScancodeName / SDL mapping-string tokens. They are the
- * only copy: host/input.cpp builds its SDL tables from rt_settings() and
- * falls back to these through rt_settings_default_binding() when a stored
- * name does not resolve, so there is no second hardcoded map to keep in
- * sync. The values reproduce the pre-settings map exactly.
+ * The keyboard and gamepad values are SDL_GetScancodeName / SDL
+ * mapping-string tokens; the mouse values are host/mouse_names.h names, SDL
+ * having no name lookup for mouse buttons. They are the only copy:
+ * host/input.cpp builds its tables from rt_settings() and falls back to
+ * these through rt_settings_default_binding() when a stored name does not
+ * resolve, so there is no second hardcoded map to keep in sync.
  */
 struct BindDef {
     const char* json_key;
@@ -70,7 +68,7 @@ struct BindDef {
  * our convention for direction, not part of the SDL token itself. */
 constexpr BindDef kKeyboardBinds[RT_KB_COUNT] = {
     {"up", "Up"}, {"down", "Down"}, {"left", "Left"}, {"right", "Right"},
-    {"cross", "X"}, {"circle", "C"}, {"square", "Z"}, {"triangle", "V"},
+    {"cross", "X"}, {"circle", "C"}, {"square", "Z"}, {"triangle", "Space"},
     {"l1", "Q"}, {"r1", "E"}, {"l2", "1"}, {"r2", "3"}, {"l3", "T"}, {"r3", "Y"},
     {"start", "Return"}, {"select", "Backspace"},
     {"lstick_up", "W"}, {"lstick_down", "S"}, {"lstick_left", "A"}, {"lstick_right", "D"},
@@ -85,6 +83,59 @@ constexpr BindDef kGamepadBinds[RT_GP_COUNT] = {
     {"l3", "leftstick"}, {"r3", "rightstick"}, {"start", "start"}, {"select", "back"},
     {"menu", "guide"},
 };
+
+/* The mouse ships with two slots bound: square (the attack button, on the
+ * left button) and r1 (the call/grab button, on the right button). Every
+ * other slot is "", which on this device means unbound and is not an error:
+ * a mouse has no key for l2 to fall back to. The two names are spelled by
+ * calling rt_mouse_input_name() so this table cannot drift from
+ * host/mouse_names.h. */
+constexpr BindDef kMouseBinds[RT_MB_COUNT] = {
+    {"up", ""}, {"down", ""}, {"left", ""}, {"right", ""},
+    {"cross", ""}, {"circle", ""},
+    {"square", rt_mouse_input_name(RT_MOUSE_LEFT)},
+    {"triangle", ""},
+    {"l1", ""}, {"r1", rt_mouse_input_name(RT_MOUSE_RIGHT)},
+    {"l2", ""}, {"r2", ""}, {"l3", ""}, {"r3", ""},
+    {"start", ""}, {"select", ""},
+};
+
+/* One binding table plus the two facts every rule about it needs: how many
+ * slots it has, and which of them is the menu key (-1 for the mouse, which
+ * has none). Indexed by RtBindDevice, so the loaders, the validators and
+ * the public accessors all walk the same list and a fourth device would be
+ * one row here. */
+struct BindTable {
+    const BindDef* defs;
+    int count;
+    int menu_slot;
+    const char* json_key;  /* the object key under "input" */
+    const char* section;   /* dotted key of the section, for log lines */
+};
+
+constexpr BindTable kBindTables[RT_BIND_DEVICE_COUNT] = {
+    {kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "keyboard", "input.keyboard"},
+    {kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "gamepad", "input.gamepad"},
+    {kMouseBinds, RT_MB_COUNT, -1, "mouse", "input.mouse"},
+};
+
+bool valid_device(RtBindDevice d) {
+    return d >= 0 && d < RT_BIND_DEVICE_COUNT;
+}
+
+/* The slot array in one settings struct for one device. */
+std::string* bind_values(RtSettings* s, RtBindDevice d) {
+    switch (d) {
+    case RT_BIND_KEYBOARD: return s->input.keyboard;
+    case RT_BIND_GAMEPAD:  return s->input.gamepad;
+    case RT_BIND_MOUSE:    return s->input.mouse;
+    default:               return nullptr;
+    }
+}
+
+const std::string* bind_values(const RtSettings& s, RtBindDevice d) {
+    return bind_values(const_cast<RtSettings*>(&s), d);
+}
 
 /* ---- environment twins ---------------------------------------------------
  *
@@ -206,8 +257,11 @@ constexpr auto kSaveDebounce = std::chrono::seconds(1);
 
 void apply_compiled_defaults(RtSettings* s) {
     *s = RtSettings{};
-    for (int i = 0; i < RT_KB_COUNT; ++i) s->input.keyboard[i] = kKeyboardBinds[i].def;
-    for (int i = 0; i < RT_GP_COUNT; ++i) s->input.gamepad[i] = kGamepadBinds[i].def;
+    for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
+        const BindTable& t = kBindTables[d];
+        std::string* v = bind_values(s, (RtBindDevice)d);
+        for (int i = 0; i < t.count; ++i) v[i] = t.defs[i].def;
+    }
 }
 
 bool is_one_of(const std::string& k, std::initializer_list<const char*> set) {
@@ -432,12 +486,20 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             rt_log("settings", "settings: \"input\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*i, "input", [](const std::string& k) {
-                return is_one_of(k, {"keyboard", "gamepad", "left_deadzone", "right_deadzone"});
+                return is_one_of(k, {"keyboard", "gamepad", "mouse", "left_deadzone", "right_deadzone",
+                    "mouse_look", "mouse_look_sensitivity", "mouse_look_invert_y"});
             });
-            map_bind_section(i->find("keyboard"), "input.keyboard", kKeyboardBinds, RT_KB_COUNT, out->input.keyboard);
-            map_bind_section(i->find("gamepad"), "input.gamepad", kGamepadBinds, RT_GP_COUNT, out->input.gamepad);
+            for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
+                const BindTable& t = kBindTables[d];
+                map_bind_section(i->find(t.json_key), t.section, t.defs, t.count,
+                    bind_values(out, (RtBindDevice)d));
+            }
             load_float_range(i->find("left_deadzone"), "input.left_deadzone", 0.0, 0.95, false, &out->input.left_deadzone);
             load_float_range(i->find("right_deadzone"), "input.right_deadzone", 0.0, 0.95, false, &out->input.right_deadzone);
+            load_bool(i->find("mouse_look"), "input.mouse_look", &out->input.mouse_look);
+            load_float_range(i->find("mouse_look_sensitivity"), "input.mouse_look_sensitivity",
+                0.05, 20.0, false, &out->input.mouse_look_sensitivity);
+            load_bool(i->find("mouse_look_invert_y"), "input.mouse_look_invert_y", &out->input.mouse_look_invert_y);
             /* Retired keys. Neither is in the known-key list above, so both are
              * also reported by log_unknown_keys and kept in the file across a
              * save; these lines say what happens instead. */
@@ -474,6 +536,14 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
             load_bool(dbg->find("log_file"), "debug.log_file", &out->debug.log_file);
             load_int_range(dbg->find("profile_fields"), "debug.profile_fields", 0, 100000, &out->debug.profile_fields);
             load_fps_limit(dbg->find("fps_limit_hz"), "debug.fps_limit_hz", &out->debug.fps_limit_hz);
+            if (dbg->find("menu_hit_editor")) {
+                /* Retired key. It is not in the known-key list above, so it is
+                 * also reported by log_unknown_keys and kept in the file across
+                 * a save; this line says why it no longer does anything. */
+                rt_log("settings", "settings: debug.menu_hit_editor is no longer a setting;"
+                    " the pointer on the game's menus reads the game's own scene objects,"
+                    " so there are no hit boxes to author");
+            }
         }
     }
 
@@ -534,10 +604,15 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     a.set("mute", RtJson::make_bool(s.audio.mute));
 
     RtJson& in = get_or_make_object(dom, "input");
-    write_bind_section(&in, "keyboard", kKeyboardBinds, RT_KB_COUNT, s.input.keyboard);
-    write_bind_section(&in, "gamepad", kGamepadBinds, RT_GP_COUNT, s.input.gamepad);
+    for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
+        const BindTable& t = kBindTables[d];
+        write_bind_section(&in, t.json_key, t.defs, t.count, bind_values(s, (RtBindDevice)d));
+    }
     in.set("left_deadzone", RtJson::make_number(s.input.left_deadzone));
     in.set("right_deadzone", RtJson::make_number(s.input.right_deadzone));
+    in.set("mouse_look", RtJson::make_bool(s.input.mouse_look));
+    in.set("mouse_look_sensitivity", RtJson::make_number(s.input.mouse_look_sensitivity));
+    in.set("mouse_look_invert_y", RtJson::make_bool(s.input.mouse_look_invert_y));
 
     RtJson& g = get_or_make_object(dom, "gameplay");
     g.set("run_any_direction", RtJson::make_bool(s.gameplay.run_any_direction));
@@ -652,44 +727,6 @@ void load_file(const std::string& path) {
     rt_log("settings", "settings: loaded from %s", path.c_str());
 }
 
-/* Atomic write of `text` to `target`: "<target>.tmp" then fsync then
- * rename over the target. Any failure logs with strerror, removes the .tmp
- * best-effort, and leaves whatever was at `target` alone. */
-bool write_atomic(const std::string& target, const std::string& text) {
-    std::error_code ec;
-    std::filesystem::path parent = std::filesystem::path(target).parent_path();
-    if (!parent.empty()) std::filesystem::create_directories(parent, ec);
-
-    std::string tmp = target + ".tmp";
-    std::FILE* f = rt_fopen_utf8(tmp.c_str(), "wb");
-    if (!f) {
-        rt_log("settings", "settings: could not open %s for writing: %s", tmp.c_str(), std::strerror(errno));
-        return false;
-    }
-    size_t written = std::fwrite(text.data(), 1, text.size(), f);
-    if (written != text.size()) {
-        rt_log("settings", "settings: short write to %s: %s", tmp.c_str(), std::strerror(errno));
-        std::fclose(f);
-        std::remove(tmp.c_str());
-        return false;
-    }
-    std::fflush(f);
-#ifdef _WIN32
-    _commit(rt_fileno(f));
-#else
-    fsync(rt_fileno(f));
-#endif
-    std::fclose(f);
-
-    std::filesystem::rename(tmp, target, ec);
-    if (ec) {
-        rt_log("settings", "settings: rename %s -> %s failed: %s", tmp.c_str(), target.c_str(), ec.message().c_str());
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
-}
-
 /* ---- source resolution ---------------------------------------------------- */
 
 enum class SourceKind { EnvPath, EnvDisabled, BaseDir, UserConfig, None };
@@ -774,9 +811,14 @@ void revert_float(float* v, float prev, const char* dotted, double lo, double hi
  * A rejection reverts to the previously committed name, never to the
  * compiled default: the user's earlier choice for that slot is theirs and
  * this commit is not a reason to lose it. Empty names are skipped rather
- * than treated as equal to each other: an empty slot is a name that did not
- * resolve, host/input.cpp already replaces it with the compiled default and
- * says so, and two of them are not a collision the user made.
+ * than treated as equal to each other: on the keyboard and the gamepad an
+ * empty slot is a name that did not resolve, host/input.cpp already
+ * replaces it with the compiled default and says so; on the mouse it is the
+ * shipped state of most slots. Either way two of them are not a collision
+ * the user made.
+ *
+ * Rule 1 does not apply to a device with no menu slot (`menu_slot` -1, the
+ * mouse); rule 2 applies to all three.
  *
  * Comparison is case-insensitive because that is how SDL_GetScancodeFromName
  * resolves ("f1" and "F1" are the same key), so a case difference in a
@@ -803,30 +845,35 @@ void note_reject(const char* fmt, ...) {
     g_last_reject += buf;
 }
 
-/* One device's slots. `menu_slot` is the last entry in both enums, which is
- * why `count` and `menu_slot` are passed rather than derived. */
-void validate_binds(std::string* cur, const std::string* prev, const BindDef* defs,
-                    int count, int menu_slot, const char* section) {
+/* One device's slots, described by its BindTable row. */
+void validate_binds(std::string* cur, const std::string* prev, const BindTable& t) {
+    const BindDef* defs = t.defs;
+    const int count = t.count;
+    const int menu_slot = t.menu_slot;
+    const char* section = t.section;
+
     /* Rule 1, first: whatever the menu key ends up as, the ordinary-slot pass
      * below then sees the settled value. Which side moved decides which side
      * reverts: binding the menu key onto an existing pad slot is the menu
      * key's fault, binding a pad slot onto the menu key is the pad slot's,
      * and reverting the menu slot in the second case would leave the
-     * collision standing. */
-    for (int i = 0; i < count; ++i) {
-        if (i == menu_slot) continue;
-        if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
-        const bool menu_changed = cur[menu_slot] != prev[menu_slot];
-        const bool other_changed = cur[i] != prev[i];
-        if (!menu_changed && !other_changed) continue;
-        note_reject("%s.menu and %s.%s are both \"%s\"; the menu key never reaches the pad,"
-            " so %s%s%s reverted",
-            section, section, defs[i].json_key, cur[menu_slot].c_str(),
-            menu_changed ? "menu" : "",
-            (menu_changed && other_changed) ? " and " : "",
-            other_changed ? defs[i].json_key : "");
-        if (menu_changed) cur[menu_slot] = prev[menu_slot];
-        if (other_changed) cur[i] = prev[i];
+     * collision standing. Skipped whole for a device with no menu slot. */
+    if (menu_slot >= 0) {
+        for (int i = 0; i < count; ++i) {
+            if (i == menu_slot) continue;
+            if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
+            const bool menu_changed = cur[menu_slot] != prev[menu_slot];
+            const bool other_changed = cur[i] != prev[i];
+            if (!menu_changed && !other_changed) continue;
+            note_reject("%s.menu and %s.%s are both \"%s\"; the menu key never reaches the pad,"
+                " so %s%s%s reverted",
+                section, section, defs[i].json_key, cur[menu_slot].c_str(),
+                menu_changed ? "menu" : "",
+                (menu_changed && other_changed) ? " and " : "",
+                other_changed ? defs[i].json_key : "");
+            if (menu_changed) cur[menu_slot] = prev[menu_slot];
+            if (other_changed) cur[i] = prev[i];
+        }
     }
 
     /* Rule 2, the same way: only the slots this commit moved revert. */
@@ -854,18 +901,17 @@ void validate_binds(std::string* cur, const std::string* prev, const BindDef* de
  * settings file is the user's own file and this layer never rewrites user
  * data on load (see the bad-value policy at the top). Saying so once at
  * startup is what keeps the commit-time rule above from having to guess. */
-void log_bind_duplicates(const std::string* v, const BindDef* defs, int count,
-                         int menu_slot, const char* section) {
-    for (int i = 0; i < count; ++i) {
-        for (int j = i + 1; j < count; ++j) {
+void log_bind_duplicates(const std::string* v, const BindTable& t) {
+    for (int i = 0; i < t.count; ++i) {
+        for (int j = i + 1; j < t.count; ++j) {
             if (!bind_name_equal(v[i], v[j])) continue;
-            if (i == menu_slot || j == menu_slot) {
+            if (i == t.menu_slot || j == t.menu_slot) {
                 rt_log("settings", "settings: %s.menu and %s.%s are both \"%s\"; the menu key is"
                     " consumed by the menu, so that pad binding will never fire",
-                    section, section, defs[i == menu_slot ? j : i].json_key, v[i].c_str());
+                    t.section, t.section, t.defs[i == t.menu_slot ? j : i].json_key, v[i].c_str());
             } else {
                 rt_log("settings", "settings: %s.%s and %s.%s are both \"%s\"; that one input will"
-                    " press both buttons", section, defs[i].json_key, section, defs[j].json_key,
+                    " press both buttons", t.section, t.defs[i].json_key, t.section, t.defs[j].json_key,
                     v[i].c_str());
             }
         }
@@ -880,6 +926,8 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
 
     revert_float(&cur->input.left_deadzone, prev.input.left_deadzone, "input.left_deadzone", 0.0, 0.95, false);
     revert_float(&cur->input.right_deadzone, prev.input.right_deadzone, "input.right_deadzone", 0.0, 0.95, false);
+    revert_float(&cur->input.mouse_look_sensitivity, prev.input.mouse_look_sensitivity,
+        "input.mouse_look_sensitivity", 0.05, 20.0, false);
 
     if (!(cur->debug.fps_limit_hz == 0.0 || (cur->debug.fps_limit_hz >= 1.0 && cur->debug.fps_limit_hz <= 1000.0))) {
         rt_log("settings", "settings: debug.fps_limit_hz = %.6g is out of range (must be 0 or [1, 1000]); reverted to %.6g",
@@ -897,10 +945,10 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
         cur->display.render_scale = prev.display.render_scale;
     }
 
-    validate_binds(cur->input.keyboard, prev.input.keyboard, kKeyboardBinds, RT_KB_COUNT,
-        RT_KB_MENU, "input.keyboard");
-    validate_binds(cur->input.gamepad, prev.input.gamepad, kGamepadBinds, RT_GP_COUNT,
-        RT_GP_MENU, "input.gamepad");
+    for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
+        validate_binds(bind_values(cur, (RtBindDevice)d), bind_values(prev, (RtBindDevice)d),
+            kBindTables[d]);
+    }
 }
 
 } // namespace
@@ -979,8 +1027,9 @@ void rt_settings_init() {
     g_last_reject.clear();
     ++g_generation;
 
-    log_bind_duplicates(g_current.input.keyboard, kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "input.keyboard");
-    log_bind_duplicates(g_current.input.gamepad, kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "input.gamepad");
+    for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
+        log_bind_duplicates(bind_values(g_current, (RtBindDevice)d), kBindTables[d]);
+    }
 
     for (const EnvTwin& t : kEnvTwins) {
         if (const char* v = env_twin_value(t)) {
@@ -1039,18 +1088,18 @@ bool rt_settings_save() {
     std::string text = rt_json_write(g_dom);
 
     if (!g_path.empty()) {
-        return write_atomic(g_path, text);
+        return rt_json_write_file(g_path, text);
     }
 
     std::string base_target = std::string(rt_base_dir()) + "/settings.json";
-    if (write_atomic(base_target, text)) {
+    if (rt_json_write_file(base_target, text)) {
         g_path = base_target;
         return true;
     }
     std::string user_dir = rt_user_config_dir();
     if (!user_dir.empty()) {
         std::string user_target = user_dir + "/settings.json";
-        if (write_atomic(user_target, text)) {
+        if (rt_json_write_file(user_target, text)) {
             g_path = user_target;
             return true;
         }
@@ -1072,18 +1121,24 @@ unsigned rt_settings_generation() {
     return g_generation;
 }
 
-const char* rt_settings_default_binding(bool gamepad, int slot) {
-    if (gamepad) {
-        return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadBinds[slot].def : "";
-    }
-    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardBinds[slot].def : "";
+const char* rt_settings_default_binding(RtBindDevice device, int slot) {
+    if (!valid_device(device)) return "";
+    const BindTable& t = kBindTables[device];
+    return (slot >= 0 && slot < t.count) ? t.defs[slot].def : "";
 }
 
-const char* rt_settings_binding_key(bool gamepad, int slot) {
-    if (gamepad) {
-        return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadBinds[slot].json_key : "";
-    }
-    return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardBinds[slot].json_key : "";
+const char* rt_settings_binding_key(RtBindDevice device, int slot) {
+    if (!valid_device(device)) return "";
+    const BindTable& t = kBindTables[device];
+    return (slot >= 0 && slot < t.count) ? t.defs[slot].json_key : "";
+}
+
+int rt_settings_bind_slot_count(RtBindDevice device) {
+    return valid_device(device) ? kBindTables[device].count : 0;
+}
+
+int rt_settings_bind_menu_slot(RtBindDevice device) {
+    return valid_device(device) ? kBindTables[device].menu_slot : -1;
 }
 
 const char* rt_settings_last_reject() {

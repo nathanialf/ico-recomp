@@ -17,9 +17,9 @@
  *      A step holds until the next line's field number. '#' starts a
  *      comment. Lines must be sorted by field number.
  *
- *   2. SDL3 gamepad + keyboard, active only when the paraLLEl-GS window
- *      path already initialized SDL video (the dump/headless path never
- *      touches SDL; without the window there is no key focus anyway).
+ *   2. SDL3 keyboard + mouse + gamepad, active only when the paraLLEl-GS
+ *      window path already initialized SDL video (the dump/headless path
+ *      never touches SDL; without the window there is no key focus anyway).
  *      First detected gamepad is opened.
  *
  *      Both maps come from rt_settings().input (host/settings.h), rebuilt
@@ -30,7 +30,7 @@
  *          W A S D           left stick
  *          I J K L           right stick
  *          X                 cross        C   circle
- *          Z                 square       V   triangle
+ *          Z                 square       Space  triangle
  *          Q / E             L1 / R1      1 3 L2 / R2
  *          T / Y             L3 / R3
  *          Enter             start        Backspace  select
@@ -39,14 +39,62 @@
  *      west=square north=triangle, both triggers as L2/R2, pressed past
  *      a raw axis value of 8192 of 32767).
  *
+ *      The mouse is the third device. Its sixteen button slots come from
+ *      input.mouse (host/settings.h) written in host/mouse_names.h's names,
+ *      and most of them ship unbound: "" is a real value there and means
+ *      exactly that, so it is not reported. A name that is not empty and
+ *      does not resolve leaves the slot unbound with a log line, because the
+ *      mouse is the one device with no compiled-in default worth falling
+ *      back to. Buttons are read as held state; the two wheel directions are
+ *      pulses (below).
+ *
+ * On the right stick the three devices have a precedence, because all three
+ * can write it: keyboard first, then mouse look, then the gamepad. Each of
+ * them fills only an axis still sitting at the centred 0x80, so a deflected
+ * key wins over the mouse and the mouse wins over an idle pad stick. Mouse
+ * look (input.mouse_look) drives a virtual stick with the pointer: the
+ * accumulated motion moves a deflection that stays where the drag left it,
+ * because the game's camera stick is a position and not a velocity.
+ * host/mouse.cpp collects the motion and host/mouse_look.h holds the stick
+ * and does the byte mapping, and neither changes anything the game computes.
+ * It is the one device that does not need a pad plugged in, so it is sampled
+ * outside the gamepad branch, and it reports a pair on every field the stick
+ * is off centre rather than only on fields the mouse moved.
+ *
+ * Where the mouse motion, buttons and wheel go is decided once per field,
+ * and each goes to exactly one place:
+ *
+ *   - While the pointer owns the mouse (rt_guest_menu_wants_mouse(),
+ *     guest/menu_nav.h: one of the game's own menus is up) the field's
+ *     motion moves the drawn cursor and the camera stick
+ *     sees none of it, and every button transition and every wheel tick is
+ *     handed to guest/menu_nav.cpp with no mouse bind pressed. That module
+ *     turns the pointer into the D-pad and cross presses the game's menu
+ *     already reads, which arrive as rt_guest_menu_pulse_bits() and are
+ *     ORed into the same field's buttons.
+ *   - Otherwise the motion goes to the camera stick through mouse look and
+ *     the bound slots are pressed from the held button state, gated on
+ *     window focus.
+ *
+ * A wheel bind is a pulse rather than a level, because a wheel has no held
+ * state: each tick is queued and presses its slot for one field, then
+ * releases it for one field before the next queued tick, so two ticks read
+ * as two presses instead of one long one. The queue is capped (logged when
+ * it bites) and is dropped on a focus loss, on a settings rebuild, and when
+ * the pointer takes the mouse.
+ *
  * Both providers can be inactive (headless, no script): every port then
  * reports "no controller" and sif/pad.cpp presents an empty port.
  *
  * While the settings menu is up (rt_ui_wants_input(), ui/ui.h) the SDL
  * provider reports a centered pad with no buttons instead of sampling the
  * devices, so keys and pad presses aimed at the menu do not also reach the
- * game. The scripted provider is never gated that way: a scripted run does
- * not bring the UI up at all.
+ * game. The mouse motion, the button transitions and the wheel ticks are
+ * thrown away for the same fields, since a device that accumulates would
+ * otherwise hand the game everything the menu did the moment the menu
+ * closes, and no guest-menu pulse bits are applied either: a neutral pad is
+ * a neutral pad. The scripted provider is never gated that way: a scripted
+ * run does not bring the UI up at all.
  *
  * Runtime-internal, NOT part of the ABI contract (include/recomp_*.h).
  */
@@ -107,6 +155,35 @@ void rt_input_poll(uint64_t field);
 /* Current state of the virtual controller on `port`. Returns false when no
  * controller should appear on that port (no provider, or port != 0). */
 bool rt_input_get(int port, RtPadState* out);
+
+/* Which kind of device the player last used. The drawn cursor on the game's
+ * own menus (ui/ui_menu_cursor.cpp) is the consumer: an arrow on screen while
+ * the player is on a pad is an arrow nobody can move.
+ *
+ * Moved by the SDL provider, once per field, from what the devices actually
+ * did that field: a held bound key, a mouse button, a wheel tick or real
+ * pointer motion say keyboard and mouse; a held pad button, an axis bind past
+ * its press point or a stick pushed a quarter of the way from centre say
+ * controller. A field that shows both leaves it alone, and so does a field
+ * that shows neither, so it names the last device that was unambiguously
+ * used rather than the one being used right now.
+ *
+ * It boots as the controller: a run where nobody touches a mouse never draws
+ * a cursor. A scripted run and a build without SDL leave it there for the
+ * whole run, since neither has devices to watch. Each change is logged as
+ * `last device is now the controller` or `... keyboard and mouse`. */
+enum RtInputDevice {
+    RT_INPUT_DEVICE_CONTROLLER,
+    RT_INPUT_DEVICE_KBM,
+};
+RtInputDevice rt_input_last_device();
+
+/* True while the SDL provider is the active one: it was selected at init and
+ * SDL video is up. host/mouse.cpp asks before it captures the pointer for
+ * mouse look, because a scripted run must stay bit-identical and must not
+ * have the pointer grabbed for a mouse whose motion nothing will read.
+ * Always false in a build without SDL. */
+bool rt_input_sdl_active();
 
 /* Actuator (rumble) values from the game: small motor 0/1, big motor
  * 0..255. Forwarded to SDL gamepad rumble whenever that provider is active,

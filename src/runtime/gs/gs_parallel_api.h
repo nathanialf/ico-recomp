@@ -144,6 +144,20 @@ RT_GS_API void  rt_pgs_notify_quit(RtPgs* pgs);
 RT_GS_API void  rt_pgs_notify_resize(RtPgs* pgs);
 /* Current surface size in pixels, 0x0 when headless. */
 RT_GS_API void  rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height);
+/* The window-backbuffer rectangle the last presented scanout was blitted
+ * into, in backbuffer pixels, plus the backbuffer size it was measured
+ * against. All zero before the first present or when headless; the size is
+ * zero with the backbuffer size still filled in on a field that presented no
+ * scanout image, which is the honest report for "nothing maps window pixels
+ * to guest pixels this field". A caller mapping a position into the picture
+ * must treat a non-positive width or height as no picture.
+ *
+ * Plain member reads, safe from pump_events and at any time as long as the
+ * ring is drained inline on the caller's own thread, which is how
+ * gs/gs_select.cpp builds it today. The day that ring gets a worker thread
+ * the members behind this have to become atomics (gs_parallel_impl.h says
+ * the same next to them). */
+RT_GS_API void rt_pgs_present_rect(RtPgs* pgs, int32_t* x, int32_t* y, int32_t* w, int32_t* h, int32_t* bb_w, int32_t* bb_h);
 /* Between frames only; fatal when called while a frame is in flight
  * (including from pump_events). Same RT_PGS_PRESENT_* values as create. */
 RT_GS_API void  rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode);

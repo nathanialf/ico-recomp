@@ -20,6 +20,7 @@
 
 #include "../runtime.h"
 #include "../ui/ui.h"
+#include "mouse.h"
 
 #ifdef ICORECOMP_PGS_SDL
 #include "../gs/gs_parallel_api.h"
@@ -119,11 +120,15 @@ void rt_window_pump() {
          * or not, and window/quit events are harmless to hand it. Inside the
          * UI the order is binding capture, then the hotkey, then RmlUi
          * (ui/ui_events.cpp); the bool it returns says whether the UI
-         * consumed the event, and nothing downstream of this loop needs it
-         * today. It stays inside the reentrancy rule: event translation and
-         * flag flips only, no rt_pgs_* calls. No-op (an inline stub in ui.h)
-         * when this build has no UI. */
-        rt_ui_handle_sdl_event(e);
+         * consumed the event, and the mouse is the consumer of that answer:
+         * a click or a motion the overlay took is the menu's and must not
+         * also reach the game. Both calls stay inside the reentrancy rule:
+         * event translation and flag flips only, no rt_pgs_* calls, and
+         * host/mouse.cpp keeps its own SDL calls in rt_mouse_tick at the
+         * field boundary. rt_ui_handle_sdl_event is a no-op (an inline stub
+         * in ui.h) when this build has no UI. */
+        const bool ui_took_it = rt_ui_handle_sdl_event(e);
+        rt_mouse_on_event(e, ui_took_it);
     }
     /* The size commit happens in rt_window_flush_pending_save, not here:
      * rt_settings_commit runs the display applier, and this function can

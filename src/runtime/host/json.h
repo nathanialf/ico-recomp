@@ -66,4 +66,16 @@ bool rt_json_parse(const std::string& text, RtJson* out, std::string* err);
  * representation that round-trips through strtod. */
 std::string rt_json_write(const RtJson& v);
 
+/* Atomic write of `text` to `path`: "<path>.tmp", flushed and fsynced,
+ * then renamed over the target. Parent directories are created. Any
+ * failure logs with strerror, removes the .tmp best-effort, leaves
+ * whatever was at `path` alone, and returns false; it is never fatal.
+ *
+ * Lives here rather than in settings.cpp because it is about writing a file
+ * and not about settings. Nothing about it is JSON specific beyond the
+ * callers it has; settings.cpp is the only one left since the menu pointer
+ * stopped keeping a table of its own.
+ */
+bool rt_json_write_file(const std::string& path, const std::string& text);
+
 #endif /* ICORECOMP_HOST_JSON_H */

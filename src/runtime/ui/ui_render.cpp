@@ -32,16 +32,47 @@ namespace rtui {
 
 namespace {
 
-/* The one image this renderer serves through LoadTexture, published by
- * ui_render_set_logo(). Held as bytes rather than as an uploaded texture
+/* The images this renderer serves through LoadTexture, published by
+ * ui_render_set_image(). Held as bytes rather than as uploaded textures
  * because RmlUi decides when it wants the upload, and it can release and ask
- * again (a resolution change re-creates the render manager's textures). */
-std::vector<uint8_t> g_logo_rgba;
-uint32_t g_logo_width = 0;
-uint32_t g_logo_height = 0;
-/* Set when a load of that image could not produce a texture. See
- * ui_render_take_logo_upload_failure in ui_internal.h. */
-bool g_logo_upload_failed = false;
+ * again (a resolution change re-creates the render manager's textures).
+ *
+ * A fixed set, one entry per scheme in ui_internal.h, rather than a map: the
+ * whole point of the scheme list is that it is closed, and two entries do
+ * not need a container. */
+struct NamedImage {
+    const char* scheme;
+    std::vector<uint8_t> rgba;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    /* Set when a load of that image could not produce a texture. See
+     * ui_render_take_image_upload_failure in ui_internal.h. */
+    bool upload_failed = false;
+};
+
+NamedImage g_images[] = {
+    {kLogoScheme, {}, 0, 0, false},
+    {kCursorScheme, {}, 0, 0, false},
+};
+
+/* The entry a scheme names, or null. Compares the strings rather than the
+ * pointers so a caller that spells the scheme out still finds it. */
+NamedImage* image_by_scheme(const char* scheme) {
+    if (!scheme) return nullptr;
+    for (NamedImage& img : g_images) {
+        if (std::strcmp(img.scheme, scheme) == 0) return &img;
+    }
+    return nullptr;
+}
+
+/* The entry a document's `src` names: the first scheme the source starts
+ * with. */
+NamedImage* image_for_source(const Rml::String& source) {
+    for (NamedImage& img : g_images) {
+        if (source.rfind(img.scheme, 0) == 0) return &img;
+    }
+    return nullptr;
+}
 
 /* R8G8B8A8_UNORM byte order, matching RtPgsOverlayVertex::rgba and
  * gs_parallel.cpp's pack_rgba: red in the low byte. */
@@ -201,54 +232,82 @@ void UiRenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
     m_free.push_back(slot);
 }
 
-bool ui_render_set_logo(const uint8_t* rgba, uint32_t width, uint32_t height) {
-    if (!rgba || width == 0 || height == 0) {
-        rt_log("ui", "the title logo image is %ux%u; nothing to publish", width, height);
+bool ui_render_set_image(const char* scheme, const uint8_t* rgba, uint32_t width, uint32_t height) {
+    NamedImage* img = image_by_scheme(scheme);
+    if (!img) {
+        rt_log("ui", "no in-memory texture scheme named \"%s\"; nothing to publish",
+            scheme ? scheme : "(null)");
         return false;
     }
-    g_logo_rgba.assign(rgba, rgba + size_t(width) * size_t(height) * 4u);
-    g_logo_width = width;
-    g_logo_height = height;
-    g_logo_upload_failed = false; /* a new image gets a fresh answer */
-    rt_log("ui", "title logo published under the \"%s\" scheme: %ux%u, %zu bytes", kLogoScheme,
-        width, height, g_logo_rgba.size());
+    if (!rgba || width == 0 || height == 0) {
+        rt_log("ui", "the \"%s\" image is %ux%u; nothing to publish", img->scheme, width, height);
+        return false;
+    }
+    img->rgba.assign(rgba, rgba + size_t(width) * size_t(height) * 4u);
+    img->width = width;
+    img->height = height;
+    img->upload_failed = false; /* a new image gets a fresh answer */
+    rt_log("ui", "published under the \"%s\" scheme: %ux%u, %zu bytes", img->scheme, width, height,
+        img->rgba.size());
     return true;
 }
 
-bool ui_render_take_logo_upload_failure() {
-    const bool failed = g_logo_upload_failed;
-    g_logo_upload_failed = false;
+bool ui_render_set_logo(const uint8_t* rgba, uint32_t width, uint32_t height) {
+    return ui_render_set_image(kLogoScheme, rgba, width, height);
+}
+
+bool ui_render_take_image_upload_failure(const char* scheme) {
+    NamedImage* img = image_by_scheme(scheme);
+    if (!img) return false;
+    const bool failed = img->upload_failed;
+    img->upload_failed = false;
     return failed;
 }
 
-/* The only texture source this build serves. There is no file loader behind
- * it on purpose: reading an arbitrary path off disk because a stylesheet
- * named one is not something the overlay renderer does. Anything else logs
- * once per distinct source and draws untextured. */
+bool ui_render_take_logo_upload_failure() {
+    return ui_render_take_image_upload_failure(kLogoScheme);
+}
+
+const uint8_t* ui_render_image_bytes(const char* scheme, uint32_t* width, uint32_t* height) {
+    if (width) *width = 0;
+    if (height) *height = 0;
+    NamedImage* img = image_by_scheme(scheme);
+    if (!img || img->rgba.empty()) return nullptr;
+    if (width) *width = img->width;
+    if (height) *height = img->height;
+    return img->rgba.data();
+}
+
+/* The only texture sources this build serves are the in-memory schemes.
+ * There is no file loader behind them on purpose: reading an arbitrary path
+ * off disk because a stylesheet named one is not something the overlay
+ * renderer does. Anything else logs once per distinct source and draws
+ * untextured. */
 Rml::TextureHandle UiRenderInterface::LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) {
     texture_dimensions = Rml::Vector2i(0, 0);
 
-    if (source.compare(0, sizeof(kLogoScheme) - 1, kLogoScheme) == 0) {
-        if (g_logo_rgba.empty()) {
-            /* RmlUi caches a failed load and never retries it, so the
-             * launcher only puts the element in the document once the image
-             * exists (the logo_available flag in ui_launcher.cpp). Reaching
-             * this means those two went out of step. */
-            rt_log("ui", "LoadTexture(%s): no title logo has been published;"
-                         " the element draws untextured", source.c_str());
-            g_logo_upload_failed = true;
+    if (NamedImage* img = image_for_source(source)) {
+        if (img->rgba.empty()) {
+            /* RmlUi caches a failed load and never retries it, so a document
+             * only puts the element in once the image exists (the
+             * logo_available flag in ui_launcher.cpp, image_cursor in
+             * ui_menu_cursor.cpp). Reaching this means those two went out of
+             * step. */
+            rt_log("ui", "LoadTexture(%s): no \"%s\" image has been published;"
+                         " the element draws untextured", source.c_str(), img->scheme);
+            img->upload_failed = true;
             return Rml::TextureHandle(0);
         }
-        const uint32_t id = backend_texture_create(g_logo_rgba.data(), g_logo_width, g_logo_height);
+        const uint32_t id = backend_texture_create(img->rgba.data(), img->width, img->height);
         if (id == 0) {
             rt_log("ui", "LoadTexture(%s): the %ux%u upload failed; the element draws untextured",
-                source.c_str(), g_logo_width, g_logo_height);
-            g_logo_upload_failed = true;
+                source.c_str(), img->width, img->height);
+            img->upload_failed = true;
             return Rml::TextureHandle(0);
         }
-        texture_dimensions = Rml::Vector2i(int(g_logo_width), int(g_logo_height));
+        texture_dimensions = Rml::Vector2i(int(img->width), int(img->height));
         rt_log("ui", "LoadTexture(%s): %ux%u uploaded as overlay texture %u", source.c_str(),
-            g_logo_width, g_logo_height, id);
+            img->width, img->height, id);
         return Rml::TextureHandle(id);
     }
 
