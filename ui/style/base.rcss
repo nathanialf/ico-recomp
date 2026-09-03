@@ -42,12 +42,12 @@
  * is present in both fonts.
  *
  * Palette, one place:
- *   panels    #0a0a0a  #0d0d0d  #171717
- *   hairlines #1a1a1a  #262626  #525252
- *   type      #333333  #404040  #525252  #737373  #a3a3a3  #d4d4d4
- *             #e5e5e5  #f9fafb
- *   accent    #22c55e (a control that is on)
- *   warning   #d4a000 on #2d2000, border #4d3800
+ *   panels    #d8c7a1  #e4d5b2  #e9dcbc  (sand, after the game)
+ *   hairlines #1a1a1a black rules; #a8997a disabled; #c8b58c and #bfab82 hover fills
+ *   type      #8a7d63 disabled, #4a3f2c secondary, #141414 primary,
+ *             #000000 hover and focus
+ *   accent    #1a1a1a (a control that is on)
+ *   warning   #3d2600 on #e9cf8e, border #1a1a1a
  */
 
 /* ---- elements ----------------------------------------------------------- */
@@ -57,7 +57,7 @@ body {
 	font-weight: 400;
 	font-style: normal;
 	font-size: 11dp;
-	color: #d4d4d4;
+	color: #141414;
 }
 
 div {
@@ -83,7 +83,12 @@ body.menu {
 	/* The one translucent surface: the game's scanout stays visible behind
 	 * the panel. The alpha is on the background color, not on the element;
 	 * container opacity would need a render layer. */
-	background-color: rgba(10, 10, 10, 217);
+	background-color: rgba(216, 199, 161, 235);
+	/* A direction key answered by the document itself (nothing focused, or
+	 * whatever was focused is gone) picks the first or last focusable
+	 * element in document order: the pad's recovery and wrap mechanism,
+	 * ui/ui_events.cpp. */
+	nav: auto;
 }
 
 /* Anchored on all four sides, so its height is what the window leaves
@@ -135,16 +140,20 @@ body.menu {
 	padding: 7dp 9dp;
 	margin-bottom: 5dp;
 	background-color: transparent;
-	border: 1dp #262626;
+	border: 1dp #1a1a1a;
 	tab-index: auto;
 	nav: auto;
 }
 
-.nav-button:hover,
-.nav-button:focus,
+.nav-button:hover {
+	background-color: #c8b58c;
+	border-color: #1a1a1a;
+}
+
+/* The tab whose pane is showing. */
 .nav-button.active {
-	background-color: #525252;
-	border-color: #525252;
+	background-color: #bfab82;
+	border-color: #1a1a1a;
 }
 
 .nav-name {
@@ -153,7 +162,7 @@ body.menu {
 	font-weight: 700;
 	font-size: 12dp;
 	letter-spacing: 0.05em;
-	color: #f9fafb;
+	color: #141414;
 	line-height: 1.2;
 	white-space: nowrap;
 	overflow: hidden;
@@ -164,28 +173,49 @@ body.menu {
 	display: block;
 	font-size: 8dp;
 	letter-spacing: 0.02em;
-	color: #737373;
+	color: #4a3f2c;
 	line-height: 1.3;
 	margin-top: 2dp;
 }
 
 .nav-button:hover .nav-name,
-.nav-button:focus .nav-name,
 .nav-button.active .nav-name {
-	color: #ffffff;
+	color: #000000;
 }
 
 .nav-button:hover .nav-tagline,
-.nav-button:focus .nav-tagline,
 .nav-button.active .nav-tagline {
-	color: rgba(255, 255, 255, 204);
+	color: #3d3526;
+}
+
+/* The pad's cursor, and the keyboard's: inverted whether or not the tab
+ * is the active one, so the selection reads at a glance. Placed after
+ * .active and :hover so it wins the ties at equal specificity. */
+.nav-button:focus {
+	background-color: #1a1a1a;
+	border-color: #1a1a1a;
+}
+
+.nav-button:focus .nav-name {
+	color: #d8c7a1;
+}
+
+.nav-button:focus .nav-tagline {
+	color: #c8b58c;
 }
 
 /* The bracket beside the nav stack: a 1dp vertical line with 1dp caps
  * reaching back toward the buttons, and a label rotated onto the line.
  * Built from nested divs because RCSS has no ::before/::after. The 5dp of
  * margin-bottom cancels the last nav button's own margin, so the bracket
- * ends on that button's bottom edge. */
+ * ends on that button's bottom edge.
+ *
+ * Nothing in here is interactive, and pointer-events is inherited, so one
+ * declaration takes the whole bracket out of hit testing. It has to: the
+ * label below is a 70dp box centred on the 1dp line, which reaches 35dp
+ * back over the nav buttons 6dp to its left. Only its text is painted, but
+ * the box is still hit tested, and being later in document order it would
+ * take hover and clicks off the right edge of every card. */
 .bracket {
 	display: flex;
 	flex-direction: column;
@@ -193,6 +223,7 @@ body.menu {
 	flex-shrink: 0;
 	margin-left: 6dp;
 	margin-bottom: 5dp;
+	pointer-events: none;
 }
 
 /* 6dp starting 5dp to the left of the line, so the cap spans -5dp to +1dp
@@ -204,16 +235,28 @@ body.menu {
 	width: 6dp;
 	height: 1dp;
 	margin-left: -5dp;
-	background-color: #525252;
+	background-color: #1a1a1a;
 }
 
+/* A column: a line segment, the label, a line segment. The label used to
+ * sit on one continuous line and hide it with an opaque box in the panel
+ * colour; over the translucent menu panel that box no longer matches what
+ * is behind it, so the line is drawn in two pieces that stop at the label's
+ * box instead, and the label carries no background at all. */
 .bracket-line {
 	display: flex;
-	flex-direction: row;
-	align-items: center;
+	flex-direction: column;
+	align-items: flex-start;
 	width: 1dp;
 	flex-grow: 1;
-	background-color: #525252;
+	background-color: transparent;
+}
+
+.bracket-seg {
+	display: block;
+	width: 1dp;
+	flex-grow: 1;
+	background-color: #1a1a1a;
 }
 
 /* Rotated about its own center, so the pre-rotation box is centered on the
@@ -225,31 +268,28 @@ body.menu {
  * left of the line instead of on it. Nowrap because a wrap here would
  * rotate a second line into the nav column.
  *
- * The mask over the line is the box itself, in #0a0a0a: 70dp long along
- * the bar against 44dp of text, so the line stops 13dp short of the text at
- * either end. That gap comes from the width, not from padding, which is why
- * the padding here is 1dp and not the portfolio's 0.4em: before rotation
- * that padding sits above and below the text, and after it the same padding
- * is width across the bar. The box is centred on the line, not on the
- * column: the -35dp margin puts the 70dp box's centre at the line's left
- * edge, and the rotation is about that centre, so the rotated box reaches
- * the same distance either side of the line. At 0.4em (3.2dp a side) that
- * reach was 8dp, past the 6dp gap to the nav buttons, and the black
- * overhung them; at 1dp the box is 11.6dp across (one 8dp line at
- * line-height 1.2, plus 1dp a side), reaching 5.8dp either way, which
- * clears the buttons by 0.2dp and leaves the right of the column empty. */
+ * The box is 70dp square so the two line segments above and below it stop
+ * 13dp short of the 44dp text at either end, which is the gap the old mask
+ * left: before rotation the segments meet the box's top and bottom edges,
+ * and the rotation is about the box's centre, so after it the same 70dp
+ * reach lies along the line. The -35dp margin puts the box's centre on the
+ * line's left edge. */
 .bracket-label {
 	display: block;
 	width: 70dp;
+	height: 70dp;
 	flex-shrink: 0;
 	margin-left: -35dp;
-	padding: 1dp 0;
-	background-color: #0a0a0a;
+	padding: 0;
+	background-color: transparent;
 	text-align: center;
 	text-transform: uppercase;
 	letter-spacing: 0.08em;
 	font-size: 8dp;
-	color: #525252;
+	/* One 8dp line centred in the 70dp box, so the rotation about the
+	 * box's centre lands the text on the line. */
+	line-height: 70dp;
+	color: #4a3f2c;
 	white-space: nowrap;
 	transform: rotate(-90deg);
 }
@@ -285,24 +325,24 @@ body.menu {
 	padding-right: 4dp;
 }
 
-/* 6dp and the slider knob's colours: at 5dp in #404040 on #1a1a1a the bar
- * is there but neither visible at a glance nor easy to grab. */
+/* 6dp: at 5dp the bar is there but neither visible at a glance nor easy to
+ * grab. Black on the sand track so it reads as a control. */
 scrollbarvertical {
 	width: 6dp;
 }
 
 scrollbarvertical slidertrack {
-	background-color: #1a1a1a;
+	background-color: #c8b58c;
 }
 
 scrollbarvertical sliderbar {
 	width: 6dp;
 	min-height: 24dp;
-	background-color: #525252;
+	background-color: #1a1a1a;
 }
 
 scrollbarvertical sliderbar:hover {
-	background-color: #737373;
+	background-color: #000000;
 }
 
 .section {
@@ -314,7 +354,7 @@ scrollbarvertical sliderbar:hover {
 	display: flex;
 	flex-direction: row;
 	align-items: baseline;
-	border-bottom: 1dp #262626;
+	border-bottom: 1dp #1a1a1a;
 	padding-bottom: 3dp;
 	margin-bottom: 8dp;
 }
@@ -322,7 +362,7 @@ scrollbarvertical sliderbar:hover {
 .section-number {
 	display: block;
 	font-size: 8dp;
-	color: #404040;
+	color: #4a3f2c;
 	flex-shrink: 0;
 	margin-right: 8dp;
 }
@@ -334,7 +374,7 @@ scrollbarvertical sliderbar:hover {
 	font-weight: 700;
 	text-transform: uppercase;
 	letter-spacing: 0.06em;
-	color: #d4d4d4;
+	color: #141414;
 	min-width: 0;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -343,7 +383,7 @@ scrollbarvertical sliderbar:hover {
 .note {
 	display: block;
 	font-size: 9dp;
-	color: #525252;
+	color: #4a3f2c;
 	line-height: 1.5;
 }
 
@@ -364,14 +404,14 @@ scrollbarvertical sliderbar:hover {
 	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
-	color: #737373;
+	color: #4a3f2c;
 	margin-bottom: 3dp;
 }
 
 .hint {
 	display: block;
 	font-size: 9dp;
-	color: #525252;
+	color: #4a3f2c;
 	line-height: 1.4;
 	margin-top: 3dp;
 }
@@ -381,9 +421,9 @@ scrollbarvertical sliderbar:hover {
 	display: block;
 	font-size: 9dp;
 	line-height: 1.4;
-	color: #d4a000;
-	background-color: #2d2000;
-	border: 1dp #4d3800;
+	color: #3d2600;
+	background-color: #e9cf8e;
+	border: 1dp #1a1a1a;
 	padding: 4dp 5dp;
 	margin-top: 4dp;
 }
@@ -419,23 +459,33 @@ select {
 	height: 20dp;
 	padding: 3dp 6dp;
 	font-size: 10dp;
-	background-color: #171717;
-	border: 1dp #262626;
-	color: #e5e5e5;
+	background-color: #e9dcbc;
+	border: 1dp #1a1a1a;
+	color: #141414;
 	text-align: left;
 }
 
 input.text:focus,
 select:focus {
-	border-color: #404040;
+	background-color: #1a1a1a;
+	border-color: #1a1a1a;
+	color: #d8c7a1;
+}
+
+select:focus selectvalue {
+	color: #d8c7a1;
+}
+
+select:focus selectarrow {
+	border-top-color: #d8c7a1;
 }
 
 input.text:disabled,
 select:disabled,
 input.checkbox:disabled,
 input.range:disabled {
-	color: #525252;
-	border-color: #1a1a1a;
+	color: #4a3f2c;
+	border-color: #a8997a;
 }
 
 /* WidgetDropDown builds the select's three children and places two of them
@@ -463,7 +513,7 @@ select selectvalue {
 	 * 4dp to 16dp and its centre is the control's centre. */
 	height: 12dp;
 	padding: 0dp;
-	color: #e5e5e5;
+	color: #141414;
 	white-space: nowrap;
 	text-overflow: ellipsis;
 }
@@ -486,17 +536,17 @@ select selectarrow {
 	width: 0dp;
 	height: 0dp;
 	margin-top: 3dp;
-	border-top: 6dp #a3a3a3;
+	border-top: 6dp #000000;
 	border-left: 5dp transparent;
 	border-right: 5dp transparent;
 }
 
 select:hover selectarrow {
-	border-top-color: #e5e5e5;
+	border-top-color: #141414;
 }
 
 select:disabled selectarrow {
-	border-top-color: #404040;
+	border-top-color: #000000;
 }
 
 /* box-sizing keeps the open list exactly as wide as the control: the
@@ -508,8 +558,8 @@ select selectbox {
 	box-sizing: border-box;
 	width: 100%;
 	max-height: 120dp;
-	background-color: #171717;
-	border: 1dp #262626;
+	background-color: #e9dcbc;
+	border: 1dp #1a1a1a;
 }
 
 /* display: block is also what the widget sets on each option as it adopts
@@ -523,54 +573,142 @@ select selectbox option {
 	width: auto;
 	padding: 3dp 6dp;
 	font-size: 10dp;
-	color: #a3a3a3;
-	background-color: #171717;
+	color: #000000;
+	background-color: #e9dcbc;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
 }
 
 select selectbox option:checked {
-	color: #e5e5e5;
+	color: #141414;
 }
 
-select selectbox option:hover {
-	background-color: #262626;
-	color: #f9fafb;
+/* :padhl is not an RmlUi pseudo-class: it is set by hand, one option at a
+ * time, by ui/ui_events.cpp's select pad session (see its file comment) to
+ * mark the option a held-and-not-yet-committed Up/Down has moved to. Same
+ * colours as :hover, which is the mouse's equivalent state. */
+select selectbox option:hover,
+select selectbox option:padhl {
+	background-color: #c8b58c;
+	color: #141414;
 }
 
 .check-row {
 	display: flex;
 	flex-direction: row;
 	align-items: center;
+	/* The row is the control: it takes the focus and the click and toggles
+	 * the bound value itself (data-event-click in the documents), so one
+	 * focus style reaches the box, the mark and the label. The input inside
+	 * only shows the state. Padding with a matching negative margin gives
+	 * the inverted fill some air without moving the row. */
+	padding: 2dp 4dp;
+	margin: -2dp -4dp;
+	tab-index: auto;
+	nav: auto;
 }
 
-input.checkbox {
-	display: inline-block;
+.check-row:focus {
+	background-color: #1a1a1a;
+}
+
+.check-row:focus .check-label {
+	color: #d8c7a1;
+}
+
+.check-row:focus input.checkbox {
+	background-color: #1a1a1a;
+	border-color: #d8c7a1;
+}
+
+.check-row:focus .check-arm {
+	background-color: #d8c7a1;
+}
+
+/* The box is a wrapper so a glyph can sit on top of the native input: the
+ * input takes the click and the focus, the glyph only shows the state.
+ * On is a black X in the box, off is the empty box; both keep the sand
+ * field and the black border, so the state reads from the mark and not
+ * from a shade of fill (user request, 2026-09-03). */
+.check-box {
+	position: relative;
+	display: block;
 	width: 11dp;
 	height: 11dp;
 	flex-shrink: 0;
 	margin-right: 7dp;
-	background-color: #171717;
-	border: 1dp #262626;
-	transition: background-color 0.15s cubic-in-out, border-color 0.15s cubic-in-out;
 }
 
-input.checkbox:hover {
-	border-color: #404040;
+input.checkbox {
+	display: block;
+	/* Border box, so the 1dp border is inside the 11dp and the box's centre
+	 * is the 5.5dp the mark's bars are centred on; content-box would make
+	 * it 13dp and put the mark 1dp up and left of centre. */
+	box-sizing: border-box;
+	width: 11dp;
+	height: 11dp;
+	margin: 0;
+	tab-index: none;
+	pointer-events: none;
+	background-color: #e9dcbc;
+	border: 1dp #1a1a1a;
+	transition: border-color 0.15s cubic-in-out;
 }
 
-/* The fill and the border cross-fade in both directions; the pop only plays
- * on the way in, because the animation sits on the :checked rule and RmlUi
- * starts it when that rule begins to apply (Element.cpp, dirty_animation).
- * cubic-out and cubic-in-out are the spellings this RmlUi has: its tween
- * keywords are <family>-<direction> and there is no plain "ease"
- * (Source/Core/PropertyParserAnimation.cpp). At 11dp a 1.15 scale adds
- * under 1dp a side, so the box never reaches the label beside it. */
-input.checkbox:checked {
-	background-color: #22c55e;
-	border-color: #22c55e;
+/* No :hover, :focus or :checked rule on the input itself. With tab-index
+ * none and pointer-events none it can never be hovered or focused, and the
+ * two states that do reach it come from the row: .check-row:focus for the
+ * ring, and the checked mark from the sibling rule on .check-glyph below.
+ * The transition above is for that focus border. */
+
+/* Over the input, never in its way: pointer-events none hands the click
+ * through to the box underneath. The X is two black bars, each the length
+ * of the inner square's diagonal, centred in the box and rotated 45
+ * degrees either way about their own centres (RmlUi's default
+ * transform-origin is the box centre), so the mark is symmetric and runs
+ * corner to corner.
+ *
+ * The pop the old :checked fill had is on the sibling rule below, not here.
+ * RmlUi restarts an animation only when the `animation` property itself
+ * changes (Element.cpp, dirty_animation); the documents show and hide this
+ * element with data-if, which only sets and clears `display`
+ * (DataViewDefault.cpp, DataViewIf::Update), so an animation declared here
+ * would run once at document load, while the glyph is hidden, and never
+ * again. Declaring it on a rule that starts applying when the box is
+ * checked is what starts it: SetPseudoClass dirties the element and its
+ * siblings for exactly this reason (Element.cpp, "in case of RCSS presence
+ * of sibling combinators"). */
+.check-glyph {
+	position: absolute;
+	top: 0;
+	left: 0;
+	width: 11dp;
+	height: 11dp;
+	pointer-events: none;
+}
+
+input.checkbox:checked + .check-glyph {
 	animation: 0.18s cubic-out check-pop;
+}
+
+/* 13dp long and 3dp thick: at 45 degrees a 13dp bar spans 9.2dp each way,
+ * the inner square of an 11dp box with 1dp borders. Every offset is a
+ * whole pixel at dp ratio 1 and 2, so the bar's centre lands on the box's
+ * centre (5.5dp) without rounding: left (11 - 13) / 2 = -1dp, top
+ * (11 - 3) / 2 = 4dp. */
+.check-arm {
+	position: absolute;
+	left: -1dp;
+	top: 4dp;
+	width: 13dp;
+	height: 3dp;
+	background-color: #000000;
+	transform: rotate(45deg);
+}
+
+.check-arm-b {
+	transform: rotate(-45deg);
 }
 
 @keyframes check-pop {
@@ -586,7 +724,7 @@ input.checkbox:checked {
 	min-width: 0;
 	font-size: 10dp;
 	line-height: 1.3;
-	color: #d4d4d4;
+	color: #141414;
 }
 
 /* The same 220dp box as a select, so the controls line up down the pane:
@@ -609,18 +747,34 @@ input.range {
 input.range slidertrack {
 	height: 4dp;
 	margin-top: 5dp;
-	background-color: #262626;
+	background-color: #1a1a1a;
 }
 
 input.range sliderbar {
 	width: 14dp;
 	height: 14dp;
-	background-color: #525252;
+	background-color: #1a1a1a;
+	/* Transparent at rest so the focus ring below only changes colour, never
+	 * the box size WidgetSlider laid the track out against. */
+	border: 1dp transparent;
 }
 
 input.range sliderbar:hover,
 input.range sliderbar:active {
-	background-color: #737373;
+	background-color: #000000;
+}
+
+/* WidgetSlider sets this pseudo-class on the bar itself when the range gets
+ * focus (WidgetSlider.cpp, EventId::Focus/Blur), so a real :focus selector
+ * on the bar works even though the range as a whole is what tab-index
+ * lands on. */
+input.range sliderbar:focus {
+	background-color: #000000;
+	border-color: #d8c7a1;
+}
+
+input.range:focus slidertrack {
+	background-color: #4a3f2c;
 }
 
 /* Widest reading is "100" for the volume and "0.95" for a deadzone: four
@@ -632,7 +786,7 @@ input.range sliderbar:active {
 	margin-left: 8dp;
 	text-align: right;
 	font-size: 10dp;
-	color: #a3a3a3;
+	color: #000000;
 	white-space: nowrap;
 	overflow: hidden;
 }
@@ -654,7 +808,7 @@ input.range sliderbar:active {
 .bind-table {
 	display: block;
 	margin-bottom: 8dp;
-	border-top: 1dp #1a1a1a;
+	border-top: 1dp #a8997a;
 }
 
 .bind-row {
@@ -662,7 +816,7 @@ input.range sliderbar:active {
 	flex-direction: row;
 	align-items: center;
 	padding: 3dp 0;
-	border-bottom: 1dp #1a1a1a;
+	border-bottom: 1dp #a8997a;
 }
 
 .bind-slot {
@@ -672,7 +826,7 @@ input.range sliderbar:active {
 	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
-	color: #404040;
+	color: #4a3f2c;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -684,7 +838,7 @@ input.range sliderbar:active {
 	flex-shrink: 1;
 	min-width: 0;
 	font-size: 9dp;
-	color: #737373;
+	color: #4a3f2c;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -692,7 +846,7 @@ input.range sliderbar:active {
 
 /* The row waiting for a key or a button. */
 .bind-name.capturing {
-	color: #22c55e;
+	color: #1a1a1a;
 }
 
 .bind-button {
@@ -701,20 +855,25 @@ input.range sliderbar:active {
 	margin-left: 8dp;
 	padding: 2dp 7dp;
 	background-color: transparent;
-	border: 1dp #262626;
+	border: 1dp #1a1a1a;
 	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.08em;
-	color: #525252;
+	color: #4a3f2c;
 	white-space: nowrap;
 	tab-index: auto;
 	nav: auto;
 }
 
-.bind-button:hover,
+.bind-button:hover {
+	color: #000000;
+	border-color: #000000;
+}
+
 .bind-button:focus {
-	color: #a3a3a3;
-	border-color: #404040;
+	background-color: #1a1a1a;
+	border-color: #1a1a1a;
+	color: #d8c7a1;
 }
 
 .bind-actions {
@@ -732,9 +891,9 @@ input.range sliderbar:active {
 	display: block;
 	font-size: 9dp;
 	line-height: 1.4;
-	color: #d4a000;
-	background-color: #2d2000;
-	border: 1dp #4d3800;
+	color: #3d2600;
+	background-color: #e9cf8e;
+	border: 1dp #1a1a1a;
 	padding: 4dp 5dp;
 	margin-bottom: 6dp;
 }
@@ -765,7 +924,7 @@ input.range sliderbar:active {
 	flex-wrap: nowrap;
 	align-items: center;
 	padding-top: 8dp;
-	border-top: 1dp #262626;
+	border-top: 1dp #1a1a1a;
 }
 
 .button {
@@ -774,20 +933,25 @@ input.range sliderbar:active {
 	margin-right: 8dp;
 	padding: 4dp 10dp;
 	background-color: transparent;
-	border: 1dp #262626;
+	border: 1dp #1a1a1a;
 	font-size: 9dp;
 	text-transform: uppercase;
 	letter-spacing: 0.1em;
-	color: #525252;
+	color: #4a3f2c;
 	white-space: nowrap;
 	tab-index: auto;
 	nav: auto;
 }
 
-.button:hover,
+.button:hover {
+	color: #000000;
+	border-color: #000000;
+}
+
 .button:focus {
-	color: #a3a3a3;
-	border-color: #404040;
+	background-color: #1a1a1a;
+	border-color: #1a1a1a;
+	color: #d8c7a1;
 }
 
 .footer-path {
@@ -796,23 +960,33 @@ input.range sliderbar:active {
 	flex-shrink: 1;
 	min-width: 0;
 	font-size: 8dp;
-	color: #333333;
+	color: #8a7d63;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
 }
 
-.footer-hotkey {
+/* .footer-hint is what the last device used can do here: the pad line while
+ * a controller was the last thing touched, the keyboard line otherwise,
+ * filled by the model each field from rt_input_last_device(). It sits on
+ * the same line as the hotkey and reads the same way, so it shares the
+ * rule. */
+.footer-hotkey,
+.footer-hint {
 	display: block;
 	flex-shrink: 0;
 	margin-left: 12dp;
 	font-size: 8dp;
-	color: #525252;
+	color: #4a3f2c;
 	white-space: nowrap;
 }
 
+.footer-hint {
+	letter-spacing: 0.05em;
+}
+
 .key {
-	color: #a3a3a3;
+	color: #000000;
 }
 
 /* ---- fps readout (fps.rml) ----------------------------------------------
@@ -848,8 +1022,8 @@ body.fps {
 /* ---- launcher (launcher.rml) ---------------------------------------------
  *
  * The launcher draws over an empty backbuffer: there is no scanout behind
- * it, so its body is opaque #0a0a0a rather than the menu's translucent
- * panel. Everything else is the same restricted set of boxes and text.
+ * it, so its body is opaque sand (#d8c7a1) rather than the menu's
+ * translucent panel. Everything else is the same restricted set of boxes and text.
  *
  * Same construction as the menu: the shell and the footer are anchored to
  * the body's edges rather than stacked in a flex column, so the shell's
@@ -862,7 +1036,9 @@ body.launcher {
 	height: 100%;
 	box-sizing: border-box;
 	display: block;
-	background-color: #0a0a0a;
+	background-color: #d8c7a1;
+	/* Same reason as body.menu above. */
+	nav: auto;
 }
 
 /* bottom: 44dp clears the footer, whose top edge is 36.6dp up (see
@@ -881,7 +1057,7 @@ body.launcher {
 	display: block;
 	margin-bottom: 16dp;
 	padding-bottom: 8dp;
-	border-bottom: 1dp #262626;
+	border-bottom: 1dp #1a1a1a;
 }
 
 /* Holds whichever of the two title states is up: the image built from the
@@ -934,7 +1110,7 @@ body.launcher {
 	font-weight: 700;
 	font-size: 34dp;
 	letter-spacing: 0.12em;
-	color: #f9fafb;
+	color: #141414;
 	/* Centres the one line in the 56dp box above. */
 	line-height: 56dp;
 	white-space: nowrap;
@@ -944,8 +1120,8 @@ body.launcher {
 .disc-panel {
 	display: block;
 	padding: 10dp 12dp;
-	background-color: #0d0d0d;
-	border: 1dp #262626;
+	background-color: #e4d5b2;
+	border: 1dp #1a1a1a;
 	margin-bottom: 14dp;
 }
 
@@ -953,7 +1129,7 @@ body.launcher {
 	display: block;
 	font-size: 10dp;
 	line-height: 1.4;
-	color: #e5e5e5;
+	color: #141414;
 	/* A disc path has no spaces to break at; without this a long one runs
 	 * off the panel. Wrapping, not clipping: which file is mounted is the
 	 * one thing this window exists to show. */
@@ -965,7 +1141,7 @@ body.launcher {
 	margin-top: 3dp;
 	font-size: 9dp;
 	line-height: 1.4;
-	color: #525252;
+	color: #4a3f2c;
 	word-break: break-all;
 }
 
@@ -1001,7 +1177,7 @@ body.launcher {
 	margin-top: 8dp;
 	font-size: 9dp;
 	line-height: 1.4;
-	color: #737373;
+	color: #4a3f2c;
 	word-break: break-word;
 }
 
@@ -1014,9 +1190,9 @@ body.launcher {
 	padding: 4dp 5dp;
 	font-size: 9dp;
 	line-height: 1.4;
-	color: #d4a000;
-	background-color: #2d2000;
-	border: 1dp #4d3800;
+	color: #3d2600;
+	background-color: #e9cf8e;
+	border: 1dp #1a1a1a;
 	word-break: break-word;
 }
 
@@ -1029,8 +1205,8 @@ body.launcher {
 }
 
 .start-button {
-	color: #d4d4d4;
-	border-color: #404040;
+	color: #141414;
+	border-color: #000000;
 }
 
 /* Start with a precheck that has not passed. Still clickable: pressing it
@@ -1039,8 +1215,8 @@ body.launcher {
 .button.disabled,
 .button.disabled:hover,
 .button.disabled:focus {
-	color: #333333;
-	border-color: #1a1a1a;
+	color: #8a7d63;
+	border-color: #a8997a;
 }
 
 .startup-row {
@@ -1062,7 +1238,7 @@ body.launcher {
 	flex-direction: row;
 	align-items: center;
 	padding-top: 8dp;
-	border-top: 1dp #262626;
+	border-top: 1dp #1a1a1a;
 }
 
 .footer-version {
@@ -1071,7 +1247,7 @@ body.launcher {
 	flex-shrink: 1;
 	min-width: 0;
 	font-size: 8dp;
-	color: #333333;
+	color: #8a7d63;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -1087,6 +1263,14 @@ body.launcher {
 	margin-left: 12dp;
 	tab-index: auto;
 	nav: auto;
+	/* Transparent at rest so the focus ring below only changes colour, never
+	 * the box size. */
+	border: 1dp transparent;
+}
+
+.credit:focus {
+	background-color: #1a1a1a;
+	border-color: #1a1a1a;
 }
 
 /* The defnf mark drawn as boxes rather than loaded as an image: the overlay
@@ -1116,28 +1300,51 @@ body.launcher {
 }
 
 .logo-cell.on {
-	background-color: rgba(255, 255, 255, 179);
+	background-color: rgba(0, 0, 0, 179);
 }
 
-/* #404040 is the portfolio's Copyright colour, one step above the version
- * stamp beside it. */
+/* #4a3f2c, the secondary type colour, one step above the version stamp
+ * beside it. */
 .credit-name {
 	display: block;
 	font-size: 8dp;
 	letter-spacing: 0.05em;
-	color: #404040;
+	color: #4a3f2c;
 	white-space: nowrap;
 }
 
-.credit:hover .credit-name,
-.credit:focus .credit-name {
-	color: #a3a3a3;
+.credit:hover .credit-name {
+	color: #000000;
 }
 
-.credit:hover .logo-cell.on,
-.credit:focus .logo-cell.on {
-	background-color: rgba(255, 255, 255, 230);
+.credit:focus .credit-name {
+	color: #d8c7a1;
 }
+
+.credit:hover .logo-cell.on {
+	background-color: rgba(0, 0, 0, 230);
+}
+
+.credit:focus .logo-cell.on {
+	background-color: rgba(216, 199, 161, 230);
+}
+
+/* ---- launcher palette ------------------------------------------------------
+ *
+ * The overlay is sand with black type and rules after the game's own
+ * palette (user request, 2026-09-03); the shared token table in the header
+ * carries the values. The wordmark is rasterised white by title_logo.cpp;
+ * image-color multiplies it per vertex in the overlay shader, so the same
+ * raster draws black here and stays white for the cursor cut from it. */
+
+body.launcher .title-logo {
+	image-color: #000000;
+}
+
+body.launcher .title-name {
+	color: #000000;
+}
+
 
 /* ---- the drawn cursor (cursor.rml) ---------------------------------------
  *

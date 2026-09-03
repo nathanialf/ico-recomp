@@ -357,30 +357,30 @@ fn corpus_sweep(bed: &mut Bed, c: &[u32], f: &mut Families) {
     let n = c.len();
 
     for i in 0..n {
-        bed.set_vf(1, lanes(&c, i));
+        bed.set_vf(1, lanes(c, i));
         for j in 0..n {
-            bed.set_vf(2, lanes(&c, j));
-            bed.set_acc(lanes(&c, i + j));
+            bed.set_vf(2, lanes(c, j));
+            bed.set_acc(lanes(c, i + j));
             bed.set_q(c[(i + 5) % n]);
             bed.set_i(c[(j + 11) % n]);
             for &kind in KINDS.iter() {
                 // every destination mask, third operand the full vector
                 for mask in 0..16 {
-                    cmp_fmac(&mut f.fmac, &bed, kind, 1, 2, 4, mask, 0, "corpus");
+                    cmp_fmac(&mut f.fmac, bed, kind, 1, 2, 4, mask, 0, "corpus");
                 }
                 // every third-operand selector, full destination mask, and
                 // the vf00 = (0,0,0,1) invariant on either operand
                 for &sel in SELS.iter() {
-                    cmp_fmac(&mut f.fmac, &bed, kind, 1, 2, sel, 0xF, 0xA5A5, "corpus-sel");
-                    cmp_fmac(&mut f.fmac, &bed, kind, 0, 2, sel, 0xF, 0, "corpus-vf00-fs");
-                    cmp_fmac(&mut f.fmac, &bed, kind, 1, 0, sel, 0xF, 0, "corpus-vf00-ft");
+                    cmp_fmac(&mut f.fmac, bed, kind, 1, 2, sel, 0xF, 0xA5A5, "corpus-sel");
+                    cmp_fmac(&mut f.fmac, bed, kind, 0, 2, sel, 0xF, 0, "corpus-vf00-fs");
+                    cmp_fmac(&mut f.fmac, bed, kind, 1, 0, sel, 0xF, 0, "corpus-vf00-ft");
                 }
             }
         }
 }
 
 for i in 0..n {
-    bed.set_vf(1, lanes(&c, i));
+    bed.set_vf(1, lanes(c, i));
     bed.set_q(c[(i + 7) % n]);
     bed.set_i(c[(i + 3) % n]);
     for &shift in SHIFTS.iter() {
@@ -404,7 +404,7 @@ for i in 0..n {
     cmp_pair16(&mut f.abs, ra, rs, || format!("abs corpus i={i}"));
 
     for j in 0..n {
-        bed.set_vf(2, lanes(&c, j));
+        bed.set_vf(2, lanes(c, j));
         for &sel in SELS.iter() {
             for is_min in 0..2 {
                 unsafe {

@@ -33,9 +33,13 @@
 
 #include "../host/portable.h"
 #include "../host/settings.h"
+#include "../host/input.h"
 #include "../host/window.h"
 #include "../iso/iso9660.h"
 #include "../runtime.h"
+#include "ps2_icon.h"
+#include "ps2_icon_render.h"
+#include "save_icon.h"
 #include "title_logo.h"
 
 #include <RmlUi/Core/Core.h>
@@ -95,6 +99,7 @@ struct LauncherModel {
     bool has_status = false;
 
     std::string version_line;
+    std::string nav_hint;
 
     /* True once the title image built from the disc has been published to the
      * renderer. The document swaps its "ICO" text for the image on this, and
@@ -270,6 +275,46 @@ void build_title_logo() {
 
     g_m.logo_available = true;
     g_model_dirty = true;
+}
+
+/* The window's icon: the same render icon_extract.cpp bakes into the .exe
+ * at package time, but read live from whatever disc ends up mounted. Tried
+ * at most once a process, the same way build_title_logo() never re-reads a
+ * disc once it has (successfully or not) settled on an image; a disc that
+ * only resolves after Browse still gets a try, since this runs from the
+ * same two call sites build_title_logo() does. Between frames only, per
+ * rt_window_set_icon's contract. Never fatal: any failure just logs and
+ * leaves the window's default icon in place. */
+void set_window_icon() {
+    /* Latches on success only, like build_title_logo(): a disc that fails
+     * the parse is retried after the next disc change, and each caller
+     * already runs once per mount. */
+    static bool done = false;
+    if (done || !g_m.disc_ok) return;
+
+    char err[512];
+    /* One disc read and parse for both sizes; the render is the cheap part. */
+    RtPs2Icon icon;
+    RtPs2IconSys icon_sys;
+    if (!rt_save_icon_load(icon, icon_sys, err, sizeof(err))) {
+        rt_log("ui", "window icon: %s; the window keeps its default icon", err);
+        return;
+    }
+    RtPs2IconImage icon64;
+    if (!rt_ps2_icon_render(icon, icon_sys, 64, 0, icon64, err, sizeof(err))) {
+        rt_log("ui", "window icon: %s; the window keeps its default icon", err);
+        return;
+    }
+    RtPs2IconImage icon128;
+    const bool have128 = rt_ps2_icon_render(icon, icon_sys, 128, 0, icon128, err, sizeof(err));
+    if (!have128) {
+        rt_log("ui", "window icon: 128 px alternate image failed (%s); using the 64 px icon alone",
+            err);
+    }
+    rt_window_set_icon(icon64.rgba.data(), icon64.width, icon64.height,
+        have128 ? icon128.rgba.data() : nullptr, have128 ? icon128.width : 0,
+        have128 ? icon128.height : 0);
+    done = true;
 }
 
 /* Points the image element at the current raster. RmlUi keys its texture cache
@@ -567,6 +612,7 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     c.Bind("status", &g_m.status);
     c.Bind("has_status", &g_m.has_status);
     c.Bind("version_line", &g_m.version_line);
+    c.Bind("nav_hint", &g_m.nav_hint);
     /* logo_available is bound here, before LoadDocument below, and that
      * ordering is load bearing. launcher.rml gives the image element
      * data-if="logo_available"; an unbound model would leave it visible at
@@ -643,6 +689,7 @@ namespace {
 
 void launcher_tick() {
     if (!g_model_valid) return;
+    sync_nav_hint(&g_m.nav_hint, &g_model, /*two_level=*/false);
 
     if (g_startup_flag_pending) {
         g_startup_flag_pending = false;
@@ -682,6 +729,7 @@ void launcher_tick() {
     if (g_logo_pending) {
         g_logo_pending = false;
         build_title_logo();
+        set_window_icon();
     }
 
     if (g_precheck_pending) {
@@ -706,9 +754,12 @@ void launcher_tick() {
 
     if (g_quit_pending) {
         g_quit_pending = false;
-        rt_log("launcher", "Quit");
-        g_done = true;
-        g_done_started = false;
+        /* Same shutdown path a closed window takes: rt_pgs_notify_quit sets
+         * the flag backend_present_ui() below reports as RT_PGS_VSYNC_
+         * WINDOW_CLOSED, and the loop's own WINDOW_CLOSED branch ends it,
+         * exactly as it would for the X button. Nothing here sets g_done:
+         * that branch's `break` is what leaves the loop. */
+        rt_request_exit("Quit from the launcher");
     }
 
     /* The image must never be drawn at anything but its raster size, so the
@@ -747,6 +798,7 @@ void launcher_prepare_first_frame() {
     }
     g_logo_pending = false;
     build_title_logo();
+    set_window_icon();
 
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
@@ -812,7 +864,7 @@ bool rt_launcher_run() {
         rt_ui_tick();
         const uint32_t flags = backend_present_ui();
         if (flags & RT_PGS_VSYNC_WINDOW_CLOSED) {
-            rt_log("launcher", "window closed; exiting");
+            rt_log("launcher", "window closed or exit requested; exiting");
             window_closed = true;
             break;
         }

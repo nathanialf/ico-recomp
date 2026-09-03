@@ -45,9 +45,12 @@
 #include "ui_internal.h"
 
 #include "../host/settings.h"
+#include "../host/input.h"
+#include "../host/window.h"
 #include "../hw/hw.h"
 #include "../runtime.h"
 
+#include <RmlUi/Core/ComputedValues.h>
 #include <RmlUi/Core/DataModelHandle.h>
 #include <RmlUi/Core/Event.h>
 
@@ -163,6 +166,11 @@ struct UiSettingsMirror {
     std::string settings_path;
     std::string active_tab = "display";
     std::string fps_text;
+    /* The Quit button's own label: "Quit" normally, "Press again to quit"
+     * for the 3 s window after the first press. No settings key -- this is
+     * UI state, not something that persists across a run. */
+    std::string quit_label = "Quit";
+    std::string nav_hint;
 };
 
 UiSettingsMirror g_m;
@@ -185,6 +193,19 @@ unsigned g_unbind_mouse_pending = 0;
 using ModelClock = std::chrono::steady_clock;
 ModelClock::time_point g_fps_text_at;
 bool g_fps_text_started = false;
+
+/* Quit-button press-again arming. Queued the same way every other control
+ * change here is (quit_game() only sets g_quit_pressed; the work happens in
+ * settings_model_tick(), at the field boundary, because the second press
+ * ends in rt_request_exit -> rt_pgs_notify_quit, which is not legal from an
+ * event callback). */
+bool g_quit_pressed = false;
+bool g_quit_armed = false;
+/* settings_model_enter_card() sets this; settings_model_post_update() acts
+ * on it. See the comment on that pair below. */
+bool g_focus_pane_pending = false;
+ModelClock::time_point g_quit_armed_at;
+constexpr auto kQuitArmWindow = std::chrono::seconds(3);
 
 /* ---- enum name tables ---------------------------------------------------
  *
@@ -517,7 +538,11 @@ void mirror_to_settings() {
     s.display.show_fps = g_m.show_fps;
 
     s.audio.master_volume = g_m.master_volume;
-    s.audio.mute = g_m.mute;
+    /* A key whose environment twin is set is never applied (settings.h);
+     * the row's click expression toggles the mirror regardless of the
+     * disabled box inside it, so the guard lives here, and the refresh
+     * below puts the mirror back to the effective value. */
+    if (!g_m.overridden_mute) s.audio.mute = g_m.mute;
 
     s.input.left_deadzone = g_m.left_deadzone;
     s.input.right_deadzone = g_m.right_deadzone;
@@ -531,7 +556,7 @@ void mirror_to_settings() {
     s.gameplay.run_any_direction = g_m.run_any_direction;
 
     s.debug.verbose = g_m.verbose;
-    s.debug.log_file = g_m.log_file;
+    if (!g_m.overridden_log_file) s.debug.log_file = g_m.log_file;
     parse_int_field(g_m.profile_fields, "debug.profile_fields", &s.debug.profile_fields);
     parse_double_field(g_m.fps_limit_hz, "debug.fps_limit_hz", &s.debug.fps_limit_hz);
 }
@@ -571,6 +596,12 @@ void on_reset_defaults(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList
 
 void on_close(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     rt_ui_set_visible(false);
+}
+
+/* Queued like every other control change: the work (arming, or the second
+ * press's flush-and-exit) happens in settings_model_tick(). */
+void on_quit_game(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    g_quit_pressed = true;
 }
 
 /* data-for gives the row index as it_index; the document passes it through.
@@ -729,10 +760,13 @@ bool settings_model_init(Rml::Context* context) {
     c.Bind("settings_path", &g_m.settings_path);
     c.Bind("active_tab", &g_m.active_tab);
     c.Bind("fps_text", &g_m.fps_text);
+    c.Bind("quit_label", &g_m.quit_label);
+    c.Bind("nav_hint", &g_m.nav_hint);
 
     c.BindEventCallback("apply", on_control_change);
     c.BindEventCallback("reset_defaults", on_reset_defaults);
     c.BindEventCallback("close_menu", on_close);
+    c.BindEventCallback("quit_game", on_quit_game);
     c.BindEventCallback("rebind_keyboard", on_rebind_keyboard);
     c.BindEventCallback("rebind_gamepad", on_rebind_gamepad);
     c.BindEventCallback("rebind_mouse", on_rebind_mouse);
@@ -764,6 +798,141 @@ const char* bind_device_name(RtBindDevice device) {
     }
 }
 
+namespace {
+/* active_tab's values (menu.rml's nav buttons set one of these) and the id
+ * of the button that selects each, in the same order the tabs are laid out
+ * (menu.rml section-numbers 01..05). One place, so the shoulder-cycle below
+ * and the initial-focus fix agree with the document. */
+constexpr const char* kTabOrder[] = {"display", "audio", "input", "gameplay", "debug"};
+constexpr const char* kTabButtonIds[] = {"nav-display", "nav-audio", "nav-input", "nav-gameplay", "nav-debug"};
+constexpr size_t kTabCount = sizeof(kTabOrder) / sizeof(kTabOrder[0]);
+} // namespace
+
+void settings_model_focus_active_tab() {
+    if (!g_ui.menu) return;
+    for (size_t i = 0; i < kTabCount; ++i) {
+        if (g_m.active_tab != kTabOrder[i]) continue;
+        if (Rml::Element* button = g_ui.menu->GetElementById(kTabButtonIds[i])) button->Focus(true);
+        return;
+    }
+}
+
+void settings_model_cycle_tab(int direction) {
+    if (!g_model_valid || !g_ui.visible) return;
+    size_t idx = 0;
+    for (size_t i = 0; i < kTabCount; ++i) {
+        if (g_m.active_tab == kTabOrder[i]) {
+            idx = i;
+            break;
+        }
+    }
+    idx = (size_t)(((int)idx + direction + (int)kTabCount) % (int)kTabCount);
+    g_m.active_tab = kTabOrder[idx];
+    g_model.DirtyVariable("active_tab");
+    settings_model_focus_active_tab();
+}
+
+void settings_model_focus_card(int direction) {
+    if (!g_ui.menu || !g_ui.context) return;
+    Rml::Element* focus = g_ui.context->GetFocusElement();
+    if (!focus) return;
+    const Rml::String id = focus->GetId();
+    for (size_t i = 0; i < kTabCount; ++i) {
+        if (id != kTabButtonIds[i]) continue;
+        const size_t next = (size_t)(((int)i + direction + (int)kTabCount) % (int)kTabCount);
+        if (Rml::Element* button = g_ui.menu->GetElementById(kTabButtonIds[next])) button->Focus(true);
+        return;
+    }
+}
+
+namespace {
+
+/* RmlUi's own definition of focusable (ElementDocument.cpp, the anonymous
+ * CanFocusElement): visible, focus not turned off by style, tab-index:
+ * auto. Mirrored here rather than called, since that function is private to
+ * ElementDocument.cpp; kept to the same three checks so this walk agrees
+ * with what Tab already does. */
+bool element_focusable(Rml::Element* el) {
+    if (!el->IsVisible()) return false;
+    const Rml::ComputedValues& computed = el->GetComputedValues();
+    if (computed.focus() == Rml::Style::Focus::None) return false;
+    return computed.tab_index() == Rml::Style::TabIndex::Auto;
+}
+
+/* Pre-order walk, i.e. document order: the first descendant of `node` for
+ * which element_focusable() is true, or null. `node` itself is never
+ * tested, only its descendants -- the one caller below starts at the pane,
+ * which is never itself a focus target. Every node visited is checked for
+ * its own visibility before recursing into it, so a .section a data-if has
+ * set display: none on is skipped whole rather than walked and rejected
+ * control by control. */
+Rml::Element* first_focusable_descendant(Rml::Element* node) {
+    const int n = node->GetNumChildren();
+    for (int i = 0; i < n; ++i) {
+        Rml::Element* child = node->GetChild(i);
+        if (!child->IsVisible()) continue;
+        if (element_focusable(child)) return child;
+        if (Rml::Element* found = first_focusable_descendant(child)) return found;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void settings_model_focus_first_in_pane() {
+    if (!g_ui.menu) return;
+    Rml::Element* pane = g_ui.menu->GetElementById("pane");
+    if (!pane) return;
+    Rml::Element* found = first_focusable_descendant(pane);
+    if (!found) return;
+    found->Focus(true);
+    /* The pane scrolls (`overflow-y: auto`), and a plain Focus() does not
+     * scroll the way RmlUi's own Tab and arrow handling does (ElementDocument
+     * ::ProcessDefaultAction pairs every Focus with a ScrollIntoView). Without
+     * this, entering a pane that was left scrolled down puts the focus ring
+     * somewhere the user cannot see. */
+    found->ScrollIntoView(true);
+}
+
+void settings_model_enter_card() {
+    if (!g_ui.context) return;
+    Rml::Element* focus = g_ui.context->GetFocusElement();
+    if (!focus) return;
+    const Rml::String id = focus->GetId();
+    for (size_t i = 0; i < kTabCount; ++i) {
+        if (id != kTabButtonIds[i]) continue;
+        if (g_m.active_tab != kTabOrder[i]) {
+            g_m.active_tab = kTabOrder[i];
+            g_model.DirtyVariable("active_tab");
+        }
+        /* Queued, not done here. DirtyVariable only marks the variable; the
+         * data-if that decides which .section is displayed is re-run by
+         * Rml::Context::Update(), which rt_ui_tick calls after this whole
+         * tick. Focusing now would walk the pane as it still is, land on a
+         * control in the section that is about to be hidden, and RmlUi then
+         * blurs an element whose display goes none (Element.cpp, the
+         * visibility branch of OnPropertyChange) onto its parent -- a plain
+         * div inside the hidden section, which current_nav_level still reads
+         * as level 2 and which no direction can move off. */
+        g_focus_pane_pending = true;
+        return;
+    }
+}
+
+void settings_model_post_update() {
+    if (!g_focus_pane_pending) return;
+    g_focus_pane_pending = false;
+    if (!g_ui.visible) return;
+    settings_model_focus_first_in_pane();
+}
+
+void settings_model_disarm_quit() {
+    if (!g_quit_armed) return;
+    g_quit_armed = false;
+    g_m.quit_label = "Quit";
+    if (g_model_valid) g_model.DirtyVariable("quit_label");
+}
+
 void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const std::string& status) {
     if (!g_model_valid) return;
 
@@ -781,7 +950,9 @@ void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const
             break;
         case RT_BIND_GAMEPAD:
             rows = &g_m.gamepad_binds;
-            prompt = "press a button or move an axis";
+            prompt = (slot == rt_settings_bind_menu_slot(RT_BIND_GAMEPAD))
+                ? "press a button, or hold two together"
+                : "press a button or move an axis";
             break;
         case RT_BIND_MOUSE:
             rows = &g_m.mouse_binds;
@@ -810,12 +981,44 @@ void settings_model_refresh() {
      * just produced is not the one being cleared. */
     g_m.rebind_status.clear();
     g_m.has_rebind_status = false;
+    /* Same reasoning as the rebind status: a reopen (or any other commit)
+     * is not a second press, so it must not read as one. */
+    settings_model_disarm_quit();
+    /* A queued pane focus belongs to the card press that queued it. A reopen
+     * has already put the focus on the active tab's card and must not then be
+     * dragged into the pane by a press from the last time the menu was up. */
+    g_focus_pane_pending = false;
     g_model.DirtyAllVariables();
     sync_fps_document();
 }
 
+/* The footer's control hint follows the last device used, so a pad user
+ * sees the pad line without touching anything else. One string per device
+ * per document; rewritten only when the device flips.
+ *
+ * `two_level` picks the settings menu's pair over the launcher's: the
+ * launcher has no cards and no pane, its navigation is flat, and East does
+ * nothing there at all (ui_events.cpp's close_menu returns false with the
+ * menu not up, so a stray press cannot quit out of the launcher). Escape is
+ * the same: it belongs to the menu, not to the launcher. */
+void sync_nav_hint(std::string* hint, Rml::DataModelHandle* model, bool two_level) {
+    const bool pad = rt_input_last_device() == RT_INPUT_DEVICE_CONTROLLER;
+    const char* text;
+    if (two_level) {
+        text = pad ? "Up Down choose a card, Left Right switch, cross opens it, circle backs out"
+                   : "Arrows or Tab move, Enter selects, Escape closes";
+    } else {
+        text = pad ? "Up Down Left Right move, cross selects"
+                   : "Arrows or Tab move, Enter selects";
+    }
+    if (*hint == text) return;
+    *hint = text;
+    model->DirtyVariable("nav_hint");
+}
+
 void settings_model_tick() {
     if (!g_model_valid) return;
+    sync_nav_hint(&g_m.nav_hint, &g_model, /*two_level=*/true);
 
     if (g_reset_pending) {
         g_reset_pending = false;
@@ -885,6 +1088,26 @@ void settings_model_tick() {
         rt_settings_request_save();
         /* commit_validate may have reverted a value; show what was kept. */
         settings_model_refresh();
+    } else if (g_quit_pressed) {
+        g_quit_pressed = false;
+        if (g_quit_armed) {
+            settings_model_disarm_quit();
+            rt_settings_flush_save();
+            rt_request_exit("Quit from the menu");
+        } else {
+            g_quit_armed = true;
+            g_quit_armed_at = ModelClock::now();
+            g_m.quit_label = "Press again to quit";
+            g_model.DirtyVariable("quit_label");
+        }
+    }
+
+    /* The arm window, checked every tick regardless of which branch above
+     * ran (or none did): a press that is never repeated has to fall back to
+     * "Quit" on its own, not only when some other control change happens to
+     * run settings_model_refresh() first. */
+    if (g_quit_armed && ModelClock::now() - g_quit_armed_at >= kQuitArmWindow) {
+        settings_model_disarm_quit();
     }
 
     if (!g_ui.fps_visible) return;

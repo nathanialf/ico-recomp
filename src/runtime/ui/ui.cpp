@@ -17,6 +17,7 @@
 #include "ui_internal.h"
 
 #include "../gs/gs_backend.h"
+#include "../host/input.h"
 #include "../host/settings.h"
 #include "../host/window.h"
 #include "../runtime.h"
@@ -53,11 +54,11 @@ UiState g_ui;
  * scanout into. The first two are main-thread reads the UI lays itself out
  * from; sending a query through the ring would mean blocking on the consumer
  * for a value only this thread can change. The present rectangle is the one
- * of the four the consumer side writes: present_frame stores it, and it is
- * read back here on the same thread only because that ring is drained inline
- * today (gs/gs_select.cpp). The day it gets a worker thread, that read needs
- * the members behind it to be atomics; gs/gs_parallel_impl.h carries the
- * same note. */
+ * of the four the consumer side writes: present_frame stores it on the GS
+ * command ring's worker thread and it is read back here on the EE thread,
+ * both under the library's own mutex, so the six values always describe one
+ * present rather than a mix of two (gs/gs_parallel_impl.h and
+ * rt_pgs_present_rect in gs/gs_parallel_api.h carry the same note). */
 
 uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height) {
     return rt_gs_backend()->overlay_texture_create(rgba8, width, height);
@@ -155,6 +156,9 @@ void sync_menu_hotkey() {
     if (Rml::Element* key = g_ui.menu->GetElementById("menu-key")) {
         key->SetInnerRML(menu_hotkey_name());
     }
+    if (Rml::Element* pad = g_ui.menu->GetElementById("menu-pad")) {
+        pad->SetInnerRML(menu_gamepad_name());
+    }
 }
 #endif
 
@@ -227,6 +231,13 @@ bool rt_ui_init() {
         rt_log("ui", "no live windowed backend in this run; the settings UI is disabled");
         return false;
     }
+
+    /* SDL video is up now (backend_window_live() just confirmed it), so the
+     * launcher, which runs before any guest thread exists and so before
+     * rt_input_init()/rt_pad_register_services() ever gets to probe, gets
+     * pad focus and button events of its own. A no-op in a build with no
+     * SDL, and a no-op after the first successful probe. */
+    rt_input_sdl_gamepad_probe();
 
     const std::string base = rt_base_dir();
     const std::string ui_dir = base + "/ui";
@@ -367,6 +378,11 @@ void rt_ui_tick() {
      * input.gamepad.menu in the commit just above; the hotkey follows the
      * committed settings, not the init-time value. */
     sync_menu_hotkey();
+    /* Held-direction repeat and the select pad-session's own field-boundary
+     * check (ui_internal.h); after rebind_tick so a capture that just ended
+     * has already dropped whatever it needed to before nav holds are
+     * re-examined. */
+    ui_nav_tick();
 #endif
     if (g_ui.flush_save_pending) {
         g_ui.flush_save_pending = false;
@@ -392,6 +408,12 @@ void rt_ui_tick() {
     }
 
     g_ui.context->Update();
+
+    /* After Update(), which is the call that re-runs the data-if deciding
+     * which .section the pane shows and lays the result out: the pad's
+     * "enter this card" queues its move into the pane for exactly this
+     * point (ui_internal.h). */
+    settings_model_post_update();
 
     /* After Update() and never from rt_ui_set_visible: the boxes are laid
      * out by the context, so heights read at the moment the document is
@@ -456,6 +478,11 @@ void rt_ui_set_visible(bool visible) {
          * launcher is not up, which is every in-game open. */
         launcher_set_covered(true);
         g_ui.menu->Show();
+        /* Show()'s own default (FocusFlag::Auto) focuses the document
+         * itself when no element carries autofocus, and menu.rml has none;
+         * this puts the pad's focus ring on whichever tab is actually
+         * showing. */
+        settings_model_focus_active_tab();
         /* Read at the next tick, once the context has laid the document
          * out. */
         g_ui.menu_metrics_pending = true;
@@ -468,6 +495,9 @@ void rt_ui_set_visible(bool visible) {
          * this same field boundary, with the menu closed (ui_rebind.cpp). */
         rebind_cancel("the menu closed");
 #endif
+        /* Every way of closing the menu disarms the Quit button's "press
+         * again" state, not only a later reopen. */
+        settings_model_disarm_quit();
         g_ui.menu->Hide();
         g_ui.menu_metrics_pending = false;
         /* Whatever the launcher had up when the menu opened comes back. */

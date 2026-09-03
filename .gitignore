@@ -9,6 +9,7 @@
 *.cue
 *.elf
 *.rom
+*.ico
 baserom/
 assets/
 saves/

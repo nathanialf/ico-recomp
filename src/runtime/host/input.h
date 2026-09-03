@@ -185,6 +185,37 @@ RtInputDevice rt_input_last_device();
  * Always false in a build without SDL. */
 bool rt_input_sdl_active();
 
+/* Probes for a gamepad the moment SDL video exists, even before any guest
+ * thread runs: the launcher (ui/ui_launcher.cpp) needs pad focus and button
+ * events of its own, and this module's own probe used to happen only from
+ * the first poll after rt_input_init()/rt_pad_register_services() (sif/
+ * pad.cpp), which is well after the launcher has already been showing a
+ * window. A no-op once a gamepad has already been probed for and always a
+ * no-op in a build with no SDL. Called from ui/ui.cpp's rt_ui_init(); every
+ * later poll re-probes too (host/input.cpp's own sdl_poll), in case no
+ * window existed the first time the launcher tried. */
+void rt_input_sdl_gamepad_probe();
+
+#ifdef ICORECOMP_PGS_SDL
+/* Forward-declared, not included: this header is included by files that see
+ * no SDL. SDL3/SDL.h's own typedef agrees with it, so either include order
+ * works (same pattern as ui/ui_internal.h). */
+union SDL_Event;
+
+/* SDL_EVENT_GAMEPAD_ADDED / SDL_EVENT_GAMEPAD_REMOVED hot-plug, from the
+ * one event pump (host/window.cpp's rt_window_pump), ahead of rt_ui_
+ * handle_sdl_event so the pad this module tracks stays current whether or
+ * not a document is up. ADDED opens the new pad only when none is open yet,
+ * otherwise it logs and keeps the one already open (SDL3 also reports every
+ * pad already attached at init as ADDED, which SDL_GetGamepadFromID
+ * answering non-null tells apart from a fresh attach, so this never
+ * reopens the pad it is already using). REMOVED closes the pad that was
+ * unplugged and opens whichever other one SDL still lists, if any. A no-op
+ * for the script provider and for every event type but these two. Plain SDL
+ * calls, legal from the pump. */
+void rt_input_on_sdl_event(const SDL_Event& e);
+#endif
+
 /* Actuator (rumble) values from the game: small motor 0/1, big motor
  * 0..255. Forwarded to SDL gamepad rumble whenever that provider is active,
  * and recorded for the log on every change, so the log shows what the game

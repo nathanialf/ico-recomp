@@ -138,6 +138,22 @@ uint64_t g_dropped = 0; /* lines lost to a full ring since the last batch */
 bool g_stop = false;
 bool g_busy = false;    /* writer holds a drained batch and is doing I/O */
 
+/* The thread that ran rt_log_init: main's first statement, so this is the
+ * process's main thread, which is also the EE thread (guest threads are
+ * coroutines on it). Two fatal-path decisions depend on knowing whether the
+ * caller is that thread, and rt_log is the one service every thread in the
+ * process already shares. */
+std::thread::id g_main_thread;
+bool g_main_thread_known = false;
+
+/* Set by rt_fatal just before it calls std::exit, and read back by
+ * rt_fatal_exit_code(). An atexit handler that has to end the process itself
+ * (gs/gs_threaded.cpp's abandon_worker, when a fatal was raised on the GS
+ * worker thread and the join would deadlock) needs the status the fatal was
+ * going to exit with; without it a fatal would report success. -1 means no
+ * fatal is in progress. */
+std::atomic<int> g_fatal_exit_code{-1};
+
 std::mutex g_mu;                 /* ring, counters, flags. Never held across I/O. */
 std::condition_variable g_cv;    /* producer -> writer */
 std::condition_variable g_idle;  /* writer -> rt_log_drain */
@@ -418,7 +434,19 @@ std::string temp_dir() {
 
 } // namespace
 
+bool rt_log_on_main_thread() {
+    /* Before rt_log_init nothing else has started, so the caller is the main
+     * thread by construction. */
+    return !g_main_thread_known || std::this_thread::get_id() == g_main_thread;
+}
+
+int rt_fatal_exit_code() {
+    return g_fatal_exit_code.load(std::memory_order_acquire);
+}
+
 void rt_log_init(const char* dir, bool file_allowed) {
+    g_main_thread = std::this_thread::get_id();
+    g_main_thread_known = true;
     /* This is main's first statement, so in practice nothing has logged
      * yet and no writer thread exists. It is still cheap to be certain:
      * park the writer for the whole of this function, not just up to the
@@ -719,6 +747,16 @@ void rt_log_hold_console() {
     /* Reached from rt_fatal and from the crash handlers. Whatever else
      * happens next, the log is complete from here on. */
     rt_log_drain();
+    /* Never wait for a keypress on a thread that is not the main one. The GS
+     * command ring's worker (gs/gs_threaded.cpp) can raise a fatal, and
+     * blocking it here would leave the process alive with a window that
+     * still looks live: the EE thread would keep waiting for a field the
+     * worker is never going to finish. The main thread reaches its own exit
+     * path and holds the console there instead. */
+    if (!rt_log_on_main_thread()) {
+        emit("[icorecomp][log] fatal on a non-main thread; not holding the console\n");
+        return;
+    }
 #ifdef _WIN32
     /* Only when this process owns the console, i.e. it was double-clicked
      * from Explorer rather than launched from an existing shell: closing
@@ -748,6 +786,9 @@ void rt_log_hold_console() {
     rt_log_drain();
     emit("[icorecomp][%s] FATAL: %s\n", component, line);
     if (ctx) rt_dump_registers(ctx);
+    /* Published before the exit so an atexit handler that has to end the
+     * process on its own still reports a failure; see rt_fatal_exit_code. */
+    g_fatal_exit_code.store(1, std::memory_order_release);
     rt_log_hold_console();
     std::exit(1);
 }

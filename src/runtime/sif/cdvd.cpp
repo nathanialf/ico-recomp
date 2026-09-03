@@ -146,6 +146,65 @@ uint64_t g_drive_busy_until = 0;
 
 uint32_t iop_alloc_room(uint32_t addr);
 
+/* ---- request ring ---------------------------------------------------------
+ *
+ * A short history of what the virtual drive was asked to do, independent of
+ * the log (which is sampled or folded for the stream READ poll). Feeds
+ * rt_cdvd_dump_state, which every inventory dump (deadlock fatal, SIGINT,
+ * exit, and now every unmapped-MMIO fatal via rt_sif_dump_inventory) prints,
+ * so the last handful of requests are visible next to whatever the guest
+ * did after them.
+ *
+ * `kind` doubles as the stream sub-command number for START/SEEK/SEEKF (1,
+ * 4, 9: CdvdStCmd_t in do_stream above), since those three share one
+ * request shape and the sub-command number is itself the useful label; the
+ * other four kinds use sentinel values outside that range. */
+constexpr uint8_t kCdReqEeRead = 0xE0;
+constexpr uint8_t kCdReqIopRead = 0xE1;
+constexpr uint8_t kCdReqStreamRead = 0xE2;
+constexpr uint8_t kCdReqStreamStop = 0xE3;
+
+struct CdReq {
+    uint64_t vclk = 0;
+    uint8_t kind = 0;
+    uint32_t lbn = 0, n = 0, buf = 0, delivered = 0, buffered_after = 0;
+    int thread = 0;
+    uint32_t ra = 0;
+};
+
+constexpr size_t kCdReqRingSize = 16;
+CdReq g_req_ring[kCdReqRingSize];
+uint64_t g_req_count = 0;
+
+const char* cd_req_kind_name(uint8_t kind) {
+    switch (kind) {
+        case kCdReqEeRead: return "EE_READ";
+        case kCdReqIopRead: return "IOP_READ";
+        case kCdReqStreamRead: return "STREAM_READ";
+        case kCdReqStreamStop: return "STREAM_STOP";
+        case 1: return "STREAM_START";
+        case 4: return "STREAM_SEEK";
+        case 9: return "STREAM_SEEKF";
+        default: return "?";
+    }
+}
+
+void cd_req_record(uint8_t kind, uint32_t lbn, uint32_t n, uint32_t buf,
+                    uint32_t delivered, uint32_t buffered_after) {
+    CdReq& r = g_req_ring[g_req_count % kCdReqRingSize];
+    r.vclk = rt_clock_now();
+    r.kind = kind;
+    r.lbn = lbn;
+    r.n = n;
+    r.buf = buf;
+    r.delivered = delivered;
+    r.buffered_after = buffered_after;
+    r.thread = rt_thread_current_id();
+    const R5900Context* ctx = rt_fault_ctx();
+    r.ra = ctx ? (uint32_t)ctx->r[31].u64x[0] : 0;
+    ++g_req_count;
+}
+
 /* ---- virtual drive timing ------------------------------------------------
  *
  * One rate and one seek latency serve both the sceCdRead busy model below
@@ -335,6 +394,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     if (per_sector) {
         g_drive_busy_until = rt_clock_now() + (uint64_t)sectors * per_sector;
     }
+    cd_req_record(to_iop ? kCdReqIopRead : kCdReqEeRead, lbn, sectors, buf, got, 0);
 }
 
 /* ---- the CD stream (ncmd fno 0x09) ---------------------------------------
@@ -396,10 +456,26 @@ struct StreamState {
     bool paused = false;
     uint32_t pos = 0;          /* next sector READ will hand over */
     uint32_t buffered = 0;     /* sectors sitting in the ring */
+    uint32_t bank = 0;         /* sectors per bank: bufmax / bankmax */
+    uint64_t arrived = 0;      /* sectors the drive has put in the ring since START/SEEK */
     uint64_t next_arrival = 0; /* clock at which `buffered` grows by one */
     uint64_t paused_at = 0;
 };
 StreamState g_st;
+
+/* sceCdStREAD default-log sampling. The loader polls this once a field
+ * while it waits, so an unsampled line per delivering call was measured to
+ * run into the hundreds over one door. By default: the first 8 calls after
+ * each StINIT/START/SEEK/SEEKF (the moments a stream (re)begins, when
+ * seeing every call matters most), then every 64th call, and every call
+ * whose delivered count drops to 0 right after a call that delivered a
+ * non-zero count (a stall edge -- the ring running dry mid-stream is worth
+ * seeing even outside the two windows above). rt_verbose("cdvd") keeps
+ * every call, same as before. The 16-entry request ring
+ * (cd_req_record/kCdReqStreamRead) already covers the inventory dumps. */
+uint32_t g_stread_calls_since_start = 0;
+uint32_t g_stread_last_delivered = 0;
+bool g_stread_have_last = false;
 
 /* Ring capacity in sectors. sceCdStInit is the only source for it, so when
  * the game starts a stream without one the capacity is genuinely unknown:
@@ -414,6 +490,30 @@ uint32_t stream_capacity() {
                        "so the drive is never stalled on a full ring (rate and seek still modeled)");
     }
     return 0xFFFFFFFFu;
+}
+
+/* Sectors READ may hand over right now. The IOP driver (cdvdstm, read as a
+ * behavioural reference in ps2sdk iop/cdvd/cdvdstm/src/cdvdstm.c,
+ * ee_stream_handler_normal) fills its ring one bank at a time and marks a
+ * bank usable only when the drive has finished it; its copy loop starts at
+ * the offset it left off inside the current usable bank and stops at the
+ * first bank that is not usable yet. So what is available is everything up
+ * to the end of the last completed bank, minus whatever was already taken
+ * out of the bank in progress, which is what
+ *   buffered - arrived % bank  ==  (arrived / bank) * bank - consumed
+ * comes to here. With requests that are bank multiples, which is what this
+ * title issues, that is bank granularity: 32 sectors asked with a bank and
+ * a half filled returns 16. ICO's stage
+ * loader depends on this (decomp ios/cdvd/iosCdvdManager.s): it refills a
+ * staging window with requests that are multiples of the 16-sector bank and
+ * takes the refilled count as the next window; a delivery that is not a
+ * multiple of 16 sends it down a partial-window branch that reorders and
+ * drops sectors, which is how a sector-granular model corrupted every area
+ * load (measured 2026-09-03, dump in dist/logs/windows-loading-2026-09-03). */
+uint32_t stream_ready() {
+    const uint32_t bank = g_st.bank ? g_st.bank : 1;
+    const uint32_t filling = (uint32_t)(g_st.arrived % bank);
+    return g_st.buffered > filling ? g_st.buffered - filling : 0;
 }
 
 /* Bring `buffered` up to date with the virtual clock. */
@@ -433,9 +533,11 @@ void stream_advance() {
     const uint64_t arrived = (now - g_st.next_arrival) / per + 1;
     const uint64_t room = (uint64_t)cap - g_st.buffered;
     if (arrived >= room) {
+        g_st.arrived += room;
         g_st.buffered = cap;
         g_st.next_arrival = now + per;
     } else {
+        g_st.arrived += arrived;
         g_st.buffered += (uint32_t)arrived;
         g_st.next_arrival += arrived * per;
     }
@@ -471,9 +573,24 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
             g_st.bufmax = lbn;
             g_st.bankmax = nsectors;
             g_st.iop_buf = buf;
-            rt_log("cdvd", "stream ring: %u sectors (%u KB) in %u banks at IOP 0x%06x; "
+            g_st.bank = g_st.bankmax ? g_st.bufmax / g_st.bankmax : g_st.bufmax;
+            if (g_st.bank == 0) g_st.bank = 1;
+            if (g_st.bankmax && g_st.bufmax % g_st.bankmax) {
+                /* The driver truncates the same way (cdvdstm INIT:
+                 * chunks_sectors = bufmax / bankmax) and never uses the
+                 * remainder, but a ring that holds it would sit at "one
+                 * bank still filling" for ever once full, so say so. Both
+                 * of this title's rings divide exactly (80/5, 576/36). */
+                rt_log("cdvd", "stream ring: %u sectors do not divide into %u banks; %u sectors of "
+                               "the ring are never used, as on the IOP driver",
+                    g_st.bufmax, g_st.bankmax, g_st.bufmax % g_st.bankmax);
+            }
+            g_stread_calls_since_start = 0;
+            g_stread_have_last = false;
+            rt_log("cdvd", "stream ring: %u sectors (%u KB) in %u banks of %u at IOP 0x%06x; "
+                           "a bank is handed over once whole; "
                            "first sector %.1f ms after a seek, then one every %.2f ms",
-                g_st.bufmax, g_st.bufmax * 2, g_st.bankmax, g_st.iop_buf,
+                g_st.bufmax, g_st.bufmax * 2, g_st.bankmax, g_st.bank, g_st.iop_buf,
                 (double)seek_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
                 (double)sector_cycles() * 1000.0 / (double)RT_BUSCLK_HZ);
             break;
@@ -482,9 +599,14 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
             g_st.paused = false;
             g_st.pos = lbn;
             g_st.buffered = 0;
+            g_st.arrived = 0;
             g_st.next_arrival = rt_clock_now() + seek_cycles();
+            g_stread_calls_since_start = 0;
+            g_stread_have_last = false;
+            cd_req_record((uint8_t)cmd, lbn, nsectors, buf, 0, 0);
             break;
         case 2: { /* READ nsectors at the stream position */
+            const uint32_t req_pos = g_st.pos; /* before this read may advance it */
             if (!g_st.running) {
                 /* No START/SEEK is live, so there is nothing to hand over.
                  * The EE library short-circuits this case itself (ps2sdk
@@ -496,8 +618,14 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
             stream_advance();
             const bool paced = sector_cycles() != 0;
             uint32_t give = nsectors;
-            if (paced && give > g_st.buffered) give = g_st.buffered;
-            else if (!paced && !g_st.running) give = 0;
+            if (paced) {
+                /* Only the sectors in completed banks are usable; see
+                 * stream_ready(). */
+                const uint32_t ready = stream_ready();
+                if (give > ready) give = ready;
+            } else if (!g_st.running) {
+                give = 0;
+            }
             uint32_t i = 0;
             if (give) {
                 static std::vector<uint8_t> stream_buf;
@@ -516,12 +644,22 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
                 g_st.buffered -= paced ? i : 0;
             }
             result = i; /* sectors read; high half = error (0) */
-            /* Not sampled. The loader polls this once a field while it
-             * waits, so a stalled load prints one line per field; that line
-             * is the only view of why it is waiting and it paces itself. */
-            rt_log("cdvd", "ncmd fno=0x09 sceCdStREAD(lbn=%u n=%u buf=0x%08x) "
-                           "delivered %u of %u (buffered %u/%u), next lbn %u",
-                lbn, nsectors, buf, i, nsectors, g_st.buffered, g_st.bufmax, g_st.pos);
+            /* See the g_stread_calls_since_start comment above the fields:
+             * the first 8 calls after a start, then every 64th, then any
+             * stall edge, are what the default channel keeps. */
+            {
+                ++g_stread_calls_since_start;
+                const bool stall_edge = g_stread_have_last && g_stread_last_delivered != 0 && i == 0;
+                if (rt_verbose("cdvd") || g_stread_calls_since_start <= 8 ||
+                    (g_stread_calls_since_start % 64) == 0 || stall_edge) {
+                    rt_log("cdvd", "ncmd fno=0x09 sceCdStREAD(lbn=%u n=%u buf=0x%08x) "
+                                   "delivered %u of %u (buffered %u/%u), next lbn %u",
+                        lbn, nsectors, buf, i, nsectors, g_st.buffered, g_st.bufmax, g_st.pos);
+                }
+                g_stread_last_delivered = i;
+                g_stread_have_last = true;
+            }
+            cd_req_record(kCdReqStreamRead, req_pos, nsectors, buf, i, g_st.buffered);
             break;
         }
         case 3: /* STOP: the ring is discarded.
@@ -532,6 +670,12 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
             g_st.running = false;
             g_st.paused = false;
             g_st.buffered = 0;
+            /* cdvdstm case 3 clears the whole usedmap, so no bank is left
+             * half filled across a STOP. */
+            g_st.arrived = 0;
+            g_stread_calls_since_start = 0;
+            g_stread_have_last = false;
+            cd_req_record(kCdReqStreamStop, g_st.pos, 0, 0, 0, 0);
             break;
         case 6: /* STAT */
             /* A sector count, not a flag. ps2sdk
@@ -551,7 +695,12 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
              * runtime used to do, means that branch is taken on every
              * iteration. It is never compared to zero and never subtracted. */
             stream_advance();
-            result = sector_cycles() == 0 ? g_st.bufmax : g_st.buffered;
+            /* cdvdstm case 6 counts the usable banks; the bank being filled
+             * is not one of them. It counts a partly consumed bank whole,
+             * where stream_ready subtracts the part already handed over;
+             * the two agree whenever READ requests are bank multiples,
+             * which is what both of this title's streams issue. */
+            result = sector_cycles() == 0 ? g_st.bufmax : stream_ready();
             break;
         case 7: /* PAUSE: arrival freezes where it is */
             if (g_st.running && !g_st.paused) {
@@ -899,6 +1048,40 @@ void svc_loadfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
 }
 
 } // namespace
+
+void rt_cdvd_dump_state() {
+    const uint64_t now = rt_clock_now();
+    rt_log("cdvd", "stream: inited=%d running=%d paused=%d pos=%u buffered=%u ready=%u "
+                   "arrived=%" PRIu64 " bufmax=%u bankmax=%u bank=%u iop_buf=0x%06x",
+        g_st.inited, g_st.running, g_st.paused, g_st.pos, g_st.buffered, stream_ready(),
+        g_st.arrived, g_st.bufmax, g_st.bankmax, g_st.bank, g_st.iop_buf);
+    if (g_st.next_arrival > now) {
+        rt_log("cdvd", "  next_arrival: vclk=%" PRIu64 " (+%.3f ms)", g_st.next_arrival,
+            (double)(g_st.next_arrival - now) * 1000.0 / (double)RT_BUSCLK_HZ);
+    } else {
+        rt_log("cdvd", "  next_arrival: vclk=%" PRIu64 " (past due)", g_st.next_arrival);
+    }
+    if (g_drive_busy_until > now) {
+        rt_log("cdvd", "drive_busy_until: vclk=%" PRIu64 " (+%.3f ms)", g_drive_busy_until,
+            (double)(g_drive_busy_until - now) * 1000.0 / (double)RT_BUSCLK_HZ);
+    } else {
+        rt_log("cdvd", "drive_busy_until: vclk=%" PRIu64 " (past due)", g_drive_busy_until);
+    }
+    rt_log("cdvd", "sector_cycles=%.3f ms seek_cycles=%.3f ms disc_sectors=%u",
+        (double)sector_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
+        (double)seek_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
+        rt_iso_total_sectors());
+    const uint64_t n = g_req_count < kCdReqRingSize ? g_req_count : (uint64_t)kCdReqRingSize;
+    rt_log("cdvd", "request ring: %" PRIu64 " total, last %" PRIu64 ":", g_req_count, n);
+    for (uint64_t k = 0; k < n; ++k) {
+        const uint64_t idx = (g_req_count - n + k) % kCdReqRingSize;
+        const CdReq& r = g_req_ring[idx];
+        rt_log("cdvd", "  %-13s vclk=%" PRIu64 " lbn=%-8u n=%-6u buf=0x%08x delivered=%-6u "
+            "buffered_after=%-6u thread=%d ra=0x%08x",
+            cd_req_kind_name(r.kind), r.vclk, r.lbn, r.n, r.buf, r.delivered, r.buffered_after,
+            r.thread, r.ra);
+    }
+}
 
 void rt_cdvd_register_services() {
     rt_iso_mount();

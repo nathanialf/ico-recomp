@@ -7,9 +7,16 @@
  *
  * Presentation policy (window vs headless, screenshots, validation layers)
  * is decided library-side at rt_pgs_create; see gs_parallel_lib.cpp. The
- * one policy this side owns is window closure: the library reports
- * RT_PGS_VSYNC_WINDOW_CLOSED and the runtime exits cleanly here, so process
- * teardown (atexit backend stats, device wait-idle) stays with the host.
+ * one policy this side owns is window closure: the library records it and
+ * the runtime exits cleanly from hw/gspriv.cpp's field boundary, so process
+ * teardown (atexit backend stats, device wait-idle) stays with the host and
+ * on the EE thread. It used to exit from inside vsync() here, which stopped
+ * being possible when vsync() started running on the command ring's worker
+ * thread (gs/gs_threaded.cpp).
+ *
+ * Thread note: every method below can run on that worker thread. Nothing
+ * here holds state of its own beyond m_pgs, and the library's own
+ * thread rules are documented per call in gs_parallel_api.h.
  */
 #include "gs_backend.h"
 
@@ -272,14 +279,25 @@ public:
         return rt_pgs_read_priv(m_pgs, offset);
     }
 
+    /* No exit here any more. This can run on the GS command ring's worker
+     * thread (gs/gs_threaded.cpp), and process teardown has to happen on the
+     * EE thread: std::exit from the worker would run the atexit handler that
+     * joins the worker, on the worker. The closure is a sticky flag inside
+     * the library instead, and hw/gspriv.cpp polls window_closed() at the
+     * field boundary and takes the exit there. */
     bool vsync(unsigned field) override {
-        uint32_t flags = rt_pgs_vsync(m_pgs, field);
-        if (flags & RT_PGS_VSYNC_WINDOW_CLOSED) {
-            rt_log("gs", "paraLLEl-GS: window closed, exiting");
-            std::exit(0);
-        }
+        const uint32_t flags = rt_pgs_vsync(m_pgs, field);
         return (flags & RT_PGS_VSYNC_PRESENTED) != 0;
     }
+
+    /* An atomic read inside the library, legal from any thread and true even
+     * while the consumer is parked in there with no vsync left to return (a
+     * window closed while the swapchain was unusable). */
+    bool window_closed() override { return rt_pgs_window_closed(m_pgs) != 0; }
+
+    /* Registers the consumer thread with Granite's thread-index table; see
+     * rt_pgs_bind_consumer_thread in gs_parallel_api.h. */
+    void bind_consumer_thread() override { rt_pgs_bind_consumer_thread(m_pgs); }
 
     void report_stats() override {
         rt_pgs_report_stats(m_pgs);

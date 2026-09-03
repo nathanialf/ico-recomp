@@ -54,6 +54,14 @@
 namespace {
 bool g_log_verbose = false;
 uint64_t g_log_lines = 0;
+/* The ring pumps the host's event loop from every producer-side wait; there
+ * is no window here, so the stub below only counts the calls, and the total
+ * shows that the waits in the worker configurations actually ran. */
+uint64_t g_pumps = 0;
+/* Event dispatch must be held for every one of those pumps: one of the waits
+ * that reaches it runs from inside the UI's own renderer. */
+int g_dispatch_held = 0;
+uint64_t g_unheld_pumps = 0;
 } // namespace
 
 void rt_log(const char* component, const char* fmt, ...) {
@@ -66,6 +74,29 @@ void rt_log(const char* component, const char* fmt, ...) {
     std::printf("\n");
     va_end(ap);
 }
+
+/* The ring holds event dispatch across every wait that pumps; there is no
+ * SDL here, so the stub only checks that the hold is balanced and that no
+ * pump ever runs unheld from a wait. */
+void rt_window_hold_event_dispatch(bool on) {
+    g_dispatch_held += on ? 1 : -1;
+    if (g_dispatch_held < 0) {
+        std::printf("rt_window_hold_event_dispatch released more times than held\n");
+        std::exit(2);
+    }
+}
+
+void rt_window_pump() {
+    ++g_pumps;
+    if (g_dispatch_held == 0) ++g_unheld_pumps;
+}
+
+/* Only reached by the ring's abandon path (a worker that will not stop),
+ * which no configuration here provokes. */
+void rt_log_drain() {}
+
+/* No fatal is in progress in this harness. */
+int rt_fatal_exit_code() { return -1; }
 
 void rt_fatal(const char* component, const R5900Context*, const char* fmt, ...) {
     va_list ap;
@@ -300,9 +331,21 @@ struct Config {
     const char* name;
     size_t ring_bytes;
     bool inline_drain;
+    /* Hands the ring to its worker thread after construction (which requires
+     * inline_drain, the mode the runtime starts in). The test thread is then
+     * the producer and the worker is the consumer, which is the shape the
+     * game runs in: the two reply-carrying calls really wait for a reply,
+     * the vsync sync point really waits for a field, and a small ring really
+     * blocks the producer until the worker frees room. */
+    bool worker;
     uint32_t max_gif_qwords;   /* ordinary packets */
     uint32_t big_gif_qwords;   /* the near-ring-size case */
 };
+
+const char* mode_name(const Config& cfg) {
+    if (cfg.worker) return "worker-thread";
+    return cfg.inline_drain ? "inline-drain" : "batched-drain";
+}
 
 /* Scratch buffers, reused so the ring is the only thing under test. */
 std::vector<uint8_t> g_packet;
@@ -323,6 +366,7 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
     RecordingBackend* wrapped = new RecordingBackend(); /* owned by the wrapper */
     wrapped->check_alignment();
     ThreadedBackend ring(wrapped, cfg.ring_bytes, cfg.inline_drain);
+    if (cfg.worker) ring.start_worker();
 
     uint64_t priv_reads_checked = 0;
     uint64_t vsync_returns_checked = 0;
@@ -370,11 +414,19 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
             const unsigned field = next_u32(2);
             const bool want = oracle.vsync(field);
             const bool got = ring.vsync(field);
-            if (cfg.inline_drain && got != want) {
+            /* The runtime's field boundary: enqueue the vsync, then wait for
+             * the one before it. A no-op outside worker mode. */
+            ring.field_sync();
+            /* The return value is only this field's answer when the record
+             * was replayed inside the call. With the consumer on its own
+             * thread it is the previous field's, by design (gs_threaded.h),
+             * so there is nothing to compare. */
+            const bool answered_here = cfg.inline_drain && !cfg.worker;
+            if (answered_here && got != want) {
                 std::printf("vsync(%u) returned %d, expected %d\n", field, int(got), int(want));
                 return false;
             }
-            if (cfg.inline_drain) ++vsync_returns_checked;
+            if (answered_here) ++vsync_returns_checked;
             break;
         }
         case kOpSetPresentation: {
@@ -476,7 +528,14 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
         }
     }
 
-    ring.drain();
+    /* Worker mode: stop and join the consumer, which replays whatever is
+     * still queued first. Otherwise this thread is the consumer and drains
+     * it itself. */
+    if (cfg.worker) {
+        ring.quiesce();
+    } else {
+        ring.drain();
+    }
 
     const std::vector<std::string>& want = oracle.log();
     const std::vector<std::string>& got = wrapped->log();
@@ -518,8 +577,7 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
     std::printf("  %-22s ring %7zu %-14s calls %6zu  records %6" PRIu64
                 "  bytes %10" PRIu64 "  wraps %5" PRIu64 "  stalls %5" PRIu64
                 "  priv-reads %" PRIu64 "  vsync-returns %" PRIu64 "\n",
-                cfg.name, cfg.ring_bytes,
-                cfg.inline_drain ? "inline-drain" : "batched-drain", want.size(),
+                cfg.name, cfg.ring_bytes, mode_name(cfg), want.size(),
                 ring.records_replayed(), ring.bytes_written(), ring.wrap_markers(),
                 ring.back_pressure_stalls(), priv_reads_checked, vsync_returns_checked);
     return true;
@@ -541,11 +599,18 @@ int main(int argc, char** argv) {
      * most of the way across its ring, which is the case where a wrap marker
      * is followed immediately by a record that only just fits. */
     const Config configs[] = {
-        { "production-shape",  ThreadedBackend::kDefaultRingBytes, true,  256,  4096 },
-        { "small-inline",      64u * 1024,                         true,  256,  1024 },
-        { "small-batched",     64u * 1024,                         false, 64,   256  },
-        { "tiny-batched",      8u * 1024,                          false, 16,   64   },
-        { "near-full-records", 8u * 1024,                          true,  200,  480  },
+        { "production-shape",  ThreadedBackend::kDefaultRingBytes, true,  false, 256,  4096 },
+        { "small-inline",      64u * 1024,                         true,  false, 256,  1024 },
+        { "small-batched",     64u * 1024,                         false, false, 64,   256  },
+        { "tiny-batched",      8u * 1024,                          false, false, 16,   64   },
+        { "near-full-records", 8u * 1024,                          true,  false, 200,  480  },
+        /* The same sequences again with the consumer on its own thread. The
+         * production shape is the one the game runs; the small ring is the
+         * one that actually reaches back pressure, which at 32 MB would take
+         * a scene the test does not have. */
+        { "production-worker", ThreadedBackend::kDefaultRingBytes, true,  true,  256,  4096 },
+        { "small-worker",      64u * 1024,                         true,  true,  256,  1024 },
+        { "tiny-worker",       8u * 1024,                          true,  true,  16,   200  },
     };
 
     std::printf("GS command ring round trip: %u calls per configuration, seed 0x%016" PRIx64 "\n",
@@ -564,8 +629,15 @@ int main(int argc, char** argv) {
         std::printf(" %s=%" PRIu64, kOpNames[i], op_counts[i]);
     }
     std::printf("\n");
-    std::printf("all %u calls in %zu configurations replayed identically\n", calls,
-                sizeof(configs) / sizeof(configs[0]));
+    if (g_unheld_pumps != 0 || g_dispatch_held != 0) {
+        std::printf("FAILED: %" PRIu64 " pump(s) ran with event dispatch not held,"
+                    " hold depth %d at exit\n", g_unheld_pumps, g_dispatch_held);
+        return 1;
+    }
+    std::printf("all %u calls in %zu configurations replayed identically"
+                " (%" PRIu64 " event-pump calls from producer waits, all with event"
+                " dispatch held)\n", calls,
+                sizeof(configs) / sizeof(configs[0]), g_pumps);
     if (!g_log_verbose) {
         std::printf("(%" PRIu64 " log lines suppressed; set "
                     "ICORECOMP_GSRING_SELFTEST_VERBOSE to see them)\n",

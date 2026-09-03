@@ -5,7 +5,9 @@
  * g_pages at boot: 32 MB EE RAM at guest 0x00000000 with aliases at the
  * 0x2/0x3 (uncached) and 0x8/0xA (kseg) prefixes, scratchpad at 0x70000000,
  * VU micro/data memory windows at 0x11000000. Pages left NULL (0x10xxxxxx
- * device registers, 0x12xxxxxx GS privileged) fall through to rt_mmio_*.
+ * device registers, 0x12xxxxxx GS privileged) fall through to rt_mmio_*,
+ * which is fatal with a state dump for any other NULL-page address
+ * (mmio.cpp; the two windows above are the only ones this title touches).
  */
 #ifndef RECOMP_API_H
 #define RECOMP_API_H

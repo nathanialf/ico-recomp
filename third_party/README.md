@@ -49,9 +49,10 @@ the launcher and the credits documents under `ui/`.
 How it is built and used:
 
 - Compiled unmodified as a static library (`RmlUi::Core` only; the debugger
-  target is EXCLUDE_FROM_ALL and nothing links it) into `icorecomp-runtime`,
-  which is MIT. Samples, Lua bindings, the SVG and Lottie plugins and Tracy
-  profiling are all off (CMakeLists.txt).
+  target is EXCLUDE_FROM_ALL and nothing links it) into the `ico` executable
+  (CMake target `icorecomp-runtime`), which is MIT. Samples, Lua bindings,
+  the SVG and Lottie plugins and Tracy profiling are all off
+  (CMakeLists.txt).
 - The library never sees Vulkan. `src/runtime/ui/ui_render.cpp` implements
   `Rml::RenderInterface` over the overlay ABI in
   `src/runtime/gs/gs_parallel_api.h`, which is plain POD: vertices, indices,
@@ -76,11 +77,12 @@ FreeType 2, the font rasterizer RmlUi's default font engine uses.
 
 How it is built:
 
-- Compiled unmodified as a static library into `icorecomp-runtime`, with
-  every optional dependency turned off: `FT_DISABLE_ZLIB`,
-  `FT_DISABLE_BZIP2`, `FT_DISABLE_PNG`, `FT_DISABLE_HARFBUZZ` and
-  `FT_DISABLE_BROTLI` (CMakeLists.txt). The port ships two TrueType fonts and
-  needs nothing else, so the build has no external font dependencies.
+- Compiled unmodified as a static library into the `ico` executable (CMake
+  target `icorecomp-runtime`), with every optional dependency turned off:
+  `FT_DISABLE_ZLIB`, `FT_DISABLE_BZIP2`, `FT_DISABLE_PNG`,
+  `FT_DISABLE_HARFBUZZ` and `FT_DISABLE_BROTLI` (CMakeLists.txt). The port
+  ships two TrueType fonts and needs nothing else, so the build has no
+  external font dependencies.
 - `SKIP_INSTALL_ALL` keeps FreeType out of the packaged folder; only the
   linked objects inside the executable ship.
 

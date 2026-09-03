@@ -56,19 +56,26 @@
 				<input type="text" data-value="path_entry"/>
 				<div class="button" data-event-click="use_path()">Use path</div>
 			</div>
+			<div class="hint" data-if="!disc_locked">type with the keyboard</div>
 
 			<div class="status-line" data-if="has_status">{{status}}</div>
 			<div class="error-line" data-if="has_precheck_error">{{precheck_error}}</div>
 		</div>
 
 		<div class="launcher-actions">
-			<div class="button start-button" data-class-disabled="!can_start" data-event-click="start()">Start</div>
+			<div class="button start-button" data-class-disabled="!can_start" data-event-click="start()" autofocus>Start</div>
 			<div class="button" data-event-click="open_settings()">Settings</div>
 			<div class="button" data-event-click="quit()">Quit</div>
 		</div>
 
-		<div class="check-row startup-row">
-			<input type="checkbox" data-checked="show_at_startup" data-event-change="startup_changed()"/>
+		<div class="check-row startup-row" data-event-click="show_at_startup = !show_at_startup; startup_changed()">
+			<div class="check-box">
+				<input type="checkbox" data-checked="show_at_startup"/>
+				<div class="check-glyph" data-if="show_at_startup">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+			</div>
 			<span class="check-label">Show this launcher at startup</span>
 		</div>
 	</div>
@@ -92,6 +99,7 @@
 	-->
 	<div class="launcher-footer">
 		<div class="footer-version">{{version_line}}</div>
+		<div class="footer-hint">{{nav_hint}}</div>
 		<div class="credit" id="credit-link">
 			<div class="defnf-logo">
 				<div class="logo-row"><div class="logo-cell on"/><div class="logo-cell"/><div class="logo-cell"/><div class="logo-cell on"/><div class="logo-cell on"/><div class="logo-cell on"/></div>

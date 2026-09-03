@@ -88,6 +88,10 @@ set(ICORECOMP_RUNTIME_SOURCES
 
 add_executable(icorecomp-runtime ${ICORECOMP_RUNTIME_SOURCES})
 
+# Ships as ico / ico.exe. The target keeps its name so CI (--target
+# icorecomp-runtime) and every selftest reference stay valid.
+set_target_properties(icorecomp-runtime PROPERTIES OUTPUT_NAME ico)
+
 # Standalone mcserv protocol exercise (sif/mc_selftest.cpp): links mc.cpp
 # against stubbed runtime services; run with ICORECOMP_SAVES_DIR set.
 add_executable(icorecomp-mc-selftest
@@ -304,7 +308,9 @@ add_executable(icorecomp-title-logo-selftest
     src/runtime/ui/title_logo.cpp
     src/runtime/ui/cursor_image.cpp
     src/runtime/ui/title_logo_selftest.cpp
+    src/runtime/ui/data_df.cpp
     src/runtime/host/inflate.cpp
+    src/runtime/host/png_write.cpp
     src/runtime/iso/iso9660.cpp
     src/runtime/loader.cpp
     src/runtime/log.cpp
@@ -319,6 +325,102 @@ target_compile_definitions(icorecomp-title-logo-selftest PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-title-logo-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# ---- packaged save icon (host tool, optional .rc embed) -------------------
+#
+# icorecomp-icon-extract (ours): reads the mounted disc's own memory-card
+# save icon (DATA.DF's icon.sys and the view icon it names, boy_blk.ico on
+# the retail disc) and renders it the way the PS2 browser draws it: a black
+# silhouette on the icon.sys background, at the sizes a Windows .ico wants.
+# A plain host tool -- no SDL, no RmlUi, no GS -- run at build time (the
+# `icon` target below) or by hand; never at game run time (the runtime's own
+# render is ui/save_icon.cpp, called from ui_launcher.cpp for the window
+# icon). See ui/icon_extract.cpp for the usage and the .ico layout it writes.
+add_executable(icorecomp-icon-extract
+    src/runtime/ui/icon_extract.cpp
+    src/runtime/ui/ps2_icon.cpp
+    src/runtime/ui/ps2_icon_render.cpp
+    src/runtime/ui/save_icon.cpp
+    src/runtime/ui/data_df.cpp
+    src/runtime/host/png_write.cpp
+    src/runtime/iso/iso9660.cpp
+    src/runtime/loader.cpp
+    src/runtime/log.cpp
+    src/runtime/sha1.cpp
+)
+target_include_directories(icorecomp-icon-extract PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-icon-extract PRIVATE
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-icon-extract PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# ICORECOMP_DISC: the disc image the `icon` target renders the save icon
+# from. Never committed (CLAUDE.md); empty by default, which configures and
+# builds exactly as before: the exe then carries no icon resource, and
+# Windows shows it with its own default application icon.
+set(ICORECOMP_DISC "" CACHE FILEPATH
+    "Disc image the icon target renders the save icon from; never committed")
+# ICORECOMP_ICON_FILE: the rendered ico.ico to embed as the Windows
+# executable's icon. Ordinarily the `icon` target's own output; set by hand
+# when cross-compiling, since icorecomp-icon-extract cannot run on the build
+# host in that configuration (see the CMAKE_CROSSCOMPILING branch below).
+set(ICORECOMP_ICON_FILE "" CACHE FILEPATH
+    "Rendered ico.ico to embed as the Windows executable icon; empty builds without one")
+
+if(ICORECOMP_DISC AND NOT CMAKE_CROSSCOMPILING)
+    set(ICORECOMP_ICON_DIR "${CMAKE_BINARY_DIR}/icon")
+    add_custom_command(
+        OUTPUT "${ICORECOMP_ICON_DIR}/ico.ico"
+        COMMAND "$<TARGET_FILE:icorecomp-icon-extract>"
+                "${ICORECOMP_DISC}" "${ICORECOMP_ICON_DIR}/ico.ico"
+                --png "${ICORECOMP_ICON_DIR}"
+        DEPENDS icorecomp-icon-extract "${ICORECOMP_DISC}"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "icorecomp: rendering the save icon from ${ICORECOMP_DISC}"
+        VERBATIM
+    )
+    add_custom_target(icon DEPENDS "${ICORECOMP_ICON_DIR}/ico.ico")
+elseif(ICORECOMP_DISC AND CMAKE_CROSSCOMPILING)
+    message(STATUS "icorecomp: ICORECOMP_DISC is set but this is a cross build; "
+                   "icorecomp-icon-extract cannot run here. Configure and build "
+                   "--target icon natively, then pass its output as "
+                   "-DICORECOMP_ICON_FILE=<path>/ico.ico to this build.")
+endif()
+
+if(WIN32 AND ICORECOMP_ICON_FILE)
+    enable_language(RC)
+    get_filename_component(_icorecomp_icon_abs "${ICORECOMP_ICON_FILE}" ABSOLUTE)
+    if(NOT EXISTS "${_icorecomp_icon_abs}")
+        # Not fatal: the documented flow is to configure with this set and
+        # build --target icon in the same tree, so the file can legitimately
+        # arrive after this line. Say so now rather than leaving the resource
+        # compiler to report it.
+        message(WARNING "icorecomp-runtime: ICORECOMP_ICON_FILE ${_icorecomp_icon_abs} does not "
+                        "exist yet; the resource compile will fail unless it is there by then")
+    endif()
+    file(TO_CMAKE_PATH "${_icorecomp_icon_abs}" ICORECOMP_ICON_FILE_RC)
+    configure_file("${CMAKE_SOURCE_DIR}/packaging/ico.rc.in" "${CMAKE_BINARY_DIR}/icon/ico.rc" @ONLY)
+    target_sources(icorecomp-runtime PRIVATE "${CMAKE_BINARY_DIR}/icon/ico.rc")
+    # The .rc names the .ico by path, so nothing in the generated build files
+    # ties the compiled resource to the icon's own bytes: without this, a
+    # re-rendered ico.ico leaves the exe carrying the previous icon. Applied
+    # by the Makefile and Ninja generators.
+    set_source_files_properties("${CMAKE_BINARY_DIR}/icon/ico.rc" PROPERTIES
+        OBJECT_DEPENDS "${_icorecomp_icon_abs}")
+    message(STATUS "icorecomp-runtime: embedding icon ${ICORECOMP_ICON_FILE}")
+elseif(WIN32)
+    message(STATUS "icorecomp-runtime: no ICORECOMP_ICON_FILE; the exe ships with the default icon")
+elseif(ICORECOMP_ICON_FILE)
+    # An icon resource is a Windows executable's, so there is nothing to do
+    # with the file here. Say it rather than ignoring the variable silently.
+    message(STATUS "icorecomp: ICORECOMP_ICON_FILE is set but this is not a Windows target; "
+                   "the icon is embedded only in ico.exe, so it is ignored here")
 endif()
 
 # ---- optional generated/ee link ------------------------------------------
@@ -715,6 +817,10 @@ if(ICORECOMP_UI)
         src/runtime/ui/ui_launcher.cpp
         src/runtime/ui/title_logo.cpp
         src/runtime/ui/cursor_image.cpp
+        src/runtime/ui/data_df.cpp
+        src/runtime/ui/ps2_icon.cpp
+        src/runtime/ui/ps2_icon_render.cpp
+        src/runtime/ui/save_icon.cpp
         src/runtime/host/inflate.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)
@@ -742,11 +848,10 @@ endif()
 
 if(WIN32)
     set(ICORECOMP_PACKAGE_PLATFORM "for Windows (x86_64)")
-    set(ICORECOMP_PACKAGE_EXE "icorecomp-runtime.exe")
 else()
     set(ICORECOMP_PACKAGE_PLATFORM "for Linux (x86_64)")
-    set(ICORECOMP_PACKAGE_EXE "icorecomp-runtime")
 endif()
+set(ICORECOMP_PACKAGE_EXE "$<TARGET_FILE_NAME:icorecomp-runtime>")
 
 if(NOT WIN32)
     # Flat layout: the installed executable finds its libraries beside

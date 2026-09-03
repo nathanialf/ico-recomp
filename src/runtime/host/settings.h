@@ -255,6 +255,20 @@ const char* rt_settings_binding_key(RtBindDevice device, int slot);
 int rt_settings_bind_slot_count(RtBindDevice device);
 int rt_settings_bind_menu_slot(RtBindDevice device);
 
+/* Chord grammar for input.gamepad.menu, the only slot a chord is legal on
+ * (see docs/SETTINGS.md section 7): "<button>+<button>", exactly one
+ * interior '+', and neither side may end in '+' or '-' -- that suffix is
+ * the axis-direction convention ("lefttrigger+"), so a trailing '+' with
+ * nothing after it is an axis, not a chord, and "a+b+c" (two interior '+'s)
+ * fails resolution rather than picking one of them. Order is not
+ * significant: nothing compares the two parts against which one struck
+ * first. Splits `name` into `*first`/`*second` and returns true when it
+ * parses as a chord; returns false, leaving both untouched, for the common
+ * case of an ordinary button or axis name. Never called on a keyboard
+ * name: "Keypad +" is a legitimate SDL scancode name and must not be
+ * chord-parsed. */
+bool rt_settings_split_chord(const std::string& name, std::string* first, std::string* second);
+
 /* The message from the last rt_settings_commit() that rejected something and
  * reverted it, or "" when the last commit accepted everything. Cleared at
  * the start of every commit. Only the binding rules (the menu key colliding

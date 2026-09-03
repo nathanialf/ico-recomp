@@ -33,9 +33,11 @@
 
 #include "cursor_image.h"
 
+#include "../host/png_write.h"
 #include "../host/portable.h"
 #include "../iso/iso9660.h"
 #include "../runtime.h"
+#include "recomp_api.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -46,101 +48,21 @@
 #include <vector>
 
 /* loader.cpp and log.cpp reference the guest page table; nothing here loads
- * an ELF or dumps registers, so an empty one satisfies the link. The IPU
- * selftest does the same for the same reason. */
+ * an ELF or dumps registers, so an empty one satisfies the link. The
+ * recomp_api.h include above is required, not decorative: it declares
+ * g_pages inside extern "C", and without it this definition gets plain C++
+ * linkage, which MSVC mangles and GCC does not, leaving the loader unable
+ * to find the symbol under MSVC (see guest/menu_nav_selftest.cpp, which
+ * carries the same fix for the same reason). The IPU selftest defines an
+ * equivalent empty array for the same underlying reason. */
 uint8_t* g_pages[0x10000];
 
 namespace {
 
-/* ---- a minimal PNG writer ------------------------------------------------
+/* PNG writing itself now lives in host/png_write.cpp (rt_png_write), shared
+ * with ui/icon_extract.cpp.
  *
- * Stored (uncompressed) DEFLATE blocks inside the zlib wrapper, which is
- * legal and needs no compressor. This is a diagnostic image, so the file
- * being three times larger than it has to be does not matter. */
-
-uint32_t crc32_of(const uint8_t* data, size_t len, uint32_t crc) {
-    static uint32_t table[256];
-    static bool built = false;
-    if (!built) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        built = true;
-    }
-    crc = ~crc;
-    for (size_t i = 0; i < len; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-    return ~crc;
-}
-
-void push_be32(std::vector<uint8_t>& v, uint32_t x) {
-    v.push_back(uint8_t(x >> 24));
-    v.push_back(uint8_t(x >> 16));
-    v.push_back(uint8_t(x >> 8));
-    v.push_back(uint8_t(x));
-}
-
-void push_chunk(std::vector<uint8_t>& out, const char tag[4], const std::vector<uint8_t>& body) {
-    push_be32(out, uint32_t(body.size()));
-    const size_t start = out.size();
-    out.insert(out.end(), tag, tag + 4);
-    out.insert(out.end(), body.begin(), body.end());
-    push_be32(out, crc32_of(out.data() + start, out.size() - start, 0));
-}
-
-/* `rgb` is width * height * 3 bytes. */
-bool write_png(const char* path, uint32_t width, uint32_t height, const std::vector<uint8_t>& rgb) {
-    std::vector<uint8_t> raw;
-    raw.reserve(size_t(height) * (1 + size_t(width) * 3));
-    for (uint32_t y = 0; y < height; ++y) {
-        raw.push_back(0); /* filter type 0 */
-        raw.insert(raw.end(), rgb.begin() + size_t(y) * width * 3,
-                   rgb.begin() + size_t(y + 1) * width * 3);
-    }
-
-    std::vector<uint8_t> z;
-    z.push_back(0x78); /* zlib header, deflate, 32K window */
-    z.push_back(0x01);
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        const uint16_t n = uint16_t(std::min<size_t>(65535, raw.size() - pos));
-        const bool last = pos + n >= raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back(uint8_t(n));
-        z.push_back(uint8_t(n >> 8));
-        z.push_back(uint8_t(~n));
-        z.push_back(uint8_t(~n >> 8));
-        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + n);
-        pos += n;
-    }
-    uint32_t a = 1, b = 0;
-    for (uint8_t byte : raw) {
-        a = (a + byte) % 65521;
-        b = (b + a) % 65521;
-    }
-    push_be32(z, (b << 16) | a);
-
-    std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
-    std::vector<uint8_t> ihdr;
-    push_be32(ihdr, width);
-    push_be32(ihdr, height);
-    ihdr.push_back(8); /* bit depth */
-    ihdr.push_back(2); /* colour type 2: truecolour */
-    ihdr.push_back(0);
-    ihdr.push_back(0);
-    ihdr.push_back(0);
-    push_chunk(out, "IHDR", ihdr);
-    push_chunk(out, "IDAT", z);
-    push_chunk(out, "IEND", {});
-
-    std::FILE* f = std::fopen(path, "wb");
-    if (!f) return false;
-    const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
-    return std::fclose(f) == 0 && ok;
-}
-
-/* ---- the menu cursor, against synthetic glyphs ---------------------------
+ * ---- the menu cursor, against synthetic glyphs ---------------------------
  *
  * One premultiplied RGBA image built by hand, so what the extraction is
  * supposed to pick is known before it runs. */
@@ -361,7 +283,12 @@ bool write_cursor_png(const std::string& path, const RtCursorImage& img) {
             rgb[o + c] = uint8_t(v > 255 ? 255 : v);
         }
     }
-    return write_png(path.c_str(), img.width, img.height, rgb);
+    char err[256];
+    if (!rt_png_write(path.c_str(), img.width, img.height, rgb.data(), 3, err, sizeof(err))) {
+        std::fprintf(stderr, "title-logo selftest: %s\n", err);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -437,8 +364,8 @@ int main(int argc, char** argv) {
             rgb[o + c] = uint8_t(v > 255 ? 255 : v);
         }
     }
-    if (!write_png(out_path.c_str(), logo.width, logo.height, rgb)) {
-        std::fprintf(stderr, "title-logo selftest: cannot write %s\n", out_path.c_str());
+    if (!rt_png_write(out_path.c_str(), logo.width, logo.height, rgb.data(), 3, err, sizeof(err))) {
+        std::fprintf(stderr, "title-logo selftest: %s\n", err);
         return 1;
     }
     std::printf("wrote %s\n", out_path.c_str());

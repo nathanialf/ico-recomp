@@ -31,6 +31,17 @@ constexpr uint32_t RT_CLEAN_EXIT_VRAM = 0xE0000000u;
 
 /* ---- logging (log.cpp) -------------------------------------------------- */
 
+/* Format-string checking for printf-style helpers. gnu_printf rather than
+ * printf: on mingw-w64 the printf archetype means the Microsoft CRT's
+ * format set, which has no %zu, and the warning it raises for size_t
+ * conversions is spurious because mingw-w64's C++ mode routes vsnprintf
+ * through its own ANSI implementation. MSVC has no equivalent attribute. */
+#if defined(__GNUC__)
+#define RT_PRINTF_FORMAT(fmt_idx, first_arg) __attribute__((format(gnu_printf, fmt_idx, first_arg)))
+#else
+#define RT_PRINTF_FORMAT(fmt_idx, first_arg)
+#endif
+
 /* Opens this run's log file and points file descriptor 2 at it, so the log
  * survives the console window dying with the process. Path comes from
  * ICORECOMP_LOG; unset it defaults to <dir>/icorecomp.log, falling back to
@@ -83,8 +94,20 @@ const char* rt_log_path();
 
 /* On Windows, when this process owns its console (a double-clicked run),
  * names the log file and waits for Enter so the failure stays readable.
- * No-op everywhere else and for runs launched from an existing shell. */
+ * No-op everywhere else, for runs launched from an existing shell, and on
+ * any thread but the main one (a fatal on a worker must not block, since
+ * nothing else can end the process while it does). */
 void rt_log_hold_console();
+
+/* True on the thread that called rt_log_init, which is main's first
+ * statement: the process's main thread, and so the EE thread. */
+bool rt_log_on_main_thread();
+
+/* The status a fatal now in progress is exiting with, or -1 when none is.
+ * For an atexit handler that cannot let std::exit finish and has to end the
+ * process itself: without this it would have to guess, and guessing success
+ * turns a crash into a clean run in every script that reads the status. */
+int rt_fatal_exit_code();
 
 void rt_log(const char* component, const char* fmt, ...);
 void rt_vlog(const char* component, const char* fmt, va_list ap);

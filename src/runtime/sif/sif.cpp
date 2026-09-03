@@ -104,11 +104,17 @@ uint32_t rt_sif_set_dma(uint32_t tx_addr, uint32_t count) {
             cid = rt_gread32(src + 8);
         }
         /* A transfer carrying an RPC command id is a rare, individually
-         * meaningful event: keep every one, on the verbose channel rather
-         * than the default one. Everything else stays sampled. */
+         * meaningful event, which is why this used to log every one
+         * unconditionally through rt_logv. But rt_logv is file-only, not
+         * verbose-gated (see runtime.h): this game issues thousands of
+         * these a run, and every one of them was still landing in the
+         * default log file. Gate it on the "sif" channel explicitly.
+         * Everything else stays sampled. */
         if (cid) {
-            rt_logv("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
-                id, i + 1, count, src, dest, size, attr, cid);
+            if (rt_verbose("sif")) {
+                rt_logv("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
+                    id, i + 1, count, src, dest, size, attr, cid);
+            }
         } else if (rt_trace() || (g_dma_count & (g_dma_count + 1)) == 0) {
             rt_log("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
                 id, i + 1, count, src, dest, size, attr, cid);
@@ -212,4 +218,5 @@ void rt_sif_dump_inventory() {
             r.id, r.src, r.dest, r.size, r.attr, r.cid, r.vclk);
     }
     rt_rpc_dump_inventory();
+    rt_cdvd_dump_state();
 }

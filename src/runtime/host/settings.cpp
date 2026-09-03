@@ -36,6 +36,7 @@
 #include "host/portable.h"
 #include "host/settings.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdarg>
@@ -111,12 +112,16 @@ struct BindTable {
     int menu_slot;
     const char* json_key;  /* the object key under "input" */
     const char* section;   /* dotted key of the section, for log lines */
+    /* Whether this device's names are ever chord-parsed. Gamepad only: a
+     * keyboard name is never split ("Keypad +" is a scancode name) and a
+     * mouse slot has no menu key for a chord to stand in for. */
+    bool chords;
 };
 
 constexpr BindTable kBindTables[RT_BIND_DEVICE_COUNT] = {
-    {kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "keyboard", "input.keyboard"},
-    {kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "gamepad", "input.gamepad"},
-    {kMouseBinds, RT_MB_COUNT, -1, "mouse", "input.mouse"},
+    {kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "keyboard", "input.keyboard", false},
+    {kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "gamepad", "input.gamepad", true},
+    {kMouseBinds, RT_MB_COUNT, -1, "mouse", "input.mouse", false},
 };
 
 bool valid_device(RtBindDevice d) {
@@ -834,6 +839,27 @@ bool bind_name_equal(const std::string& a, const std::string& b) {
     return true;
 }
 
+} // namespace
+
+bool rt_settings_split_chord(const std::string& name, std::string* first, std::string* second) {
+    const size_t plus_count = (size_t)std::count(name.begin(), name.end(), '+');
+    if (plus_count != 1) return false;
+    const size_t pos = name.find('+');
+    const std::string a = name.substr(0, pos);
+    const std::string b = name.substr(pos + 1);
+    /* Empty on either side covers both a leading '+' and a trailing one
+     * (the axis-direction convention, "lefttrigger+"); either way this is
+     * not a chord. */
+    if (a.empty() || b.empty()) return false;
+    const char la = a.back(), lb = b.back();
+    if (la == '+' || la == '-' || lb == '+' || lb == '-') return false;
+    *first = a;
+    *second = b;
+    return true;
+}
+
+namespace {
+
 void note_reject(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -857,8 +883,16 @@ void validate_binds(std::string* cur, const std::string* prev, const BindTable& 
      * reverts: binding the menu key onto an existing pad slot is the menu
      * key's fault, binding a pad slot onto the menu key is the pad slot's,
      * and reverting the menu slot in the second case would leave the
-     * collision standing. Skipped whole for a device with no menu slot. */
-    if (menu_slot >= 0) {
+     * collision standing. Skipped whole for a device with no menu slot, and
+     * also skipped when the menu slot holds a chord: "back+start" over the
+     * bound select/start is the expected setup for a pad whose PS button the
+     * OS or Steam intercepts, and the guest sees both parts exactly as
+     * hardware would until the menu opens and blanks the pad (ui_events.cpp
+     * only consumes the chord as a whole, on the edge that completes it). */
+    std::string menu_chord_a, menu_chord_b;
+    const bool menu_is_chord = t.chords && menu_slot >= 0 &&
+        rt_settings_split_chord(cur[menu_slot], &menu_chord_a, &menu_chord_b);
+    if (menu_slot >= 0 && !menu_is_chord) {
         for (int i = 0; i < count; ++i) {
             if (i == menu_slot) continue;
             if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
@@ -895,6 +929,31 @@ void validate_binds(std::string* cur, const std::string* prev, const BindTable& 
             if (j_changed) cur[j] = prev[j];
         }
     }
+
+    /* Rule 3: a chord is only legal in the menu slot. Anywhere else it would
+     * have to hide its two parts from the virtual pad, which changes what
+     * the game sees, so it reverts like any other slot this commit moved. */
+    if (t.chords) {
+        for (int i = 0; i < count; ++i) {
+            if (i == menu_slot) continue;
+            std::string a, b;
+            if (!rt_settings_split_chord(cur[i], &a, &b)) continue;
+            if (cur[i] == prev[i]) continue;
+            note_reject("%s.%s = \"%s\" is a chord, which only %s.menu accepts; reverted",
+                section, defs[i].json_key, cur[i].c_str(), section);
+            cur[i] = prev[i];
+        }
+    }
+
+    /* Rule 4: a chord whose two parts are the same button is not two
+     * buttons at all. Only the menu slot can hold a chord, so this only
+     * ever looks at it. */
+    if (menu_is_chord && bind_name_equal(menu_chord_a, menu_chord_b) &&
+        cur[menu_slot] != prev[menu_slot]) {
+        note_reject("%s.menu = \"%s\" chords a button with itself; reverted",
+            section, cur[menu_slot].c_str());
+        cur[menu_slot] = prev[menu_slot];
+    }
 }
 
 /* Load-time report only, no value change: a duplicate that came in from the
@@ -914,6 +973,36 @@ void log_bind_duplicates(const std::string* v, const BindTable& t) {
                     " press both buttons", t.section, t.defs[i].json_key, t.section, t.defs[j].json_key,
                     v[i].c_str());
             }
+        }
+    }
+
+    /* A chord is only legal in the menu slot; one that arrived in the file
+     * anywhere else is reported once here and left alone, the same way a
+     * duplicate is: this is the user's own file, and the commit-time rule
+     * above (rule 3) only reverts a slot the running commit itself moved. */
+    if (t.chords) {
+        for (int i = 0; i < t.count; ++i) {
+            if (i == t.menu_slot) continue;
+            std::string a, b;
+            if (!rt_settings_split_chord(v[i], &a, &b)) continue;
+            rt_log("settings", "settings: %s.%s = \"%s\" is a chord, which only %s.menu accepts;"
+                " that slot cannot resolve it and host/input.cpp falls back to its default",
+                t.section, t.defs[i].json_key, v[i].c_str(), t.section);
+        }
+
+        /* Rule 4's load-time twin, the same shape: the commit-time rule only
+         * reverts a slot the running commit itself moved, so a chord that
+         * pairs a button with itself and arrived in the file would otherwise
+         * pass without a word. It resolves, and ui/ui_events.cpp then reads
+         * one press of that button as the whole chord, because SDL has
+         * already recorded the button as down by the time the event for it is
+         * handled. Reported, not rewritten: this is the user's file. */
+        std::string menu_a, menu_b;
+        if (t.menu_slot >= 0 && rt_settings_split_chord(v[t.menu_slot], &menu_a, &menu_b) &&
+            bind_name_equal(menu_a, menu_b)) {
+            rt_log("settings", "settings: %s.menu = \"%s\" chords a button with itself, which is one"
+                " button, not two; that one press will open and close the menu",
+                t.section, v[t.menu_slot].c_str());
         }
     }
 }

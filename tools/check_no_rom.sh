@@ -23,8 +23,10 @@ for f in "${files[@]}"; do
     esac
 
     # Forbidden extensions: game binaries, disc images, extracted assets.
+    # .ico is the rendered save icon, an image produced from the disc at
+    # package time.
     case "${f,,}" in
-        *.iso|*.bin|*.cue|*.elf|*.rom|*.irx|*.img|*.vag|*.tm2|*.pss|*.hd|*.bd|*.int|*.df|*.png)
+        *.iso|*.bin|*.cue|*.elf|*.rom|*.irx|*.img|*.vag|*.tm2|*.pss|*.hd|*.bd|*.int|*.df|*.png|*.ico)
             err "$f (game-data file extension)" ;;
     esac
 

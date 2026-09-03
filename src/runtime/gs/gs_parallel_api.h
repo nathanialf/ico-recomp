@@ -42,8 +42,15 @@ typedef struct RtPgsHost {
      * (the pre-shim-3 behavior; the replay tool and any host without a UI
      * use that). Called from inside Granite's WSI::begin_frame, so a
      * swapchain image may be acquired: the callback may only queue events
-     * and call rt_pgs_notify_quit / rt_pgs_notify_resize. Any other
-     * rt_pgs_* call from inside it is fatal (see the in-frame guard). */
+     * and call rt_pgs_notify_quit / rt_pgs_notify_resize /
+     * rt_pgs_sample_window_state. Any other rt_pgs_* call from inside it is
+     * fatal (see the in-frame guard).
+     *
+     * Only ever called on the creating thread. Once the host has registered
+     * a consumer thread (rt_pgs_bind_consumer_thread), the library skips
+     * this callback on that thread rather than calling SDL from it, and the
+     * host's own per-field pump is what delivers events; see the threads
+     * section below. */
     void (*pump_events)(void);
 } RtPgsHost;
 
@@ -116,6 +123,52 @@ RT_GS_API uint64_t rt_pgs_read_priv(RtPgs* pgs, uint32_t offset);
 #define RT_PGS_VSYNC_WINDOW_CLOSED 2u
 RT_GS_API uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field);
 
+/* ---- threads ------------------------------------------------------------
+ *
+ * One instance, two host threads at most, never at the same time:
+ *
+ *   the creating thread   the host's EE and main thread. It called
+ *                         rt_pgs_create, owns the SDL window and is the only
+ *                         thread that may call SDL, so it is the only thread
+ *                         that may call rt_pgs_notify_* and
+ *                         rt_pgs_sample_window_state.
+ *   the consumer thread   the host's GS command ring worker
+ *                         (src/runtime/gs/gs_threaded.cpp). After
+ *                         rt_pgs_bind_consumer_thread it is the only thread
+ *                         that calls rt_pgs_submit_gif, rt_pgs_write_priv,
+ *                         rt_pgs_vsync, rt_pgs_set_*, rt_pgs_overlay_* and
+ *                         rt_pgs_present_ui.
+ *
+ * The rest is readable from either thread at any time: rt_pgs_read_priv,
+ * rt_pgs_present_timings, rt_pgs_present_rect, rt_pgs_surface_size,
+ * rt_pgs_window_handle and rt_pgs_window_closed. The state behind those is
+ * atomic, or published under the library's own mutex, for that reason.
+ *
+ * rt_pgs_bind_consumer_thread registers the calling thread as the consumer:
+ * today that means giving it Granite's thread index 0, which its per-thread
+ * command pools are keyed on. The creating thread already holds index 0 from
+ * Device::set_context and the two never run library calls at the same time,
+ * so they share it. Call once, on the consumer thread, before its first call
+ * from the list above. */
+RT_GS_API void rt_pgs_bind_consumer_thread(RtPgs* pgs);
+
+/* Non-zero once the window has closed or a quit was requested, sticky, and
+ * readable from any thread. rt_pgs_vsync's RT_PGS_VSYNC_WINDOW_CLOSED bit
+ * says the same thing, but only to whoever called it; with the consumer on
+ * its own thread the host needs the answer even while that thread is inside
+ * the library and cannot return one (parked waiting for a minimized window
+ * to come back, for instance). */
+RT_GS_API uint32_t rt_pgs_window_closed(RtPgs* pgs);
+
+/* Samples the window's pixel size and minimized state into the library's
+ * cache. Creating thread only, because it calls SDL; the host calls it from
+ * its event pump, so the cache is refreshed once per field and after every
+ * resize. That cache is what the consumer thread reads when Granite asks the
+ * platform for a surface size or whether the window can be presented to,
+ * which is why the consumer never has to touch SDL. Safe from inside
+ * pump_events. */
+RT_GS_API void rt_pgs_sample_window_state(RtPgs* pgs);
+
 RT_GS_API void rt_pgs_report_stats(RtPgs* pgs);
 
 /* Present-path timings for the host's profiler: nanoseconds accumulated in
@@ -152,11 +205,12 @@ RT_GS_API void  rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* heigh
  * to guest pixels this field". A caller mapping a position into the picture
  * must treat a non-positive width or height as no picture.
  *
- * Plain member reads, safe from pump_events and at any time as long as the
- * ring is drained inline on the caller's own thread, which is how
- * gs/gs_select.cpp builds it today. The day that ring gets a worker thread
- * the members behind this have to become atomics (gs_parallel_impl.h says
- * the same next to them). */
+ * Published under the library's own mutex by the present that measured it
+ * and read back under the same mutex here, so the six values always describe
+ * one present and never a mix of two. Safe from pump_events and from either
+ * thread at any time (see the threads section above): the host reads it on
+ * the EE thread to map a mouse position into the picture while the consumer
+ * thread is presenting. */
 RT_GS_API void rt_pgs_present_rect(RtPgs* pgs, int32_t* x, int32_t* y, int32_t* w, int32_t* h, int32_t* bb_w, int32_t* bb_h);
 /* Between frames only; fatal when called while a frame is in flight
  * (including from pump_events). Same RT_PGS_PRESENT_* values as create. */

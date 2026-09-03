@@ -49,7 +49,7 @@ cat <<'EOF'
 
 Done. Run the game:
 
-    ICORECOMP_GS=parallel ./build/release/icorecomp-runtime
+    ICORECOMP_GS=parallel ./build/release/ico
 
 (omit ICORECOMP_GS=parallel for a headless run; on Windows builds the
 window is the default). Controller: any SDL3-supported pad, or keyboard;

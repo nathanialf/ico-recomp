@@ -27,10 +27,14 @@
 #include "../host/settings.h"
 #include "../runtime.h"
 
+#include <RmlUi/Core/Elements/ElementFormControlSelect.h>
 #include <RmlUi/Core/Input.h>
+#include <RmlUi/Core/Traits.h>
 
 #include <SDL3/SDL.h>
 
+#include <chrono>
+#include <cstdio>
 #include <string>
 
 namespace rtui {
@@ -41,7 +45,10 @@ namespace {
  * same defaults settings.cpp ships ("F1" and "guide") so an unresolvable
  * name can fall back without inventing a different binding. */
 SDL_Scancode g_menu_scancode = SDL_SCANCODE_F1;
-SDL_GamepadButton g_menu_button = SDL_GAMEPAD_BUTTON_GUIDE;
+/* A single button (g_menu_chord[1] == INVALID) or a chord of two
+ * (input.gamepad.menu = "back+start"). Order carries no meaning: dispatch
+ * below checks either half as the one just pressed with the other held. */
+SDL_GamepadButton g_menu_chord[2] = {SDL_GAMEPAD_BUTTON_GUIDE, SDL_GAMEPAD_BUTTON_INVALID};
 
 Rml::Input::KeyIdentifier convert_key(SDL_Keycode key) {
     // clang-format off
@@ -217,32 +224,369 @@ bool text_input_focused() {
     return type == "text" || type == "password";
 }
 
-bool close_menu() {
+/* `force` skips the text-field exception: the keyboard's Escape belongs to a
+ * focused text field there (it reverts the edit), but the gamepad's East
+ * closes the menu regardless of what has focus, because East has no other
+ * meaning a text field could claim. */
+bool close_menu(bool force = false) {
     /* Nothing to close: the launcher is up on its own. Escape does nothing
      * there on purpose, so a stray press cannot quit out of it. Returning
      * false lets the key reach RmlUi, where it is only a focus-level key. */
     if (!g_ui.visible) return false;
-    if (text_input_focused()) return false;
+    if (!force && text_input_focused()) return false;
     rt_ui_set_visible(false);
     return true;
 }
 
-/* Gamepad navigation while the menu is up. RmlUi drives focus from the
- * arrow keys and Enter (ElementDocument::ProcessDefaultAction), so the
- * translation is a d-pad-to-arrow-keys mapping plus south for Enter; the
- * documents carry `nav: auto` and `tab-index: auto` on every control, which
- * is what makes the arrow keys move the focus at all. KI_UNKNOWN means
- * "this button has no menu meaning", and the event falls through unconsumed.
- */
+/* Gamepad navigation while the menu is up. South maps to Enter, which
+ * ElementDocument::ProcessDefaultAction turns into a Click() on whatever
+ * has tab-index: auto focus (every control in these documents): that is
+ * how South starts a button, toggles a checkbox and opens a closed select.
+ * The d-pad directions are not mapped here: they and the left stick share
+ * one held/repeat state machine below (NavHold), because a direction has to
+ * behave the same way whichever one produced it. KI_UNKNOWN means "this
+ * button has no menu meaning", and the event falls through unconsumed. */
 Rml::Input::KeyIdentifier convert_gamepad_button(SDL_GamepadButton button) {
     switch (button) {
-    case SDL_GAMEPAD_BUTTON_DPAD_UP:    return Rml::Input::KI_UP;
-    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  return Rml::Input::KI_DOWN;
-    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  return Rml::Input::KI_LEFT;
-    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Rml::Input::KI_RIGHT;
-    case SDL_GAMEPAD_BUTTON_SOUTH:      return Rml::Input::KI_RETURN;
-    default:                            return Rml::Input::KI_UNKNOWN;
+    case SDL_GAMEPAD_BUTTON_SOUTH: return Rml::Input::KI_RETURN;
+    default:                       return Rml::Input::KI_UNKNOWN;
     }
+}
+
+/* ---- gamepad directional navigation ---------------------------------------
+ *
+ * The left stick is read as four synthetic d-pad edges (hysteresis, fixed
+ * and independent of input.left_deadzone: this is about the menu noticing a
+ * deliberate push, not about what the game is told the stick reports), and
+ * both the real d-pad and the stick share one held/repeat state per
+ * direction: press dispatches once and starts a hold, ui_nav_tick() (called
+ * every field from rt_ui_tick, after rebind_tick) re-dispatches it after
+ * 400 ms and then every 100 ms, and the hold clears on release, on the menu
+ * closing, or on the pad being unplugged.
+ *
+ * A direction that reaches RmlUi and is not consumed (ElementDocument's own
+ * arrow handling found nothing to move to -- the last item in a column, or
+ * nothing focused at all) is re-dispatched once with the document itself
+ * focused; `body { nav: auto }` (base.rcss) then answers it with the first
+ * or last focusable element in document order, which is this module's one
+ * wrap mechanism and also its recovery when a data-if removed whatever had
+ * the focus.
+ */
+
+constexpr Sint16 kNavAxisPress = 16384;
+constexpr Sint16 kNavAxisRelease = 9830;
+constexpr auto kNavRepeatDelay = std::chrono::milliseconds(400);
+constexpr auto kNavRepeatInterval = std::chrono::milliseconds(100);
+
+enum class NavDir { Left, Right, Up, Down, Count };
+
+struct NavHold {
+    bool held = false;
+    std::chrono::steady_clock::time_point next_repeat_at;
+};
+NavHold g_nav_hold[(size_t)NavDir::Count];
+
+Rml::Input::KeyIdentifier nav_dir_key(NavDir dir) {
+    switch (dir) {
+    case NavDir::Left:  return Rml::Input::KI_LEFT;
+    case NavDir::Right: return Rml::Input::KI_RIGHT;
+    case NavDir::Up:    return Rml::Input::KI_UP;
+    case NavDir::Down:  return Rml::Input::KI_DOWN;
+    default:            return Rml::Input::KI_UNKNOWN;
+    }
+}
+
+/* ---- select pad session ----------------------------------------------------
+ *
+ * A closed <select> is reached like any other focusable control: native
+ * tab-index, native South -> Click(), which opens it. An open one is not
+ * driven through RmlUi's own arrow handling, because WidgetDropDown answers
+ * an Up/Down there by moving the selection immediately (WidgetDropDown.cpp,
+ * SeekSelection -> SetSelection), which sets the <select>'s value and fires
+ * "change" on every step -- exactly the event menu.rml's data-event-
+ * change="apply()" commits, so an intermediate option the thumb passed
+ * through on the way to the one it wanted would be saved. A pad session
+ * therefore owns Up/Down itself while a select is open: it moves a
+ * highlighted option (the "padhl" pseudo-class, ui/style/base.rcss) without
+ * touching the control's value, and only South commits, by clicking the
+ * highlighted option once, the same way a mouse click on it always has.
+ */
+Rml::Element* g_nav_select = nullptr;        /* the open <select>, or null */
+Rml::Element* g_nav_select_option = nullptr; /* the highlighted option */
+
+void select_session_clear_highlight() {
+    if (g_nav_select_option) g_nav_select_option->SetPseudoClass("padhl", false);
+    g_nav_select_option = nullptr;
+}
+
+void select_session_end() {
+    select_session_clear_highlight();
+    g_nav_select = nullptr;
+}
+
+/* WidgetDropDown moves every <option> out of the <select>'s own children and
+ * under an internal "selectbox" element it owns (ElementFormControlSelect.cpp
+ * MoveChildren, WidgetDropDown.cpp AddOption), and that wrapper is appended as
+ * a non-DOM child (WidgetDropDown's constructor passes false). A subtree query
+ * from the select therefore never reaches the options: Element::
+ * GetElementsByTagName walks GetNumChildren(), which counts DOM children only.
+ * ElementFormControlSelect's own GetNumOptions/GetOption is the one way in from
+ * outside the widget. A data-for template option stays a child of the box with
+ * display: none and is not a real option; WidgetDropDown::OnChildAdd tells it
+ * apart by the same attribute, and skipping it here keeps the two agreeing. */
+void select_session_options(Rml::Element* select, Rml::ElementList* out) {
+    out->clear();
+    Rml::ElementFormControlSelect* control = rmlui_dynamic_cast<Rml::ElementFormControlSelect*>(select);
+    if (!control) return;
+    const int count = control->GetNumOptions();
+    for (int i = 0; i < count; ++i) {
+        Rml::Element* option = control->GetOption(i);
+        if (option && !option->HasAttribute("data-for")) out->push_back(option);
+    }
+}
+
+void select_session_begin(Rml::Element* select) {
+    Rml::ElementList options;
+    select_session_options(select, &options);
+    if (options.empty()) return;
+    g_nav_select = select;
+    Rml::Element* current = nullptr;
+    for (Rml::Element* opt : options) {
+        if (opt->IsPseudoClassSet("checked")) {
+            current = opt;
+            break;
+        }
+    }
+    g_nav_select_option = current ? current : options.front();
+    g_nav_select_option->SetPseudoClass("padhl", true);
+}
+
+void select_session_move(bool forward) {
+    if (!g_nav_select) return;
+    Rml::ElementList options;
+    select_session_options(g_nav_select, &options);
+    if (options.empty()) return;
+    size_t idx = 0;
+    for (size_t i = 0; i < options.size(); ++i) {
+        if (options[i] == g_nav_select_option) {
+            idx = i;
+            break;
+        }
+    }
+    const size_t n = options.size();
+    idx = forward ? (idx + 1) % n : (idx + n - 1) % n;
+    select_session_clear_highlight();
+    g_nav_select_option = options[idx];
+    g_nav_select_option->SetPseudoClass("padhl", true);
+}
+
+/* Commits the highlighted option by clicking it: WidgetDropDown's own Click
+ * handler for an option (ProcessEvent, EventId::Click) sets the value,
+ * fires exactly one "change", hides the box and returns focus to the
+ * <select> -- the same sequence a mouse click on it produces. */
+void select_session_commit() {
+    if (g_nav_select_option) g_nav_select_option->Click();
+    select_session_end();
+}
+
+/* If nothing is focused, or focus has drifted outside the document that is
+ * actually up (a data-if removed the focused element, or the menu just
+ * opened over the launcher), focus the document itself so the first arrow
+ * key answers with the first or last focusable element (`nav: auto` on
+ * body.menu / body.launcher) instead of doing nothing. Called before any
+ * pad key that means something to this module. */
+void ensure_document_focus(Rml::Context* context) {
+    Rml::ElementDocument* target = g_ui.visible ? g_ui.menu : g_ui.launcher;
+    if (!target) return;
+    Rml::Element* focus = context->GetFocusElement();
+    if (!focus || focus->GetOwnerDocument() != target) target->Focus();
+}
+
+/* One arrow key: dispatch, and once, if nothing consumed it, retry with the
+ * document itself focused (the wrap/recovery mechanism the file comment
+ * above describes). */
+bool dispatch_nav_key(Rml::Context* context, Rml::Input::KeyIdentifier key) {
+    bool consumed = !context->ProcessKeyDown(key, 0);
+    if (!consumed) {
+        Rml::ElementDocument* doc = g_ui.visible ? g_ui.menu : g_ui.launcher;
+        if (doc) {
+            doc->Focus();
+            consumed = !context->ProcessKeyDown(key, 0);
+        }
+    }
+    return consumed;
+}
+
+/* ---- the settings menu's two-level pad model ------------------------------
+ *
+ * menu.rml is two regions: the cards column on the left (five .nav-button
+ * elements) and the pane on the right, which shows the active tab's
+ * section. Native RmlUi spatial nav, asked to move Up/Down/Left/Right from
+ * an arbitrary point, does not know about that split -- it just finds the
+ * nearest focusable element in the requested screen direction, which can
+ * and does cross from a card into the pane or back, and would also open a
+ * <select>'s own arrow-key handling to a stray Left/Right. This section
+ * layers a level on top of the native handling rather than replacing it:
+ * level 1 (a card has focus) answers Up/Down by moving among the five
+ * cards and Left/Right by changing the active tab; level 2 (something in
+ * the pane has focus) answers Up/Down with the native search, vetoed if it
+ * would land on a card, and Left/Right with the native search alone (a
+ * range slider or a select's own handling claims it; nothing else does,
+ * and nothing here falls back to a document-wide search the way
+ * dispatch_nav_key's Up/Down does).
+ *
+ * The level is never stored: it is read from wherever the focus actually
+ * is, every time, by current_nav_level() below. That is what keeps a mouse
+ * click from ever disagreeing with the pad -- clicking a card or a pane
+ * control changes what has focus, which is the only thing the level is
+ * decided from.
+ */
+enum class NavLevel { Cards, Pane };
+
+NavLevel current_nav_level(Rml::Context* context) {
+    for (Rml::Element* e = context->GetFocusElement(); e; e = e->GetParentNode()) {
+        if (e->IsClassSet("nav-button")) return NavLevel::Cards;
+        if (e->IsClassSet("pane")) return NavLevel::Pane;
+    }
+    return NavLevel::Cards;
+}
+
+/* Level 2's guard against escaping the pane, shared by Up/Down and
+ * Left/Right: one ProcessKeyDown call can relocate focus onto a card or a
+ * footer button, and this puts it back. The escape is the document-wrap
+ * fallback, not the native search: the native
+ * search itself is confined to the focused element's nearest scroll
+ * container (ElementDocument.cpp, FindNextNavigationElement's
+ * GetNearestScrollContainer), which for anything in the pane is the pane
+ * (`overflow-y: auto`), but dispatch_nav_key's second try focuses the
+ * document, and from the document `nav: auto` answers with the next
+ * focusable element in the whole document (FindNextTabElement) -- a card
+ * going Down, the footer's last button going Up. Up/Down goes through
+ * dispatch_nav_key and so has that fallback, which for a control at the
+ * top or bottom of a section is common; Left/Right goes through a single
+ * plain ProcessKeyDown with no fallback and so should never escape, and
+ * runs through here anyway rather than trusting that. Landing outside the
+ * pane is the one outcome this function reverts; whatever else the key did
+ * (a slider's own adjustment, a text field's own cursor move) stands. */
+void nav_fire_pane_key(Rml::Context* context, Rml::Input::KeyIdentifier key, bool with_wrap) {
+    Rml::Element* before = context->GetFocusElement();
+    if (with_wrap) {
+        dispatch_nav_key(context, key);
+    } else {
+        context->ProcessKeyDown(key, 0);
+    }
+    Rml::Element* after = context->GetFocusElement();
+    /* Anything outside the pane is an escape, not only a card: the
+     * document-wrap fallback lands Down on the first focusable element
+     * (a card) and Up on the last (the footer's Quit button). */
+    if (before && after && after != before && current_nav_level(context) != NavLevel::Pane) {
+        before->Focus(true);
+    }
+}
+
+/* The settings menu's own direction handling (g_ui.visible), level decided
+ * fresh each call. Left to nav_fire below when only the launcher is up
+ * (g_ui.launcher_visible without g_ui.visible): the launcher has no cards
+ * and no pane, and keeps the flat navigation it always had. */
+void nav_fire_menu(Rml::Context* context, NavDir dir) {
+    if (current_nav_level(context) == NavLevel::Cards) {
+        /* Level 1 with the focus somewhere that is not one of the five cards:
+         * a footer button, or the document itself, which is where RmlUi puts
+         * the focus after a click on empty panel (Context::ProcessMouse
+         * ButtonDown walks up to the first element that accepts focus, and
+         * the body does). settings_model_focus_card and _enter_card both
+         * match the focused element against the five card ids, so without
+         * this every direction would be a no-op and the pad would have no way
+         * back to a card. The active tab's card is where it goes. */
+        Rml::Element* focus = context->GetFocusElement();
+        if (!focus || !focus->IsClassSet("nav-button")) {
+            settings_model_focus_active_tab();
+            return;
+        }
+        switch (dir) {
+        case NavDir::Up:    settings_model_focus_card(-1); return;
+        case NavDir::Down:  settings_model_focus_card(1);  return;
+        case NavDir::Left:  settings_model_cycle_tab(-1);  return;
+        case NavDir::Right: settings_model_cycle_tab(1);   return;
+        default: return;
+        }
+    }
+    switch (dir) {
+    case NavDir::Up:
+    case NavDir::Down:
+        nav_fire_pane_key(context, nav_dir_key(dir), /*with_wrap=*/true);
+        return;
+    case NavDir::Left:
+    case NavDir::Right:
+        nav_fire_pane_key(context, nav_dir_key(dir), /*with_wrap=*/false);
+        return;
+    default:
+        return;
+    }
+}
+
+/* What a single press of `dir` does: moves the select session's highlight
+ * if one is open, otherwise routes to the settings menu's two-level model
+ * while it is up, or dispatches the plain arrow key everywhere else (the
+ * launcher, whose navigation stays flat). Shared by the press edge
+ * (BUTTON_DOWN / an axis crossing its press threshold) and by ui_nav_
+ * tick()'s repeat, so the two can never disagree about what a direction
+ * means. */
+void nav_fire(NavDir dir) {
+    Rml::Context* context = g_ui.context;
+    if (!context) return;
+    if (g_nav_select) {
+        /* An open box owns all four directions, not only the two it acts on:
+         * a Left or Right forwarded to RmlUi would be answered by the pane's
+         * own spatial search, which moves the focus off the <select>, and the
+         * blur that follows closes the box behind the session's back. */
+        if (dir == NavDir::Up || dir == NavDir::Down) select_session_move(dir == NavDir::Down);
+        return;
+    }
+    if (g_ui.visible) {
+        nav_fire_menu(context, dir);
+        return;
+    }
+    dispatch_nav_key(context, nav_dir_key(dir));
+}
+
+void nav_hold_set(NavDir dir, bool held) {
+    NavHold& hold = g_nav_hold[(size_t)dir];
+    if (held && !hold.held) {
+        hold.held = true;
+        hold.next_repeat_at = std::chrono::steady_clock::now() + kNavRepeatDelay;
+        nav_fire(dir);
+    } else if (!held) {
+        hold.held = false;
+    }
+}
+
+void nav_hold_clear_all() {
+    for (NavHold& hold : g_nav_hold) hold.held = false;
+}
+
+bool button_to_navdir(SDL_GamepadButton button, NavDir* out) {
+    switch (button) {
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  *out = NavDir::Left;  return true;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: *out = NavDir::Right; return true;
+    case SDL_GAMEPAD_BUTTON_DPAD_UP:    *out = NavDir::Up;    return true;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  *out = NavDir::Down;  return true;
+    default: return false;
+    }
+}
+
+/* Left-stick axis motion as the same two press/release edges a d-pad button
+ * would produce, with hysteresis: press above kNavAxisPress, release below
+ * kNavAxisRelease, so a stick resting between the two (as one that never
+ * quite recenters will) does not chatter the hold. */
+void axis_edge(NavDir dir, bool press, bool release) {
+    if (press) {
+        nav_hold_set(dir, true);
+    } else if (release) {
+        nav_hold_set(dir, false);
+    }
+    /* Neither: the axis sits in the hysteresis band, and whatever the hold
+     * already was stands. */
 }
 
 } // namespace
@@ -268,22 +612,85 @@ void resolve_menu_hotkey() {
     }
 
     const std::string& gp = rt_settings().input.gamepad[RT_GP_MENU];
-    SDL_GamepadButton button =
-        gp.empty() ? SDL_GAMEPAD_BUTTON_INVALID : SDL_GetGamepadButtonFromString(gp.c_str());
-    if (button == SDL_GAMEPAD_BUTTON_INVALID) {
-        rt_log("ui", "input.gamepad.menu \"%s\" is not an SDL gamepad button name; keeping the default %s",
-            gp.c_str(), SDL_GetGamepadStringForButton(g_menu_button));
+    std::string chord_a, chord_b;
+    if (rt_settings_split_chord(gp, &chord_a, &chord_b)) {
+        const SDL_GamepadButton a = SDL_GetGamepadButtonFromString(chord_a.c_str());
+        const SDL_GamepadButton b = SDL_GetGamepadButtonFromString(chord_b.c_str());
+        if (a == SDL_GAMEPAD_BUTTON_INVALID || b == SDL_GAMEPAD_BUTTON_INVALID) {
+            rt_log("ui", "input.gamepad.menu \"%s\" does not resolve as a chord; keeping the default %s",
+                gp.c_str(), menu_gamepad_name());
+        } else {
+            g_menu_chord[0] = a;
+            g_menu_chord[1] = b;
+        }
     } else {
-        g_menu_button = button;
+        const SDL_GamepadButton button =
+            gp.empty() ? SDL_GAMEPAD_BUTTON_INVALID : SDL_GetGamepadButtonFromString(gp.c_str());
+        if (button == SDL_GAMEPAD_BUTTON_INVALID) {
+            rt_log("ui", "input.gamepad.menu \"%s\" is not an SDL gamepad button name; keeping the default %s",
+                gp.c_str(), menu_gamepad_name());
+        } else {
+            g_menu_chord[0] = button;
+            g_menu_chord[1] = SDL_GAMEPAD_BUTTON_INVALID;
+        }
     }
 
     rt_log("ui", "menu hotkey: keyboard %s, gamepad %s",
-        SDL_GetScancodeName(g_menu_scancode), SDL_GetGamepadStringForButton(g_menu_button));
+        SDL_GetScancodeName(g_menu_scancode), menu_gamepad_name());
 }
 
 const char* menu_hotkey_name() {
     const char* name = SDL_GetScancodeName(g_menu_scancode);
     return name ? name : "";
+}
+
+const char* menu_gamepad_name() {
+    /* SDL's longest button name ("rightpaddle2") is well under half of
+     * this, even doubled with a '+' between the two. */
+    static char buf[64];
+    if (g_menu_chord[1] == SDL_GAMEPAD_BUTTON_INVALID) {
+        const char* name = SDL_GetGamepadStringForButton(g_menu_chord[0]);
+        return name ? name : "";
+    }
+    const char* a = SDL_GetGamepadStringForButton(g_menu_chord[0]);
+    const char* b = SDL_GetGamepadStringForButton(g_menu_chord[1]);
+    std::snprintf(buf, sizeof(buf), "%s+%s", a ? a : "", b ? b : "");
+    return buf;
+}
+
+void ui_nav_tick() {
+    /* Which document the pad is driving: the menu while it is up, the
+     * launcher otherwise, nothing when neither is. Keyed on that rather
+     * than on "anything is up" so a hold or a select session is dropped
+     * when the menu opens over the launcher or closes back onto it too,
+     * not only when everything goes away: a direction still held across
+     * that boundary would otherwise carry on repeating into whichever
+     * document comes next, and a session belongs to the document its
+     * <select> lives in. */
+    static const void* prev_document = nullptr;
+    const void* document = g_ui.visible ? (const void*)g_ui.menu
+                                        : (g_ui.launcher_visible ? (const void*)g_ui.launcher : nullptr);
+    if (document != prev_document) {
+        prev_document = document;
+        nav_hold_clear_all();
+        select_session_end();
+    }
+    if (!document) return;
+
+    if (g_nav_select && g_ui.context->GetFocusElement() != g_nav_select) {
+        /* The select lost focus by some means other than the East/South
+         * handling below (a mouse click elsewhere, Tab, the document itself
+         * losing focus): the session no longer means anything. */
+        select_session_end();
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < (size_t)NavDir::Count; ++i) {
+        NavHold& hold = g_nav_hold[i];
+        if (!hold.held || now < hold.next_repeat_at) continue;
+        hold.next_repeat_at = now + kNavRepeatInterval;
+        nav_fire((NavDir)i);
+    }
 }
 
 } // namespace rtui
@@ -303,6 +710,17 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
      * that the press being bound does not click whatever is under the
      * pointer. rebind_active() also covers the moment after a mouse capture
      * has ended while the release of the press it accepted is still owed. */
+    if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        /* Nothing here consumes this: host/input.cpp's own rt_input_on_sdl_
+         * event (called first by the pump) decides whether another pad
+         * takes over. This side effect only keeps a hold or a select session
+         * from surviving the pad it was reading. Ahead of the capture below,
+         * which does consume this event for a gamepad capture: after it, a
+         * direction held when the pad was pulled would keep repeating. */
+        nav_hold_clear_all();
+        select_session_end();
+    }
+
     if (rebind_active() && rebind_handle_sdl_event(e)) return true;
 
     /* The hotkey is looked at whether the menu is up or not, and is consumed
@@ -315,9 +733,21 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
     case SDL_EVENT_KEY_DOWN:
         if (!e.key.repeat && e.key.scancode == g_menu_scancode) return toggle_menu();
         break;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        if (SDL_GamepadButton(e.gbutton.button) == g_menu_button) return toggle_menu();
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        const SDL_GamepadButton button = SDL_GamepadButton(e.gbutton.button);
+        if (g_menu_chord[1] == SDL_GAMEPAD_BUTTON_INVALID) {
+            if (button == g_menu_chord[0]) return toggle_menu();
+        } else if (button == g_menu_chord[0] || button == g_menu_chord[1]) {
+            /* Chord: the other half has to already be held, so the toggle
+             * fires exactly once, on whichever half completes the pair, in
+             * either order. */
+            const SDL_GamepadButton other = (button == g_menu_chord[0]) ? g_menu_chord[1] : g_menu_chord[0];
+            if (SDL_Gamepad* gp = SDL_GetGamepadFromID(e.gbutton.which)) {
+                if (SDL_GetGamepadButton(gp, other)) return toggle_menu();
+            }
+        }
         break;
+    }
     default:
         break;
     }
@@ -330,8 +760,58 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
     Rml::Context* context = g_ui.context;
     switch (e.type) {
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        ensure_document_focus(context);
         const SDL_GamepadButton button = SDL_GamepadButton(e.gbutton.button);
-        if (button == SDL_GAMEPAD_BUTTON_EAST) return close_menu();
+
+        if (button == SDL_GAMEPAD_BUTTON_EAST) {
+            if (g_nav_select) {
+                g_nav_select->Click(); /* closes the open box, no value change */
+                select_session_end();
+                return true;
+            }
+            /* The settings menu's level 2: East backs out to level 1 (the
+             * card for the tab that is still showing) rather than closing
+             * the menu. A second East from there falls through to the
+             * close below, since current_nav_level() now reads Cards. */
+            if (g_ui.visible && current_nav_level(context) == NavLevel::Pane) {
+                settings_model_focus_active_tab();
+                return true;
+            }
+            /* Forced: East closes the menu even out of a focused text field,
+             * unlike the keyboard's Escape (see close_menu's comment). */
+            return close_menu(/*force=*/true);
+        }
+        if (button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER || button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) {
+            settings_model_cycle_tab(button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER ? 1 : -1);
+            return true;
+        }
+
+        NavDir dir = NavDir::Count;
+        if (button_to_navdir(button, &dir)) {
+            nav_hold_set(dir, true);
+            return true;
+        }
+
+        if (button == SDL_GAMEPAD_BUTTON_SOUTH) {
+            Rml::Element* focus = context->GetFocusElement();
+            /* The settings menu's level 1: South enters the focused card,
+             * making its tab active (if it was not already) and moving
+             * focus into the now-visible pane (level 2). */
+            if (focus && focus->IsClassSet("nav-button")) {
+                settings_model_enter_card();
+                return true;
+            }
+            if (focus && focus->GetTagName() == "select" && !focus->IsPseudoClassSet("disabled")) {
+                if (g_nav_select == focus) {
+                    select_session_commit();
+                } else {
+                    select_session_begin(focus);
+                    focus->Click(); /* opens the box */
+                }
+                return true;
+            }
+        }
+
         const Rml::Input::KeyIdentifier key = convert_gamepad_button(button);
         if (key == Rml::Input::KI_UNKNOWN) return false;
         /* Every Rml::Context::Process* below is negated. RmlUi's convention
@@ -353,9 +833,24 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
         return consumed;
     }
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
-        const Rml::Input::KeyIdentifier key = convert_gamepad_button(SDL_GamepadButton(e.gbutton.button));
+        const SDL_GamepadButton button = SDL_GamepadButton(e.gbutton.button);
+        NavDir dir = NavDir::Count;
+        if (button_to_navdir(button, &dir)) {
+            nav_hold_set(dir, false);
+            return true;
+        }
+        const Rml::Input::KeyIdentifier key = convert_gamepad_button(button);
         if (key == Rml::Input::KI_UNKNOWN) return false;
         return !context->ProcessKeyUp(key, 0);
+    }
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        if (e.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTX && e.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTY) return false;
+        ensure_document_focus(context);
+        const bool vertical = e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+        const Sint16 v = e.gaxis.value;
+        axis_edge(vertical ? NavDir::Up : NavDir::Left, v <= -kNavAxisPress, v > -kNavAxisRelease);
+        axis_edge(vertical ? NavDir::Down : NavDir::Right, v >= kNavAxisPress, v < kNavAxisRelease);
+        return false; /* the game does not read gamepad axis events either way */
     }
     case SDL_EVENT_MOUSE_MOTION: {
         int x = 0, y = 0;

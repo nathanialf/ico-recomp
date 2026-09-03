@@ -152,6 +152,10 @@ bool rt_intc_get_eie();
 uint32_t rt_cop0_status_word();
 bool rt_in_interrupt();
 
+/* The context whose registers describe the guest code running right now:
+ * the interrupt context while a handler runs, else the scheduled thread. */
+R5900Context* rt_fault_ctx();
+
 int rt_intc_add_handler(int cause, uint32_t vram, int next, uint32_t gp);
 int rt_intc_remove_handler(int cause, int hid);
 int rt_intc_enable(int cause);

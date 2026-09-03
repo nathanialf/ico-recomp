@@ -87,6 +87,12 @@ void RtPgs::fatalf(const char* fmt, ...) {
 }
 
 RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(host) {
+    /* The window this constructor is about to create belongs to this thread
+     * for the rest of the run: SDL's event queue is per thread on Windows,
+     * so every later SDL call has to come from here. on_owner_thread() is
+     * the test, and the WSI platform uses it to decide whether it may poll
+     * at all. See the threads section of gs_parallel_api.h. */
+    m_owner_thread = std::this_thread::get_id();
     m_have_opts = opts != nullptr;
     if (m_have_opts) {
         m_opts = *opts;
@@ -328,12 +334,14 @@ void RtPgs::report_stats() {
 
 void RtPgs::present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
                             uint64_t* present_ns, uint64_t* fields) {
-    if (flush_ns) *flush_ns = m_flush_ns;
-    if (scanout_ns) *scanout_ns = m_scanout_ns;
-    if (present_ns) *present_ns = m_present_ns;
-    if (fields) *fields = m_timing_fields;
-    m_flush_ns = 0;
-    m_scanout_ns = 0;
-    m_present_ns = 0;
-    m_timing_fields = 0;
+    /* Read and cleared in one step each: the writer is the GS consumer
+     * thread and it does not stop for this. */
+    const uint64_t flush = m_flush_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t scanout = m_scanout_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t present = m_present_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t n = m_timing_fields.exchange(0, std::memory_order_relaxed);
+    if (flush_ns) *flush_ns = flush;
+    if (scanout_ns) *scanout_ns = scanout;
+    if (present_ns) *present_ns = present;
+    if (fields) *fields = n;
 }

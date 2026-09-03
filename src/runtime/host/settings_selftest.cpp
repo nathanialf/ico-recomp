@@ -260,6 +260,7 @@ int main() {
         m.debug.fps_limit_hz = 0.0;
         m.display.render_scale = 4;
         m.input.keyboard[RT_KB_MENU] = "F2";
+        m.input.gamepad[RT_GP_MENU] = "back+start";
         m.gameplay.run_any_direction = true;
         rt_settings_commit();
 
@@ -271,6 +272,7 @@ int main() {
         CHECK(s.debug.fps_limit_hz == 0.0);
         CHECK(s.display.render_scale == 4);
         CHECK(s.input.keyboard[RT_KB_MENU] == "F2");
+        CHECK(s.input.gamepad[RT_GP_MENU] == "back+start");
         CHECK(s.gameplay.run_any_direction == true);
     }
     { /* 8. unknown-key preservation across load/save */
@@ -880,6 +882,132 @@ int main() {
         rt_settings_init();
         CHECK(rt_settings().display.deinterlace == RtDeinterlace::Bob);
         CHECK(rt_settings().display.show_fps);
+    }
+
+    { /* 39. rt_settings_split_chord's grammar: exactly one interior '+',
+       * neither half ending in '+' or '-' (that suffix is the axis-
+       * direction convention and must never be mistaken for a chord). */
+        std::string a, b;
+        CHECK(rt_settings_split_chord("back+start", &a, &b));
+        CHECK(a == "back" && b == "start");
+        CHECK(!rt_settings_split_chord("lefttrigger+", &a, &b));  /* axis, not a chord */
+        CHECK(!rt_settings_split_chord("righttrigger-", &a, &b)); /* axis, not a chord */
+        CHECK(!rt_settings_split_chord("+start", &a, &b));        /* empty first half */
+        CHECK(!rt_settings_split_chord("back+", &a, &b));         /* empty second half */
+        CHECK(!rt_settings_split_chord("a+b+c", &a, &b));         /* two interior '+'s */
+        CHECK(!rt_settings_split_chord("back+start-", &a, &b));   /* second half ends in a direction suffix */
+        CHECK(!rt_settings_split_chord("start", &a, &b));         /* no '+' at all */
+        CHECK(!rt_settings_split_chord("Keypad +", &a, &b));      /* trailing '+', same shape as an axis */
+    }
+    { /* 40. the keyboard table is never chord-parsed: "Keypad +" is a
+       * legitimate SDL scancode name, and BindTable::chords is false for
+       * RT_BIND_KEYBOARD, so rules 3 and 4 never even look at it. A name
+       * that happens to look chord-shaped on the keyboard commits
+       * untouched, the same as any other scancode name. */
+        std::string path = scratch + "/chord_keyboard.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        rt_settings_mutable().input.keyboard[RT_KB_L2] = "Keypad +";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_L2] == "Keypad +");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+
+        rt_settings_mutable().input.keyboard[RT_KB_L3] = "F1+F2";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.keyboard[RT_KB_L3] == "F1+F2");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 41. rule 1 (menu key vs. an ordinary pad binding) is skipped whole
+       * when the menu slot holds a chord. bind_name_equal compares the two
+       * slots' whole strings, not the chord's parts against them, so
+       * "back+start" in the menu slot is never equal to "back" or "start"
+       * held by the compiled-in select/start slots -- with or without the
+       * skip, rule 1 never fires there and that scenario proves nothing.
+       * The only string that can ever match a menu-slot chord is the
+       * identical chord string in another slot. Build that: a chord that
+       * arrives from the settings file into an ordinary slot survives load
+       * untouched (rule 3 only reverts a slot the running commit itself
+       * moved) and log_bind_duplicates reports it once; committing that
+       * same chord string onto gamepad.menu then makes bind_name_equal
+       * true for rule 1, and it must still be accepted because
+       * menu_is_chord skips rule 1 whole. */
+        std::string path = scratch + "/menuchord.json";
+        write_file(path,
+            "{\"version\": 1, \"input\": {\"gamepad\": {\"cross\": \"back+start\", \"menu\": \"guide\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(rt_settings().input.gamepad[RT_GP_CROSS] == "back+start");
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == "guide");
+        CHECK(log_has("input.gamepad.cross = \"back+start\" is a chord"));
+
+        rt_settings_mutable().input.gamepad[RT_GP_MENU] = "back+start";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == "back+start");
+        CHECK(rt_settings().input.gamepad[RT_GP_CROSS] == "back+start");
+        CHECK(std::string(rt_settings_last_reject()).empty());
+    }
+    { /* 42. rule 3: a chord anywhere but the menu slot reverts at commit,
+       * and one that arrives in the file is reported once at load and then
+       * left alone -- the same load-once, commit-silent shape as case 26's
+       * menu-key collision. */
+        std::string path = scratch + "/chord_wrong_slot.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        const std::string up_default = rt_settings().input.gamepad[RT_GP_UP];
+
+        rt_settings_mutable().input.gamepad[RT_GP_UP] = "dpup+dpdown";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.gamepad[RT_GP_UP] == up_default);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+
+        std::string file_path = scratch + "/chord_wrong_slot_file.json";
+        write_file(file_path, "{\"version\": 1, \"input\": {\"gamepad\": {\"up\": \"dpup+dpdown\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", file_path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(rt_settings().input.gamepad[RT_GP_UP] == "dpup+dpdown");
+        CHECK(log_has("input.gamepad.up = \"dpup+dpdown\" is a chord"));
+
+        rt_settings_mutable().audio.master_volume = 62;
+        rt_settings_commit(false);
+        CHECK(std::string(rt_settings_last_reject()).empty());
+        CHECK(rt_settings().input.gamepad[RT_GP_UP] == "dpup+dpdown");
+    }
+    { /* 43. rule 4: a chord whose two parts are the same button is not
+       * two buttons at all. */
+        std::string path = scratch + "/chord_equal.json";
+        set_env("ICORECOMP_SETTINGS", path.c_str());
+        rt_settings_init();
+        const std::string menu_default = rt_settings().input.gamepad[RT_GP_MENU];
+
+        rt_settings_mutable().input.gamepad[RT_GP_MENU] = "start+start";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == menu_default);
+        CHECK(!std::string(rt_settings_last_reject()).empty());
+
+        /* Case only, rejected the same way as every other equality check in
+         * this file. */
+        rt_settings_mutable().input.gamepad[RT_GP_MENU] = "Start+START";
+        rt_settings_commit(false);
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == menu_default);
+
+        /* The load-time twin, the same load-once, commit-silent shape rule 3
+         * has: one that arrives in the file keeps its value and is reported
+         * once, because the commit rule only reverts a slot the running
+         * commit itself moved. */
+        std::string file_path = scratch + "/chord_equal_file.json";
+        write_file(file_path, "{\"version\": 1, \"input\": {\"gamepad\": {\"menu\": \"start+start\"}}}\n");
+        set_env("ICORECOMP_SETTINGS", file_path.c_str());
+        log_clear();
+        rt_settings_init();
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == "start+start");
+        CHECK(log_has("chords a button with itself"));
+
+        rt_settings_mutable().audio.master_volume = 41;
+        rt_settings_commit(false);
+        CHECK(std::string(rt_settings_last_reject()).empty());
+        CHECK(rt_settings().input.gamepad[RT_GP_MENU] == "start+start");
     }
 
     unset_env("ICORECOMP_SETTINGS");

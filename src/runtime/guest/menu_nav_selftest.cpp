@@ -43,6 +43,7 @@
 #include "guest/ico_syms.h"
 #include "guest/menu_nav.h"
 #include "host/input.h"
+#include "recomp_api.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -57,7 +58,10 @@
 /* rt_gptr (ee/kernel.h) indexes this; mem.cpp owns it in the real runtime.
  * The harness maps the pages the tables fall in and leaves the rest null,
  * which is exactly the "before the ELF is loaded" state the reader has to
- * cope with. */
+ * cope with. The recomp_api.h include above is required, not decorative: it
+ * declares g_pages inside extern "C", and without it this definition gets
+ * plain C++ linkage, which MSVC mangles and GCC does not, leaving
+ * add_layout_items unable to find the symbol under MSVC. */
 uint8_t* g_pages[0x10000];
 
 namespace {

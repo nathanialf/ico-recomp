@@ -377,6 +377,7 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
  * since there is no scanout-producing caller to do it afterwards. */
 uint32_t RtPgs::present_ui_windowed() {
     uint32_t flags = 0;
+    m_platform->sync_from_host();
     if (!m_platform->presentable()) {
         /* Same reasoning as present_frame: begin_frame() would park the
          * calling thread while minimized, so poll here instead. */
@@ -429,8 +430,8 @@ uint32_t RtPgs::present_ui_windowed() {
 
     /* Same window-closed bookkeeping present() does around present_frame,
      * inlined here since rt_pgs_present_ui has no separate wrapper. */
-    if (!m_platform->alive(*m_wsi)) m_window_closed = true;
-    if (m_window_closed) flags |= RT_PGS_VSYNC_WINDOW_CLOSED;
+    if (!m_platform->alive(*m_wsi)) m_window_closed.store(true, std::memory_order_release);
+    if (m_window_closed.load(std::memory_order_acquire)) flags |= RT_PGS_VSYNC_WINDOW_CLOSED;
     return flags;
 }
 

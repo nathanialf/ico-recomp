@@ -162,6 +162,10 @@ void rt_intc_set_eie(bool on) {
 bool rt_intc_get_eie() { return g_eie; }
 bool rt_in_interrupt() { return g_in_interrupt; }
 
+R5900Context* rt_fault_ctx() {
+    return g_in_interrupt ? &g_int_ctx : rt_sched_current_ctx();
+}
+
 /* COP0 Status for mfc0 $12: EIE is bit 16, IE is bit 0 (EE Core manual
  * layout; both must be set for interrupts). */
 uint32_t rt_cop0_status_word() {

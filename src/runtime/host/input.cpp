@@ -31,6 +31,14 @@ bool g_inited = false;
 
 RtPadState g_state;             /* port 0; port 1 never has a controller */
 uint8_t g_act_small = 0, g_act_big = 0;
+/* rt_input_set_actuators: the first 8 rumble changes are logged by
+ * default (enough to see a cue land). That function already logs nothing
+ * when the motor state is unchanged, and the game re-sends the same state
+ * every field while a rumble is active, but a title that ramps or pulses
+ * can still change it every field for seconds, so this caps the default
+ * channel too. rt_verbose("input") keeps every change. */
+constexpr uint32_t kRumbleLogCap = 8;
+uint32_t g_rumble_logged = 0;
 
 /* The device the player last used, and the only state behind
  * rt_input_last_device(). It boots as the controller by decision, so a run
@@ -148,22 +156,34 @@ bool sdl_active() {
     return SDL_WasInit(SDL_INIT_VIDEO) != 0;
 }
 
-void sdl_probe() {
+/* Opens `id`, replacing whatever g_gamepad already holds (the caller has
+ * either checked that it is null or is deliberately replacing it). Logs the
+ * name, or "(open failed)" the same way the pre-hot-plug probe did. */
+void open_gamepad(SDL_JoystickID id) {
+    g_gamepad = SDL_OpenGamepad(id);
+    rt_log("input", "SDL gamepad: %s", g_gamepad ? SDL_GetGamepadName(g_gamepad) : "(open failed)");
+}
+
+/* SDL_INIT_GAMEPAD plus the first-attached open, once. Split out of the old
+ * sdl_probe() so rt_input_sdl_gamepad_probe() (below) can call it from
+ * rt_ui_init(), ahead of rt_input_init()/rt_pad_register_services(): the
+ * launcher runs before the pad HLE registers, and it needs pad focus and
+ * button events of its own. */
+void gamepad_subsystem_init() {
     if (g_sdl_probed) return;
     g_sdl_probed = true;
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         rt_log("input", "SDL gamepad subsystem init failed: %s (keyboard only)", SDL_GetError());
-    } else {
-        int count = 0;
-        SDL_JoystickID* ids = SDL_GetGamepads(&count);
-        if (ids && count > 0) {
-            g_gamepad = SDL_OpenGamepad(ids[0]);
-            rt_log("input", "SDL gamepad: %s", g_gamepad ? SDL_GetGamepadName(g_gamepad) : "(open failed)");
-        } else {
-            rt_log("input", "SDL: no gamepad detected; keyboard map active (see host/input.h)");
-        }
-        SDL_free(ids);
+        return;
     }
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    if (ids && count > 0) {
+        open_gamepad(ids[0]);
+    } else {
+        rt_log("input", "SDL: no gamepad detected; keyboard map active (see host/input.h)");
+    }
+    SDL_free(ids);
 }
 
 uint8_t axis_to_u8(Sint16 v) {
@@ -288,6 +308,16 @@ bool split_axis_name(const std::string& name, std::string* token, int* dir) {
 }
 
 bool resolve_pad_name(const std::string& name, PadBind* out) {
+    /* A chord ("back+start") is only meaningful for input.gamepad.menu,
+     * which ui_events.cpp resolves on its own; this table serves only the
+     * sixteen ordinary DS2 bits, so a chord-shaped name here can never be
+     * valid input. settings.cpp's validate_binds rule 3 already reverts one
+     * that reaches a pad-bit slot through the menu, so this is the
+     * defensive twin for a file that was hand-edited (and so never
+     * committed) or loaded before the very first commit runs. */
+    std::string chord_a, chord_b;
+    if (rt_settings_split_chord(name, &chord_a, &chord_b)) return false;
+
     std::string token;
     int dir = 0;
     if (split_axis_name(name, &token, &dir)) {
@@ -474,7 +504,7 @@ void mouse_events_drop() {
 }
 
 void sdl_poll(uint64_t field) {
-    sdl_probe();
+    gamepad_subsystem_init();
     sync_tables();
 
     const RtSettings& cfg = rt_settings();
@@ -786,6 +816,57 @@ void rt_input_poll(uint64_t field) {
 
 RtInputDevice rt_input_last_device() { return g_last_device; }
 
+void rt_input_sdl_gamepad_probe() {
+#ifdef ICORECOMP_PGS_SDL
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
+    gamepad_subsystem_init();
+#endif
+}
+
+#ifdef ICORECOMP_PGS_SDL
+void rt_input_on_sdl_event(const SDL_Event& e) {
+    /* A scripted run has no devices to watch (see host/input.h) and must
+     * stay bit-identical; it also never brings the UI up, so this would
+     * never fire in practice, but the guard is cheap and makes the
+     * contract explicit rather than accidental. */
+    if (g_provider == Provider::Script) return;
+
+    switch (e.type) {
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        const SDL_JoystickID id = e.gdevice.which;
+        /* SDL3 also reports every pad already attached at init as ADDED;
+         * SDL_GetGamepadFromID answering non-null is what tells that apart
+         * from a fresh attach, so this does not reopen the one already
+         * open. */
+        if (SDL_GetGamepadFromID(id)) return;
+        if (g_gamepad) {
+            SDL_Gamepad* candidate = SDL_OpenGamepad(id);
+            const char* name = candidate ? SDL_GetGamepadName(candidate) : nullptr;
+            rt_log("input", "SDL gamepad attached: %s; keeping %s",
+                name ? name : "(open failed)", SDL_GetGamepadName(g_gamepad));
+            if (candidate) SDL_CloseGamepad(candidate);
+            return;
+        }
+        open_gamepad(id);
+        break;
+    }
+    case SDL_EVENT_GAMEPAD_REMOVED: {
+        if (!g_gamepad || SDL_GetGamepadID(g_gamepad) != e.gdevice.which) return;
+        rt_log("input", "SDL gamepad removed: %s", SDL_GetGamepadName(g_gamepad));
+        SDL_CloseGamepad(g_gamepad);
+        g_gamepad = nullptr;
+        int count = 0;
+        SDL_JoystickID* ids = SDL_GetGamepads(&count);
+        if (ids && count > 0) open_gamepad(ids[0]);
+        SDL_free(ids);
+        break;
+    }
+    default:
+        break;
+    }
+}
+#endif
+
 bool rt_input_sdl_active() {
 #ifdef ICORECOMP_PGS_SDL
     return g_inited && g_provider == Provider::Sdl && sdl_active();
@@ -807,7 +888,11 @@ bool rt_input_get(int port, RtPadState* out) {
 void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor) {
     if (port != 0) return;
     if (small_motor != g_act_small || big_motor != g_act_big) {
-        rt_log("input", "rumble: small=%u big=%u", small_motor, big_motor);
+        const bool within_cap = g_rumble_logged < kRumbleLogCap;
+        if (within_cap) ++g_rumble_logged;
+        if (within_cap || rt_verbose("input")) {
+            rt_log("input", "rumble: small=%u big=%u", small_motor, big_motor);
+        }
         g_act_small = small_motor;
         g_act_big = big_motor;
     }

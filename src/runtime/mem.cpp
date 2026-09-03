@@ -10,7 +10,8 @@
  *   0xA0000000-0xA1FFFFFF  RAM alias (kseg1, uncached)
  *   0x70000000-0x7000FFFF  scratchpad (16 KB architectural, see below)
  *   0x11000000-0x1100FFFF  VU0/VU1 micro+data memory window (see below)
- *   0x10xxxxxx, 0x12xxxxxx MMIO; left NULL, routed to rt_mmio_*
+ *   0x10xxxxxx, 0x12xxxxxx MMIO; left NULL, routed to rt_mmio_*, which is
+ *                          fatal for any other NULL-page address (mmio.cpp)
  *
  * Deviation / documented tradeoff -- scratchpad:
  *   The page table is 64 KB-granular but the EE scratchpad (SPR) is only

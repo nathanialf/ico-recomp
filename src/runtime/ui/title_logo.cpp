@@ -100,6 +100,9 @@
  */
 #include "title_logo.h"
 
+#include "data_df.h"
+#include "raster_edge.h"
+
 #include "../host/inflate.h"
 #include "../host/portable.h"
 #include "../iso/iso9660.h"
@@ -131,8 +134,6 @@ constexpr uint32_t kGeometryVersion = 5;
 
 constexpr char kMagic[8] = {'I', 'C', 'O', 'L', 'O', 'G', 'O', '\0'};
 
-constexpr size_t kOuterEntrySize = 40;
-constexpr size_t kOuterNameBytes = 32;
 constexpr size_t kInnerHeaderBytes = 32;
 constexpr size_t kInnerEntrySize = 548;
 constexpr size_t kInnerNameBytes = 512;
@@ -200,31 +201,6 @@ uint16_t rd_u16(const uint8_t* p) {
     return uint16_t(uint32_t(p[0]) | (uint32_t(p[1]) << 8));
 }
 
-/* ---- disc reads ---------------------------------------------------------- */
-
-/* Reads [offset, offset + length) of DATA.DF, which the ISO reader only
- * offers in whole 2048-byte sectors. */
-bool read_data_df(const RtIsoFile& file, uint64_t offset, size_t length, std::vector<uint8_t>& out,
-                  char* err, size_t err_len) {
-    if (offset > file.size || length > file.size - offset) {
-        set_err(err, err_len, "DATA.DF range [%llu, +%zu) is outside the file's %u bytes",
-            (unsigned long long)offset, length, file.size);
-        return false;
-    }
-    const uint32_t first = uint32_t(offset / 2048);
-    const uint32_t skip = uint32_t(offset % 2048);
-    const uint32_t sectors = uint32_t((skip + length + 2047) / 2048);
-
-    std::vector<uint8_t> raw(size_t(sectors) * 2048);
-    const uint32_t got = rt_iso_read_sectors(file.lsn + first, sectors, raw.data());
-    if (got != sectors) {
-        set_err(err, err_len, "read %u of %u sectors at LSN %u", got, sectors, file.lsn + first);
-        return false;
-    }
-    out.assign(raw.begin() + skip, raw.begin() + skip + length);
-    return true;
-}
-
 /* ---- container tables ---------------------------------------------------- */
 
 struct InnerEntry {
@@ -232,36 +208,6 @@ struct InnerEntry {
     uint32_t offset = 0;
     uint32_t next_size = 0;
 };
-
-/* Finds one outer entry by name (exact, the stored name is uppercase ASCII).
- * The outer table is the first bytes of DATA.DF. */
-bool find_outer_entry(const RtIsoFile& file, const char* name, uint32_t* offset, uint32_t* size,
-                      char* err, size_t err_len) {
-    std::vector<uint8_t> head;
-    if (!read_data_df(file, 0, 2048, head, err, err_len)) return false;
-    const uint32_t count = rd_u32(head.data());
-    if (count == 0 || count > 4096) {
-        set_err(err, err_len, "DATA.DF outer table declares %u entries", count);
-        return false;
-    }
-    const size_t table_bytes = 4 + size_t(count) * kOuterEntrySize;
-    if (!read_data_df(file, 0, table_bytes, head, err, err_len)) return false;
-
-    for (uint32_t i = 0; i < count; ++i) {
-        const uint8_t* e = head.data() + 4 + size_t(i) * kOuterEntrySize;
-        char stored[kOuterNameBytes + 1];
-        std::memcpy(stored, e, kOuterNameBytes);
-        stored[kOuterNameBytes] = 0;
-        if (std::strcmp(stored, name) != 0) continue;
-        *offset = rd_u32(e + kOuterNameBytes);
-        *size = rd_u32(e + kOuterNameBytes + 4);
-        rt_log("ui", "title logo: DATA.DF outer table has %u entries; %s at offset %u, %u bytes",
-            count, name, *offset, *size);
-        return true;
-    }
-    set_err(err, err_len, "DATA.DF has no outer entry named %s (%u entries scanned)", name, count);
-    return false;
-}
 
 /* Parses the inflated archive's own table. `image` may be a prefix of the
  * archive as long as it covers the table. */
@@ -527,25 +473,8 @@ bool parse_bga_nodes(const uint8_t* d, size_t len, TitleNode out[kLetterCount], 
 }
 
 /* ---- rasteriser ---------------------------------------------------------- */
-
-/* Twice the signed area of the triangle (a, b, c), positive for a clockwise
- * winding in the y-down space the raster works in. Doubles because the inputs
- * are pixel coordinates that can reach a few thousand and the sign has to be
- * exact for the fill rule below. */
-double orient2d(double ax, double ay, double bx, double by, double cx, double cy) {
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-}
-
-/* The GS's fill rule: a pixel belongs to the triangle whose interior contains
- * its centre, and a centre exactly on an edge belongs to the triangle for
- * which that edge is a top or a left one. For the positive winding above, an
- * edge (a, b) is top when it is horizontal with b to the right of a, and left
- * when it runs upward (b.y < a.y). The two triangles sharing an edge see it in
- * opposite directions, so exactly one of them claims such a centre: no seam
- * and no double coverage. */
-bool top_left(double ax, double ay, double bx, double by) {
-    return (ay == by && bx > ax) || (by < ay);
-}
+/* orient2d and the top-left fill rule live in raster_edge.h, shared with
+ * ui/ps2_icon_render.cpp's rasteriser. */
 
 /* Fills one triangle into a binary mask at the output resolution. No coverage
  * blending anywhere: the hardware draws these polygons with antialiasing off,
@@ -553,7 +482,7 @@ bool top_left(double ax, double ay, double bx, double by) {
 void fill_triangle(std::vector<uint8_t>& mask, uint32_t mw, uint32_t mh, const double vx[3],
                    const double vy[3]) {
     double ax = vx[0], ay = vy[0], bx = vx[1], by = vy[1], cx = vx[2], cy = vy[2];
-    const double area = orient2d(ax, ay, bx, by, cx, cy);
+    const double area = rt_orient2d(ax, ay, bx, by, cx, cy);
     if (area == 0.0) return; /* degenerate: no pixel centre can be inside it */
     if (area < 0.0) {
         std::swap(bx, cx);
@@ -576,18 +505,18 @@ void fill_triangle(std::vector<uint8_t>& mask, uint32_t mw, uint32_t mh, const d
     const int y_lo = int(std::max(fy_lo, 0.0));
     const int y_hi = int(std::min(fy_hi, last_y));
 
-    const bool tl0 = top_left(ax, ay, bx, by);
-    const bool tl1 = top_left(bx, by, cx, cy);
-    const bool tl2 = top_left(cx, cy, ax, ay);
+    const bool tl0 = rt_top_left(ax, ay, bx, by);
+    const bool tl1 = rt_top_left(bx, by, cx, cy);
+    const bool tl2 = rt_top_left(cx, cy, ax, ay);
 
     for (int y = y_lo; y <= y_hi; ++y) {
         const double py = double(y) + 0.5;
         uint8_t* row = mask.data() + size_t(y) * mw;
         for (int x = x_lo; x <= x_hi; ++x) {
             const double px = double(x) + 0.5;
-            const double w0 = orient2d(ax, ay, bx, by, px, py);
-            const double w1 = orient2d(bx, by, cx, cy, px, py);
-            const double w2 = orient2d(cx, cy, ax, ay, px, py);
+            const double w0 = rt_orient2d(ax, ay, bx, by, px, py);
+            const double w1 = rt_orient2d(bx, by, cx, cy, px, py);
+            const double w2 = rt_orient2d(cx, cy, ax, ay, px, py);
             if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0) continue;
             if ((w0 == 0.0 && !tl0) || (w1 == 0.0 && !tl1) || (w2 == 0.0 && !tl2)) continue;
             row[x] = 1;
@@ -920,7 +849,7 @@ bool locate(const std::vector<InnerEntry>& entries, size_t total, WantedFile& w,
 bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], char* err,
              size_t err_len) {
     uint32_t archive_offset = 0, archive_size = 0;
-    if (!find_outer_entry(data_df, kArchiveName, &archive_offset, &archive_size, err, err_len)) {
+    if (!rt_data_df_find(data_df, kArchiveName, &archive_offset, &archive_size, err, err_len)) {
         return false;
     }
     if (archive_size == 0 || archive_size > kMaxArchiveBytes) {
@@ -931,7 +860,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> compressed;
-    if (!read_data_df(data_df, archive_offset, archive_size, compressed, err, err_len)) return false;
+    if (!rt_data_df_read(data_df, archive_offset, archive_size, compressed, err, err_len)) return false;
     rt_log("ui", "title logo: read %u compressed bytes of %s in %.1f ms", archive_size, kArchiveName,
         ms_since(t0));
 
@@ -1097,10 +1026,7 @@ bool ensure_geometry(char* err, size_t err_len) {
         return false;
     }
     RtIsoFile data_df;
-    if (!rt_iso_search("/DFDATAS/DATA.DF", &data_df)) {
-        set_err(err, err_len, "the mounted disc has no DFDATAS/DATA.DF");
-        return false;
-    }
+    if (!rt_data_df_open(&data_df, err, err_len)) return false;
 
     const uint64_t key = disc_key(data_df);
     const auto t0 = std::chrono::steady_clock::now();

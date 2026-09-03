@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+namespace Rml { class DataModelHandle; }
+
 #ifdef ICORECOMP_PGS_SDL
 /* Declared, not included, for the same reason ui.h declares it: this header
  * is included by files that see no SDL. SDL3/SDL.h's own typedef agrees with
@@ -320,6 +322,80 @@ const char* bind_device_name(RtBindDevice device);
  * only from ui_rebind.cpp. */
 void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const std::string& status);
 
+/* Focuses the nav button for whichever tab active_tab currently names
+ * ("nav-display" .. "nav-debug" in menu.rml). Called from rt_ui_set_
+ * visible(true) after Show(): Show()'s own FocusFlag::Auto default focuses
+ * the first tab-index element in document order (always the Display tab),
+ * which is wrong whenever the menu was left open on a different tab last
+ * time. Also called by settings_model_cycle_tab below, after it moves the
+ * tab, so the pad's focus ring always sits on the tab actually showing. */
+void settings_model_focus_active_tab();
+
+/* Steps active_tab by +1 or -1 through the five tabs, wrapping, dirties it,
+ * and focuses the new tab's nav button. A no-op while the menu is not open
+ * (the launcher has no tabs). Called from ui_events.cpp's gamepad shoulder
+ * handling (L1/R1), and from its level-1 Left/Right (the two-level pad
+ * model below). */
+void settings_model_cycle_tab(int direction);
+
+/* ---- two-level pad model (menu.rml's cards column + its pane) ------------
+ *
+ * ui_events.cpp decides which of the two levels a gamepad direction or
+ * South applies to by walking up from whatever has focus (a .nav-button
+ * ancestor means level 1, a .pane ancestor means level 2), never from state
+ * of its own, so a mouse click can never leave the two disagreeing. These
+ * three are what level 1 needs beyond settings_model_cycle_tab (Left/Right)
+ * and settings_model_focus_active_tab (East, going back from level 2).
+ */
+
+/* Moves the pad's focus ring by +1 or -1 among the five cards, from
+ * whichever one currently has focus, wrapping at the ends. Unlike
+ * settings_model_cycle_tab, this never touches active_tab or which pane is
+ * showing: it is level 1's Up/Down, which only relocates the cursor among
+ * the cards. A no-op if focus is not currently on one of the five cards
+ * (ui_events.cpp only calls it once it already knows that). */
+void settings_model_focus_card(int direction);
+
+/* Level 1's South: makes the focused card's tab the active one, if it
+ * differs, and queues the move into the now-visible pane for settings_
+ * model_post_update() below. A no-op if focus is not currently on one of
+ * the five cards. */
+void settings_model_enter_card();
+
+/* The queued half of settings_model_enter_card: focuses the first focusable
+ * control in the pane. Called from rt_ui_tick after Rml::Context::Update(),
+ * and only from there, because that is the call that re-runs the data-if
+ * deciding which .section is displayed. Doing it inside enter_card would
+ * walk the pane one field stale. A no-op with nothing queued or with the
+ * menu not up. */
+void settings_model_post_update();
+
+/* Focuses the first element inside the visible pane (menu.rml's <div
+ * id="pane">, the one .section a data-if is currently showing) that has
+ * tab-index: auto -- a pre-order walk of the pane's descendants, skipping
+ * every subtree whose own display is none (a hidden .section, or anything
+ * else data-if or a style rule hid), stopping at the first element that is
+ * both visible and focusable by RmlUi's own definition (ElementDocument.cpp
+ * CanFocusElement: visible, focus != none, tab-index: auto). Called by
+ * settings_model_enter_card above; a no-op if the pane has nothing
+ * focusable (should not happen, every section carries at least one
+ * control). */
+void settings_model_focus_first_in_pane();
+
+/* Rewrites `hint` for the last device used (pad or keyboard) and dirties
+ * "nav_hint" on `model` when it changed. `two_level` picks the settings
+ * menu's wording (cards and pane, East backs out, Escape closes) over the
+ * launcher's, whose navigation is flat and where neither East nor Escape
+ * does anything. ui_settings_model.cpp. */
+void sync_nav_hint(std::string* hint, Rml::DataModelHandle* model, bool two_level);
+
+/* Clears the "press again to quit" arm and its label immediately, without
+ * waiting for the tick's own 3 s timeout. Called from rt_ui_set_visible(
+ * false) so every way of closing the menu (Close, Escape, gamepad East)
+ * disarms it, not only a reopen (settings_model_refresh() calls this too)
+ * or the timeout. A no-op when nothing is armed. */
+void settings_model_disarm_quit();
+
 /* ---- launcher (ui_launcher.cpp) -----------------------------------------
  *
  * The "launcher" data model (separate from "settings": it holds the disc
@@ -384,6 +460,10 @@ void resolve_menu_hotkey();
 /* SDL's name for the resolved keyboard hotkey, for the menu document's
  * "press X to close" line. Valid after resolve_menu_hotkey(). */
 const char* menu_hotkey_name();
+/* The resolved gamepad hotkey's name, for the same line and the startup
+ * log: one SDL button name ("guide"), or "first+second" when input.gamepad.
+ * menu is a chord ("back+start"). Valid after resolve_menu_hotkey(). */
+const char* menu_gamepad_name();
 /* SDL3 delivers SDL_EVENT_TEXT_INPUT only between SDL_StartTextInput and
  * SDL_StopTextInput, so the menu turns it on while it is up and off again
  * when it closes. Called from rt_ui_set_visible (ui.cpp), which is why it
@@ -437,6 +517,19 @@ bool rebind_handle_sdl_event(const SDL_Event& e);
 /* The field-boundary half: applies an accepted capture and expires one that
  * has been waiting too long. Called from rt_ui_tick. */
 void rebind_tick();
+
+/* ---- gamepad navigation (ui_events.cpp) ----------------------------------
+ *
+ * Held-direction repeat and the select pad-session both need a field
+ * boundary: a NavHold's repeat cadence is a clock, not an event, and a
+ * select session has to notice its element losing focus by some means
+ * other than an event the loss might not raise here at all (a mouse click
+ * elsewhere is handled by RmlUi itself, not by this module). Called from
+ * rt_ui_tick after rebind_tick, whether or not the menu is up: with nothing
+ * visible it only clears whatever a hold or a session still thinks it owns,
+ * so neither survives into the next time the menu opens.
+ */
+void ui_nav_tick();
 #endif
 
 } // namespace rtui

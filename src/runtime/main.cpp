@@ -46,6 +46,7 @@
 #include "runtime.h"
 
 #include "ee/kernel.h"
+#include "gs/gs_backend.h"
 #include "host/settings.h"
 #include "host/window.h"
 #include "hw/hw.h"
@@ -403,6 +404,14 @@ int main(int argc, char** argv) {
      * (settings plan): ICORECOMP_INPUT_SCRIPT drives the pad from a file and
      * must stay reproducible, which a menu that eats input would break. */
     if (!ui_ready && !std::getenv("ICORECOMP_INPUT_SCRIPT")) rt_ui_init();
+
+    /* Hands the GS command ring to its worker thread (gs/gs_threaded.cpp).
+     * Here, and not at rt_hw_init: everything above this line runs the ring
+     * inline on this thread, which is what the launcher's own present loop
+     * and the UI's first texture uploads expect, and from here on every
+     * field of the game is produced by the EE thread and consumed by the
+     * worker. A no-op when ICORECOMP_GS_THREAD=0 bypassed the ring. */
+    rt_gs_backend_start_worker();
 
     rt_sched_init();
 

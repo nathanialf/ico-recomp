@@ -35,6 +35,33 @@ uint64_t g_syscall_count = 0;
 uint32_t g_set_syscall_vec[256];
 bool g_dchain_logged = false;
 
+/* Per-call-site log cap: the first `cap` calls land on the default
+ * channel, everything after that only when `channel` is verbose. The
+ * counter is tested first because rt_verbose walks a tag list, and these
+ * sit on paths the game takes constantly.
+ *
+ * CreateThread/StartThread/CreateSema use it for the first 32 of each kind
+ * (enough to see the boot-time thread and sema population, which this
+ * title mostly creates up front); past that the "sched" inventory dump
+ * (rt_sched_dump_inventory) already lists every live thread and semaphore
+ * with its creator, so a per-call line stops earning its keep. */
+bool log_capped(const char* channel, uint32_t* logged, uint32_t cap) {
+    if (*logged < cap) {
+        ++*logged;
+        return true;
+    }
+    return rt_verbose(channel);
+}
+
+constexpr uint32_t kSchedLogCap = 32;
+/* The cap on the generic syscall trace line for the syscalls named in
+ * is_syscall_trace_capped below; SetSyscall's own "recorded" line uses it
+ * too, so the two lines for one call appear and stop together. */
+constexpr uint32_t kSyscallTraceCap = 8;
+uint32_t g_thread_create_logged = 0;
+uint32_t g_thread_start_logged = 0;
+uint32_t g_sema_create_logged = 0;
+
 void set_v0(R5900Context* ctx, int64_t v) {
     ctx->r[2].s64x[0] = v;
     ctx->r[2].u64x[1] = 0;
@@ -95,13 +122,17 @@ int64_t h_CreateThread(const Args& a) {
     uint32_t attr = rt_gread32(a.a0 + 0x1C);
     uint32_t option = rt_gread32(a.a0 + 0x20);
     int id = rt_thread_create(func, stack, stack_size, gp, prio, attr, option);
-    rt_log("sched", "CreateThread: id=%d entry=0x%08x stack=0x%08x+0x%x gp=0x%08x prio=%d",
-        id, func, stack, stack_size, gp, prio);
+    if (log_capped("sched", &g_thread_create_logged, kSchedLogCap)) {
+        rt_log("sched", "CreateThread: id=%d entry=0x%08x stack=0x%08x+0x%x gp=0x%08x prio=%d",
+            id, func, stack, stack_size, gp, prio);
+    }
     return id;
 }
 int64_t h_DeleteThread(const Args& a) { return rt_thread_delete((int)a.a0); }
 int64_t h_StartThread(const Args& a) {
-    rt_log("sched", "StartThread: id=%d arg=0x%08x", (int)a.a0, a.a1);
+    if (log_capped("sched", &g_thread_start_logged, kSchedLogCap)) {
+        rt_log("sched", "StartThread: id=%d arg=0x%08x", (int)a.a0, a.a1);
+    }
     return rt_thread_start((int)a.a0, a.a1);
 }
 int64_t h_ExitThread(const Args&) { rt_thread_exit_current(false); return 0; }
@@ -167,8 +198,10 @@ int64_t h_CreateSema(const Args& a) {
     uint32_t attr = rt_gread32(a.a0 + 0x10);
     uint32_t option = rt_gread32(a.a0 + 0x14);
     int id = rt_sema_create(init_count, max_count, attr, option);
-    rt_log("sched", "CreateSema: id=%d init=%d max=%d (thread %d, ra=0x%08x)",
-        id, init_count, max_count, rt_thread_current_id(), (uint32_t)a.ctx->r[31].u64x[0]);
+    if (log_capped("sched", &g_sema_create_logged, kSchedLogCap)) {
+        rt_log("sched", "CreateSema: id=%d init=%d max=%d (thread %d, ra=0x%08x)",
+            id, init_count, max_count, rt_thread_current_id(), (uint32_t)a.ctx->r[31].u64x[0]);
+    }
     return id;
 }
 int64_t h_DeleteSema(const Args& a) { return rt_sema_delete((int)a.a0); }
@@ -239,9 +272,15 @@ int64_t h_SetVSyncFlag(const Args& a) {
     return 0;
 }
 
+uint32_t g_set_syscall_logged = 0;
 int64_t h_SetSyscall(const Args& a) {
     g_set_syscall_vec[a.a0 & 0xFF] = a.a1;
-    rt_log("syscall", "SetSyscall(num=0x%x, vector=0x%08x) recorded", a.a0, a.a1);
+    /* Same channel and cap as the generic trace line for this syscall
+     * (kSyscallTraceCap): the first few by default, all of them under
+     * debug.verbose=syscall. */
+    if (log_capped("syscall", &g_set_syscall_logged, kSyscallTraceCap)) {
+        rt_log("syscall", "SetSyscall(num=0x%x, vector=0x%08x) recorded", a.a0, a.a1);
+    }
     return 0;
 }
 
@@ -535,8 +574,40 @@ SigSlot g_sig_table[kSigTableSize];
 uint64_t g_sig_fallback_counts[256];
 bool g_sig_fallback_warned[256];
 
+/* Some syscalls are called constantly with an a0 that differs almost every
+ * time (WakeupThread/iWakeupThread take the woken thread's id, SifSetDma an
+ * entry count, SleepThread none but still gets called every field), so the
+ * per-signature table above never folds them down: each call looks like a
+ * fresh signature and the power-of-two sampling barely bites. These six
+ * names were measured to dominate a run's default log this way; capped at
+ * kSyscallTraceCap occurrences of each name (not signature) in the default
+ * channel. rt_verbose("syscall") keeps every one, exactly like the rest of
+ * this function's sampling. Identified by syscall table key since
+ * should_log sees only (num, a0), not the resolved Entry::name. */
+bool is_syscall_trace_capped(uint32_t key) {
+    switch (key) {
+    case 0x32: /* SleepThread */
+    case 0x33: /* WakeupThread */
+    case 0x34: /* iWakeupThread */
+    case 0x74: /* SetSyscall */
+    case 0x76: /* SifDmaStat */
+    case 0x77: /* SifSetDma */
+        return true;
+    default:
+        return false;
+    }
+}
+uint32_t g_syscall_trace_capped_counts[256];
+
 bool should_log(int32_t num, uint32_t a0) {
     if (rt_trace()) return true;
+    /* Masked the same way rt_syscall picks the table entry, so a number
+     * that is dispatched and named as one of the six is capped as one of
+     * the six. */
+    const uint32_t key = (uint32_t)(num < 0 ? -num : num) & 0xFF;
+    if (is_syscall_trace_capped(key)) {
+        return log_capped("syscall", &g_syscall_trace_capped_counts[key], kSyscallTraceCap);
+    }
     uint64_t h = (uint64_t)(uint32_t)num;
     h = h * 0x9E3779B97F4A7C15ull ^ a0;
     h ^= h >> 32;

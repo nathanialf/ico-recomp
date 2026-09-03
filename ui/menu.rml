@@ -17,23 +17,23 @@
 	<div class="shell">
 		<div class="nav">
 			<div class="nav-stack">
-				<div class="nav-button" data-class-active="active_tab == 'display'" data-event-click="active_tab = 'display'">
+				<div id="nav-display" class="nav-button" data-class-active="active_tab == 'display'" data-event-click="active_tab = 'display'">
 					<span class="nav-name">Display</span>
 					<span class="nav-tagline">window, scaling, rate</span>
 				</div>
-				<div class="nav-button" data-class-active="active_tab == 'audio'" data-event-click="active_tab = 'audio'">
+				<div id="nav-audio" class="nav-button" data-class-active="active_tab == 'audio'" data-event-click="active_tab = 'audio'">
 					<span class="nav-name">Audio</span>
 					<span class="nav-tagline">output volume</span>
 				</div>
-				<div class="nav-button" data-class-active="active_tab == 'input'" data-event-click="active_tab = 'input'">
+				<div id="nav-input" class="nav-button" data-class-active="active_tab == 'input'" data-event-click="active_tab = 'input'">
 					<span class="nav-name">Input</span>
 					<span class="nav-tagline">sticks, binds</span>
 				</div>
-				<div class="nav-button" data-class-active="active_tab == 'gameplay'" data-event-click="active_tab = 'gameplay'">
+				<div id="nav-gameplay" class="nav-button" data-class-active="active_tab == 'gameplay'" data-event-click="active_tab = 'gameplay'">
 					<span class="nav-name">Gameplay</span>
 					<span class="nav-tagline">retail by default</span>
 				</div>
-				<div class="nav-button" data-class-active="active_tab == 'debug'" data-event-click="active_tab = 'debug'">
+				<div id="nav-debug" class="nav-button" data-class-active="active_tab == 'debug'" data-event-click="active_tab = 'debug'">
 					<span class="nav-name">Debug</span>
 					<span class="nav-tagline">logs, pacing, profiler</span>
 				</div>
@@ -41,13 +41,15 @@
 			<div class="bracket">
 				<div class="bracket-cap"/>
 				<div class="bracket-line">
+					<div class="bracket-seg"/>
 					<div class="bracket-label">Settings</div>
+					<div class="bracket-seg"/>
 				</div>
 				<div class="bracket-cap"/>
 			</div>
 		</div>
 
-		<div class="pane">
+		<div id="pane" class="pane">
 			<div class="section" data-if="active_tab == 'display'">
 				<div class="section-header">
 					<span class="section-number">01</span>
@@ -139,8 +141,14 @@
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="show_fps" data-event-change="apply()"/>
+					<div class="check-row" data-event-click="show_fps = !show_fps; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="show_fps"/>
+							<div class="check-glyph" data-if="show_fps">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Show the field rate</span>
 					</div>
 				</div>
@@ -162,8 +170,14 @@
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="mute" data-event-change="apply()" data-attrif-disabled="overridden_mute"/>
+					<div class="check-row" data-event-click="mute = !mute; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="mute" data-attrif-disabled="overridden_mute"/>
+							<div class="check-glyph" data-if="mute">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Mute</span>
 					</div>
 					<div class="override" data-if="overridden_mute">{{override_text_mute}}</div>
@@ -258,8 +272,14 @@
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="mouse_look" data-event-change="apply()"/>
+					<div class="check-row" data-event-click="mouse_look = !mouse_look; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="mouse_look"/>
+							<div class="check-glyph" data-if="mouse_look">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Mouse look (right stick)</span>
 					</div>
 					<div class="hint">on: mouse motion is reported as right stick deflection. off: the right stick comes from the pad and the stick keys only</div>
@@ -275,8 +295,14 @@
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="mouse_look_invert_y" data-event-change="apply()"/>
+					<div class="check-row" data-event-click="mouse_look_invert_y = !mouse_look_invert_y; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="mouse_look_invert_y"/>
+							<div class="check-glyph" data-if="mouse_look_invert_y">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Invert mouse Y</span>
 					</div>
 					<div class="hint">flips the vertical direction of mouse look; the horizontal one is unchanged</div>
@@ -293,8 +319,14 @@
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="run_any_direction" data-event-change="apply()"/>
+					<div class="check-row" data-event-click="run_any_direction = !run_any_direction; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="run_any_direction"/>
+							<div class="check-glyph" data-if="run_any_direction">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Run in every stick direction</span>
 					</div>
 					<div class="hint">off reproduces the retail game: only near-cardinal tilts run. on pre-scales the left stick so a full tilt runs at any angle. the game's own code is unchanged</div>
@@ -310,13 +342,19 @@
 				<div class="control">
 					<div class="control-label">Verbose channels</div>
 					<input type="text" data-value="verbose" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_verbose"/>
-					<div class="hint">channel list as for ICORECOMP_VERBOSE; empty means the defaults</div>
+					<div class="hint">channel list as for ICORECOMP_VERBOSE; empty means the defaults; type with the keyboard</div>
 					<div class="override" data-if="overridden_verbose">{{override_text_verbose}}</div>
 				</div>
 
 				<div class="control">
-					<div class="check-row">
-						<input type="checkbox" data-checked="log_file" data-event-change="apply()" data-attrif-disabled="overridden_log_file"/>
+					<div class="check-row" data-event-click="log_file = !log_file; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="log_file" data-attrif-disabled="overridden_log_file"/>
+							<div class="check-glyph" data-if="log_file">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
 						<span class="check-label">Write a log file</span>
 					</div>
 					<div class="hint">takes effect at the next start</div>
@@ -326,14 +364,14 @@
 				<div class="control">
 					<div class="control-label">Profiler period, fields</div>
 					<input type="text" data-value="profile_fields" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_profile_fields"/>
-					<div class="hint">0 turns the profiler off; 180 is one summary every 3 seconds</div>
+					<div class="hint">0 turns the profiler off; 180 is one summary every 3 seconds; type with the keyboard</div>
 					<div class="override" data-if="overridden_profile_fields">{{override_text_profile_fields}}</div>
 				</div>
 
 				<div class="control">
 					<div class="control-label">Frame limit, Hz</div>
 					<input type="text" data-value="fps_limit_hz" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_fps_limit_hz"/>
-					<div class="hint">0 disables pacing</div>
+					<div class="hint">0 disables pacing; type with the keyboard</div>
 					<div class="override" data-if="overridden_fps_limit_hz">{{override_text_fps_limit_hz}}</div>
 				</div>
 			</div>
@@ -343,8 +381,10 @@
 	<div class="footer">
 		<div class="button" data-event-click="reset_defaults()">Reset to defaults</div>
 		<div class="button" data-event-click="close_menu()">Close</div>
+		<div class="button" data-event-click="quit_game()">{{quit_label}}</div>
 		<div class="footer-path">{{settings_path}}</div>
-		<div class="footer-hotkey"><span class="key" id="menu-key">F1</span> closes</div>
+		<div class="footer-hotkey"><span class="key" id="menu-key">F1</span> / <span class="key" id="menu-pad">guide</span> closes</div>
+		<div class="footer-hint">{{nav_hint}}</div>
 	</div>
 </body>
 </rml>

@@ -45,7 +45,10 @@
  * Single threaded by construction: every zone below is on the main OS
  * thread (guest threads are minicoro coroutines on that thread), so the
  * counters need no locking. The log writer thread (log.cpp) never calls
- * rt_log, so it never enters a zone.
+ * rt_log, so it never enters a zone, and the GS command ring's worker
+ * (gs/gs_threaded.cpp) opens no zone either: it keeps its own atomic
+ * counters and hands them over once per window through rt_gs_field_prof,
+ * which is what the "gs worker" line of the summary prints.
  *
  * Coroutine caveat: a guest thread can yield (WaitSema, SleepThread) with
  * a zone still open on its coroutine stack, so zone exits are not always
@@ -88,6 +91,15 @@ enum RtProfZone : int {
                          * Separate from GS because a blocking present and a
                          * slow packet ingest need opposite fixes, and one
                          * averaged bucket cannot tell them apart. */
+    RT_PROF_GSWAIT,     /* waiting on the GS command ring's worker thread at
+                         * the field sync point (hw/gspriv.cpp). Zero while
+                         * the ring is drained inline or bypassed. Once the
+                         * worker is up, "gs" and "present" hold only the
+                         * enqueue cost and this holds the field boundary's
+                         * share of the handover. The other two waits (a
+                         * reply, a full ring) happen wherever their caller
+                         * is and land in that caller's bucket; the "gs
+                         * worker" line totals all three. */
     RT_PROF_DISC,       /* disc image reads (ISO sector fetch) */
     RT_PROF_LIMIT,      /* frame limiter sleeping. Large means there is
                          * headroom; near zero means the port is running
@@ -131,8 +143,10 @@ namespace rt_prof_detail {
 
 inline const char* const kName[RT_PROF_COUNT] = {
     "other", "ee", "mmio", "syscall", "intc", "dma",
-    "vif1", "vu1", "gif", "gs", "present", "disc", "limit", "ipu", "audio", "log",
+    "vif1", "vu1", "gif", "gs", "present", "gswait", "disc", "limit", "ipu", "audio", "log",
 };
+static_assert(sizeof(kName) / sizeof(kName[0]) == RT_PROF_COUNT,
+              "one name per RtProfZone, in the same order");
 
 inline uint64_t g_ns[RT_PROF_COUNT] = {0};
 inline uint64_t g_calls[RT_PROF_COUNT] = {0};
@@ -336,6 +350,18 @@ struct RtGsFieldProf {
     uint64_t scanout_ns;
     uint64_t present_ns;
     uint64_t present_fields;
+    /* The GS command ring's worker thread, when there is one (see
+     * RtGsConsumerTimings in gs/gs_backend.h). All zero with the ring
+     * drained inline or bypassed, and the summary drops the line. The three
+     * costs are that thread's, not this one's, so they do not belong in the
+     * bucket table above: they are a second budget against the same field
+     * period, and both have to fit in it. */
+    uint64_t worker_gs_ns;
+    uint64_t worker_present_ns;
+    uint64_t worker_idle_ns;
+    uint64_t worker_fields;
+    uint64_t worker_wait_ns;
+    uint64_t worker_waits;
 };
 extern "C" void rt_gs_field_prof(RtGsFieldProf* out);
 extern "C" double rt_disc_prof_max_ms(void);
@@ -437,6 +463,28 @@ inline void rt_prof_report() {
                 (double)fp.flush_ns / 1e6 / pf,
                 (double)fp.scanout_ns / 1e6 / pf,
                 (double)fp.present_ns / 1e6 / pf);
+        }
+        /* The other thread's budget. Read against the same field period as
+         * the buckets above: the EE thread and the GS worker run at the same
+         * time, so the port holds the field rate only if each of them fits
+         * in 16.68 ms on its own. "idle" is the worker's headroom. The wait
+         * is every nanosecond the EE spent blocked on the consumer: the
+         * field sync point, which is also the "gswait" bucket above, plus
+         * the two waits that bucket does not cover because they happen
+         * wherever the caller is -- a reply to an overlay texture upload,
+         * and a full ring. A wait total much larger than gswait means one of
+         * those two, not the field boundary. */
+        if (fp.worker_fields) {
+            const double wf = (double)fp.worker_fields;
+            rt_log("prof", "  gs worker: replay %.3f ms/field  present %.3f ms/field"
+                           "  idle %.3f ms/field over %llu fields;"
+                           " EE waited %.3f ms/field in %llu waits",
+                (double)fp.worker_gs_ns / 1e6 / wf,
+                (double)fp.worker_present_ns / 1e6 / wf,
+                (double)fp.worker_idle_ns / 1e6 / wf,
+                (unsigned long long)fp.worker_fields,
+                (double)fp.worker_wait_ns / 1e6 / wf,
+                (unsigned long long)fp.worker_waits);
         }
     }
 

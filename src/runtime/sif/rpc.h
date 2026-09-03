@@ -105,6 +105,12 @@ void rt_rpc_register_service(uint32_t sid, const char* name, RtRpcServiceFn fn);
  * mounts the disc image (fatal if no usable image is found). */
 void rt_cdvd_register_services();
 
+/* cdvd.cpp: logs the stream state machine, the drive busy timer, and the
+ * last handful of read/stream requests. Called from rt_sif_dump_inventory
+ * so every inventory dump (deadlock fatal, SIGINT, exit, unmapped MMIO)
+ * carries it. */
+void rt_cdvd_dump_state();
+
 /* sndn2.cpp: the game's own IOP sound server (SNDN2DRV.IRX). */
 void rt_sndn2_register_service();
 

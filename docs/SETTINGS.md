@@ -134,26 +134,54 @@ deadzone math is skipped entirely rather than run with a zero threshold,
 so a fresh install produces the exact same axis values the pre-settings
 build did.
 
-Two rules keep one host key or button from being asked to do two things at
-once, both enforced by `validate_binds()` in `settings.cpp` at commit time:
-the menu key must not also name a pad slot (the menu consumes that input
-before the pad ever sees it), and two ordinary slots on the same device must
-not share a name, because one host input cannot press two DS2 buttons. The
-mouse has no menu slot, so only the second rule applies to it, and two
-unbound mouse slots never count as sharing a name.
+Four rules keep one host key or button from being asked to do two things at
+once, all enforced by `validate_binds()` in `settings.cpp` at commit time:
 
-Both rules revert only the slots that commit changed, whichever side of the
-pair they are: binding the menu key onto an existing pad slot reverts the
-menu key, binding a pad slot onto the menu key reverts the pad slot, and
-changing both reverts both. A revert goes back to the previously committed
+1. The menu key must not also name a pad slot (the menu consumes that input
+   before the pad ever sees it).
+2. Two ordinary slots on the same device must not share a name, because one
+   host input cannot press two DS2 buttons.
+3. A chord (below) is only legal in `gamepad.menu`; one that ends up in any
+   other slot reverts.
+4. A chord whose two parts are the same button (`gamepad.menu = "start+start"`)
+   is not two buttons and reverts.
+
+The mouse has no menu slot, so only rule 2 applies to it, and two unbound
+mouse slots never count as sharing a name. Rule 1 is skipped entirely when
+the menu slot holds a chord: `back+start` over the bound `select`/`start` is
+the expected setup for a pad whose PS button the OS or Steam intercepts, and
+the guest sees both parts exactly as hardware would until the menu opens and
+blanks the pad.
+
+Rules 1 and 3 revert only the slots that commit changed, whichever side of
+the collision they are: binding the menu key onto an existing pad slot
+reverts the menu key, binding a pad slot onto the menu key reverts the pad
+slot, changing both reverts both, and a chord that landed on an ordinary
+slot reverts that slot alone. A revert goes back to the previously committed
 name, not the compiled default, logs why, and is also shown inline in the
-Input tab that made the change. A collision where neither slot changed is
-skipped: it arrived in the settings file, `log_bind_duplicates()` reports it
-once at load, and the load path never rewrites the user's own file, so
-re-rejecting it on every later commit would only leave a permanent message
-in a pane that cannot fix it. Name comparison for both rules is
-case-insensitive, matching how `SDL_GetScancodeFromName` itself resolves
-names.
+Input tab that made the change. A collision or a misplaced chord where
+nothing changed this commit is skipped: it arrived in the settings file,
+`log_bind_duplicates()` reports it once at load, and the load path never
+rewrites the user's own file, so re-rejecting it on every later commit would
+only leave a permanent message in a pane that cannot fix it. Name comparison
+for every rule is case-insensitive, matching how `SDL_GetScancodeFromName`
+itself resolves names.
+
+**Chords.** `gamepad.menu` is the one slot that also accepts a chord:
+`<button>+<button>`, exactly one interior `+`, neither side ending in `+` or
+`-` (that suffix is the axis-direction convention, `lefttrigger+`, so it is
+never mistaken for a chord and `a+b+c` fails resolution rather than picking
+one pair out of it). Order carries no meaning. `rt_settings_split_chord()`
+(`settings.cpp`) is the one place this grammar is parsed; keyboard names are
+never passed through it (`Keypad +` is a legitimate scancode name). A pad-bit
+slot (0-15) refuses a chord outright: `host/input.cpp`'s `resolve_pad_name()`
+treats a chord-shaped name there as unresolvable and falls back to the
+compiled default, the same way an unknown SDL token does. This is the
+documented alternative for a DualSense (or any pad) whose PS button the OS or
+a launcher like Steam intercepts before this process ever sees it: bind
+`gamepad.menu` to `back+start` (Create + Options on a DualSense) from the
+Input tab's Rebind button (see Remapping, section 7) or by hand in
+`settings.json`.
 
 Default keyboard bindings (`kKeyboardBinds`, `settings.cpp`):
 
@@ -186,6 +214,12 @@ Default gamepad bindings (`kGamepadBinds`, `settings.cpp`):
 | square | x | start | start |
 | triangle | y | select | back |
 | menu | guide | | |
+
+The default stays `guide` (the PS/Xbox/Home button through SDL's mapping):
+most pads and most platforms deliver it. `back+start` (Create + Options on a
+DualSense) is the documented alternative, not a second default, for a pad or
+a launcher (Steam, in particular) that intercepts the guide button before
+this process sees it; see the chord paragraph above.
 
 Sticks are not rebindable slots: they map natively from the gamepad's own
 analog axes.
@@ -410,9 +444,24 @@ is what separates a GPU wait (present, gs) from a host read (disc) or a decode
 profiler boundaries, so a field's own pacing sleep is billed to the field
 after it. Where a backend has a present path, a `present flush / scanout / present_frame` line under it
 names three spans inside the `present` bucket, so a field lost to the
-swapchain and a field lost to the renderer can be told apart. The bucket table
-above them is an average over the whole window, which is the wrong shape for a
-stutter; these are the extremes in it.
+swapchain and a field lost to the renderer can be told apart; once the GS
+worker thread is up (below) those three spans are that thread's, not the EE
+thread's `present` bucket. The bucket table above them is an average over the
+whole window, which is the wrong shape for a stutter; these are the extremes
+in it.
+
+Once the game boots, the GS command ring is drained by a worker thread, so the
+bucket table describes the EE thread alone: `gs` and `present` there hold only
+the cost of writing records into the ring, and `gswait` holds the field sync
+point where the EE waits for that worker to finish the previous field. The
+worker's own budget is the `gs worker` line, in milliseconds per field:
+`replay` is packet parsing and privileged writes, `present` is flush, scanout
+and swapchain present, and `idle` is how long it sat with an empty ring, which
+is its headroom. The two threads run at the same time against the same 16.68 ms
+field, so the port holds the field rate only when each of them fits in it on
+its own. `ICORECOMP_GS_THREAD=0` bypasses the ring entirely and puts all of it
+back on the EE thread; it is a bisect switch for "is the ring responsible for
+this?" and has no settings.json twin.
 
 ### launcher
 
@@ -708,7 +757,16 @@ slot (`ui/ui_rebind.cpp`):
 
 - **Key**: the next key pressed is stored as its `SDL_GetScancodeName`.
 - **Gamepad button**: the next button pressed is stored as its SDL button
-  string.
+  string, on the press, immediately, for every slot except `gamepad.menu`.
+  That one slot is the exception, because it is the one a chord is legal on
+  (section 2): its capture prompts "press a button, or hold two together"
+  and accepts on release, once nothing is held, from every button pressed
+  since the capture armed. One distinct button becomes its own name; two
+  become `first+second` in the order they were pressed (order carries no
+  meaning once stored, see section 2's chord grammar); a third distinct
+  button invalidates the attempt (a status line says so) and the user
+  releases everything and starts over. An axis is refused outright for this
+  one slot, with its own status line, since a chord is buttons only.
 - **Mouse button or wheel**: the next mouse button pressed, or the next
   wheel tick, is stored under its name from the table above. A platform
   that reports the wheel already inverted (SDL's flipped direction) is
@@ -744,6 +802,130 @@ Each device has its own reset, independent of the "reset to defaults"
 button that touches the rest of the settings: resetting a device's
 bindings restores that device's compiled-in table (section 2) without
 touching the other device's bindings or any non-input setting.
+
+### Controller
+
+The focused control is drawn inverted, black with sand type, so the pad's
+selection reads at a glance; a text field, a select and a check row invert
+the same way, the field or the whole row going black. The footer's last
+line names the controls for the device last used: after a pad input the pad
+line, after a key or the mouse the keyboard line. It is bound to `nav_hint`
+on both the settings and the launcher models and follows the `last device is
+now ...` log line. The two documents get different wording, because their
+pad models differ: the menu's pair names the cards, the pane and East, the
+launcher's names neither East nor Escape, since neither does anything
+there.
+
+Both overlay documents (the menu and the launcher) are navigable end to end
+with a gamepad, entirely from `ui/ui_events.cpp`; nothing under `ui/` needs
+its own input handling for this. Guide (or the `back+start` chord) opens
+and closes the menu from anywhere, and the left stick's four synthetic
+d-pad edges use a fixed hysteresis (press above a raw axis value of 16384,
+release below 9830) independent of `input.left_deadzone`, which is about
+what the game is told the stick reports, not about the menu noticing a
+deliberate push; held, a direction repeats after 400 ms and then every
+100 ms. Both documents share those two rules; everything else below is
+specific to one or the other, because the menu's layout (a column of cards
+beside the pane the active one shows) and the launcher's (one flat list of
+controls) call for different pad models.
+
+**The launcher** stays flat, the way the whole overlay used to work: South
+activates the focused control (press a button, toggle a check row);
+Up/Down/Left/Right move the focus ring by RmlUi's own spatial search
+(`nav: auto` on every control, `body.launcher { nav: auto; }` as the wrap
+target when a search finds nothing, which is also the recovery if nothing
+is focused at all). East does nothing here, deliberately, the same way
+Escape does not close the launcher: a stray press must not be able to quit
+out of it. Quit is a button on the window, reached and pressed like any
+other control. The Start button carries `autofocus`, so the pad has
+something focused from the first frame.
+
+**The settings menu** is two levels, decided fresh every time from where the
+focus actually is (`current_nav_level()`, `ui/ui_events.cpp`) rather than
+from state of its own, so a mouse click into either region is never out of
+step with the pad: focus inside one of the five cards in the left column is
+level 1, focus inside the pane on the right is level 2, and anywhere else
+(the footer buttons, or the body itself, which is where RmlUi leaves the
+focus after a click on empty panel) reads as level 1 too. Level 1's own
+moves are written against the five cards by id, so from one of those
+in-between places any direction key first puts the focus back on the active
+tab's card; from there the table below applies.
+
+| pad input | level 1 (a card) | level 2 (the pane) |
+|---|---|---|
+| Up/Down | move the focus ring among the five cards, wrapping; does not change which pane is showing | RmlUi's own spatial search (native, `dispatch_nav_key`'s usual document-wrap fallback included), vetoed if it would land on a card -- focus stays where it was instead |
+| Left/Right | switch the active tab (same as L1/R1), keeping focus on the card | a single native key dispatch, no document-wrap fallback: a range slider adjusts, a text field moves its cursor, anything else moves focus within the pane by RmlUi's own default handling (which is confined to the pane anyway, since the pane is the nearest scroll container) -- vetoed if it lands outside the pane. An open select's session (below) swallows these two rather than dispatching them |
+| South | make the focused card's tab active if it was not already, then focus the first focusable control in the now-visible pane (enters level 2) | activate the focused control: press a button, toggle a checkbox, open a closed select, commit a select's highlighted option, or (in a text field) commit the field |
+| East | close the menu | back out to level 1: focus the card for the tab still showing, even out of a focused text field (a second East from there closes the menu, since level 1 is what East then sees) |
+| L1 / R1 | previous/next tab from either level; from level 2 this also moves focus back to the new card (level 1) | (same) |
+
+A `<select>`'s South/East/Up-Down at level 2 go through their own session
+rather than RmlUi's native arrow-key handling, because `WidgetDropDown`
+answers an Up/Down while its list is open by moving the selection
+immediately, which fires a `change` event on every step, exactly the event
+the menu's controls commit on. South on a closed select opens it and
+highlights the currently selected option (the `padhl` pseudo-class, styled
+identically to `:hover` in `ui/style/base.rcss`); Up/Down move the
+highlight only, consumed here and never forwarded to RmlUi; South commits
+the highlighted option (one `change`, the same as a mouse click on it);
+East closes the list without committing, and the menu stays open (level 2,
+not a level-1 East). Left and Right are swallowed while the list is open,
+because forwarding them would move the focus off the select and the blur
+that follows would close the list behind the session's back. The session
+ends on its own if the select loses focus by any other means (a mouse click
+elsewhere, Tab), and whenever the document being navigated changes, both of
+which `ui_nav_tick()` notices at the next field boundary.
+
+The pad is blanked for the game while the menu is up (`host/input.cpp`, see
+the paragraph above this subsection): `rt_ui_wants_input()` reads `g_ui.
+visible` fresh every time `rt_input_poll()` runs, and the hotkey that flips
+it is consumed and applied synchronously inside the event pump
+(`rt_window_pump`), not queued to a later field boundary the way a settings
+change is. Whether the guest's own pad read for the field that opened or
+closed the menu falls before or after that pump call is guest-scheduling
+dependent (`rt_pad_run_due()`'s catch-up loop runs off the guest's virtual
+clock, not off `rt_gs_vsync_hook`'s field count) and is not measured here;
+what the mechanism guarantees is that no read ever mixes a stale visibility
+flag with a stale pad sample, only ever the current pair.
+
+Text fields are reachable and rebindable by pad. Up/Down leave the field at
+once (`WidgetTextInput` never claims the vertical keys); Left/Right move the
+cursor and only leave the field once it is already at that end
+(`WidgetTextInput.cpp`, the `out_of_bounds` check). South commits the same
+way Enter does on the keyboard. Three Debug fields (Verbose channels,
+Profiler period, Frame limit) and the launcher's disc path field carry a
+"type with the keyboard" hint for exactly this reason: a pad can focus and
+commit them, but SDL3 only delivers `SDL_EVENT_TEXT_INPUT` from an attached
+keyboard, so there is no way to type a character from the pad itself.
+
+Gamepad hot-plug (`host/input.cpp`'s `rt_input_on_sdl_event`, called from
+the one event pump ahead of the UI) keeps whichever pad is open current
+whether or not a menu is up: attaching a second pad while one is already
+open just logs and keeps the first; unplugging the open one closes it and
+opens whichever other pad SDL still lists, if any.
+
+### Quit
+
+The menu's footer carries a Quit button between Close and the settings
+path, labeled `{{quit_label}}`. The first press arms it (`quit_label`
+becomes "Press again to quit") for three seconds; the second press within
+that window flushes any pending settings write and calls `rt_request_exit
+("Quit from the menu")` (`host/window.cpp`), the same shutdown path a
+closed window takes. The arm disarms on its own after three seconds with no
+second press, and immediately on every way the menu can close (Close,
+Escape, gamepad East) or reopen, so a Quit press left hanging never
+survives past the moment the menu goes away. There is no settings key for
+any of this; `quit_label` and the arm state are UI-only.
+
+The launcher's own Quit button goes through the identical function
+(`ui_launcher.cpp`), which is what lets its loop notice the request the same
+way it would notice the window's own close button: `rt_request_exit` calls
+`rt_pgs_notify_quit`, and the launcher's loop sees `RT_PGS_VSYNC_WINDOW_
+CLOSED` on its very next `backend_present_ui()` call and exits through that
+one branch, logged as "window closed or exit requested; exiting" either
+way. In game the same flag is read by `hw/gspriv.cpp`'s vsync hook, which
+logs "paraLLEl-GS: window closed or exit requested, exiting" and unwinds
+from there.
 
 ### Supported RCSS subset
 
@@ -855,7 +1037,11 @@ took and why.
 ### What the window shows
 
 The launcher window (`ui/launcher.rml`, model and logic in
-`src/runtime/ui/ui_launcher.cpp`) shows:
+`src/runtime/ui/ui_launcher.cpp`) is drawn, like the in-game menu, in the
+game's own palette: sand panels with black type and black rules (the
+token table at the top of `ui/style/base.rcss`), and the wordmark tinted
+black through RmlUi's `image-color`, which the overlay shader multiplies
+into the white raster the disc gives. The window shows:
 
 - **Disc path and source**: the image currently resolved to mount, and
   where it came from (`--disc`, `settings.json launcher.disc_path`,
@@ -887,6 +1073,14 @@ The launcher window (`ui/launcher.rml`, model and logic in
   since the overlay renderer draws no file images (see the RCSS subset
   above). Third-party license notices ship in the package README, not in
   the window.
+
+Every control here but Browse is reachable by gamepad the same way the
+in-game menu is (section 7's Controller subsection): Start, Settings, Quit,
+Clear, Use path, the show-at-startup checkbox and the credit link all carry
+`tab-index: auto` already. Browse is the one exception: it opens the native
+OS file dialog (`SDL_ShowOpenFileDialog`), a separate window this process
+does not draw and so cannot feed pad events to; picking a disc from a pad
+means typing its path into the field and pressing Use path instead.
 
 ### The title image
 
@@ -1015,6 +1209,22 @@ simply closed.
 
 ## 9. Log lines to look for
 
+By default the log keeps state changes, first occurrences, errors,
+summaries and the ring dumps (SIF DMA, CD stream requests, and so on); it
+does not keep a line for every SIF RPC command transfer, every sndn2
+volume or pitch command, a timer MODE write that repeats the value already
+logged, a CreateThread/StartThread/CreateSema past the first 32 of its
+kind, most of the generic syscall trace for WakeupThread, iWakeupThread,
+SleepThread, SifDmaStat, SifSetDma and SetSyscall, most rumble changes
+past the first 8, or most sceCdStREAD polls. Those are the lines that
+were measured to dominate a run's log without telling a reader anything
+past the first several. `debug.verbose = "sif,sndn2,timer,sched,syscall,
+input,cdvd"` (the `ICORECOMP_VERBOSE` twin; section 3) turns every one of
+them back on and reproduces the old per-call output exactly; `all` (or
+`1`) turns on every channel this build defines, not only these seven. See
+`debug.verbose` in section 2 and `rt_verbose()` (`log.cpp`) for how a
+channel spec is parsed.
+
 These are exact prefixes and phrases, all under the `main`, `settings`,
 `ui`, `launcher`, `gs`, `audio`, `input`, `guest`, `json` or `prof` log
 components, worth grepping `icorecomp.log` for:
@@ -1034,6 +1244,12 @@ components, worth grepping `icorecomp.log` for:
 | `profiling on:` | the frame-time profiler is active, and how often it reports |
 | `RenderInterface::` | a stylesheet under `ui/` used something the overlay renderer cannot draw |
 | `title logo:` | the launcher's title image: a cache hit, or each step of building one from the disc, with timings (section 8) |
+| `SDL gamepad:` | which gamepad was opened at probe time, or that none was found; `host/input.cpp`, once a run, from whichever probe gets there first: `rt_input_sdl_gamepad_probe()` at UI init, or `sdl_poll`'s own on the first poll if there was no SDL window yet at UI init |
+| `SDL gamepad attached:` / `SDL gamepad removed:` | hot-plug: a second pad was seen and ignored (the line names which one stayed open), or the open pad was unplugged and another took over, if any (`rt_input_on_sdl_event`, section 7) |
+| `menu hotkey:` | the resolved keyboard and gamepad menu hotkeys, the gamepad half spelled `first+second` when `input.gamepad.menu` is a chord; logged at UI init and again whenever the committed settings move |
+| `rebind gamepad.menu` | the outcome of a capture on the one chord-eligible slot: the accepted name (a single button or `first+second`), a rejection, or a timeout (section 7, Remapping) |
+| `exit requested:` | `rt_request_exit()` was called and named why (`Quit from the menu`, `Quit from the launcher`, or the window's own close); the shutdown that follows is the same one a closed window always takes |
+| `window closed or exit requested` | the loop is unwinding because the window closed or `rt_request_exit()` was called; both reasons produce this one line, from `hw/gspriv.cpp`'s vsync hook in game and from `rt_launcher_run`'s own loop in the launcher |
 | `no title logo from this disc:` | the title image could not be built and the launcher kept its text title; the line says why |
 | `menu cursor:` | which cursor the pointer draws on the game's own menus: the letter I cut out of the title image, with its size, hotspot and which end was found to be the point, or `no logo image; drawn arrow` (section 10) |
 | `launcher gate:` | which of the two boot orderings this run took, and why (section 8) |

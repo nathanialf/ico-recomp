@@ -27,10 +27,12 @@
 #include <SDL3/SDL_vulkan.h>
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -79,6 +81,15 @@ struct RtPgs {
     void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
                          uint64_t* present_ns, uint64_t* fields);
 
+    /* Threads; see the threads section of gs_parallel_api.h.
+     * on_owner_thread() is what the WSI platform above asks before it does
+     * anything SDL: true only on the thread that created this instance and
+     * the window. */
+    void bind_consumer_thread();
+    bool window_closed() const { return m_window_closed.load(std::memory_order_acquire); }
+    void sample_window_state();
+    bool on_owner_thread() const { return std::this_thread::get_id() == m_owner_thread; }
+
     /* Window control / event pump inversion (shim 3); see gs_parallel_api.h. */
     void* window_handle();
     void notify_quit();
@@ -108,7 +119,17 @@ private:
 #ifdef ICORECOMP_PGS_SDL
     /* Minimal Vulkan::WSIPlatform on SDL3. Only what a fixed-function "blit
      * the scanout" presenter needs: surface creation, size queries, an alive
-     * flag and event pumping. */
+     * flag and event pumping.
+     *
+     * Threads: Granite calls every method here from whichever thread is
+     * inside the WSI, which after the host starts its GS command ring worker
+     * is not the thread that owns the window. SDL's video functions belong to
+     * the thread that created the window (on Windows the message queue is
+     * per thread), so nothing here calls SDL except init(), the destructor,
+     * and sample_state(), all of which run on the creating thread. What the
+     * WSI asks for between frames -- surface size, minimized, alive, resize
+     * -- is served from the atomics below, refreshed by sample_state() from
+     * the host's own event pump once per field. */
     class SdlWsiPlatform final : public Vulkan::WSIPlatform {
     public:
         explicit SdlWsiPlatform(RtPgs& owner) : m_owner(owner) {}
@@ -124,7 +145,23 @@ private:
                 m_owner.logf("paraLLEl-GS: SDL_CreateWindow failed: %s", SDL_GetError());
                 return false;
             }
+            /* Primes the cache the WSI reads from before the first
+             * begin_frame asks for a surface size. */
+            sample_state();
             return true;
+        }
+
+        /* Creating thread only: the two SDL queries below are the reason.
+         * Called from init(), from the host's event pump every field, and
+         * from notify_resize. */
+        void sample_state() {
+            if (!m_window) return;
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(m_window, &w, &h);
+            m_surface_w.store(uint32_t(w > 0 ? w : 1), std::memory_order_relaxed);
+            m_surface_h.store(uint32_t(h > 0 ? h : 1), std::memory_order_relaxed);
+            m_minimized.store((SDL_GetWindowFlags(m_window) & SDL_WINDOW_MINIMIZED) != 0,
+                              std::memory_order_relaxed);
         }
 
         ~SdlWsiPlatform() override {
@@ -148,19 +185,13 @@ private:
             return std::vector<const char*>(exts, exts + count);
         }
 
-        uint32_t get_surface_width() override {
-            int w = 0, h = 0;
-            SDL_GetWindowSizeInPixels(m_window, &w, &h);
-            return uint32_t(w > 0 ? w : 1);
-        }
+        /* Cached, not queried: these are called by Granite from whichever
+         * thread is inside the WSI. sample_state() keeps them fresh. */
+        uint32_t get_surface_width() override { return m_surface_w.load(std::memory_order_relaxed); }
 
-        uint32_t get_surface_height() override {
-            int w = 0, h = 0;
-            SDL_GetWindowSizeInPixels(m_window, &w, &h);
-            return uint32_t(h > 0 ? h : 1);
-        }
+        uint32_t get_surface_height() override { return m_surface_h.load(std::memory_order_relaxed); }
 
-        bool alive(Vulkan::WSI&) override { return m_alive; }
+        bool alive(Vulkan::WSI&) override { return m_alive.load(std::memory_order_acquire); }
 
         /* Shared by the inline poll_input() loop below and the
          * rt_pgs_notify_quit / rt_pgs_notify_resize entry points, so the
@@ -169,39 +200,88 @@ private:
          * enclosing class) calls these directly, and a nested class does
          * not automatically grant the enclosing class access to its own
          * private members. */
-        void handle_quit() { m_alive = false; }
-        void handle_resize() { resize = true; }
+        void handle_quit() { m_alive.store(false, std::memory_order_release); }
+        /* Granite's own `resize` flag is a plain bool it reads from inside
+         * the WSI, so the host's notification lands in an atomic here and is
+         * transferred into it by sync_from_host(), on the WSI's own thread,
+         * before every frame. */
+        void handle_resize() { m_resize_pending.store(true, std::memory_order_release); }
+        void sync_from_host() {
+            if (m_resize_pending.exchange(false, std::memory_order_acquire)) resize = true;
+        }
         SDL_Window* window() const { return m_window; }
 
         /* True when begin_frame() is safe to call. A minimized window makes
          * the driver report a 0x0 maxImageExtent, which Granite answers with
          * SwapchainError::NoSurface and a call to
          * block_until_wsi_forward_progress. That blocks on the calling
-         * thread, and the caller here is the EE thread, so guest execution
-         * would stop for as long as the window stays minimized. Callers skip
-         * the frame instead. */
+         * thread; the caller is the GS command ring's consumer, so the ring
+         * would back up and the EE would stall on it at the next field sync
+         * for as long as the window stays minimized. Callers skip the frame
+         * instead. */
         bool presentable() {
-            if (!m_alive || !m_window) return false;
-            return (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MINIMIZED) == 0;
+            if (!m_window || !m_alive.load(std::memory_order_acquire)) return false;
+            return !m_minimized.load(std::memory_order_relaxed);
         }
 
         /* Reached only if the window is minimized between presentable() and
          * begin_frame(). Granite's blocking_init_swapchain loops
          * `do { init_swapchain(); } while (err != None)` with no way to give
          * up on NoSurface, so returning while the window is gone would spin
-         * that loop forever with no way for the host to see the close. The
-         * window being gone is exactly the condition gs_parallel.cpp answers
-         * with exit(0); apply the same policy from the one place that cannot
-         * return to it. */
+         * that loop forever.
+         *
+         * Waiting here is correct as long as somebody keeps pumping events:
+         * the host does, once per field on its own thread, and every host
+         * wait on this consumer pumps too (gs/gs_threaded.cpp), so the
+         * restore or the close still arrives while this parks.
+         *
+         * A close is the one condition this cannot return from, because the
+         * swapchain will never come back. It used to call exit(0) from here
+         * whichever thread it was on; with the consumer on its own thread
+         * that would run the atexit handler that joins this very thread. So
+         * off the window's own thread it records the closure, which the host
+         * reads through rt_pgs_window_closed, and parks: the host sees the
+         * flag at its next field boundary, logs and exits, and its teardown
+         * gives up on this thread after a bounded wait rather than
+         * destroying a device it is still inside. On the window's own thread
+         * there is no other thread to take that exit -- the launcher, a run
+         * with ICORECOMP_GS_THREAD=0, icorecomp-gs-replay -- so it keeps the
+         * old exit(0) instead of hanging the process. */
         void block_until_wsi_forward_progress(Vulkan::WSI& wsi) override {
-            m_owner.logf("paraLLEl-GS: window cannot present (minimized), guest execution is blocked");
-            while (!resize && alive(wsi)) {
-                poll_input();
+            m_owner.logf("paraLLEl-GS: window cannot present (minimized), the GS consumer is blocked");
+            /* Leaves on any of three: a resize, the window coming back from
+             * minimized, or the window going away. The minimized test is not
+             * redundant with the resize one. Restoring a minimized window on
+             * Windows usually keeps the pixel size, so SDL raises no resize
+             * event and the host's notify_resize never fires; the host's
+             * per-field state sample clears m_minimized either way. Without
+             * this test the consumer would park here for the rest of the run
+             * and the EE would wait on it every field.
+             *
+             * The wait comes before the test, not after it. Granite reaches
+             * here because the driver reported a 0x0 surface extent, and
+             * m_minimized is sampled on the host's thread a pump later, so
+             * on entry the two disagree in exactly the case that gets here
+             * (the window was minimized between presentable() and
+             * begin_frame). Testing first would return without waiting and
+             * spin blocking_init_swapchain's do-while on a full core until
+             * the two agree. */
+            for (;;) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                poll_input();
+                sync_from_host();
+                if (resize || !alive(wsi) || !m_minimized.load(std::memory_order_relaxed)) break;
             }
             if (!alive(wsi)) {
-                m_owner.logf("paraLLEl-GS: window closed while the swapchain was unusable, exiting");
-                std::exit(0);
+                m_owner.m_window_closed.store(true, std::memory_order_release);
+                if (m_owner.on_owner_thread()) {
+                    m_owner.logf("paraLLEl-GS: window closed while the swapchain was unusable,"
+                                 " exiting");
+                    std::exit(0);
+                }
+                m_owner.logf("paraLLEl-GS: window closed while the swapchain was unusable;"
+                             " the GS consumer is parked and the host exits from its own thread");
+                for (;;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
 
@@ -209,8 +289,22 @@ private:
          * owns the only SDL_PollEvent loop; see gs_parallel_api.h and
          * host/window.cpp), hand control to it instead of polling here. NULL
          * keeps the pre-shim-3 behavior (icorecomp-gs-replay, or any host
-         * without a UI). */
+         * without a UI).
+         *
+         * Off the creating thread this does nothing at all. SDL's event
+         * queue belongs to the thread that made the window, and the host
+         * pumps it there every field, so a call from the GS consumer has
+         * nothing to do and must not poll. Logged once so a log says which
+         * of the two shapes the run had. */
         void poll_input() override {
+            if (!m_owner.on_owner_thread()) {
+                if (!m_pump_skipped_logged) {
+                    m_pump_skipped_logged = true;
+                    m_owner.logf("paraLLEl-GS: WSI event pump called off the window's own thread;"
+                                 " skipped (the host pumps SDL on its own thread every field)");
+                }
+                return;
+            }
             if (m_owner.m_host.pump_events) {
                 m_owner.m_host.pump_events();
                 return;
@@ -236,7 +330,14 @@ private:
     private:
         RtPgs& m_owner;
         SDL_Window* m_window = nullptr;
-        bool m_alive = true;
+        /* Every one of these is written by the creating thread (the host's
+         * event pump) and read by whichever thread is inside the WSI. */
+        std::atomic<bool> m_alive{true};
+        std::atomic<bool> m_resize_pending{false};
+        std::atomic<bool> m_minimized{false};
+        std::atomic<uint32_t> m_surface_w{1};
+        std::atomic<uint32_t> m_surface_h{1};
+        bool m_pump_skipped_logged = false;
     };
 
     void init_windowed();
@@ -278,28 +379,43 @@ private:
     const char* m_screenshot_path = nullptr;
     uint64_t m_vsyncs = 0;
 
+    /* The thread that ran the constructor: the host's EE and main thread,
+     * which created the window and is the only one that may call SDL. */
+    std::thread::id m_owner_thread;
+
     /* Present-path timings since the host last read them (vsync stamps
      * them, present_timings clears them). Three steady_clock pairs per
      * field, which is nothing next to the work they bracket.
      *
-     * Plain integers, not atomics, because vsync and present_timings are
-     * both called from the host's EE thread today (gs/gs_threaded.cpp
-     * drains its ring inline). They have to become atomics on the day that
-     * ring gets a worker thread, since vsync would then write them while
-     * the profiler reads and clears them. */
-    uint64_t m_flush_ns = 0;
-    uint64_t m_scanout_ns = 0;
-    uint64_t m_present_ns = 0;
-    uint64_t m_timing_fields = 0;
+     * Atomics because vsync runs on the host's GS consumer thread while
+     * present_timings is read from its EE thread by the profiler. Each is
+     * independent, so a read can land between two of the four stores and
+     * bill a field's flush to one window and its present to the next. That
+     * is a fraction of a millisecond once per profile window and the
+     * alternative is a lock on the present path. */
+    std::atomic<uint64_t> m_flush_ns{0};
+    std::atomic<uint64_t> m_scanout_ns{0};
+    std::atomic<uint64_t> m_present_ns{0};
+    std::atomic<uint64_t> m_timing_fields{0};
     bool m_transfer_since_vsync = false;
     bool m_wsi_active = false;
-    bool m_window_closed = false;
+    /* Sticky, and read by the host from its own thread through
+     * rt_pgs_window_closed: it is how the host learns of a close even while
+     * this instance's consumer thread is parked inside the WSI. */
+    std::atomic<bool> m_window_closed{false};
     /* True from a successful m_wsi->begin_frame() until the matching
      * end_frame(). Swapchain-touching entry points (set_present_mode,
      * set_presentation, set_render_scale) fatal while this is set: they run
      * from pump_events, which Granite calls from inside begin_frame, and
      * Vulkan::WSI::set_present_mode would otherwise silently no-op mid-frame
-     * instead of taking effect. */
+     * instead of taking effect.
+     *
+     * Consumer-thread state, so a plain bool: everything that sets or tests
+     * it (vsync, present, present_ui, the set_* entry points) is on the
+     * consumer side of the host's command ring, and the ring replays those
+     * records in order, which means a settings applier can no longer land
+     * inside a frame at all. Before the ring it could, which is what this
+     * guard was written for; it stays as the check that keeps it true. */
     bool m_in_frame = false;
     /* The window-backbuffer rectangle the last present blitted the scanout
      * into, and the backbuffer size it was measured against. Written by
@@ -311,12 +427,14 @@ private:
      * maps window pixels to guest pixels, and reporting the whole backbuffer
      * would put the caller's cursor on a picture that is not there.
      *
-     * Plain integers, not atomics, for the same reason as the timings above:
-     * present_frame and rt_pgs_present_rect both run on the host's EE thread
-     * today (gs/gs_threaded.cpp drains its ring inline, gs/gs_select.cpp
-     * builds the ThreadedBackend with inline_drain true). They have to become
-     * atomics on the day that ring gets a worker thread, since present_frame
-     * would then write them while the host reads them. */
+     * present_frame runs on the host's GS consumer thread and
+     * rt_pgs_present_rect is read on its EE thread, so the six are published
+     * and read under m_present_rect_mu. A mutex rather than six atomics
+     * because a caller mapping a cursor into the picture needs one
+     * consistent rectangle, not six values that could come from two
+     * different presents; it is taken once per present and a couple of times
+     * per field on the reader. */
+    mutable std::mutex m_present_rect_mu;
     int32_t m_present_x = 0, m_present_y = 0;
     int32_t m_present_w = 0, m_present_h = 0;
     int32_t m_present_bb_w = 0, m_present_bb_h = 0;

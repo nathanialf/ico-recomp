@@ -49,6 +49,18 @@ uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field) {
     return pgs->vsync(field);
 }
 
+void rt_pgs_bind_consumer_thread(RtPgs* pgs) {
+    pgs->bind_consumer_thread();
+}
+
+uint32_t rt_pgs_window_closed(RtPgs* pgs) {
+    return pgs->window_closed() ? 1u : 0u;
+}
+
+void rt_pgs_sample_window_state(RtPgs* pgs) {
+    pgs->sample_window_state();
+}
+
 void rt_pgs_report_stats(RtPgs* pgs) {
     pgs->report_stats();
 }

@@ -35,6 +35,30 @@
  * the UI include gs_parallel_api.h themselves for the layout. */
 struct RtPgsOverlayFrame;
 
+/* Consumer-side cost of a backend that has a worker thread, since the last
+ * read; all zero for one that does not. Filled by consumer_timings() below
+ * and reported by the profile summary (prof.h) as its own "gs worker" line,
+ * because once the ring is drained by a worker the EE's own "gs" and
+ * "present" buckets hold only the cost of enqueueing.
+ *
+ *   gs_ns       replaying everything but a vsync record: packet parse,
+ *               privileged writes, overlay uploads
+ *   present_ns  replaying vsync records: flush, scanout, swapchain present
+ *   idle_ns     parked with an empty ring, which is the worker's headroom
+ *   fields      vsync records replayed, so the three above can be per field
+ *   ee_wait_ns  time the EE thread spent waiting on the consumer (the field
+ *               sync point, a reply, or a full ring), and ee_waits how many
+ *               waits that was. This is what the thread costs the EE.
+ */
+struct RtGsConsumerTimings {
+    uint64_t gs_ns;
+    uint64_t present_ns;
+    uint64_t idle_ns;
+    uint64_t fields;
+    uint64_t ee_wait_ns;
+    uint64_t ee_waits;
+};
+
 class GsBackend {
 public:
     virtual ~GsBackend() = default;
@@ -52,8 +76,40 @@ public:
      * presented (any GIF transfer landed since the previous vsync). */
     virtual bool vsync(unsigned field) = 0;
 
-    /* End-of-run statistics dump (atexit; see gs_select.cpp). */
+    /* End-of-run statistics dump (atexit; see gs_select.cpp), called with any
+     * consumer thread already stopped (see quiesce). */
     virtual void report_stats() {}
+
+    /* ---- consumer thread ------------------------------------------------
+     *
+     * Only gs_threaded.cpp's ThreadedBackend has one; every other backend
+     * runs on its caller's thread and takes the defaults here.
+     *
+     * field_sync() is the EE's one per-field wait: it returns when the
+     * consumer has finished every vsync but the most recent, so at most one
+     * field is in flight. hw/gspriv.cpp calls it right after vsync().
+     *
+     * window_closed() is the exit condition the EE polls after that wait.
+     * The live backend sets it from the RT_PGS_VSYNC_WINDOW_CLOSED bit and
+     * from the library's own window state, so it is true even while the
+     * consumer is parked inside the library with no vsync to return.
+     * hw/gspriv.cpp owns the policy: it logs and exits, on the EE thread,
+     * so process teardown runs where it always did.
+     *
+     * quiesce() stops and joins the consumer after everything committed so
+     * far has been replayed. Idempotent. Nothing may be enqueued after it.
+     *
+     * bind_consumer_thread() runs once on the consumer thread before the
+     * first record is replayed, for a backend that needs the thread
+     * registered with something (the live one registers it with Granite's
+     * thread-index table; see gs_parallel_lib.cpp). */
+    virtual void field_sync() {}
+    virtual bool window_closed() { return false; }
+    virtual void quiesce() {}
+    virtual void bind_consumer_thread() {}
+    /* See RtGsConsumerTimings. Reading clears; a backend with no consumer
+     * thread leaves the caller's struct untouched, so callers zero it. */
+    virtual void consumer_timings(RtGsConsumerTimings* /*out*/) {}
 
     /* Present-path decomposition for the profile summary (prof.h): the
      * nanoseconds spent flushing the renderer, scanning out and presenting
@@ -116,6 +172,13 @@ GsBackend* rt_gs_backend();
  * nothing to push into, exactly as it had when the guard there was
  * rt_gs_parallel_handle() != nullptr. */
 GsBackend* rt_gs_backend_if_created();
+
+/* Moves the command ring from inline draining to its worker thread. Called
+ * once from main.cpp, after the launcher has handed over and before the
+ * scheduler boots, so the whole launcher phase stays single threaded. A
+ * no-op when the ring was bypassed (ICORECOMP_GS_THREAD=0) or when no
+ * backend has been created. */
+void rt_gs_backend_start_worker();
 
 /* Factories. rt_gs_make_parallel_backend() exists only when built with
  * ICORECOMP_HAVE_PARALLEL_GS; it fatals (loudly) if no usable Vulkan device

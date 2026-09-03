@@ -19,11 +19,14 @@
  * (see CMakeLists.txt, ICORECOMP_HAVE_PARALLEL_GS) is fatal too.
  *
  * Whichever of the three is built is then wrapped in gs_threaded.cpp's
- * ThreadedBackend, which encodes every call into the GS command ring and
- * (today) replays it inline. ICORECOMP_GS_THREAD=0 leaves the wrapper out
- * and hands out the inner backend directly. That is a developer bisect
- * switch for "is the ring responsible for this?", not a user-facing choice,
- * so it is an environment variable only and has no settings.json twin.
+ * ThreadedBackend, which encodes every call into the GS command ring. The
+ * ring is drained inline on the caller's thread until
+ * rt_gs_backend_start_worker() (main.cpp, after the launcher) moves the
+ * consumer onto its worker thread, which is where it stays for the rest of
+ * the run. ICORECOMP_GS_THREAD=0 leaves the wrapper out and hands out the
+ * inner backend directly. That is a developer bisect switch for "is the ring
+ * responsible for this?", not a user-facing choice, so it is an environment
+ * variable only and has no settings.json twin.
  */
 #include "gs_backend.h"
 
@@ -71,6 +74,17 @@ public:
         m_dump->report_stats();
     }
 
+    /* Window closure is a property of the live backend; the dump writer has
+     * no window. bind_consumer_thread goes to both because either could need
+     * the consumer thread registered with something (only the live one does
+     * today, with Granite's thread-index table). */
+    bool window_closed() override { return m_live->window_closed(); }
+
+    void bind_consumer_thread() override {
+        m_live->bind_consumer_thread();
+        m_dump->bind_consumer_thread();
+    }
+
     /* Only the live backend has a present path; the dump writer has none. */
     void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
                          uint64_t* present_ns, uint64_t* fields) override {
@@ -111,15 +125,27 @@ private:
 };
 
 GsBackend* g_backend = nullptr;
+/* The same object as g_backend when the ring is in use, null when
+ * ICORECOMP_GS_THREAD=0 bypassed it. Kept as its own pointer rather than
+ * recovered with a dynamic_cast: this file is the one place that knows
+ * which of the two it built. */
+ThreadedBackend* g_ring = nullptr;
+bool g_creating = false;
 
 void backend_atexit() {
     if (g_backend) {
+        /* First: stop the command ring's worker thread, so the statistics
+         * below are final and the teardown after them is the only thread
+         * touching the backend. A no-op when the ring is drained inline or
+         * bypassed. */
+        g_backend->quiesce();
         rt_geom_report();
         g_backend->report_stats();
         /* Destroy the backend so a live Vulkan device tears down cleanly
          * (wait-idle in its destructor) even on std::exit paths. */
         delete g_backend;
         g_backend = nullptr;
+        g_ring = nullptr;
     }
 }
 
@@ -190,6 +216,15 @@ GsBackend* rt_gs_backend_if_created() {
 
 GsBackend* rt_gs_backend() {
     if (!g_backend) {
+        /* make_backend opens the Vulkan device and the window, which runs a
+         * good deal of code (SDL, Granite, the driver) that must not reach
+         * back in here and start a second one. Nothing does today; this is
+         * the loud version of that fact. */
+        if (g_creating) {
+            rt_fatal("gs", nullptr,
+                     "rt_gs_backend() called while the backend is still being created");
+        }
+        g_creating = true;
         GsBackend* inner = make_backend(std::getenv("ICORECOMP_GS"),
                                         std::getenv("ICORECOMP_GS_DUMP"));
         const char* thread = std::getenv("ICORECOMP_GS_THREAD");
@@ -198,11 +233,36 @@ GsBackend* rt_gs_backend() {
                          "no command ring");
             g_backend = inner;
         } else {
-            rt_log("gs", "GS command ring active (gs_threaded.cpp, drained inline); "
-                         "set ICORECOMP_GS_THREAD=0 to bypass it");
-            g_backend = rt_gs_make_threaded_backend(inner);
+            rt_log("gs", "GS command ring active (gs_threaded.cpp, drained inline until the "
+                         "game boots); set ICORECOMP_GS_THREAD=0 to bypass it");
+            g_ring = static_cast<ThreadedBackend*>(rt_gs_make_threaded_backend(inner));
+            g_backend = g_ring;
         }
+        g_creating = false;
         std::atexit(backend_atexit);
     }
     return g_backend;
+}
+
+/* See gs_backend.h. main.cpp calls this once, after the launcher has handed
+ * over and before the scheduler boots: the launcher's own present loop
+ * (ui/ui_launcher.cpp) then runs single threaded exactly as it did before
+ * the worker existed, and every field of the game runs with the ring drained
+ * off the EE thread. */
+void rt_gs_backend_start_worker() {
+    if (!g_backend) {
+        /* rt_hw_init() runs before this on both of main.cpp's orderings, so
+         * there is always a backend by now. Silence here would mean a run
+         * that quietly stayed single threaded, which is exactly the kind of
+         * performance change that gets diagnosed as something else. */
+        rt_log("gs", "GS worker thread not started: no backend exists yet, so the GS command "
+                     "ring was never built; this run keeps the GS on the EE thread");
+        return;
+    }
+    if (!g_ring) {
+        rt_log("gs", "GS worker thread not started: the command ring is bypassed "
+                     "(ICORECOMP_GS_THREAD=0), so the GS runs on the EE thread");
+        return;
+    }
+    g_ring->start_worker();
 }

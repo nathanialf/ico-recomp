@@ -63,6 +63,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 namespace rtui {
 
@@ -94,6 +95,27 @@ RebindClock::time_point g_started;
  * moment it arrives, the capture ends at the next field boundary, and the
  * user's finger is normally still down then. */
 int g_swallow_button = -1;
+
+/* Chord capture: gamepad.menu, and only gamepad.menu, accepts on release
+ * rather than on the first press, because it is the one slot a chord is
+ * legal on. `g_chord_seen` is every distinct button pressed since the
+ * capture armed, in press order; `g_chord_held` is how many of them are
+ * still down. Accept happens once nothing is held: one distinct button
+ * accepted alone, two accepted as "first+second" (order carries no meaning,
+ * see settings.cpp's rt_settings_split_chord), a third distinct button
+ * invalidates the attempt so the user is never left trying to store a chord
+ * bigger than two. */
+std::vector<SDL_GamepadButton> g_chord_seen;
+int g_chord_held = 0;
+
+bool is_menu_slot_capture() {
+    return g_device == RT_BIND_GAMEPAD && g_slot == rt_settings_bind_menu_slot(RT_BIND_GAMEPAD);
+}
+
+void chord_reset() {
+    g_chord_seen.clear();
+    g_chord_held = 0;
+}
 
 const std::string& stored_name(RtBindDevice device, int slot) {
     const RtSettings& s = rt_settings();
@@ -127,6 +149,7 @@ void end_capture(const char* log_reason, const std::string& status) {
     /* Nothing was stored, so no release is owed to this file: a press that
      * got this far was rejected, or the capture ended without one. */
     g_swallow_button = -1;
+    chord_reset();
     settings_model_set_rebind(false, g_device, g_slot, status);
     if (log_reason) {
         rt_log("ui", "rebind %s.%s: %s",
@@ -183,7 +206,11 @@ bool capture_key(const SDL_Event& e) {
     return true;
 }
 
-/* Gamepad button events while a gamepad slot is capturing. */
+/* Gamepad button events while a gamepad slot is capturing. Every slot but
+ * gamepad.menu accepts on the first press, same as always. gamepad.menu
+ * accepts on release instead, because it is the one slot a chord is legal
+ * on: see the g_chord_seen comment above and capture_gamepad_button_up
+ * below, which does the accepting. */
 bool capture_gamepad_button(const SDL_Event& e) {
     const SDL_GamepadButton button = SDL_GamepadButton(e.gbutton.button);
     const char* name = SDL_GetGamepadStringForButton(button);
@@ -191,14 +218,58 @@ bool capture_gamepad_button(const SDL_Event& e) {
         set_status("SDL has no name for that button; it cannot be stored");
         return true;
     }
-    accept(name);
+    if (!is_menu_slot_capture()) {
+        accept(name);
+        return true;
+    }
+    bool already_seen = false;
+    for (SDL_GamepadButton b : g_chord_seen) {
+        if (b == button) already_seen = true;
+    }
+    if (!already_seen) {
+        if (g_chord_seen.size() >= 2) {
+            chord_reset();
+            set_status("only two buttons make a chord; release and try again");
+            return true;
+        }
+        g_chord_seen.push_back(button);
+    }
+    ++g_chord_held;
     return true;
 }
 
-/* Axis motion while a gamepad slot is capturing. The stored name carries the
- * direction as a trailing '+' or '-', the convention host/input.cpp reads
- * back (settings.cpp's kGamepadBinds ships "lefttrigger+"). */
+/* The release half of the menu-slot chord capture above: every other slot's
+ * gamepad release is simply swallowed (nothing to do, the button already
+ * accepted on the press). Accepts once nothing captured is still held: one
+ * distinct button becomes its own name, two become "first+second" in the
+ * order they were pressed. */
+bool capture_gamepad_button_up(const SDL_Event& e) {
+    if (!is_menu_slot_capture()) return true;
+    if (g_chord_held > 0) --g_chord_held;
+    (void)e;
+    if (g_chord_held > 0 || g_chord_seen.empty()) return true;
+    if (g_chord_seen.size() == 1) {
+        accept(SDL_GetGamepadStringForButton(g_chord_seen[0]));
+    } else {
+        const char* a = SDL_GetGamepadStringForButton(g_chord_seen[0]);
+        const char* b = SDL_GetGamepadStringForButton(g_chord_seen[1]);
+        accept(std::string(a ? a : "") + "+" + (b ? b : ""));
+    }
+    chord_reset();
+    return true;
+}
+
+/* Axis motion while a gamepad slot is capturing. Refused outright for
+ * gamepad.menu: an axis can never be part of a chord and the grammar (settings.cpp,
+ * rt_settings_split_chord) has no way to spell one alongside a button
+ * anyway. The stored name for every other slot carries the direction as a
+ * trailing '+' or '-', the convention host/input.cpp reads back
+ * (settings.cpp's kGamepadBinds ships "lefttrigger+"). */
 bool capture_gamepad_axis(const SDL_Event& e) {
+    if (is_menu_slot_capture()) {
+        set_status("an axis cannot be the menu key; press a button, or hold two together");
+        return true;
+    }
     const float value = (float)e.gaxis.value;
     if (value > -kCaptureAxis && value < kCaptureAxis) return true;
     const char* name = SDL_GetGamepadStringForAxis(SDL_GamepadAxis(e.gaxis.axis));
@@ -285,6 +356,7 @@ void rebind_begin(RtBindDevice device, int slot) {
     g_slot = slot;
     g_state = State::Capturing;
     g_started = RebindClock::now();
+    chord_reset();
     settings_model_set_rebind(true, device, slot, "");
     rt_log("ui", "rebind %s.%s: waiting for input (Escape cancels, 5 s timeout)",
         bind_device_name(device), rt_settings_binding_key(device, slot));
@@ -344,9 +416,22 @@ bool rebind_handle_sdl_event(const SDL_Event& e) {
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         return g_device == RT_BIND_GAMEPAD ? capture_gamepad_button(e) : true;
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        return true;
+        return g_device == RT_BIND_GAMEPAD ? capture_gamepad_button_up(e) : true;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
         return g_device == RT_BIND_GAMEPAD ? capture_gamepad_axis(e) : true;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        /* The pad this capture was reading is gone. host/input.cpp (called
+         * first by the pump) decides whether another pad takes over; either
+         * way any partial chord read from the old pad is meaningless, so
+         * drop it and tell the user to press again rather than let a stale
+         * g_chord_seen combine with buttons from whatever pad shows up
+         * next. Only the capture's own device cares: a keyboard or mouse
+         * capture ignores it and falls through, same as ui_events.cpp's
+         * nav-hold clear does for that event. */
+        if (g_device != RT_BIND_GAMEPAD) return false;
+        chord_reset();
+        set_status("controller removed; press the button again");
+        return true;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         return mouse ? capture_mouse_button(e) : false;
     case SDL_EVENT_MOUSE_WHEEL:

@@ -1,16 +1,56 @@
 /* mmio.cpp: MMIO trap handlers for guest addresses whose page is NULL in
- * g_pages (0x10xxxxxx device registers, 0x12xxxxxx GS privileged registers).
+ * g_pages (0x10xxxxxx device registers, 0x12xxxxxx GS privileged registers,
+ * and every other hole in the EE physical map: kseg2/kseg3, the gap above
+ * 32 MB of RAM, the IOP RAM and EE ROM windows, and everything else no page
+ * is mapped for).
+ *
+ * The log-everything, read-returns-0 policy described below now holds only
+ * inside the two hardware windows this title's binary actually touches:
+ * 0x10000000-0x1000FFFF (EE bus registers: DMAC channel slots, VIF0/VIF1
+ * FIFO windows, GIF, timers, INTC, SIF) and 0x12000000-0x12001FFF (GS
+ * privileged registers). An access outside those windows is a wild guest
+ * pointer, not an unmodeled register, and CLAUDE.md's "unmapped MMIO is
+ * fatal with a state dump" applies: unmapped_fatal below stops the run with
+ * a register and scheduler dump instead of returning 0 and letting the
+ * guest spin forever on a value that will never change. A misaligned
+ * 16/32/64-bit access inside the two modeled windows is likewise fatal
+ * (unaligned_fatal): lh/lw/ld and sh/sw/sd raise AdEL/AdES for that on the
+ * EE, they do not silently truncate. Two qualifications, both recorded
+ * here rather than guessed at:
+ *   - lq/sq do not fault. They force 16-byte alignment by masking the
+ *     effective address (recomp_ops.h's rc_read128/rc_write128 do the same
+ *     for RAM), so rt_mmio_read128/rt_mmio_write128 mask before dispatch
+ *     and 128-bit accesses are never checked here.
+ *   - lwl/lwr/ldl/ldr and swl/swr/sdl/sdr are the R5900's unaligned-access
+ *     instructions and do not fault either, but recomp_ops.h implements
+ *     them by handing the unaligned address to rc_read32/rc_read64 and
+ *     letting those mask it, so on a NULL page they arrive here looking
+ *     exactly like a misaligned lw. No such access to a hardware register
+ *     is in the measured census of this binary, so the fatal stands; if
+ *     one ever fires with an lwl-family return address, this is why.
+ *
+ * Within the two modeled windows, the P1 policy stands:
  *
  * P1 policy: every access is logged (addr, size, value, running count per
- * address) and every read returns 0. Named-register lookup exists purely to
- * make logs legible; addresses are public PS2 hardware register addresses
- * (DMAC/GS/VIF/timer/INTC/SIF, as documented by e.g. psdevwiki/ps2tek), not
- * anything derived from the ICO decomp or ROM.
+ * address) and every read returns 0 unless a P2/P3 hardware model (see
+ * hw_read/hw_write below) claims the register. Named-register lookup exists
+ * purely to make logs legible; addresses are public PS2 hardware register
+ * addresses (DMAC/GS/VIF/timer/INTC/SIF, as documented by e.g.
+ * psdevwiki/ps2tek), not anything derived from the ICO decomp or ROM.
  *
  * Flood control: an access to the same address logs on its 1st, 2nd, 4th,
  * 8th, ... (power-of-two) occurrence, then the running count is folded into
  * every subsequent power-of-two log line so nothing is silently dropped from
  * view, but a tight poll loop does not spam the log once per instruction.
+ *
+ * Unaligned loads/stores that land on a mapped RAM page never reach this
+ * file: recomp_ops.h's rc_read../rc_write.. mask the offset to the access
+ * size before touching guest memory, because that header is the ABI shared
+ * by generated code and the interpreter. A hardware-accurate AdEL/AdES
+ * check for those belongs there, gated behind a measurement of whether the
+ * game ever mis-aligns a RAM access (not done here: see RC_CHECK_ALIGN in
+ * a future change), not in this file, which only ever sees NULL-page
+ * addresses.
  */
 #include "runtime.h"
 
@@ -193,8 +233,88 @@ bool hw_write(uint32_t norm, bool ipu, uint64_t v) {
     return false;
 }
 
+/* Which of the two hardware windows (if either) this title's binary
+ * touches. Measured basis: every unnamed MMIO access seen in a healthy run
+ * (before the wild-pointer read that motivated this file) falls inside
+ * 0x1000xxxx (DMAC channel slots, VIF0/VIF1 FIFO windows at
+ * 0x10004000/0x10005000, GIF, timers, INTC, SIF) or 0x1200xxxx (GS
+ * privileged registers). Nothing else on the EE bus is ever addressed by
+ * this game. */
+enum class MmioClass { EeRegs, GsPriv, Wild };
+
+MmioClass mmio_class(uint32_t addr, uint32_t norm) {
+    /* hw_norm's mask is the kseg0/kseg1 physical translation and does not
+     * apply above them: kseg2/kseg3 are TLB mapped and this title maps
+     * nothing there (mem.cpp maps RAM aliases at the 0x8 and 0xA prefixes
+     * only). An address there whose masked form happens to land in a
+     * window is still a wild pointer, so classify it before the mask. */
+    if (addr >= 0xC0000000u) return MmioClass::Wild;
+    if (norm >= 0x10000000u && norm < 0x10010000u) return MmioClass::EeRegs;
+    if (norm >= 0x12000000u && norm < 0x12002000u) return MmioClass::GsPriv;
+    return MmioClass::Wild;
+}
+
+/* An access this file must fault on. 128-bit is absent by design: lq/sq
+ * mask the low 4 bits of the effective address instead of raising AdEL or
+ * AdES, and rt_mmio_read128/rt_mmio_write128 have already applied that
+ * mask, so a 128-bit access is aligned by the time it gets here. */
+bool misaligned(uint32_t addr, int bits) {
+    return bits > 8 && bits < 128 && (addr & (uint32_t)(bits / 8 - 1)) != 0;
+}
+
+/* Names the hole a wild access landed in, for the fatal log line. addr is
+ * the raw guest address (pre hw_norm) so the kseg2/kseg3 check sees the
+ * segment bits hw_norm's masking would otherwise erase; norm is the
+ * physical address for everything else. */
+const char* mmio_region_name(uint32_t addr, uint32_t norm) {
+    if (addr >= 0xC0000000u) return "kseg2/kseg3 (TLB mapped, nothing mapped there by this title)";
+    if (norm < 0x10000000u) return "beyond the 32 MB of EE RAM";
+    if (norm >= 0x1C000000u && norm < 0x1C200000u) return "IOP RAM through the EE window (not modeled)";
+    if (norm >= 0x1E000000u && norm < 0x20000000u) return "EE ROM/IOP register window (not modeled)";
+    return "nothing on the EE bus";
+}
+
+/* A wild guest access: not inside either hardware window. Returning 0 and
+ * carrying on, the P1 behavior this replaces, let the guest read garbage
+ * off the bus and loop forever on a value that would never change on real
+ * hardware either (the addresses seen doing this are not backed by
+ * anything). CLAUDE.md: unmapped MMIO is a fatal with a state dump. */
+[[noreturn]] void unmapped_fatal(const char* dir, uint32_t addr, uint32_t norm, int bits, uint64_t value) {
+    rt_log_drain();
+    R5900Context* ctx = rt_fault_ctx();
+    uint32_t ra = ctx ? (uint32_t)ctx->r[31].u64x[0] : 0;
+    const char* suffix = misaligned(addr, bits)
+        ? (dir[0] == 'r' ? ", unaligned (AdEL on the EE)" : ", unaligned (AdES on the EE)")
+        : "";
+    rt_log("mmio", "FATAL: unmapped guest %s%d at 0x%08x (physical 0x%08x, %s)%s value=0x%llx thread=%d ra=0x%08x",
+        dir, bits, addr, norm, mmio_region_name(addr, norm), suffix, (unsigned long long)value,
+        rt_thread_current_id(), ra);
+    rt_dump_registers(ctx);
+    rt_sched_dump_inventory("unmapped guest access");
+    rt_fatal("mmio", nullptr, "unmapped guest %s%d at 0x%08x; the state dump is above", dir, bits, addr);
+}
+
+/* A misaligned 16/32/64-bit access that DOES land inside a modeled window
+ * (see misaligned() for why 128-bit is not one of these). lh/lw/ld and
+ * sh/sw/sd raise AdEL/AdES for this on hardware; recomp_ops.h masks the
+ * offset instead on the RAM path, a divergence the file header records,
+ * but nothing masks it here. */
+[[noreturn]] void unaligned_fatal(const char* dir, uint32_t addr, uint32_t norm, int bits, uint64_t value) {
+    rt_log_drain();
+    R5900Context* ctx = rt_fault_ctx();
+    uint32_t ra = ctx ? (uint32_t)ctx->r[31].u64x[0] : 0;
+    rt_log("mmio", "FATAL: unaligned guest %s%d of hardware register 0x%08x (physical 0x%08x) value=0x%llx "
+        "thread=%d ra=0x%08x", dir, bits, addr, norm, (unsigned long long)value, rt_thread_current_id(), ra);
+    rt_dump_registers(ctx);
+    rt_sched_dump_inventory("unaligned guest access");
+    rt_fatal("mmio", nullptr, "unaligned guest %s%d of hardware register 0x%08x: the EE raises AdEL/AdES here",
+        dir, bits, addr);
+}
+
 uint64_t mmio_read_common(uint32_t addr, int bits) {
     const uint32_t norm = hw_norm(addr);
+    if (mmio_class(addr, norm) == MmioClass::Wild) unmapped_fatal("read", addr, norm, bits, 0);
+    if (misaligned(addr, bits)) unaligned_fatal("read", addr, norm, bits, 0);
     const bool ipu = is_ipu_addr(norm);
     RT_PROF_ZONE(ipu ? RT_PROF_IPU : RT_PROF_MMIO);
     /* Ordering matters for guest poll loops: advance the virtual clock and
@@ -214,6 +334,8 @@ uint64_t mmio_read_common(uint32_t addr, int bits) {
 
 void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
     const uint32_t norm = hw_norm(addr);
+    if (mmio_class(addr, norm) == MmioClass::Wild) unmapped_fatal("write", addr, norm, bits, v);
+    if (misaligned(addr, bits)) unaligned_fatal("write", addr, norm, bits, v);
     const bool ipu = is_ipu_addr(norm);
     RT_PROF_ZONE(ipu ? RT_PROF_IPU : RT_PROF_MMIO);
     hw_write(norm, ipu, v);
@@ -240,7 +362,9 @@ uint64_t rt_mmio_read64(uint32_t addr) {
 }
 rc_u128 rt_mmio_read128(uint32_t addr) {
     rc_u128 v{};
-    v.u64x[0] = mmio_read_common(addr, 128);
+    /* lq forces 16-byte alignment by masking, exactly as recomp_ops.h's
+     * rc_read128 does on the RAM path; it does not raise AdEL. */
+    v.u64x[0] = mmio_read_common(addr & ~0xFu, 128);
     return v;
 }
 
@@ -260,7 +384,14 @@ void rt_mmio_write128(uint32_t addr, rc_u128 v) {
     /* FIFO windows (VIF0/VIF1/GIF) consume the full quadword; everything
      * else keeps the P1 behavior (low 64 bits, registers are at most 64
      * bits wide). */
+    /* sq forces 16-byte alignment by masking, exactly as recomp_ops.h's
+     * rc_write128 does on the RAM path; it does not raise AdES. */
+    addr &= ~0xFu;
     uint32_t naddr = hw_norm(addr);
+    /* The FIFO windows (0x10004000/0x10005000/0x10006000) are inside
+     * EeRegs, so a wild 128-bit store never matches rt_hw_fifo_write128
+     * and falls through to mmio_write_common below, where mmio_class
+     * catches it. */
     {
         RT_PROF_ZONE(is_ipu_addr(naddr) ? RT_PROF_IPU : RT_PROF_MMIO);
         if (rt_hw_fifo_write128(naddr, &v)) {

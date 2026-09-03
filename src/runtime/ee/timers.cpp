@@ -14,7 +14,12 @@
  */
 #include "kernel.h"
 
+#include <cstdio>
+
 namespace {
+
+/* 1, 2, 4, 8, ... : the log flood control this file shares with mmio.cpp. */
+bool is_pow2(uint32_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
 struct Timer {
     uint32_t mode = 0;
@@ -24,6 +29,20 @@ struct Timer {
     uint32_t base_count = 0;
     bool equf = false, ovff = false;
     uint64_t last_check = 0;  /* vclk of the last flag evaluation */
+
+    /* MODE-write logging (rt_timers_mmio_write, reg 0x10): the game rewrites
+     * MODE with the same bits and the same COMP every field on some timers,
+     * which used to log an identical line each time. logged tracks whether
+     * logged_mode/logged_comp hold a real value yet; identical_rewrites
+     * counts MODE writes suppressed since the last logged one, so the next
+     * real change can say how many were skipped. A timer whose MODE never
+     * changes again would otherwise never report that count at all, so the
+     * count is also folded into a line on its 1st, 2nd, 4th, 8th, ...
+     * suppression, the same flood control mmio.cpp uses. */
+    bool logged = false;
+    uint32_t logged_mode = 0;
+    uint32_t logged_comp = 0;
+    uint32_t identical_rewrites = 0;
 };
 
 Timer g_t[4];
@@ -196,9 +215,34 @@ bool rt_timers_mmio_write(uint32_t addr, uint32_t v) {
             t.base_count = count_now(t);
             t.base_vclk = rt_clock_now();
             t.last_check = t.base_vclk;
-            rt_log("timer", "T%d_MODE = 0x%03x (clks=%u cue=%d cmpe=%d ovfe=%d zret=%d comp=0x%04x)",
-                i, t.mode, t.mode & 3, !!(t.mode & 0x80), !!(t.mode & 0x100), !!(t.mode & 0x200),
-                !!(t.mode & 0x40), t.comp);
+            /* Some timers get MODE rewritten with the same bits and the
+             * same COMP every field; log only a real change, a power-of-two
+             * suppression count, or every write under the "timer" verbose
+             * channel. See the fields on Timer above. */
+            {
+                const bool changed = !t.logged || t.mode != t.logged_mode || t.comp != t.logged_comp;
+                if (!changed) ++t.identical_rewrites;
+                const bool milestone = !changed && is_pow2(t.identical_rewrites);
+                if (changed || milestone || rt_verbose("timer")) {
+                    char tail[64] = "";
+                    if (changed && t.identical_rewrites > 0) {
+                        std::snprintf(tail, sizeof(tail), " after %u identical rewrites",
+                            t.identical_rewrites);
+                    } else if (!changed) {
+                        std::snprintf(tail, sizeof(tail), " [identical rewrite #%u]",
+                            t.identical_rewrites);
+                    }
+                    rt_log("timer", "T%d_MODE = 0x%03x (clks=%u cue=%d cmpe=%d ovfe=%d zret=%d comp=0x%04x)%s",
+                        i, t.mode, t.mode & 3, !!(t.mode & 0x80), !!(t.mode & 0x100), !!(t.mode & 0x200),
+                        !!(t.mode & 0x40), t.comp, tail);
+                    if (changed) {
+                        t.logged = true;
+                        t.logged_mode = t.mode;
+                        t.logged_comp = t.comp;
+                        t.identical_rewrites = 0;
+                    }
+                }
+            }
             return true;
         case 0x20: t.comp = v & 0xFFFF; return true;
         case 0x30: t.hold = v & 0xFFFF; return true;

@@ -11,7 +11,11 @@
 
 #include "gs_pgs_context.h"
 
+/* Granite's thread-index table, for bind_consumer_thread below. */
+#include "thread_id.hpp"
+
 #include <cmath>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -81,12 +85,46 @@ void RtPgs::notify_quit() {
 #ifdef ICORECOMP_PGS_SDL
     if (m_platform) m_platform->handle_quit();
 #endif
+    /* Recorded here as well as at the next present: the host polls this from
+     * its own thread to decide when to exit, and a quit raised while the
+     * consumer cannot present would otherwise never be seen. */
+    m_window_closed.store(true, std::memory_order_release);
 }
 
 void RtPgs::notify_resize() {
 #ifdef ICORECOMP_PGS_SDL
-    if (m_platform) m_platform->handle_resize();
+    if (m_platform) {
+        /* Sample first, then raise the flag. The caller is the window's own
+         * thread (see gs_parallel_api.h) and the consumer acts on the flag,
+         * so raising it first would let the consumer rebuild the swapchain
+         * against the size cache this call is about to replace. */
+        m_platform->sample_state();
+        m_platform->handle_resize();
+    }
 #endif
+}
+
+/* Creating thread only; the host calls it once per event pump. */
+void RtPgs::sample_window_state() {
+#ifdef ICORECOMP_PGS_SDL
+    if (m_platform) m_platform->sample_state();
+#endif
+}
+
+/* Consumer thread only, once, before its first call into this instance. */
+void RtPgs::bind_consumer_thread() {
+    /* Granite keys its per-frame command pools on a thread index kept in
+     * thread-local storage (Granite/util/thread_id.cpp), set for the creating
+     * thread by Device::set_context. An unregistered thread logs an error and
+     * falls back to index 0, so register index 0 explicitly: the device is
+     * created with one thread index (init_context_from_platform(1, ...)), and
+     * the creating thread and this one never run library calls at the same
+     * time -- the host's command ring hands the work from one to the other
+     * with its own happens-before edges -- so sharing the index is exactly
+     * the arrangement Granite expects from a single-threaded submitter. */
+    Util::register_thread_index(0);
+    logf("paraLLEl-GS: GS consumer thread bound (Granite thread index 0); GIF transfers,"
+         " vsync and present run on it from here");
 }
 
 void RtPgs::surface_size(uint32_t* width, uint32_t* height) {
@@ -103,14 +141,13 @@ void RtPgs::surface_size(uint32_t* width, uint32_t* height) {
 
 void RtPgs::present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
                          int32_t* bb_w, int32_t* bb_h) {
-    /* Plain member reads. The members are only written from present_frame,
-     * which today runs on the same thread that calls this (gs/gs_select.cpp
-     * builds the ThreadedBackend with inline_drain true, so the ring is
-     * drained on the host's EE thread), so no frame guard and no
-     * synchronization is needed. That is a fact about today's wiring and not
-     * a structural invariant: the day the ring gets a worker thread these
-     * members have to become atomics, along with the timing members next to
-     * them in gs_parallel_impl.h. */
+    /* Under the mutex present_frame publishes them with, so all six describe
+     * the same present: the writer is the host's GS consumer thread and this
+     * reader is its EE thread (host/mouse.cpp, guest/menu_nav.cpp and
+     * ui/ui_menu_cursor.cpp map a cursor position into the picture with
+     * them). No frame guard: this reads state, it does not touch the
+     * swapchain. */
+    std::lock_guard<std::mutex> lk(m_present_rect_mu);
     if (x) *x = m_present_x;
     if (y) *y = m_present_y;
     if (w) *w = m_present_w;
@@ -428,17 +465,21 @@ void RtPgs::present(const ParallelGS::ScanoutResult& scanout, double aspect) {
     present_frame(scanout, aspect);
     /* Runs on every path out of present_frame, including its early returns.
      * A window closed while the swapchain was unusable still has to reach the
-     * host: RT_PGS_VSYNC_WINDOW_CLOSED is the only signal gs_parallel.cpp
-     * exits on, so missing it leaves the process running with no window and
-     * no way to quit. */
-    if (!m_platform->alive(*m_wsi)) m_window_closed = true;
+     * host: the flag below and RT_PGS_VSYNC_WINDOW_CLOSED are the only
+     * signals hw/gspriv.cpp exits on, so missing it leaves the process
+     * running with no window and no way to quit. */
+    if (!m_platform->alive(*m_wsi)) m_window_closed.store(true, std::memory_order_release);
 }
 
 void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspect) {
+    /* Takes the host's resize notification, if any, into Granite's own flag.
+     * On this thread, before begin_frame reads it. */
+    m_platform->sync_from_host();
     if (!m_platform->presentable()) {
-        /* begin_frame() would park the EE thread here; see presentable().
-         * Nothing else pumps SDL when the frame is skipped, so do it here or
-         * the restore and close events are never seen. */
+        /* begin_frame() would park this thread here; see presentable().
+         * Pumping is a no-op off the window's own thread, where the host's
+         * per-field pump is what delivers the restore and close events; it
+         * still matters in the launcher phase, where this is that thread. */
         m_platform->poll_input();
         return;
     }
@@ -473,6 +514,11 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
 
     const int bb_w = int(backbuffer.get_width());
     const int bb_h = int(backbuffer.get_height());
+
+    /* The rectangle rt_pgs_present_rect will report, published once at the
+     * end of the two branches below so a reader on the other thread never
+     * sees half of one present and half of the next. */
+    int32_t rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0;
 
     if (scanout.image) {
         /* Presentation of the already-rendered scanout only: fit and filter
@@ -592,13 +638,13 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
                         { int(scanout.image->get_width()), int(scanout.image->get_height()), 1 },
                         0, 0, 0, 0, 1, filter);
 
-        /* Record what the blit actually used, for rt_pgs_present_rect. The
-         * store is after the fit has been resolved, so a letterbox fallback
-         * from the integer path is reflected rather than the requested fit. */
-        m_present_x = int32_t(x0);
-        m_present_y = int32_t(y0);
-        m_present_w = int32_t(dst_w);
-        m_present_h = int32_t(dst_h);
+        /* Record what the blit actually used, for rt_pgs_present_rect. Taken
+         * after the fit has been resolved, so a letterbox fallback from the
+         * integer path is reflected rather than the requested fit. */
+        rect_x = int32_t(x0);
+        rect_y = int32_t(y0);
+        rect_w = int32_t(dst_w);
+        rect_h = int32_t(dst_h);
     } else {
         /* No scanout this field: the backbuffer holds the clear and,
          * possibly, the overlay. Nothing maps window pixels to guest pixels,
@@ -607,14 +653,18 @@ void RtPgs::present_frame(const ParallelGS::ScanoutResult& scanout, double aspec
          * whole backbuffer either: a caller mapping a cursor into that would
          * get a position on a picture the guest never drew. An empty
          * rectangle is what every reader already treats as "no picture"
-         * (guest/menu_nav.cpp, ui/ui_menu_cursor.cpp both test w and h). */
-        m_present_x = 0;
-        m_present_y = 0;
-        m_present_w = 0;
-        m_present_h = 0;
+         * (guest/menu_nav.cpp, ui/ui_menu_cursor.cpp both test w and h). The
+         * rect_* locals are already zero. */
     }
-    m_present_bb_w = int32_t(bb_w);
-    m_present_bb_h = int32_t(bb_h);
+    {
+        std::lock_guard<std::mutex> lk(m_present_rect_mu);
+        m_present_x = rect_x;
+        m_present_y = rect_y;
+        m_present_w = rect_w;
+        m_present_h = rect_h;
+        m_present_bb_w = int32_t(bb_w);
+        m_present_bb_h = int32_t(bb_h);
+    }
 
     if (!m_overlay_cmds.empty()) {
         /* Overlay pass: draw the retained frame on top of what was just

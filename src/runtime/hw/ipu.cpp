@@ -227,7 +227,7 @@ bool trace_v(int slot, const char* fmt, va_list ap) {
     return true;
 }
 
-void trace(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+RT_PRINTF_FORMAT(1, 2) void trace(const char* fmt, ...);
 
 /* True while a metered class may still emit; says so once when it stops. */
 bool trace_share(uint64_t* used, uint64_t share, const char* what) {
@@ -251,7 +251,7 @@ void trace(const char* fmt, ...) {
 
 /* A polled register state: identical consecutive lines from the same slot
  * collapse into a count, and each slot has its own share of the budget. */
-void trace_state(int slot, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+RT_PRINTF_FORMAT(2, 3) void trace_state(int slot, const char* fmt, ...);
 void trace_state(int slot, const char* fmt, ...) {
     if (!trace_share(&g_trace_polled[slot], kTracePolled, kTraceSlotName[slot])) return;
     va_list ap;
@@ -261,7 +261,7 @@ void trace_state(int slot, const char* fmt, ...) {
 }
 
 /* A command start, with its own share of the budget. */
-void trace_cmd(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+RT_PRINTF_FORMAT(1, 2) void trace_cmd(const char* fmt, ...);
 void trace_cmd(const char* fmt, ...) {
     if (!trace_share(&g_trace_cmds, kTraceCmdStarts, "command starts")) return;
     va_list ap;

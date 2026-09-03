@@ -320,6 +320,19 @@ extern "C" void rt_gs_field_prof(RtGsFieldProf* out) {
     if (GsBackend* be = rt_gs_backend_if_created()) {
         be->present_timings(&out->flush_ns, &out->scanout_ns,
                             &out->present_ns, &out->present_fields);
+        /* The GS command ring's worker, when there is one: what it spent on
+         * replaying packets and on presenting, how much of the window it sat
+         * idle, and what its being a thread cost this one in waiting. A
+         * backend with no worker leaves the struct alone (it is already
+         * zeroed) and the summary drops the line. */
+        RtGsConsumerTimings ct = {};
+        be->consumer_timings(&ct);
+        out->worker_gs_ns = ct.gs_ns;
+        out->worker_present_ns = ct.present_ns;
+        out->worker_idle_ns = ct.idle_ns;
+        out->worker_fields = ct.fields;
+        out->worker_wait_ns = ct.ee_wait_ns;
+        out->worker_waits = ct.ee_waits;
     }
 }
 
@@ -348,13 +361,41 @@ void rt_gs_vsync_hook(unsigned field) {
     rt_settings_apply_pending();
     rt_ui_tick();
     rt_mouse_tick();
+    GsBackend* be = rt_gs_backend();
     {
         RT_PROF_ZONE(RT_PROF_PRESENT);
-        GsBackend* be = rt_gs_backend();
         uint64_t csr = 0;
         if (rt_gs_mmio_read(0x12001000u, &csr)) be->write_priv(0x1000, csr);
         be->write_priv(0x1010, rt_gs_get_imr());
         be->vsync(field);
+    }
+    {
+        /* The one sync point with the GS command ring's worker thread
+         * (gs/gs_threaded.h): it returns once the worker has finished every
+         * field but the one just enqueued, so at most one field is ever in
+         * flight. It pumps the window while it waits, because a worker
+         * parked on a minimized window is waiting for an event only this
+         * thread can deliver.
+         *
+         * Its own zone rather than "present": with the ring drained by the
+         * worker, the "gs" and "present" buckets hold only the enqueue cost,
+         * and what the move to a thread actually costs this thread is
+         * exactly this wait. The worker's own budget is the "gs worker" line
+         * of the profile summary (prof.h). A no-op while the ring is drained
+         * inline, and when it is bypassed. */
+        RT_PROF_ZONE(RT_PROF_GSWAIT);
+        be->field_sync();
+    }
+    /* Window closure, polled here rather than acted on inside the backend:
+     * the backend's vsync can run on the worker thread now, and process
+     * teardown (the atexit handler that joins that worker, the Vulkan
+     * wait-idle, the pipeline cache write) has to happen on this one. The
+     * flag is sticky and set by the live backend for a closed window or a
+     * quit request; host/window.cpp's rt_request_exit and the pump's
+     * SDL_EVENT_QUIT both reach it through rt_pgs_notify_quit. */
+    if (be->window_closed()) {
+        rt_log("gs", "paraLLEl-GS: window closed or exit requested, exiting");
+        std::exit(0);
     }
     static const bool geom = rt_verbose("geom");
     if (geom) rt_geom_field(field);

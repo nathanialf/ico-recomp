@@ -229,10 +229,10 @@ uint32_t RtPgs::vsync(unsigned field) {
     const bool presented = m_transfer_since_vsync;
     m_transfer_since_vsync = false;
 
-    ++m_timing_fields;
+    m_timing_fields.fetch_add(1, std::memory_order_relaxed);
     const auto t_flush = PgsProfClock::now();
     m_iface->flush();
-    m_flush_ns += elapsed_ns(t_flush);
+    m_flush_ns.fetch_add(elapsed_ns(t_flush), std::memory_order_relaxed);
 
     ParallelGS::VSyncInfo info = {};
     /* The phase is the vertical position the field in VRAM was drawn for,
@@ -662,7 +662,7 @@ uint32_t RtPgs::vsync(unsigned field) {
 
     const auto t_scanout = PgsProfClock::now();
     ParallelGS::ScanoutResult scanout = m_iface->vsync(info);
-    m_scanout_ns += elapsed_ns(t_scanout);
+    m_scanout_ns.fetch_add(elapsed_ns(t_scanout), std::memory_order_relaxed);
 
     /* Logged here rather than in present() so headless runs report it too,
      * and once per geometry change so a mode switch is visible without
@@ -1006,7 +1006,7 @@ uint32_t RtPgs::vsync(unsigned field) {
         }
         const auto t_present = PgsProfClock::now();
         present(*to_present, present_aspect);
-        m_present_ns += elapsed_ns(t_present);
+        m_present_ns.fetch_add(elapsed_ns(t_present), std::memory_order_relaxed);
     }
 #endif
     if (m_screenshot_path && scanout.image) {
@@ -1030,6 +1030,6 @@ uint32_t RtPgs::vsync(unsigned field) {
     }
 
     uint32_t flags = presented ? RT_PGS_VSYNC_PRESENTED : 0u;
-    if (m_window_closed) flags |= RT_PGS_VSYNC_WINDOW_CLOSED;
+    if (m_window_closed.load(std::memory_order_acquire)) flags |= RT_PGS_VSYNC_WINDOW_CLOSED;
     return flags;
 }

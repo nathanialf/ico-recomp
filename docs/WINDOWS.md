@@ -30,7 +30,7 @@ Steps, from a VS x64 developer prompt in the repo root:
 
 3. Point the runtime at your disc image, either per run:
 
-       build\Release\icorecomp-runtime.exe --disc "C:\path\to\Ico (USA).iso"
+       build\Release\ico.exe --disc "C:\path\to\Ico (USA).iso"
 
    or once, in `config\local.toml`:
 
@@ -48,12 +48,15 @@ Steps, from a VS x64 developer prompt in the repo root:
 
        cmake --install build --config Release --prefix dist\windows
 
-   `dist\windows` then holds four files and nothing else:
+   `dist\windows` then holds four files and one folder, nothing else:
 
-       icorecomp-runtime.exe
+       ico.exe
        libicorecomp-parallel-gs.dll     (icorecomp-parallel-gs.dll on MSVC)
        SDL3.dll
        README.txt
+       ui\                              (the menu's documents, stylesheet
+                                        and fonts; absent if you configured
+                                        with -DICORECOMP_UI=OFF)
 
    Drop your disc image in beside them as `ico.iso` (or `ico.bin` for a raw
    bin/cue dump) and the folder is self-contained: no config files to
@@ -64,7 +67,7 @@ Steps, from a VS x64 developer prompt in the repo root:
 
 5. Run:
 
-       build\Release\icorecomp-runtime.exe
+       build\Release\ico.exe
 
    A window should open via Vulkan (on Windows builds with the live
    backend, an unset `ICORECOMP_GS` defaults to it). Useful environment
@@ -75,6 +78,41 @@ Steps, from a VS x64 developer prompt in the repo root:
    - `ICORECOMP_MAX_VBLANKS=N` to stop after N fields
    - `ICORECOMP_WAV_CAPTURE=out.wav` to capture the audio mix
    - `ICORECOMP_VERBOSE=geom` to turn on the vertex-level checker
+
+## Executable icon
+
+By default `ico.exe` carries no icon resource, so Windows shows it with its
+own default application icon. To ship it with the save's own PS2
+memory-card icon instead (the black silhouette on its icon.sys background),
+point `ICORECOMP_DISC` at your disc image and build the `icon` target on a
+native (non-cross) configure. That runs the host tool
+`icorecomp-icon-extract`, which reads `DFDATAS/DATA.DF`'s `icon.sys` and the
+save icon it names, renders it at the sizes a `.ico` wants, and writes
+`build/icon/ico.ico` plus a PNG a size for a quick look:
+
+    cmake -B build -DICORECOMP_PARALLEL_GS=ON -DICORECOMP_DISC="C:\path\to\Ico (USA).iso"
+    cmake --build build --config Release --target icon
+    cmake -B build -DICORECOMP_ICON_FILE=build\icon\ico.ico
+    cmake --build build --config Release
+
+Reconfiguring with `ICORECOMP_ICON_FILE` set embeds `ico.ico` as the
+`icorecomp-runtime` target's icon resource (Windows only; `enable_language(RC)`
+runs only in that branch, so a build with neither variable set, including
+CI, configures and builds exactly as before). When cross-compiling from
+Linux, `icorecomp-icon-extract` cannot run on the build host: build the
+`icon` target on a native configure first, then pass its `ico.ico` as
+`ICORECOMP_ICON_FILE` to the cross build. Nothing this produces is ever
+committed -- `build/icon` stays under the build directory, and
+`tools/check_no_rom.sh` blocks `*.ico` and `*.png` outright.
+
+`ico.exe`'s window carries the same render, read from whatever disc ends up
+mounted at run time (`src/runtime/ui/save_icon.cpp`), independent of
+whether the exe itself was built with `ICORECOMP_ICON_FILE`.
+
+The geometry, the vertex colours and the background come from the disc. The
+camera does not: the one the PS2 browser uses is not documented anywhere
+this project has found, so the framing is a stated approximation, written
+down in `src/runtime/ui/ps2_icon_render.h`.
 
 ## Capturing a geometry run
 
@@ -100,7 +138,7 @@ The per-microprogram lines are always present. The `geom:` line needs the
 checker, which is off by default because it re-parses every GIF packet:
 
     set ICORECOMP_VERBOSE=geom
-    icorecomp-runtime.exe
+    ico.exe
 
 Play until well past the point where it goes wrong, then close the window
 and send `icorecomp.log`. A run made to read frame times should leave
