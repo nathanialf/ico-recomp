@@ -105,6 +105,28 @@ uint64_t g_sdl_dropped = 0;
  * cap the stream queue grows without bound. */
 constexpr uint32_t kMaxQueuedBytes = RT_AUDIO_RATE * 2 * sizeof(float);
 
+/* Frames of silence held ahead of the device. The device starts consuming
+ * the moment it is resumed and a mix only arrives when the game issues its
+ * sndn2 flush, so without a cushion that gap is an immediate underrun and
+ * every later hitch has nothing to absorb it. */
+constexpr uint32_t kPrimeFrames = RT_AUDIO_RATE / 20; /* 50 ms */
+
+/* Called once, at device open, and never again while the run continues.
+ * Re-priming a queue that has run empty would be worse than the gap it
+ * tries to cover: hw/gspriv.cpp's pace_field makes this queue the master
+ * clock and steers the field period by its depth against a 2400-frame
+ * target, so pushing 2400 frames of silence in behind a starving queue
+ * puts the depth back on target and the limiter stops correcting, while
+ * the silence itself is spliced ahead of the real mix as an audible gap
+ * and a permanent 50 ms shift that stacks on every repeat. A submit that
+ * finds the queue empty is counted in the underrun stat instead, and the
+ * profile block's queue-depth line reports it. */
+void prime_cushion() {
+    if (!g_sdl_stream) return;
+    static float silence[kPrimeFrames * 2] = {0.0f};
+    SDL_PutAudioStreamData(g_sdl_stream, silence, (int)sizeof silence);
+}
+
 void sdl_open() {
     if (const char* e = std::getenv("ICORECOMP_NO_AUDIO")) {
         /* audio.mute's env twin. The env var's actual effect predates
@@ -135,11 +157,7 @@ void sdl_open() {
      * moment it is resumed, and the first mix does not arrive until the
      * game issues its first sndn2 flush; without a cushion that gap is an
      * immediate underrun, and every later hitch has nothing to absorb it. */
-    {
-        constexpr uint32_t kPrimeFrames = RT_AUDIO_RATE / 20; /* 50 ms */
-        static float silence[kPrimeFrames * 2] = {0.0f};
-        SDL_PutAudioStreamData(g_sdl_stream, silence, (int)sizeof silence);
-    }
+    prime_cushion();
     SDL_ResumeAudioStreamDevice(g_sdl_stream);
     rt_log("audio", "SDL3 audio stream open (driver=%s, 48000 Hz stereo f32, "
                     "50 ms primed)", SDL_GetCurrentAudioDriver());
@@ -163,7 +181,14 @@ void sdl_submit(const float* lr, uint32_t frames) {
         if (q > g_q_max) g_q_max = q;
         g_q_sum += q;
         ++g_q_n;
-        if (q == 0) ++g_underruns;
+        if (q == 0) {
+            /* The cushion is gone: the device has played everything and is
+             * about to run dry between this submit and the next. Counted,
+             * not refilled (see prime_cushion): silence pushed in here
+             * would hide the starvation from the limiter that paces the
+             * port off this queue. */
+            ++g_underruns;
+        }
     }
     if (queued >= 0 && (uint32_t)queued > kMaxQueuedBytes) {
         g_sdl_dropped += frames;

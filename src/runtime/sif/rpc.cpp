@@ -41,6 +41,8 @@
  */
 #include "rpc.h"
 
+#include "../snd/snd.h" /* rt_snd_pcm_note_iop_write: the PCM ring write witness */
+
 #include <cinttypes>
 #include <cstring>
 #include <deque>
@@ -334,6 +336,12 @@ void rt_rpc_on_dma_entry(uint32_t src_ee, uint32_t dest_iop, uint32_t size) {
     uint32_t room = RT_IOP_RAM_SIZE - (dest_iop & (RT_IOP_RAM_SIZE - 1));
     uint32_t n = size < room ? size : room;
     rt_gread_bytes(src_ee, dst, n);
+    /* The attract movie refills its SgStPcm ring with raw SifSetDma entries
+     * (ito/mpeg/mv_sub.c func_0023DB80), so this is the one place the runtime
+     * sees the EE's writes to that ring. The engine needs them to tell a block
+     * the EE never refreshed from one it refreshed with the same bytes; a
+     * transfer anywhere else costs one compare inside the callee. */
+    rt_snd_pcm_note_iop_write(dest_iop & (RT_IOP_RAM_SIZE - 1), n);
 
     if ((dest_iop & 0x1FFFFFFFu) != RT_SIF_IOP_CMDBUF || size < 16) return;
 

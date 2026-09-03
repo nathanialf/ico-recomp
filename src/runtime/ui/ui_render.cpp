@@ -26,10 +26,22 @@
 #include <RmlUi/Core/Matrix4.h>
 
 #include <cstring>
+#include <vector>
 
 namespace rtui {
 
 namespace {
+
+/* The one image this renderer serves through LoadTexture, published by
+ * ui_render_set_logo(). Held as bytes rather than as an uploaded texture
+ * because RmlUi decides when it wants the upload, and it can release and ask
+ * again (a resolution change re-creates the render manager's textures). */
+std::vector<uint8_t> g_logo_rgba;
+uint32_t g_logo_width = 0;
+uint32_t g_logo_height = 0;
+/* Set when a load of that image could not produce a texture. See
+ * ui_render_take_logo_upload_failure in ui_internal.h. */
+bool g_logo_upload_failed = false;
 
 /* R8G8B8A8_UNORM byte order, matching RtPgsOverlayVertex::rgba and
  * gs_parallel.cpp's pack_rgba: red in the low byte. */
@@ -189,8 +201,57 @@ void UiRenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
     m_free.push_back(slot);
 }
 
+bool ui_render_set_logo(const uint8_t* rgba, uint32_t width, uint32_t height) {
+    if (!rgba || width == 0 || height == 0) {
+        rt_log("ui", "the title logo image is %ux%u; nothing to publish", width, height);
+        return false;
+    }
+    g_logo_rgba.assign(rgba, rgba + size_t(width) * size_t(height) * 4u);
+    g_logo_width = width;
+    g_logo_height = height;
+    g_logo_upload_failed = false; /* a new image gets a fresh answer */
+    rt_log("ui", "title logo published under the \"%s\" scheme: %ux%u, %zu bytes", kLogoScheme,
+        width, height, g_logo_rgba.size());
+    return true;
+}
+
+bool ui_render_take_logo_upload_failure() {
+    const bool failed = g_logo_upload_failed;
+    g_logo_upload_failed = false;
+    return failed;
+}
+
+/* The only texture source this build serves. There is no file loader behind
+ * it on purpose: reading an arbitrary path off disk because a stylesheet
+ * named one is not something the overlay renderer does. Anything else logs
+ * once per distinct source and draws untextured. */
 Rml::TextureHandle UiRenderInterface::LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) {
     texture_dimensions = Rml::Vector2i(0, 0);
+
+    if (source.compare(0, sizeof(kLogoScheme) - 1, kLogoScheme) == 0) {
+        if (g_logo_rgba.empty()) {
+            /* RmlUi caches a failed load and never retries it, so the
+             * launcher only puts the element in the document once the image
+             * exists (the logo_available flag in ui_launcher.cpp). Reaching
+             * this means those two went out of step. */
+            rt_log("ui", "LoadTexture(%s): no title logo has been published;"
+                         " the element draws untextured", source.c_str());
+            g_logo_upload_failed = true;
+            return Rml::TextureHandle(0);
+        }
+        const uint32_t id = backend_texture_create(g_logo_rgba.data(), g_logo_width, g_logo_height);
+        if (id == 0) {
+            rt_log("ui", "LoadTexture(%s): the %ux%u upload failed; the element draws untextured",
+                source.c_str(), g_logo_width, g_logo_height);
+            g_logo_upload_failed = true;
+            return Rml::TextureHandle(0);
+        }
+        texture_dimensions = Rml::Vector2i(int(g_logo_width), int(g_logo_height));
+        rt_log("ui", "LoadTexture(%s): %ux%u uploaded as overlay texture %u", source.c_str(),
+            g_logo_width, g_logo_height, id);
+        return Rml::TextureHandle(id);
+    }
+
     if (m_missing_textures.insert(std::string(source)).second) {
         rt_log("ui", "LoadTexture(%s): file images are not implemented in this build;"
                      " the element draws untextured", source.c_str());

@@ -191,6 +191,13 @@ RtPgs::~RtPgs() {
      * owned by the device's cache; only the pointer is dropped. */
     m_overlay_textures.clear();
     m_overlay_white.reset();
+    /* Same reason, and the same trap: ScanoutResult holds a
+     * Vulkan::ImageHandle, and m_held_scanout is declared after m_iface, m_wsi
+     * and the headless device, so the member destructor pass reaches it only
+     * after this body has already destroyed the device the image belongs to.
+     * Reachable whenever the window is closed during the attract movie, which
+     * is exactly when a pair is held. */
+    m_held_scanout = {};
     m_overlay_program = nullptr;
     m_iface.reset();
 #ifdef ICORECOMP_PGS_SDL
@@ -208,11 +215,85 @@ void RtPgs::submit_gif(int path, const uint8_t* data, uint32_t qwords) {
     m_transfer_since_vsync = true;
 }
 
+/* DISPFB field layout, public hardware facts (ps2tek, "GS privileged
+ * registers"): FBP bits 0-8 in 2048-word units, FBW bits 9-14 in units of 64
+ * pixels, PSM bits 15-19, DBX bits 32-42, DBY bits 43-53. Matches
+ * ParallelGS::DISPFBBits (gs_registers.hpp:612-621), which is what the
+ * renderer reads out of the same word. */
+void RtPgs::note_display_register(uint32_t offset, uint64_t old_v, uint64_t new_v) {
+    const bool is_dispfb = (offset == 0x0070u || offset == 0x0090u);
+    if (is_dispfb) {
+        /* The guest pointed the CRTC at a different buffer this field, which
+         * is what separates a field the guest skipped from a field whose new
+         * picture arrived by a route the display copy snoop cannot see.
+         * RtPgs::vsync is the consumer; see the phase derivation there.
+         *
+         * Two conditions, because a flip that is neither costs a field of
+         * high-resolution scanout in gameplay. It has to be the circuit the
+         * scanout reads: vsync derives everything from EN2 ? DISPFB2 :
+         * DISPFB1, so a DISPFB1 write while circuit 1 is off moves nothing on
+         * screen. And it has to move the read window inside VRAM: FBP, DBX or
+         * DBY. A write that only reshapes the buffer description (FBW, PSM)
+         * is a display environment reprogram, not a new picture, and a
+         * gameplay field that dropped its copy and reprogrammed the display
+         * would otherwise be handed the counter phase and lose hires. */
+        static constexpr uint64_t kReadWindowMask =
+            0x1FFull | (0x7FFull << 32) | (0x7FFull << 43);
+        const bool is_circuit2 = (offset == 0x0090u);
+        const auto& priv = m_iface->get_priv_register_state();
+        const bool scanned_circuit = (priv.pmode.EN2 != 0) == is_circuit2;
+        if (scanned_circuit && ((old_v ^ new_v) & kReadWindowMask) != 0)
+            m_dispfb_flip = true;
+        ++m_dispfb_changes;
+        /* A change confined to FBP is the per-field buffer select and says
+         * nothing new about the geometry. Anything else reshapes the window. */
+        const bool geometry_bits = ((old_v ^ new_v) & ~0x1FFull) != 0;
+        /* The first handful, then powers of two. The first four cover two
+         * full alternations of the pair the attract movie flips between,
+         * which is what says whether the two buffers are adjacent field
+         * halves of one picture or two whole frames. Geometry changes get a
+         * budget of their own on top rather than an exemption from the
+         * counter: an exemption is not a bound, and a game that reprograms
+         * the display every field would print a line every field. */
+        const uint64_t n = m_dispfb_changes;
+        bool log_it = false;
+        if (m_dispfb_log_left) {
+            --m_dispfb_log_left;
+            log_it = true;
+        } else if ((n & (n - 1)) == 0) {
+            log_it = true;
+        } else if (geometry_bits && m_dispfb_geom_log_left) {
+            --m_dispfb_geom_log_left;
+            log_it = true;
+        }
+        if (log_it) {
+            logf("paraLLEl-GS: DISPFB%u change %llu: fbp %u->%u fbw %u->%u psm %u->%u"
+                 " dbx %u->%u dby %u->%u (raw 0x%016llx -> 0x%016llx)",
+                 offset == 0x0090u ? 2u : 1u, (unsigned long long)n,
+                 unsigned(old_v & 0x1FFu), unsigned(new_v & 0x1FFu),
+                 unsigned((old_v >> 9) & 0x3Fu), unsigned((new_v >> 9) & 0x3Fu),
+                 unsigned((old_v >> 15) & 0x1Fu), unsigned((new_v >> 15) & 0x1Fu),
+                 unsigned((old_v >> 32) & 0x7FFu), unsigned((new_v >> 32) & 0x7FFu),
+                 unsigned((old_v >> 43) & 0x7FFu), unsigned((new_v >> 43) & 0x7FFu),
+                 (unsigned long long)old_v, (unsigned long long)new_v);
+        }
+        if (geometry_bits) m_display_geom_changed = true;
+        return;
+    }
+    /* PMODE, SMODE1, SMODE2, DISPLAY1, DISPLAY2: every register the scanout
+     * rectangle is derived from. */
+    if (offset == 0x0000u || offset == 0x0010u || offset == 0x0020u ||
+        offset == 0x0080u || offset == 0x00A0u)
+        m_display_geom_changed = true;
+}
+
 void RtPgs::write_priv(uint32_t offset, uint64_t v) {
     offset &= 0x1FFF;
     auto& priv = m_iface->get_priv_register_state();
     if (offset < 0x1000) {
-        priv.qwords_lo[(offset >> 4) * 2] = v;
+        uint64_t& slot = priv.qwords_lo[(offset >> 4) * 2];
+        if (v != slot) note_display_register(offset, slot, v);
+        slot = v;
     } else {
         priv.qwords_hi[((offset - 0x1000) >> 4) * 2] = v;
     }

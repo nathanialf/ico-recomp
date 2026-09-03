@@ -94,10 +94,39 @@ struct AccessStat {
 std::unordered_map<uint32_t, AccessStat> g_read_stats;
 std::unordered_map<uint32_t, AccessStat> g_write_stats;
 
+/* Direct-mapped front for the two maps above.
+ *
+ * The counter itself is the point of the map, so it cannot be skipped, but
+ * the hash probe on the way to it can: the movie touches five registers in
+ * rotation and makes about 33000 accesses a field, and the probe measured
+ * 7.1 ns each (hw/ipu_selftest.cpp's register access benchmark). Hardware
+ * registers are 16-byte aligned, so the low bits of addr >> 4 spread them
+ * without collisions in practice; a collision just costs the map lookup it
+ * would have cost anyway. std::unordered_map is node based, so a stat's
+ * address is stable once inserted and safe to hold here. */
+constexpr size_t kStatCacheSize = 128; /* power of two */
+struct StatCache {
+    uint32_t addr[kStatCacheSize];
+    AccessStat* st[kStatCacheSize];
+    bool valid[kStatCacheSize];
+};
+StatCache g_read_cache{}, g_write_cache{};
+
+AccessStat& stat_for(uint32_t addr, std::unordered_map<uint32_t, AccessStat>& stats, StatCache& cache) {
+    const size_t i = (addr >> 4) & (kStatCacheSize - 1);
+    if (cache.valid[i] && cache.addr[i] == addr) return *cache.st[i];
+    AccessStat& st = stats[addr];
+    cache.addr[i] = addr;
+    cache.st[i] = &st;
+    cache.valid[i] = true;
+    return st;
+}
+
 bool is_pow2(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
 
-void log_access(const char* dir, uint32_t addr, int size_bits, uint64_t value, std::unordered_map<uint32_t, AccessStat>& stats) {
-    AccessStat& st = stats[addr];
+void log_access(const char* dir, uint32_t addr, int size_bits, uint64_t value,
+                std::unordered_map<uint32_t, AccessStat>& stats, StatCache& cache) {
+    AccessStat& st = stat_for(addr, stats, cache);
     ++st.count;
     st.last_value = value;
     if (!is_pow2(st.count)) return;
@@ -117,39 +146,57 @@ uint32_t hw_norm(uint32_t addr) {
     return addr >= 0x80000000u ? (addr & 0x1FFFFFFFu) : addr;
 }
 
+/* The IPU register block (IPU_CMD/CTRL/BP/TOP) and its two FIFO windows.
+ *
+ * Used for two things, both about the cost of an access rather than its
+ * meaning. It picks the profile bucket, so an IPU access opens one zone
+ * here instead of one here and a second inside hw/ipu.cpp: the movie makes
+ * about 33000 register accesses per field and each zone costs two clock
+ * reads, which measured 64 ns per access for the nested pair against 19 ns
+ * for the IPU handler's own work (hw/ipu_selftest.cpp's register access
+ * benchmark). And it lets hw_read/hw_write try the IPU first instead of
+ * walking the DMAC, VIF, GIF, timer, INTC and SIF handlers to reach it. */
+bool is_ipu_addr(uint32_t norm) {
+    return (norm & ~0x3Fu) == 0x10002000u || (norm & ~0x1Fu) == 0x10007000u;
+}
+
 /* P2/P3 hardware model dispatch (hw/dmac.cpp, hw/vif1.cpp, hw/gif.cpp,
  * hw/gspriv.cpp, ee/intc.cpp, ee/timers.cpp, sif/sif.cpp). Returns true
  * when a module owns the register; unmatched addresses fall back to the P1
- * log-and-return-0 behavior. */
-bool hw_read(uint32_t addr, uint64_t* out) {
-    addr = hw_norm(addr);
+ * log-and-return-0 behavior.
+ *
+ * `norm` is the physical address (hw_norm applied) and `ipu` is
+ * is_ipu_addr(norm), both computed once by the caller, which needs the
+ * flag anyway to pick the profile bucket. */
+bool hw_read(uint32_t norm, bool ipu, uint64_t* out) {
+    if (ipu) return rt_ipu_mmio_read(norm, out); /* IPU regs are 64-bit reads */
     uint32_t v32;
-    if (rt_dmac_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_vif_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_gif_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_timers_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_intc_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_sif_mmio_read(addr, &v32)) { *out = v32; return true; }
-    if (rt_ipu_mmio_read(addr, out)) return true; /* IPU regs are 64-bit reads */
-    if (rt_gspriv_mmio_read(addr, out)) return true;
+    if (rt_dmac_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_vif_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_gif_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_timers_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_intc_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_sif_mmio_read(norm, &v32)) { *out = v32; return true; }
+    if (rt_gspriv_mmio_read(norm, out)) return true;
     return false;
 }
 
-bool hw_write(uint32_t addr, uint64_t v) {
-    addr = hw_norm(addr);
-    if (rt_dmac_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_vif_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_gif_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_timers_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_intc_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_sif_mmio_write(addr, (uint32_t)v)) return true;
-    if (rt_ipu_mmio_write(addr, v)) return true;
-    if (rt_gspriv_mmio_write(addr, v)) return true;
+bool hw_write(uint32_t norm, bool ipu, uint64_t v) {
+    if (ipu) return rt_ipu_mmio_write(norm, v);
+    if (rt_dmac_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_vif_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_gif_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_timers_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_intc_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_sif_mmio_write(norm, (uint32_t)v)) return true;
+    if (rt_gspriv_mmio_write(norm, v)) return true;
     return false;
 }
 
 uint64_t mmio_read_common(uint32_t addr, int bits) {
-    RT_PROF_ZONE(RT_PROF_MMIO);
+    const uint32_t norm = hw_norm(addr);
+    const bool ipu = is_ipu_addr(norm);
+    RT_PROF_ZONE(ipu ? RT_PROF_IPU : RT_PROF_MMIO);
     /* Ordering matters for guest poll loops: advance the virtual clock and
      * raise due status bits FIRST, then sample the register, then deliver
      * pending interrupts. This models the real interrupt latency window in
@@ -157,18 +204,20 @@ uint64_t mmio_read_common(uint32_t addr, int bits) {
      * before the kernel dispatcher acks it. The retail vsync wait (clear
      * VB_ON, spin on I_STAT bit 2) depends on that window; delivering
      * before the sample starves it forever. */
-    rt_clock_tick(512);
+    rt_kernel_mmio_bill();
     uint64_t v = 0;
-    hw_read(addr, &v); /* v stays 0 for unmodeled registers */
-    log_access("read", addr, bits, v, g_read_stats);
+    hw_read(norm, ipu, &v); /* v stays 0 for unmodeled registers */
+    log_access("read", addr, bits, v, g_read_stats, g_read_cache);
     rt_intc_deliver();
     return v;
 }
 
 void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
-    RT_PROF_ZONE(RT_PROF_MMIO);
-    hw_write(addr, v);
-    log_access("write", addr, bits, v, g_write_stats);
+    const uint32_t norm = hw_norm(addr);
+    const bool ipu = is_ipu_addr(norm);
+    RT_PROF_ZONE(ipu ? RT_PROF_IPU : RT_PROF_MMIO);
+    hw_write(norm, ipu, v);
+    log_access("write", addr, bits, v, g_write_stats, g_write_cache);
     /* CHCR-triggered DMA completions raised their D_STAT bits inside
      * hw_write; delivery happens here, after the store completed, via the
      * standard deferred path. */
@@ -213,9 +262,9 @@ void rt_mmio_write128(uint32_t addr, rc_u128 v) {
      * bits wide). */
     uint32_t naddr = hw_norm(addr);
     {
-        RT_PROF_ZONE(RT_PROF_MMIO);
+        RT_PROF_ZONE(is_ipu_addr(naddr) ? RT_PROF_IPU : RT_PROF_MMIO);
         if (rt_hw_fifo_write128(naddr, &v)) {
-            log_access("write", naddr, 128, v.u64x[0], g_write_stats);
+            log_access("write", naddr, 128, v.u64x[0], g_write_stats, g_write_cache);
             rt_kernel_mmio_tick();
             return;
         }

@@ -66,3 +66,23 @@ Scope: only render passes that both use field aware rendering and have a
 super-sampled texture bound. Triangles are unaffected either way (they never
 carry `SNAP_RASTER`), and rendering without high resolution scanout never
 reaches the halving at all.
+
+### parallel-gs-0002-report-scanout-placement.patch
+
+`ScanoutResult` gains `circuit_enabled`, `circuit_x`, `circuit_y`,
+`circuit_width` and `circuit_height`: where each CRTC window ended up in the
+output image, in the single-sampled domain, after the CRTC shift and the
+horizontal adaptation. `GSRenderer::vsync` fills them from `crtc_rects` just
+before it assigns `result.internal_width`.
+
+Why: the shim's placement and crop log lines
+(`src/runtime/gs/gs_parallel_scanout.cpp`) need to say whether a display
+window fits the mode area or is cropped by it, and the horizontal answer
+cannot be re-derived from the registers alone. `adapt_to_internal_horizontal_resolution`
+folds both circuits' MAGH and both circuit image widths into `mode_width`,
+so a second derivation in the shim would drift from the renderer's. ICO
+measured: gameplay lands at (0,0) 512x224 in a 512x224 frame, the attract
+movie at (0,0) 720x240 in a 640x224 frame from the same DX and DY.
+
+Scope: reporting only. No existing caller renders anything differently, and
+nothing outside the new assignments is touched. Applies on top of 0001.

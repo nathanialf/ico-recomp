@@ -128,6 +128,21 @@ void sync_menu_hotkey() {
 }
 #endif
 
+} // namespace
+
+/* The ratio the context is running at, read from the live surface rather than
+ * from g_ui, so it is right before the first tick has applied a size. The
+ * launcher needs it to rasterise the title image at the exact pixel size the
+ * overlay will draw it. */
+float ui_density_ratio() {
+    uint32_t width = 0, height = 0;
+    backend_surface_size(&width, &height);
+    if (height == 0) height = g_ui.surface_height;
+    return density_for(height);
+}
+
+namespace {
+
 void apply_surface_size(uint32_t width, uint32_t height) {
     g_ui.surface_width = width;
     g_ui.surface_height = height;

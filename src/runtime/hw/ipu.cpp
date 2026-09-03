@@ -46,9 +46,15 @@
  *     write that clears STR stops it where it stands (rt_ipu_dma_stop).
  *   - Commands execute synchronously at the IPU_CMD write. A command that
  *     runs out of bitstream rewinds to its start and stays pending (BUSY
- *     reads 1); it is retried after the next ch4 kick supplies data. CSC,
- *     whose input is far larger than the FIFO, commits each macroblock as
- *     it goes, so a rewind never crosses more than one.
+ *     reads 1); it is retried after the next ch4 kick supplies data.
+ *     A command whose input is larger than the FIFO commits instead of
+ *     replaying, because hardware has no rewind: CSC after every
+ *     macroblock, and BDEC once its macroblock is out, so its trailing
+ *     start-code scan across this stream's zero stuffing (up to 18389
+ *     bytes) carries the retry point with it. Without that the model asks
+ *     IPU_BP to name a rewind point hundreds of quadwords back, which the
+ *     register cannot encode, and the command can never finish once the
+ *     ch4 chain runs dry.
  *     Two positions come out of that. The decode cursor (g_in_pos) is where
  *     the next attempt will start reading, and it is what IPU_BP reports:
  *     the library's restart rewinds the DMA to BP and re-sends those
@@ -63,6 +69,13 @@
  *   - Output is an unbounded byte queue drained by the fromIPU DMA (ch3,
  *     normal mode). A ch3 kick that cannot be satisfied yet stays pending
  *     (STR stays set) and completes when a command produces enough data.
+ *     The drain is not gated on command completion: an armed ch3 takes
+ *     each macroblock as the decoder produces it, because the library's
+ *     snapshot spins on IPU_CTRL.OFC reading zero before it goes on
+ *     (func_00240090.s at 0x240140-0x240158 masks the readback with 0xF0
+ *     and loops while it is nonzero), and a BDEC that has emitted its
+ *     macroblock and is still scanning would otherwise hold that wait open
+ *     for the whole scan.
  *   - Command completion raises INTC cause 8 (IPU), matching hardware.
  *
  * Diagnostics: the sampled power-of-two lines below describe a healthy run
@@ -135,16 +148,22 @@ constexpr int RT_INTC_IPU = 8; /* ee/kernel.h cause numbering */
  * ICORECOMP_TRACE lifts every cap. */
 constexpr uint64_t kTraceEvents = 4096;    /* whole budget */
 constexpr uint64_t kTraceCmdStarts = 1024; /* share for command starts */
-constexpr uint64_t kTracePolled = 1024;    /* share for polled states */
+/* Share for polled states, per slot rather than shared between them. One
+ * pool would let a new slot take the volume of an existing one: the
+ * every-field "ch4 stopped when it was already idle" line was 584 of the
+ * 3430 lines in the last Windows trace, and out of a single 1024-line pool
+ * that is 584 IPU_BP reads the trace no longer shows. */
+constexpr uint64_t kTracePolled = 1024;
 
 /* Polled-state slots. Each keeps its own "last line" so two spin loops
  * interleaving (a walk stop and an IPU_BP read, say) still collapse. */
-enum TraceSlot { TS_WALK_FULL, TS_WALK_HELD, TS_BP, TS_HOLD_LIFT, TS_COUNT };
+enum TraceSlot { TS_WALK_FULL, TS_WALK_HELD, TS_BP, TS_HOLD_LIFT, TS_STOP_IDLE, TS_COUNT };
 const char* kTraceSlotName[TS_COUNT] = {
     "ch4 walk stops: input FIFO full",
     "ch4 walk stops: the DMAC is held",
     "IPU_BP read",
     "DMAC hold lifted with no IPU kick queued",
+    "ch4 stopped when it was already idle",
 };
 
 struct TraceState {
@@ -156,7 +175,7 @@ TraceState g_ts[TS_COUNT];
 
 uint64_t g_trace_n = 0;        /* lines emitted */
 uint64_t g_trace_cmds = 0;     /* command-start lines emitted */
-uint64_t g_trace_polled = 0;   /* polled-state lines emitted */
+uint64_t g_trace_polled[TS_COUNT] = {0}; /* polled-state lines emitted, per slot */
 bool g_trace_spent = false;    /* budget notice already printed */
 
 void trace_out(const char* text) {
@@ -216,7 +235,7 @@ bool trace_share(uint64_t* used, uint64_t share, const char* what) {
     if (*used < share) return true;
     if (*used == share) {
         ++*used;
-        trace("%s have used their %" PRIu64 "-line share of the trace; the rest of the run traces "
+        trace("%s: the %" PRIu64 "-line share of the trace is used up; the rest of the run traces "
             "only the channel events", what, share);
     }
     return false;
@@ -231,13 +250,13 @@ void trace(const char* fmt, ...) {
 }
 
 /* A polled register state: identical consecutive lines from the same slot
- * collapse into a count, and the class has its own share of the budget. */
+ * collapse into a count, and each slot has its own share of the budget. */
 void trace_state(int slot, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 void trace_state(int slot, const char* fmt, ...) {
-    if (!trace_share(&g_trace_polled, kTracePolled, "polled register states")) return;
+    if (!trace_share(&g_trace_polled[slot], kTracePolled, kTraceSlotName[slot])) return;
     va_list ap;
     va_start(ap, fmt);
-    if (trace_v(slot, fmt, ap)) ++g_trace_polled;
+    if (trace_v(slot, fmt, ap)) ++g_trace_polled[slot];
     va_end(ap);
 }
 
@@ -349,6 +368,12 @@ size_t walk_qw() { return qw_from(g_in_hw); }
  * split does not matter to the library (func_002587E0 and func_002407C0
  * only ever use IFC + FP), the sum does. */
 uint32_t bp_fp() { return held_qw() ? 1u : 0u; }
+/* Declared here so the IPU_BP overrun below can name the command that
+ * rewound past what the register can encode; defined with the rest of the
+ * decoder state further down. */
+extern bool g_busy;
+extern uint32_t g_cur_cmd;
+
 /* IFC saturates at the FIFO depth, as the 4-bit field does on hardware. The
  * DMA bound keeps the real count inside that range while no command is
  * mid-replay; past that the register cannot describe the state the library
@@ -361,8 +386,10 @@ uint32_t bp_ifc() {
         if (rt_trace() || is_pow2(++n)) {
             rt_log("ipu", "%zu quadwords sit between the decode cursor and the end of the input, more "
                 "than the %zu the input FIFO holds; IPU_BP.IFC saturates and the library's "
-                "MADR - (IFC + FP) * 16 rewind would stop short [#%" PRIu64 "]",
-                h, kFifoQw + 1, n);
+                "MADR - (IFC + FP) * 16 rewind would stop short. The command that rewound this "
+                "far is 0x%08x%s [#%" PRIu64 "]",
+                h, kFifoQw + 1, g_busy ? g_cur_cmd : 0u,
+                g_busy ? "" : " (none pending, so this is DMA run-ahead)", n);
         }
     }
     h -= 1;
@@ -648,10 +675,14 @@ int32_t get_signed(unsigned n) {
     return v;
 }
 
-/* Retire quadwords the decoder has left behind; only when no command is
- * mid-flight, so a retry can still rewind to its start. Whole quadwords
- * only: the FIFO is a quadword queue and IPU_BP.BP is an offset inside its
- * head, so the grid the position arithmetic runs on must not shift. */
+/* Retire quadwords the decoder has left behind.
+ *
+ * Callable with a command mid-flight, because commit_scan pairs it with a
+ * fresh take_snapshot: the invariant is that a retry rewinds to the
+ * snapshot, and the snapshot is taken after the compaction, never before
+ * it. Whole quadwords only: the FIFO is a quadword queue and IPU_BP.BP is
+ * an offset inside its head, so the grid the position arithmetic runs on
+ * must not shift. */
 void compact_in() {
     size_t drop = (g_in_pos / 128) * 16;
     if (drop > g_in.size()) drop = (g_in.size() / 16) * 16;
@@ -665,6 +696,7 @@ void compact_in() {
 
 std::vector<uint8_t> g_out;
 size_t g_out_head = 0;
+uint64_t g_out_produced = 0; /* bytes ever pushed; the retry snapshot's mark */
 
 size_t out_avail() { return g_out.size() - g_out_head; }
 
@@ -672,6 +704,7 @@ void out_push(const void* data, size_t len) {
     size_t base = g_out.size();
     g_out.resize(base + len);
     std::memcpy(g_out.data() + base, data, len);
+    g_out_produced += len;
 }
 
 void complete_ch3() {
@@ -727,7 +760,7 @@ int g_dcpred[3];
 /* Retry snapshot: taken at command acceptance, restored on input underflow. */
 struct Snapshot {
     size_t in_pos;
-    size_t out_size;
+    uint64_t out_produced;
     int dcpred[3];
     uint32_t cbp;
 };
@@ -1153,17 +1186,68 @@ void store_chroma_block(int16_t (*plane)[8], const double* px, bool intra) {
     }
 }
 
+void take_snapshot();
+
+/* The scan below is committed rather than replayed, so a stall inside it
+ * rewinds to the byte it had reached and not to the BDEC that started it.
+ * compact_in moves the cursor, so the snapshot is taken after it. */
+void commit_scan() {
+    compact_in();
+    take_snapshot();
+}
+
+/* True once the macroblock has been emitted and only the trailing scan is
+ * left, so a retry of the pending BDEC resumes the scan instead of decoding
+ * the macroblock again. Cleared when a command is accepted. */
+bool g_bdec_tail = false;
+
+/* True once that scan has entered the zero run, so a retry resumes inside
+ * the run instead of re-testing the gate that opened it.
+ *
+ * The gate is "the next 8 bits are zero", read before the stream is byte
+ * aligned. The alignment step then commits the cursor onto the following
+ * byte, of which only the leading misalign bits have been proved zero, so
+ * if the scan starves after that commit the retry would re-read the gate at
+ * a byte that can be nonzero, skip the run entirely and return with ECD
+ * clear where the uninterrupted decode sets it. Committed alongside the
+ * cursor for that reason, and cleared with g_bdec_tail. */
+bool g_bdec_tail_run = false;
+
 /* Trailing start-code scan after a BDEC: if the next 8 bits are zero, the
  * stream aligns to the byte boundary and zero bytes are skipped; a
  * following 000001 sets SCD, other nonzero data sets ECD. (Behavior per
  * hardware as documented by the reference emulator; libmpeg relies on SCD
- * to find the end of each slice.) */
+ * to find the end of each slice.)
+ *
+ * The scan is not short. This movie is padded to a constant bit rate with
+ * zero bytes, and the run that follows the last slice of a picture is
+ * measured at up to 18389 bytes in the retail elementary stream (read off
+ * the disc by hw/ipu_selftest.cpp), which is 143 times what the input FIFO
+ * holds. Hardware takes those bytes out of the FIFO as it scans and the
+ * DMA refills behind it, so the position is never given back. The model
+ * has to do the same, which is why every skipped byte commits: a scan that
+ * stalled for input and rewound to the command start instead would ask
+ * IPU_BP to name a rewind point hundreds of quadwords back, which the
+ * register cannot encode, and once the ch4 chain ran dry the command could
+ * never finish at all. That is measured: it is where the retail movie
+ * wedged on Windows, with a BDEC 10078 bytes into the stuffing after an I
+ * picture and 630 quadwords sitting between the cursor and the end of the
+ * input. */
 bool bdec_tail_scan() {
-    if (!ensure_bits(8)) return false;
-    if (peek_bits(8) == 0) {
-        /* Align to the byte boundary. */
-        size_t misalign = g_in_pos & 7;
-        if (misalign) advance_bits(8 - misalign);
+    if (!g_bdec_tail_run) {
+        if (!ensure_bits(8)) return false;
+        if (peek_bits(8) == 0) {
+            /* Inside the run from here, whatever the retries do. */
+            g_bdec_tail_run = true;
+            /* Align to the byte boundary. */
+            size_t misalign = g_in_pos & 7;
+            if (misalign) {
+                advance_bits(8 - misalign);
+                commit_scan();
+            }
+        }
+    }
+    if (g_bdec_tail_run) {
         for (;;) {
             if (!ensure_bits(24)) return false;
             uint32_t sc = peek_bits(24);
@@ -1173,7 +1257,11 @@ bool bdec_tail_scan() {
                 break;
             }
             advance_bits(8);
+            commit_scan();
         }
+        /* The break above sets ECD or SCD from bits it did not consume, so
+         * a retry that re-enters the loop reads the same 24 bits and sets
+         * the same flag; the run stays open until the command is done. */
     }
     if (!ensure_bits(32)) return false;
     g_top = peek_bits(32);
@@ -1193,6 +1281,10 @@ void bdec_error(const char* what) {
 }
 
 bool exec_bdec(uint32_t val) {
+    /* A retry of a BDEC whose macroblock is already out resumes the
+     * committed trailing scan; the macroblock is not decoded twice. */
+    if (g_bdec_tail) return bdec_tail_scan();
+
     uint32_t fb = val & 0x3F;
     uint32_t qsc = (val >> 16) & 0x1F;
     bool dt = (val >> 25) & 1;
@@ -1271,6 +1363,18 @@ bool exec_bdec(uint32_t val) {
 
     g_cbp_reg = cbp;
     out_push(&g_mb16, sizeof(g_mb16)); /* 48 qwords */
+    /* The macroblock is out and the DC predictors are updated: nothing left
+     * can be replayed, so the retry point moves here and only the trailing
+     * scan is still in flight. */
+    g_bdec_tail = true;
+    take_snapshot();
+    /* An armed ch3 takes it now rather than at the end of the command. The
+     * scan below can run for thousands of bytes, and func_00240090.s waits
+     * for IPU_CTRL.OFC to read 0 before it takes its snapshot, so leaving a
+     * decoded macroblock in the output queue for the length of the scan
+     * would park the library in that wait. Hardware does not: the fromIPU
+     * channel drains the output FIFO while the command is still running. */
+    drain_ch3();
     if (!bdec_tail_scan()) return false;
     return true;
 }
@@ -1409,8 +1513,6 @@ void csc_one_mb(const MacroBlock8* mb, uint8_t* rgb_out /* 1024 bytes */) {
  * anything IPU_BP could describe. */
 uint32_t g_csc_done = 0;
 
-void take_snapshot();
-
 bool exec_csc(uint32_t val) {
     uint32_t mbc = val & 0x7FF;
     bool ofm = (val >> 27) & 1;
@@ -1432,6 +1534,7 @@ bool exec_csc(uint32_t val) {
         out_push(rgb, sizeof(rgb));
         /* Committed: a stall inside the next macroblock rewinds to here. */
         take_snapshot();
+        drain_ch3(); /* as above: ch3 is not gated on command completion */
     }
     return true;
 }
@@ -1501,10 +1604,13 @@ void soft_reset() {
     g_in_hw = 0;
     g_out.clear();
     g_out_head = 0;
+    g_out_produced = 0;
     g_cbp_reg = 0;
     g_th[0] = g_th[1] = 0;
     g_ecd = g_scd = false;
     g_busy = false;
+    g_bdec_tail = false;
+    g_bdec_tail_run = false;
     g_top = 0;
     g_cmd_data = 0;
     g_underflow = false;
@@ -1527,7 +1633,7 @@ void soft_reset() {
 
 void take_snapshot() {
     g_snap.in_pos = g_in_pos;
-    g_snap.out_size = g_out.size();
+    g_snap.out_produced = g_out_produced;
     std::memcpy(g_snap.dcpred, g_dcpred, sizeof(g_dcpred));
     g_snap.cbp = g_cbp_reg;
 }
@@ -1535,7 +1641,21 @@ void take_snapshot() {
 void restore_snapshot() {
     /* g_in_hw is deliberately not restored: see the file header. */
     g_in_pos = g_snap.in_pos;
-    g_out.resize(g_snap.out_size);
+    /* Output pushed since the snapshot goes back. Both producers (BDEC's
+     * macroblock, CSC's per-macroblock commit) snapshot the instant they
+     * push, so there is never any to take back; if there is, the fromIPU
+     * DMA may already have moved it out of the model's reach, which is a
+     * model error rather than something to paper over. */
+    if (g_out_produced != g_snap.out_produced) {
+        uint64_t drop = g_out_produced - g_snap.out_produced;
+        if (drop > (uint64_t)out_avail()) {
+            rt_fatal("ipu", nullptr, "a stalled command has to take back %" PRIu64 " output bytes but "
+                "only %zu are still queued; the fromIPU DMA has already moved the rest out",
+                drop, out_avail());
+        }
+        g_out.resize(g_out.size() - (size_t)drop);
+        g_out_produced = g_snap.out_produced;
+    }
     std::memcpy(g_dcpred, g_snap.dcpred, sizeof(g_dcpred));
     g_cbp_reg = g_snap.cbp;
 }
@@ -1662,6 +1782,8 @@ void cmd_write(uint32_t val) {
             g_cur_cmd = val;
             g_busy = true;
             g_csc_done = 0;
+            g_bdec_tail = false;
+            g_bdec_tail_run = false;
             take_snapshot();
             run_pending();
             return;
@@ -1769,6 +1891,15 @@ void rt_ipu_dma_kick(int ch) {
     }
 }
 
+/* One wording for the two ch4 stop lines below. A macro rather than a
+ * const char*, because both call sites take a printf format attribute and
+ * that only checks a literal; the two differ in the metering, not the
+ * text. */
+#define IPU_CH4_STOP_FMT \
+    "ch4 stopped by a CHCR write without STR (chcr=0x%08x): the channel was %s, " \
+    "madr=0x%08x qwc=%u tadr=0x%08x, %" PRIu64 " qword%s resident (bp=%u ifc=%u fp=%u), " \
+    "pending command 0x%08x %s"
+
 /* CHCR written with STR=0: the transfer stops where it is. The registers
  * are left alone (they are what the library reads back straight after:
  * func_002586F8.s at 0x258710-0x258754 loads MADR, TADR, QWC and CHCR the
@@ -1777,13 +1908,24 @@ void rt_ipu_dma_kick(int ch) {
 void rt_ipu_dma_stop(int ch) {
     if (ch == 4) {
         bind_regs();
-        trace("ch4 stopped by a CHCR write without STR (chcr=0x%08x): the channel was %s, madr=0x%08x "
-            "qwc=%u tadr=0x%08x, %" PRIu64 " qword%s resident (bp=%u ifc=%u fp=%u), pending command "
-            "0x%08x %s",
-            *g_ch4_reg[0], g_to.active ? "running" : "already idle", *g_ch4_reg[1], *g_ch4_reg[2],
-            *g_ch4_reg[3], (uint64_t)held_qw(), held_qw() == 1 ? "" : "s", bp_bp(), bp_ifc(), bp_fp(),
-            g_cur_cmd, g_busy ? "still pending" : "done");
-        if (!g_to.active) return;
+        /* A stop of a channel that is already idle changes nothing, and the
+         * player writes one every field whether or not ch4 is running: 584
+         * of the 3430 lines in the last Windows trace were that one line
+         * repeated. It is metered and collapsed with the other polled
+         * states so it cannot crowd out the events that do change
+         * something. A stop that actually catches the channel running is
+         * one of those events and stays unmetered. */
+        if (g_to.active) {
+            trace(IPU_CH4_STOP_FMT, *g_ch4_reg[0], "running", *g_ch4_reg[1], *g_ch4_reg[2],
+                *g_ch4_reg[3], (uint64_t)held_qw(), held_qw() == 1 ? "" : "s", bp_bp(), bp_ifc(),
+                bp_fp(), g_cur_cmd, g_busy ? "still pending" : "done");
+        } else {
+            trace_state(TS_STOP_IDLE, IPU_CH4_STOP_FMT, *g_ch4_reg[0], "already idle",
+                *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3], (uint64_t)held_qw(),
+                held_qw() == 1 ? "" : "s", bp_bp(), bp_ifc(), bp_fp(), g_cur_cmd,
+                g_busy ? "still pending" : "done");
+            return;
+        }
         g_to.active = false;
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
@@ -1807,6 +1949,7 @@ void rt_ipu_dma_stop(int ch) {
         }
     }
 }
+#undef IPU_CH4_STOP_FMT
 
 void rt_ipu_dma_resume() {
     bind_regs();
@@ -1835,8 +1978,13 @@ void rt_ipu_dma_resume() {
 
 /* ---- MMIO ---------------------------------------------------------------- */
 
+/* No RT_PROF_ZONE here or in rt_ipu_mmio_write/rt_ipu_fifo_feed: mmio.cpp
+ * already opens RT_PROF_IPU for this address range, and a second nested
+ * zone would double the profiler's two clock reads on the movie's hottest
+ * path for no extra information. The DMA entry points below keep theirs;
+ * they are reached from a DMAC register write, which is billed to
+ * RT_PROF_MMIO, and they run per transfer rather than per access. */
 bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
-    RT_PROF_ZONE(RT_PROF_IPU);
     switch (addr) {
         case 0x10002000: { /* IPU_CMD */
             service_input();
@@ -1909,7 +2057,6 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
 }
 
 bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
-    RT_PROF_ZONE(RT_PROF_IPU);
     switch (addr) {
         case 0x10002000: /* IPU_CMD */
             bind_regs();
@@ -1944,7 +2091,6 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
 }
 
 void rt_ipu_fifo_feed(const uint8_t* qw16) {
-    RT_PROF_ZONE(RT_PROF_IPU);
     static uint64_t n = 0;
     /* Hardware stalls the store until the FIFO has room. Commands here run
      * synchronously, so give the pending one a chance to drain first; if the

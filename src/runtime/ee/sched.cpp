@@ -322,11 +322,60 @@ void rt_clock_tick(uint64_t cycles) {
     g_vclk = target;
 }
 
+/* Bus cycles billed for one EE hardware-register access.
+ *
+ * This used to be 512, chosen so that a tight guest poll loop would cross a
+ * 16.7 ms field boundary in a few thousand iterations. That is a liveness
+ * figure, not a hardware one, and it is 256 times what rt_backedge bills a
+ * RAM-resident loop iteration, so any guest code that drives a peripheral
+ * through its registers runs two orders of magnitude slower than the rest
+ * of the game.
+ *
+ * The attract movie is exactly that code, and it measured the old value out
+ * of existence. In the 22:22 Windows log (dist/windows/icorecomp.log, prof
+ * window "fields 2881..3060") the movie spends the whole field on register
+ * traffic and nothing else: 855361 MMIO accesses over 180 fields is 4752
+ * per field, and 4752 * 512 = 2433024 of the 2460060 cycles a field holds.
+ * The host is idle 68.7% of that field ("limit" bucket) and no thread is
+ * ever blocked ("idle 0.0%"), so the movie's frame rate is set by this
+ * constant and by nothing else.
+ *
+ * The retail game bounds it from the other side. The same window shows
+ * roughly 50000 to 60000 register accesses per decoded picture, most of
+ * them the MPEG library's byte-at-a-time FDEC scan across the stream's
+ * zero stuffing. A retail PS2 plays that movie at 29.97 pictures a second,
+ * two fields per picture, which is 4920120 bus cycles. Even if the EE did
+ * nothing else at all in those two fields, the per-access cost cannot
+ * exceed about 89 cycles, and the loop also runs motion compensation, the
+ * CSC feed, the display list and the sound tick, so the real figure is well
+ * under that.
+ *
+ * The exact EE uncached-access latency is not measured here and this is not
+ * a claim about it. 32 bus cycles (64 EE cycles) is chosen as a value
+ * comfortably inside the bound the retail workload proves, and 16 times a
+ * loop iteration's 2 cycles, which is the right order for an uncached
+ * hardware read against RAM-resident code. A poll loop still crosses a
+ * field, in about 72000 iterations rather than 5000.
+ *
+ * Gameplay was checked on this value: a user run of the retail game on this
+ * build held 59.9 fields per second with a healthy audio queue. The hazard
+ * to watch when changing it is the one the g_backedge_cycles comment below
+ * names, because this constant pulls the same lever from the other side:
+ * bill too few cycles per access and the guest does more work per field
+ * than a real EE could, so the game's sound tick runs too often per field
+ * and over-refills the sndn2 stream ring.
+ *
+ * Tunable by ICORECOMP_MMIO_CYCLES for a sweep; the value in force is
+ * logged at startup. */
+uint64_t g_mmio_cycles = 32;
+
+void rt_kernel_mmio_bill() {
+    g_cyc_mmio += g_mmio_cycles;
+    rt_clock_tick(g_mmio_cycles);
+}
+
 void rt_kernel_mmio_tick() {
-    /* ~3.5 us per polled MMIO access: a tight guest poll loop crosses a
-     * 16.7 ms field boundary in a few thousand iterations. */
-    g_cyc_mmio += 512;
-    rt_clock_tick(512);
+    rt_kernel_mmio_bill();
     rt_intc_deliver();
 }
 
@@ -375,6 +424,20 @@ void rt_sched_init() {
                     "(ICORECOMP_EE_LOOP_CYCLES; higher = slower emulated EE "
                     "relative to the field clock)",
         (unsigned long long)g_backedge_cycles);
+    if (const char* m = std::getenv("ICORECOMP_MMIO_CYCLES")) {
+        uint64_t v = std::strtoull(m, nullptr, 10);
+        if (v >= 1 && v <= 4096) {
+            g_mmio_cycles = v;
+        } else {
+            rt_log("sched", "ICORECOMP_MMIO_CYCLES=%s is outside 1..4096; keeping %llu",
+                m, (unsigned long long)g_mmio_cycles);
+        }
+    }
+    rt_log("sched", "MMIO billing: %llu bus cycles per hardware-register access, so a field of "
+                    "%llu cycles holds %llu of them (ICORECOMP_MMIO_CYCLES; this is what paces "
+                    "register-driven guest code such as the MPEG player)",
+        (unsigned long long)g_mmio_cycles, (unsigned long long)RT_CYCLES_PER_FIELD,
+        (unsigned long long)(RT_CYCLES_PER_FIELD / g_mmio_cycles));
     rt_intc_init();
     rt_timers_init();
     rt_sif_init();

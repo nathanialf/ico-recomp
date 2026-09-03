@@ -123,6 +123,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-settings-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
+# Standalone exercise of the SgStPcm ring geometry (snd/pcm_stream.h), the
+# interleave the attract movie's audio streams out of the IOP buffer. The
+# subject is header only, so this links nothing: no SDL, no runtime services.
+# Its numbers are the ones the retail game sends.
+add_executable(icorecomp-snd-pcm-selftest
+    src/runtime/snd/tests/pcm_stream_selftest.cpp
+)
+target_include_directories(icorecomp-snd-pcm-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-snd-pcm-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
 # Standalone exercise of the left-stick reshaping behind
 # gameplay.run_any_direction (host/stick_shape.h). The subject is header
 # only, so this links nothing: no SDL, no settings model, no runtime
@@ -183,6 +198,35 @@ target_compile_definitions(icorecomp-ipu-selftest PRIVATE
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(icorecomp-ipu-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
+endif()
+
+# ---- title logo selftest --------------------------------------------------
+#
+# Standalone check of the launcher's title image (ui/title_logo.cpp): mounts
+# the disc image, pulls the three letter meshes and the title animation out of
+# DFDATAS/DATA.DF, reduces them to the wordmark's geometry, rasterises it to a
+# PNG for eyeball verification, and then reads the result back through the
+# cache. Links no RmlUi, no SDL and no GS. The output path is a required
+# argument and must be outside the repository: the PNG it writes is
+# game-derived.
+add_executable(icorecomp-title-logo-selftest
+    src/runtime/ui/title_logo.cpp
+    src/runtime/ui/title_logo_selftest.cpp
+    src/runtime/host/inflate.cpp
+    src/runtime/iso/iso9660.cpp
+    src/runtime/loader.cpp
+    src/runtime/log.cpp
+    src/runtime/sha1.cpp
+)
+target_include_directories(icorecomp-title-logo-selftest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/runtime
+)
+target_compile_definitions(icorecomp-title-logo-selftest PRIVATE
+    ICORECOMP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(icorecomp-title-logo-selftest PRIVATE -Wall -Wextra -fno-strict-aliasing)
 endif()
 
 # ---- optional generated/ee link ------------------------------------------
@@ -562,6 +606,8 @@ if(ICORECOMP_UI)
         src/runtime/ui/ui_rebind.cpp
         src/runtime/ui/ui_settings_model.cpp
         src/runtime/ui/ui_launcher.cpp
+        src/runtime/ui/title_logo.cpp
+        src/runtime/host/inflate.cpp
     )
     target_compile_definitions(icorecomp-runtime PRIVATE ICORECOMP_UI)
     # RmlUi::Core only. The debugger is a separate target that nothing here

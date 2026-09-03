@@ -60,6 +60,43 @@ void backend_set_frame(const RtPgsOverlayFrame* frame);
  * ui_events.cpp. NULL when there is no window. */
 void* backend_window_handle();
 
+/* The context's density-independent pixel ratio, derived from the live
+ * surface height against the 640x480 design size and clamped to [1, 4] (see
+ * density_for in ui.cpp). Valid before the first rt_ui_tick, which is what
+ * the launcher needs: it rasterises the title image at the pixel size this
+ * implies before the first frame is presented. */
+float ui_density_ratio();
+
+/* ---- the title logo texture scheme --------------------------------------
+ *
+ * The launcher's title image is built from the user's disc at run time
+ * (ui/title_logo.h) and lives in memory, not in a file. A document names it
+ * with this scheme in an `src` attribute; UiSystemInterface::JoinPath passes
+ * such a source through untouched and UiRenderInterface::LoadTexture answers
+ * it from the published bytes. Nothing else is servable: this build has no
+ * file image loader.
+ */
+inline constexpr char kLogoScheme[] = "logo:";
+
+/* Publishes the RGBA8 image the scheme serves. `rgba` is width * height * 4
+ * bytes with alpha premultiplied, and is copied. Returns false, having
+ * logged, for an empty or zero-sized image.
+ *
+ * Call this before the flag that puts the element in the document: RmlUi
+ * caches a texture load that returned nothing and never asks again. */
+bool ui_render_set_logo(const uint8_t* rgba, uint32_t width, uint32_t height);
+
+/* True once if LoadTexture was asked for the published image and could not
+ * hand a texture back, which for the backend means the GPU upload failed.
+ * Reading it clears it, and publishing a new image clears it too.
+ *
+ * The raster succeeding says nothing about the upload: the two happen in
+ * different places and only this side knows the second answer. Without it a
+ * failed upload leaves the document showing an element whose texture is
+ * missing, with its text fallback switched off, which is a blank box. The
+ * launcher polls this and puts the text back. */
+bool ui_render_take_logo_upload_failure();
+
 /* ---- render interface ---------------------------------------------------
  *
  * Geometry is pooled on this side of the ABI: CompileGeometry copies the
@@ -128,8 +165,9 @@ private:
     bool m_has_transform = false;
     Rml::Matrix4f m_transform;
 
-    /* LoadTexture has no implementation in v1 (text and solid boxes only);
-     * one log line per distinct source keeps a repeated draw quiet. */
+    /* Sources LoadTexture refused. The "logo:" scheme above is the only one
+     * it serves; there is no file loader, so every other source lands here
+     * and gets one log line, which keeps a repeated draw quiet. */
     std::set<std::string> m_missing_textures;
 
     /* Deferred texture destruction. RmlUi releases a texture the moment it
@@ -152,6 +190,8 @@ class UiSystemInterface final : public Rml::SystemInterface {
 public:
     double GetElapsedTime() override;
     bool LogMessage(Rml::Log::Type type, const Rml::String& message) override;
+    void JoinPath(Rml::String& translated_path, const Rml::String& document_path,
+                  const Rml::String& path) override;
     void SetMouseCursor(const Rml::String& cursor_name) override;
     void SetClipboardText(const Rml::String& text) override;
     void GetClipboardText(Rml::String& text) override;

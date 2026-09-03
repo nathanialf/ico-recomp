@@ -28,21 +28,36 @@ struct Timer {
 
 Timer g_t[4];
 
-uint64_t prescale(const Timer& t) {
-    switch (t.mode & 3) {
-        case 0: return 1;
-        case 1: return 16;
-        case 2: return 256;
-        default: return RT_CYCLES_PER_HBLANK;
-    }
-}
+/* Bus cycles per tick, indexed by Tn_MODE.CLKS. */
+constexpr uint64_t kPrescale[4] = {1, 16, 256, RT_CYCLES_PER_HBLANK};
+
+/* The same three power-of-two divisors as shifts, for raw_ticks. The
+ * static_asserts are the tie: change a prescale without its shift and the
+ * build stops. */
+constexpr unsigned kPrescaleShift[3] = {0, 4, 8};
+static_assert(kPrescale[0] == 1ull << kPrescaleShift[0], "CLKS 0 prescale and shift disagree");
+static_assert(kPrescale[1] == 1ull << kPrescaleShift[1], "CLKS 1 prescale and shift disagree");
+static_assert(kPrescale[2] == 1ull << kPrescaleShift[2], "CLKS 2 prescale and shift disagree");
+
+uint64_t prescale(const Timer& t) { return kPrescale[t.mode & 3]; }
 
 bool counting(const Timer& t) { return (t.mode & 0x80) != 0; } /* CUE */
 
-/* Ticks elapsed since base (not wrapped). */
+/* Ticks elapsed since base (not wrapped).
+ *
+ * Three of the four prescales are powers of two, so those divide by a
+ * shift. This is on the hot path by way of rt_timers_next_event, which
+ * clock_next_event calls on every MMIO access: the movie makes about 33000
+ * of those per field, and a 64-bit divide each was paying for nothing. Only
+ * the H-blank prescale needs the real division. The result is still
+ * elapsed / prescale(t) for every CLKS value; kPrescaleShift above is
+ * asserted against kPrescale so the two cannot drift apart. */
 uint64_t raw_ticks(const Timer& t) {
     if (!counting(t)) return 0;
-    return (rt_clock_now() - t.base_vclk) / prescale(t);
+    const uint64_t elapsed = rt_clock_now() - t.base_vclk;
+    const unsigned clks = t.mode & 3;
+    if (clks == 3) return elapsed / kPrescale[3];
+    return elapsed >> kPrescaleShift[clks];
 }
 
 uint32_t count_now(const Timer& t) {
@@ -62,8 +77,22 @@ int timer_index(uint32_t addr, uint32_t* reg) {
 
 void rt_timers_init() {}
 
-/* Next compare/overflow interrupt across enabled timers, absolute vclk. */
-uint64_t rt_timers_next_event() {
+namespace {
+
+/* Next compare/overflow interrupt across enabled timers, absolute vclk.
+ *
+ * Memoized, because clock_next_event calls this on every MMIO access and
+ * the answer only moves when the timer state does. Every "when" below is an
+ * absolute cycle computed from base_vclk, base_count, comp and mode, none
+ * of which change as time passes, so the answer is good until something
+ * writes a timer register or rt_timers_run_due retires an event. Those are
+ * the only two places in this file that touch g_t, and both drop the cache;
+ * nothing outside this file can reach that array, so the invalidation is
+ * complete by construction rather than by convention. */
+uint64_t g_next_event_cache = 0;
+bool g_next_event_valid = false;
+
+uint64_t timers_next_event_slow() {
     uint64_t best = UINT64_MAX;
     for (const Timer& t : g_t) {
         if (!counting(t)) continue;
@@ -85,7 +114,21 @@ uint64_t rt_timers_next_event() {
     return best;
 }
 
+} // namespace
+
+uint64_t rt_timers_next_event() {
+    if (!g_next_event_valid) {
+        g_next_event_cache = timers_next_event_slow();
+        g_next_event_valid = true;
+    }
+    return g_next_event_cache;
+}
+
 void rt_timers_run_due() {
+    /* Unconditional: a compare that fired without resetting the count still
+     * has to move the cached answer on to the next period, or the tick loop
+     * would keep finding the same event due. */
+    g_next_event_valid = false;
     for (int i = 0; i < 4; ++i) {
         Timer& t = g_t[i];
         if (!counting(t)) { t.last_check = rt_clock_now(); continue; }
@@ -137,6 +180,7 @@ bool rt_timers_mmio_write(uint32_t addr, uint32_t v) {
     int i = timer_index(addr, &reg);
     if (i < 0) return false;
     Timer& t = g_t[i];
+    g_next_event_valid = false; /* the only other writer of g_t; see the cache */
     switch (reg) {
         case 0x00:
             t.base_count = v & 0xFFFF;

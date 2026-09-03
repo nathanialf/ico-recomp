@@ -51,6 +51,7 @@ struct RtPgs {
      * drawn for. See the comment on info.phase in vsync(). */
     void snoop_display_copy_phase(const uint8_t* data, uint32_t qwords);
     void note_xyoffset(uint32_t reg, uint32_t ofy);
+    void note_display_register(uint32_t offset, uint64_t old_v, uint64_t new_v);
     void write_priv(uint32_t offset, uint64_t v);
     uint64_t read_priv(uint32_t offset);
     uint32_t vsync(unsigned field);
@@ -251,10 +252,12 @@ private:
      * geometry or scale change is visible in the log without spamming every
      * field. Kept in the same order the geom[] literal in vsync() builds. */
     uint32_t m_aspect_log_geom[7] = {};
-    /* Fields still owed a "crtc field" line. Armed at construction and re-armed
-     * whenever the scanout geometry line above fires, so a log always carries a
-     * few consecutive fields of CRTC state for both phases without the line
-     * running for the whole session. Two phases plus a spare pair. */
+    /* Fields still owed a "crtc field" line. Armed at construction, re-armed
+     * whenever the scanout geometry line above fires, and re-armed once on the
+     * first field that takes the DISPFB branch of the phase derivation, so a
+     * log always carries a few consecutive fields of CRTC state for both
+     * phases without the line running for the whole session. Two phases plus a
+     * spare pair. */
     unsigned m_crtc_log_left = 6;
 
     /* Display copy phase tracking (snoop_display_copy_phase / note_xyoffset).
@@ -274,9 +277,63 @@ private:
     uint32_t m_copy_ofy_reg = 0;      /* 0x18 or 0x19 once latched, else 0 */
     int32_t m_copy_ofy_base = -1;     /* OFY with a zero fraction, once seen */
     int m_copy_parity = -1;           /* this field: -1 none, 0 base, 1 base+8 */
+    /* This field: a draw programmed the copy's XYOFFSET at all, whichever
+     * half of the pair it was. Separate from m_copy_parity because the parity
+     * needs the half pixel form to have been seen once and this does not, so
+     * m_hires_from_copy is right from the first copy field rather than from
+     * the first half pixel field. Set by note_xyoffset, cleared by vsync. */
+    bool m_copy_seen = false;
     int m_last_phase = -1;            /* phase handed over on the previous field */
     uint64_t m_phase_held = 0;        /* fields with no copy, phase repeated */
     uint64_t m_phase_disagreed = 0;   /* fields where the copy and the field counter differ */
+    /* Set by write_priv when DISPFB1 or DISPFB2 changes value, cleared by
+     * vsync. The attract movie never draws the display copy: it decodes to
+     * two field buffers in VRAM and alternates DISPFB2's FBP between them
+     * once per field from its own vblank handler, so a field with no copy in
+     * it is a new picture there rather than a repeat of the last one. */
+    bool m_dispfb_flip = false;
+    uint64_t m_phase_from_flip = 0;   /* fields with no copy but a DISPFB change */
+    /* False once a field's picture is known to have arrived by a plain
+     * DISPFB flip rather than by the super-sampled display copy. It gates
+     * info.high_resolution_scanout; see the derivation in RtPgs::vsync.
+     * Sticky across held fields, because a held field scans out the same
+     * buffer the last decided field did. */
+    bool m_hires_from_copy = true;
+    /* Set by write_priv for any display register change that is not just the
+     * movie's per-field FBP select, cleared by vsync. Forces the scanout
+     * geometry line and the CRTC lines to log again, so a log shows the
+     * registers each distinct display setup was built from. Budgeted, since
+     * the point is a handful of setups and not every field. */
+    bool m_display_geom_changed = false;
+    unsigned m_display_relog_left = 12;
+    /* DISPFB change lines still owed. The first few carry the alternating
+     * pair the movie flips between; after that the count decides. */
+    unsigned m_dispfb_log_left = 8;
+    /* DISPFB changes that touch something other than FBP get this many lines
+     * beyond the opening budget and the power-of-two counter. A bound, not an
+     * exemption: a game that reprograms the display every field must not turn
+     * the change log into a per-field log. */
+    unsigned m_dispfb_geom_log_left = 8;
+    uint64_t m_dispfb_changes = 0;
+    /* The attract movie's field pair, held between vsyncs. Its two buffers are
+     * the two halves of one 29.97 fps picture and the pair is only complete on
+     * the field that uploaded the second half, so the other field presents
+     * this copy instead of a composition that pairs halves of two different
+     * pictures. See the derivation in RtPgs::vsync. */
+    ParallelGS::ScanoutResult m_held_scanout = {};
+    double m_held_aspect = 0.0;
+    uint64_t m_pair_repeats = 0;
+    /* The crop lines: the game asked for a display window wider or taller
+     * than the mode area the renderer models, so the right or the bottom of
+     * it is not scanned out. Loud rather than silent, per the accuracy rule.
+     *
+     * One DH and one DW, so the state is "the last window height that was
+     * reported" and not a set: a run that alternates between two heights
+     * re-reports both. m_crop_log_left is what bounds that, shared by the two
+     * lines, since a change detector on its own is not a bound. */
+    uint32_t m_crop_logged_dh = 0;
+    uint32_t m_crop_logged_dw = 0;
+    unsigned m_crop_log_left = 8;
     bool m_copy_ofy_logged = false;   /* the once-only calibration line */
     unsigned m_copy_ofy_search_left = 600; /* fields spent looking before saying so */
 

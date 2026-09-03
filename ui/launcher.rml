@@ -16,8 +16,24 @@
 -->
 <body class="launcher" data-model="launcher">
 	<div class="launcher-shell">
+		<!--
+			The title mark is the game's own wordmark when it could be built
+			from the disc (the three letter meshes out of DFDATAS/DATA.DF,
+			rendered by src/runtime/ui/title_logo.cpp and served to the
+			renderer under the "logo:" scheme), and the word ICO when it could
+			not: no disc mounted yet, an archive that would not read, a mesh
+			format the decoder does not take. The two are given the identical
+			fixed box in style/base.rcss, so which one is up changes pixels
+			and never layout. The image is normally already built before the
+			first frame is presented (launcher_prepare_first_frame in
+			ui_launcher.cpp); the swap is only visible when a disc is chosen
+			in this window, which is the one case where it cannot be.
+		-->
 		<div class="title-block">
-			<div class="title-name">ICO</div>
+			<div class="title-mark">
+				<img id="title-logo" class="title-logo" src="logo:ico" data-if="logo_available"/>
+				<div class="title-name" data-if="!logo_available">ICO</div>
+			</div>
 			<div class="title-tagline">PlayStation 2 static recompilation</div>
 		</div>
 

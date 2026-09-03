@@ -36,13 +36,18 @@
 #include "../host/window.h"
 #include "../iso/iso9660.h"
 #include "../runtime.h"
+#include "title_logo.h"
 
+#include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/DataModelHandle.h>
 #include <RmlUi/Core/Element.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/EventListener.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -90,6 +95,11 @@ struct LauncherModel {
     bool has_status = false;
 
     std::string version_line;
+
+    /* True once the title image built from the disc has been published to the
+     * renderer. The document swaps its "ICO" text for the image on this, and
+     * keeps the text whenever it stays false. */
+    bool logo_available = false;
 };
 
 LauncherModel g_m;
@@ -113,6 +123,18 @@ bool g_precheck_pending = false;
  * text field. */
 bool g_mount_pending = false;
 std::string g_mount_path;
+/* Set by refresh_precheck() when a disc is mounted and no logo has been built
+ * yet. Drained by launcher_tick(); the disc that is already resolved at
+ * startup is handled before the first present instead, see
+ * launcher_prepare_first_frame(). */
+bool g_logo_pending = false;
+/* The pixel size the title image was last rasterised at, and how many times it
+ * has been rasterised. The counter is only there to give each raster its own
+ * texture source string: RmlUi caches a texture by that string and will not
+ * ask for it again, so a re-raster after a window-scale change needs a name it
+ * has not seen. */
+uint32_t g_logo_px_w = 0, g_logo_px_h = 0;
+unsigned g_logo_generation = 0;
 
 /* Set once the loop is allowed to end, and how. */
 bool g_done = false;
@@ -162,6 +184,179 @@ void refresh_precheck() {
     g_model_dirty = true;
     rt_log("launcher", "boot precheck: %s (disc '%s', %s)", ok ? "ready" : err,
         g_m.disc_path.c_str(), g_m.disc_source.c_str());
+
+    /* The title image can only be built once a disc is mounted, which is
+     * here. A disc that changes later re-arms this, so picking a working
+     * image after a bad one still gets the logo. */
+    if (g_m.disc_ok && !g_m.logo_available) g_logo_pending = true;
+}
+
+/* ---- title logo ---------------------------------------------------------
+ *
+ * Built on this loop rather than on a worker thread. The ISO reader is a
+ * single file handle with no locking, and this same loop remounts it from
+ * mount_chosen_path(), so a background reader would race the user's own disc
+ * picker. The cost is one long call the first time a disc is seen: 82 ms on
+ * the machine this was measured on, nearly all of it inflating the archive,
+ * and about a millisecond on later runs, which come out of the cache. The log
+ * lines carry the timings, so a slow disk shows up rather than being guessed
+ * at.
+ *
+ * When the disc is already resolved at startup this runs before the first
+ * present, so the launcher's first painted frame carries the image. Doing it
+ * a tick later meant the window drew its text title and swapped a few frames
+ * in, which reads as the panel adjusting after load. A disc chosen later,
+ * through Browse or the path field, still goes the deferred way, because the
+ * window has to be up for the user to choose it at all.
+ */
+
+/* The pixel box the overlay will draw the image across: the stylesheet's dp
+ * box (kRtTitleLogoDp*, mirrored in .title-logo in ui/style/base.rcss) at the
+ * context's current dp ratio. Rasterising at exactly this means one texel a
+ * pixel, so the hard polygon edges the GS produces are not blurred by a
+ * minifying sampler on the way to the screen. */
+void logo_pixel_box(uint32_t* w, uint32_t* h) {
+    rt_title_logo_pixel_box(ui_density_ratio(), w, h);
+}
+
+/* Rasterises at `w` by `h` and publishes it. `first` distinguishes the initial
+ * build from a re-raster after the window scale moved.
+ *
+ * Nothing below this line may throw out of it. title_logo.h promises the build
+ * is never fatal, and the whole feature is a launcher decoration: a disc that
+ * makes it fail, in any way, costs the image and nothing else. The build keeps
+ * that promise for itself; the catch here covers the publish and anything the
+ * two allocate between them. */
+bool raster_title_logo(uint32_t w, uint32_t h, bool first) try {
+    RtTitleLogo logo;
+    char err[512];
+    if (!rt_title_logo_build(w, h, logo, err, sizeof(err))) {
+        rt_log("ui", "no title logo from this disc: %s; the launcher keeps its text title", err);
+        return false;
+    }
+    if (!ui_render_set_logo(logo.rgba.data(), logo.width, logo.height)) return false;
+
+    g_logo_px_w = logo.width;
+    g_logo_px_h = logo.height;
+    ++g_logo_generation;
+    rt_log("ui", "title logo: %s at %ux%u pixels (%ux%u dp at ratio %.2f)",
+        first ? "rasterised for the first paint" : "re-rasterised for the new window scale",
+        logo.width, logo.height, kRtTitleLogoDpWidth, kRtTitleLogoDpHeight,
+        double(ui_density_ratio()));
+    return true;
+} catch (const std::exception& e) {
+    rt_log("ui", "title logo: building the %ux%u image threw (%s); the launcher keeps its text"
+                 " title",
+        w, h, e.what());
+    return false;
+} catch (...) {
+    rt_log("ui", "title logo: building the %ux%u image threw a non-standard exception; the launcher"
+                 " keeps its text title",
+        w, h);
+    return false;
+}
+
+void build_title_logo() {
+    if (g_m.logo_available) return;
+
+    uint32_t w = 0, h = 0;
+    logo_pixel_box(&w, &h);
+    if (!raster_title_logo(w, h, true)) return;
+
+    g_m.logo_available = true;
+    g_model_dirty = true;
+}
+
+/* Points the image element at the current raster. RmlUi keys its texture cache
+ * on the source string and never re-asks for one it has already loaded, so a
+ * new raster needs a name it has not seen; the scheme's suffix is that name
+ * and nothing else reads it (ui_render.cpp matches on the "logo:" prefix).
+ *
+ * The name it is leaving has to be released, or each re-raster strands one
+ * full image: the texture database holds an entry per source for the life of
+ * the context and nothing else ever drops one, so dragging a window edge
+ * would upload a new image per size and free none of them.
+ * Rml::ReleaseTexture goes through UiRenderInterface::ReleaseTexture, which
+ * defers the backend destroy by two ticks, so a frame still naming that
+ * texture stays valid. */
+void refresh_logo_source() {
+    if (!g_ui.launcher) return;
+    Rml::Element* img = g_ui.launcher->GetElementById("title-logo");
+    if (!img) {
+        rt_log("ui", "launcher: no element 'title-logo' in %s; the image cannot be shown",
+            g_ui.launcher->GetSourceURL().c_str());
+        return;
+    }
+    char src[64];
+    std::snprintf(src, sizeof(src), "%s%ux%u.%u", kLogoScheme, g_logo_px_w, g_logo_px_h,
+        g_logo_generation);
+    const Rml::String previous = img->GetAttribute<Rml::String>("src", Rml::String());
+    if (!previous.empty() && previous != src) Rml::ReleaseTexture(previous);
+    img->SetAttribute("src", Rml::String(src));
+}
+
+/* Re-rasterises when the window scale has moved, so the image is never scaled
+ * on screen. Cheap: the geometry is already in memory, so this is the raster
+ * alone, under a millisecond. */
+void sync_logo_scale() {
+    if (!g_m.logo_available) return;
+    uint32_t w = 0, h = 0;
+    logo_pixel_box(&w, &h);
+    if (w == g_logo_px_w && h == g_logo_px_h) return;
+    /* A re-raster that fails leaves the old size in place, so the next tick
+     * asks for the same new size and fails again. Without this the log would
+     * carry one failure line per frame for as long as the window stays at
+     * that size. One box size, one attempt, one line. */
+    static uint32_t failed_w = 0, failed_h = 0;
+    if (w == failed_w && h == failed_h) return;
+    rt_log("ui", "title logo: window scale moved, %ux%u is no longer the drawn size", g_logo_px_w,
+        g_logo_px_h);
+    if (raster_title_logo(w, h, false)) {
+        failed_w = failed_h = 0;
+        refresh_logo_source();
+    } else {
+        failed_w = w;
+        failed_h = h;
+    }
+}
+
+/* The raster succeeding does not mean the image is on screen: the upload to
+ * the backend happens later, inside RmlUi's texture load, and only the
+ * renderer sees whether it worked. RmlUi latches a load that returned nothing
+ * and never retries it, so a failed upload would leave the document showing
+ * the image element, with the text fallback switched off by logo_available,
+ * over no texture at all: a blank box where the title should be. Clearing the
+ * flag puts the text back. */
+void poll_logo_upload() {
+    if (!ui_render_take_logo_upload_failure()) return;
+    if (!g_m.logo_available) return;
+    rt_log("ui", "title logo: the %ux%u image could not be uploaded; the launcher goes back to its"
+                 " text title",
+        g_logo_px_w, g_logo_px_h);
+    g_m.logo_available = false;
+    g_model_dirty = true;
+}
+
+/* One check that the box the layout actually gave the image matches the box it
+ * was rasterised for. A mismatch means ui/style/base.rcss and
+ * kRtTitleLogoDpWidth/Height have drifted apart, which costs a resample and
+ * the crisp edges with it, so it says so rather than quietly blurring. */
+void verify_logo_box() {
+    static unsigned checked_generation = 0;
+    if (!g_m.logo_available || checked_generation == g_logo_generation) return;
+    if (!g_ui.launcher) return;
+    Rml::Element* img = g_ui.launcher->GetElementById("title-logo");
+    if (!img) return;
+    const Rml::Vector2f size = img->GetBox().GetSize();
+    if (size.x <= 0.0f || size.y <= 0.0f) return; /* not laid out yet */
+    checked_generation = g_logo_generation;
+    if (std::fabs(size.x - float(g_logo_px_w)) > 0.5f ||
+        std::fabs(size.y - float(g_logo_px_h)) > 0.5f) {
+        rt_log("ui", "title logo: the layout gave the image %.1fx%.1f pixels but it was rasterised"
+                     " for %ux%u; ui/style/base.rcss and kRtTitleLogoDpWidth/Height disagree, so the"
+                     " overlay is resampling it",
+            double(size.x), double(size.y), g_logo_px_w, g_logo_px_h);
+    }
 }
 
 /* Validates one path, mounts it, and on success saves it as
@@ -387,6 +582,16 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     c.Bind("status", &g_m.status);
     c.Bind("has_status", &g_m.has_status);
     c.Bind("version_line", &g_m.version_line);
+    /* logo_available is bound here, before LoadDocument below, and that
+     * ordering is load bearing. launcher.rml gives the image element
+     * data-if="logo_available"; an unbound model would leave it visible at
+     * the document's first layout, RmlUi would ask for the "logo:" source
+     * before any image has been published, and it caches a load that
+     * returned nothing and never asks again (see LoadTexture in
+     * ui_render.cpp). The title would then stay blank for the run. Bound and
+     * false, the element is display:none at first layout and no load is
+     * attempted until the flag turns true. */
+    c.Bind("logo_available", &g_m.logo_available);
 
     c.BindEventCallback("start", on_start);
     c.BindEventCallback("quit", on_quit);
@@ -417,6 +622,9 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
         set_status("disc set on the command line");
     }
 
+    /* After every Bind above, never before one: see the note on
+     * logo_available. The document's first layout reads the model, and an
+     * element whose data-if is unbound is visible for that layout. */
     const std::string launcher_path = ui_dir + "/launcher.rml";
     g_ui.launcher = context->LoadDocument(launcher_path);
     if (!g_ui.launcher) {
@@ -503,6 +711,15 @@ void launcher_tick() {
         g_precheck_pending = false; /* mount_chosen_path already re-ran it */
     }
 
+    /* Ahead of the precheck below, not after it: a precheck arms this, and
+     * draining it in the same tick would put the archive read in the same
+     * field as the precheck's own megabyte of disc reads and hashing. One
+     * tick later the window has already drawn. */
+    if (g_logo_pending) {
+        g_logo_pending = false;
+        build_title_logo();
+    }
+
     if (g_precheck_pending) {
         g_precheck_pending = false;
         refresh_precheck();
@@ -530,10 +747,47 @@ void launcher_tick() {
         g_done_started = false;
     }
 
+    /* The image must never be drawn at anything but its raster size, so the
+     * window scale is followed rather than sampled around. Both are no-ops
+     * until the image exists. */
+    sync_logo_scale();
+    verify_logo_box();
+    poll_logo_upload();
+
     if (g_model_dirty) {
         g_model_dirty = false;
         g_model.DirtyAllVariables();
     }
+}
+
+/* Everything that has to be done before the window's first frame is presented.
+ *
+ * The precheck resolves whatever disc --disc, settings.json, config/local.toml
+ * or the folder next to the executable already name, and if one is there the
+ * title image is rasterised right here. Nothing has been presented yet at this
+ * point, so the first painted frame carries the image and the panel never
+ * visibly adjusts. The wait is bounded by the extraction itself: about 82 ms
+ * cold and a millisecond out of the cache.
+ *
+ * When no disc resolves, this leaves g_logo_pending set exactly as before and
+ * launcher_tick() picks the image up once one is chosen in the window. */
+void launcher_prepare_first_frame() {
+    const auto t0 = std::chrono::steady_clock::now();
+    g_precheck_pending = false;
+    refresh_precheck();
+
+    if (!g_logo_pending) {
+        rt_log("ui", "title logo: no disc resolved before the first frame; the launcher opens with"
+                     " its text title and picks the image up when a disc is chosen");
+        return;
+    }
+    g_logo_pending = false;
+    build_title_logo();
+
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    rt_log("ui", "title logo: held the first launcher frame for %.1f ms; it %s", ms,
+        g_m.logo_available ? "carries the image" : "falls back to the text title");
 }
 
 } // namespace
@@ -573,7 +827,8 @@ bool rt_launcher_run() {
 
     g_done = false;
     g_done_started = false;
-    g_precheck_pending = true;
+    /* Before the loop, so nothing has been presented yet when it runs. */
+    launcher_prepare_first_frame();
 
     bool window_closed = false;
 #ifdef ICORECOMP_PGS_SDL

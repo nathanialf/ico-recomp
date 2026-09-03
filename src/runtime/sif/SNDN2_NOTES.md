@@ -154,7 +154,105 @@ ADPCM streaming (SgStAdpcm*, retail func_0025DCF0..func_0025DFB0):
   0x2EE00 = 192000 = 4 x 48000 (the SPU2 4x pitch ceiling). The boot
   ambience runs at 0xAC44 = 44100.
 - `0x42` Play(handle), `0x43` Stop(handle).
-- `0x46`..`0x4F` `SgStPcm*` family (PCM streaming; not observed).
+
+PCM streaming (`SgStPcm*`, retail func_0025E020..func_0025E280). Derived from
+the decomp asm plus one Windows run; the attract movie is the only user in
+this binary and it drives the block from `ito/mpeg/mv_sub.c`.
+
+- `0x46` Init (retail `func_0025E020`), `0x47` Quit (`func_0025E038`). No
+  operands, all three words zero.
+- `0x48` Open (`func_0025E050`). The caller passes a four word struct
+  {channel, flags, IOP address, ring size}; the emitter rejects a channel
+  >= 0x10 or either address word above 0x1FFFFF, then packs
+  `w1 = channel << 24 | flags`, `w2 = IOP address`, `w3 = ring size`.
+  The movie (`func_0023D8A8`) allocates one 0x6000 byte IOP buffer and opens
+  two channels into it, at `buf` and `buf + 0x200`, both with ring 0x6000 and
+  flags 0x00010400. Observed: `w1=0x00010400 w2=0x001b0100 w3=0x00006000`
+  and `w1=0x01010400 w2=0x001b0300 w3=0x00006000`.
+  Bits 23:16 are 0x01; cmd 0x3E's equivalent field is a channel count, but
+  that reading does not survive here (both channels sit in one ring 0x200
+  apart), so the field is left unexplained rather than given a plausible
+  meaning.
+- Ring layout. `func_0023DEB0` keeps one write offset (`self+0x4C`, reduced
+  modulo the ring size) and `func_0023DB80` fills the ring with a single
+  linear wrapping SIF DMA, so the two channels are block interleaved inside
+  it: 0x200 bytes of channel 0, then 0x200 of channel 1, period 0x400. The
+  runtime derives the base as the lowest opened address and each channel's
+  run as the distance to the next channel up, so it assumes no channel count
+  (snd/pcm_stream.h). A channel it cannot place that way is left without a
+  cursor rather than given a fabricated one.
+- Where 0x400 comes from. MEASURED: it is the refill quantum. `func_0023DEB0`
+  reduces its free-space figure to a whole number of 0x400 byte units with
+  the compiler's signed `x / 0x400 * 0x400` idiom, `sra $2, 10; sll $4, $2,
+  10` at 0023DF78 and again at 0023DFDC (the `addiu 0x3FF` / `movn` pair
+  ahead of each is the negative-value bias). The 0x200 channel spacing tiles
+  a period of 0x400 exactly, and bits 15:8 of the flags word also hold 0x400.
+  INFERRED: that bits 15:8 are that interleave block. Cmd 0x3E is not
+  evidence for it either way: the runtime reads 0x3E's bits 15:8 into
+  `st_blk`, the IOP transfer block the reported cursor is quantized to
+  (engine.cpp), while the ADPCM interleave stride there is a separate
+  hard-coded 0x800. snd/pcm_stream.h marks the same conclusion INFERRED.
+- `0x49` Close(channel) (`func_0025E0C0`): w1 = channel, w2 = w3 = 0.
+- `0x4A` ChannelVolume(mask, w2, w3) (`func_0025E1E8`): w1 is a channel mask
+  with bits 31:24 required zero, w2 and w3 are each 0..0x7FFF.
+  `func_0025E1E8` has four callers, all in `ito/mpeg/mv_sub.c`. The two play
+  paths, `func_0023E298` and its near copy `func_0023E368` (restart/resume),
+  send (1, 0, vol) and (2, vol, 0), one hard pan per channel, or
+  (3, vol/2, vol/2) when the byte at `self+0x58` is set; vol is the word at
+  `self+0x5C`. The two teardown paths, `func_0023E228` (0023E240) and
+  `func_0023E330` (0023E348), send (3, 0, 0) as a mute immediately before
+  Stop(3). Nothing in the decomp names the two operands; the runtime reads
+  w2 as left and w3 as right to match cmd 0x01 and cmd 0x40, which puts
+  channel 0 on the right. Unresolved: the stereo image may be mirrored.
+  The vol the movie carries is 0x3FFF, and it is a constant in the caller,
+  not a measurement of anything: `func_0019D678` passes it as StageOrientInit
+  argument 7 (`addiu $10, $0, 0x3FFF` at 0019D7F4), StageOrientInit keeps it
+  in $22 (0019D2A0) and passes it as argument 3 to `func_0023D8A8` (0019D398),
+  which stores it at `self+0x5C` (0023D8CC, 0023D9BC).
+- `0x4B` Play(mask) (`func_0025E118`), `0x4C` Stop(mask) (`func_0025E158`).
+  Same mask rule. Observed with mask 3.
+- `0x4D` (channel, value) (`func_0025E198`): w1 = channel < 0x10,
+  w2 <= 0x1FFFFF, w3 = 0. Two callers, both in `ito/mpeg/mv_sub.c` and both
+  sending (0, 0) then (1, 0) immediately before Play(3): `func_0023E298`
+  (0023E2AC/0023E2B8) and its near copy `func_0023E368`
+  (0023E37C/0023E388), the restart/resume path. So the only observed effect
+  is starting a channel at the bottom of the ring. Reading w2 as a ring
+  offset is inferred; both the zero and the nonzero case are logged, and a
+  channel that is not open is left alone.
+- `0x4E` (`func_0025E100`): w1 forwarded with no validation. The movie sends
+  8, once, after opening both channels. Meaning not established.
+- `0x4F` (`func_0025E280`): w1 = mask, w2 <= 0x1FFFFF, w3 < 2. Never sent.
+- Handshake. The EE polls how far the driver has consumed the ring with
+  retail `func_0025E238`, which reads status block word
+  `+0x180 + channel * 4` through the same uncached status pointer
+  `func_0025DFB0` uses. `func_0023DEB0` turns it into the refill size as
+  `free = ((cursor + ring - write_ptr) - 0x400) mod ring`, rounded down to
+  0x400, so the word is a byte OFFSET WITHIN THE RING like the ADPCM cursor
+  at +0xC0, not an address, and 0x400 is a deliberate guard band between the
+  driver's read point and the EE's write point. Only channel 0 is polled.
+  Leaving the word at zero, as this runtime did before the block was
+  modelled, tells the movie the driver has consumed nothing.
+- Starvation. The driver has no way to stall for the EE: a real IOP hands the
+  ring to the SPU2 core input on the hardware's own 48 kHz clock and plays
+  whatever the memory holds. The model does the same rather than stopping,
+  and counts the blocks the EE failed to refill.
+  The sound service never sees the EE's write pointer, because the movie
+  fills the ring with raw SIF DMA rather than through this service. The DMA
+  does pass through the runtime, though: every EE to IOP transfer entry
+  reaches `rt_rpc_on_dma_entry` (sif/rpc.cpp), which calls
+  `rt_snd_pcm_note_iop_write`. That is the write-side witness. Each
+  interleave block of the ring carries the value of a counter bumped once per
+  DMA touching the ring, and a block is counted stale when the play cursor
+  enters it and finds the same stamp it left there on the previous lap: a
+  whole lap of playback with no write to those bytes. Content is never
+  compared, so repeated content (silence, most obviously) is not mistaken for
+  starvation, which a per-block content checksum cannot avoid.
+- Sample format. Not established from the decomp. The runtime plays the ring
+  as 16 bit signed little endian at 48 kHz, 1:1 with its own output, on the
+  grounds that the ADPCM family carries an explicit rate command (0x41) for
+  its varying source material while this family has none, which only works
+  for a driver fixed at the hardware's own rate. engine.cpp logs the first
+  bytes and the peak of the first run at Play so a log settles it.
 
 ## Pitch unit
 

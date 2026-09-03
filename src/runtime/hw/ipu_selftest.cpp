@@ -52,20 +52,29 @@
 #include "hw.h"
 
 #include "../iso/iso9660.h"
+#include "../prof.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 /* ---- stubs for symbols ipu.cpp pulls in (no scheduler/DMAC linked) ------- */
 
 uint8_t* g_pages[0x10000];
 
-bool rt_trace() { return std::getenv("ICORECOMP_TRACE") != nullptr; }
+/* Cached, like the runtime's (ee/sched.cpp): the decoder calls this on
+ * every command and every walk step, and a getenv per call would put the
+ * benchmark below in a different cost regime from the real runtime. */
+bool rt_trace() {
+    static const bool on = std::getenv("ICORECOMP_TRACE") != nullptr;
+    return on;
+}
 void rt_intc_raise(int) {}
 void rt_dmac_raise(int) {}
 /* No DMAC is linked, so nothing can hold it: the selftest feeds the input
@@ -86,6 +95,7 @@ namespace {
 /* ---- MMIO driver helpers ------------------------------------------------- */
 
 constexpr uint32_t IPU_CMD = 0x10002000, IPU_CTRL = 0x10002010, IPU_BP = 0x10002020;
+constexpr uint32_t IPU_TOP = 0x10002030;
 
 /* Input FIFO depth in quadwords; the same figure hw/ipu.cpp models, and the
  * bound IPU_BP.IFC (4 bits) plus IPU_BP.FP (2 bits) has to stay inside. */
@@ -130,11 +140,17 @@ const char* g_pass = "direct";
 
 uint32_t* ch4r(int which) { return rt_dmac_ipu_reg(4, which); }
 
+size_t g_ram_mapped = 0;
+
 void map_ram(size_t bytes) {
+    for (size_t off = 0; off < g_ram_mapped; off += 0x10000) {
+        g_pages[(kRamBase + (uint32_t)off) >> 16] = nullptr;
+    }
     g_ram.assign(bytes, 0);
     for (size_t off = 0; off < bytes; off += 0x10000) {
         g_pages[(kRamBase + (uint32_t)off) >> 16] = g_ram.data() + off;
     }
+    g_ram_mapped = bytes;
 }
 
 /* Copies the two out-of-band quantizer matrices and `bytes` of elementary
@@ -298,7 +314,34 @@ void maybe_restart(const char* where) {
     library_stop_restart(where);
 }
 
+/* The movie player arms ch3 before every BDEC, so the output FIFO is
+ * drained while the command is still running and IPU_CTRL.OFC is back to 0
+ * by the time func_00240090 takes its snapshot. This stands in for that
+ * channel: everything the IPU has produced is taken out as it appears and
+ * held here until the decoder asks for it. */
+std::vector<uint8_t> g_out_held;
+
+void drain_out() {
+    uint8_t buf[4096];
+    for (;;) {
+        size_t n = rt_ipu_test_read_out(buf, sizeof(buf));
+        if (n == 0) break;
+        g_out_held.insert(g_out_held.end(), buf, buf + n);
+    }
+}
+
+/* Takes exactly `n` bytes the drain collected, and says so if the command
+ * produced a different amount. */
+bool take_out(void* dst, size_t n) {
+    drain_out();
+    if (g_out_held.size() != n) return false;
+    std::memcpy(dst, g_out_held.data(), n);
+    g_out_held.clear();
+    return true;
+}
+
 uint64_t cmd_result() {
+    drain_out();
     uint64_t r = r64(IPU_CMD);
     uint64_t spins = 0;
     bool restarted = false;
@@ -312,6 +355,8 @@ uint64_t cmd_result() {
                 "the model wedged", g_pass, spins, *ch4r(0), *ch4r(1), *ch4r(2), *ch4r(3),
                 rt_ipu_test_avail_bits(), rt_ipu_test_resident_qw());
         }
+        drain_out();
+        check_fifo_bound("a busy poll with a command pending");
         if (*ch4r(0) & 0x100u) {
             maybe_restart("a busy poll");
         } else if (g_restart_mid_cmd && !restarted) {
@@ -329,6 +374,7 @@ uint64_t cmd_result() {
         }
         r = r64(IPU_CMD);
     }
+    drain_out();
     if (g_dma) check_fifo_bound("a command boundary");
     return r;
 }
@@ -668,9 +714,8 @@ unsigned decode_slice(uint32_t start_code, bool store) {
             if (ctrl & (1u << 14)) {
                 rt_fatal("selftest", nullptr, "ECD after BDEC at mb %d (ctrl=0x%08x)", addr, ctrl);
             }
-            size_t got = rt_ipu_test_read_out((uint8_t*)mb16, sizeof(mb16));
-            if (got != sizeof(mb16)) {
-                rt_fatal("selftest", nullptr, "BDEC produced %zu bytes, expected 768", got);
+            if (!take_out(mb16, sizeof(mb16))) {
+                rt_fatal("selftest", nullptr, "BDEC produced %zu bytes, expected 768", g_out_held.size());
             }
             uint32_t tag = (uint32_t)addr;
             hash_bytes(&tag, sizeof(tag));
@@ -748,6 +793,7 @@ struct PassResult {
 PassResult decode_pass(const std::vector<uint8_t>& es, bool i_only) {
     w32(IPU_CTRL, 1u << 30);   /* soft reset: drops both queues and the DMA state */
     w32(IPU_CMD, 0x00000000u); /* BCLR */
+    g_out_held.clear();
     g_mb_hash = 0xCBF29CE484222325ull;
     g_bdec_count = 0;
     g_last_restart_pos = 0;
@@ -1023,6 +1069,437 @@ void restart_continues_chain_check() {
         "0x%08x and carried on to TADR 0x%08x", g_pass, qwc + ifc + fp, tadr, *ch4r(3));
 }
 
+/* ---- a BDEC trailing scan across the stream's zero stuffing --------------
+ *
+ * The movie is padded to a constant bit rate with zero bytes, and near the
+ * start it is almost all padding: the elementary stream read off the disc
+ * here has runs of up to 18389 zero bytes after the last slice of a
+ * picture. The BDEC that decodes that last macroblock scans them all
+ * looking for the next start code, so one command consumes far more than
+ * the 8-quadword input FIFO.
+ *
+ * The passes above never reach that. They start 4000 sectors into the movie
+ * where the pictures are large and the padding between them is short, so
+ * every command fits inside the FIFO and the model's rewind-and-replay of a
+ * starved command is never asked to reach past what IPU_BP can describe.
+ *
+ * The retail movie starts at sector 0 of the stream and hits it on the
+ * first I picture of the second GOP. In the Windows trace of that run
+ * (dist/windows/icorecomp.log, trace 2310) BDEC 0x28010000 stalled 10078
+ * bytes into the padding with 630 quadwords sitting between the decode
+ * cursor and the end of the input, IPU_BP.IFC saturated at 8, and the
+ * command never completed again: the chain had drained and every replay
+ * started from the same rewound cursor. The movie stopped there.
+ *
+ * So this pass decodes one of those picture-then-padding stretches through
+ * the ch4 chain, published one 2048-byte slot at a time so the scan starves
+ * repeatedly, and requires both that IPU_BP keeps describing the state (the
+ * check_fifo_bound call in the busy poll) and that the picture comes out
+ * bit-identical to the direct feed. */
+void stuffing_tail_scan_check() {
+    std::vector<uint8_t> lead;
+    extract_video_es(lead, 768u << 10, 0);
+
+    /* Find a sequence header whose own first picture, and nothing after it,
+     * runs into a stuffing run longer than the input FIFO: that picture is
+     * the I picture the pass decodes, and its last macroblock's BDEC is the
+     * one whose trailing scan has to cross the run. A second picture start
+     * code before the run means the run belongs to a later picture, so that
+     * sequence header is no good. Fatal if the stream has none, because the
+     * check would otherwise go quiet without saying it had stopped covering
+     * anything. */
+    const size_t kRunMin = (kFifoQw + 1) * 16 * 4; /* four FIFOs of padding */
+    auto code_at = [&lead](size_t at, uint8_t id) {
+        return at + 4 <= lead.size() && lead[at] == 0 && lead[at + 1] == 0 && lead[at + 2] == 1 &&
+               lead[at + 3] == id;
+    };
+    size_t seq = 0, run_at = 0, run_len = 0;
+    for (size_t i = 0; i + 4 < lead.size() && !run_at; ++i) {
+        if (!code_at(i, 0xB3)) continue;
+        size_t pic = i;
+        while (pic + 4 < lead.size() && !code_at(pic, 0x00)) ++pic;
+        bool second_picture = false;
+        /* One byte at a time: a start code is preceded by zero bytes, so
+         * stepping over a short zero run would step over the code with
+         * it. */
+        for (size_t z = pic + 4; z + kRunMin < lead.size(); ++z) {
+            if (code_at(z, 0x00)) { second_picture = true; break; }
+            if (lead[z] != 0) continue;
+            size_t e = z;
+            while (e < lead.size() && lead[e] == 0) ++e;
+            if (e - z >= kRunMin) { run_at = z; run_len = e - z; break; }
+        }
+        if (second_picture) { run_at = run_len = 0; continue; }
+        if (run_at) seq = i;
+    }
+    if (!run_at) {
+        rt_fatal("selftest", nullptr, "no sequence header whose first picture runs into a stuffing "
+            "run of at least %zu bytes in the first %zu bytes of the stream; this check has nothing "
+            "to cover", kRunMin, lead.size());
+    }
+
+    /* The segment runs from that sequence header to a little past the end of
+     * the stuffing, so the scan has a start code to find. */
+    size_t end = run_at + run_len + (8u << 10);
+    if (end > lead.size()) end = lead.size();
+    std::vector<uint8_t> seg(lead.begin() + (ptrdiff_t)seq, lead.begin() + (ptrdiff_t)end);
+    rt_log("selftest", "stuffing pass: sequence header at stream byte %zu, %zu bytes of headers and "
+        "picture data, then %zu bytes of zero stuffing for the last macroblock's BDEC to scan "
+        "(%zu times the %zu-quadword input FIFO); segment %zu bytes",
+        seq, run_at - seq, run_len, run_len / ((kFifoQw + 1) * 16), kFifoQw + 1, seg.size());
+
+    const char* prev_pass = g_pass;
+    const size_t prev_batch = g_slot_batch_want;
+    const uint32_t prev_restart = g_restart_bytes;
+    const bool prev_mid = g_restart_mid_cmd;
+    g_dma = false;
+    g_restart_bytes = 0;
+    g_restart_mid_cmd = false;
+    g_pass = "stuffing direct";
+    PassResult ref = decode_pass(seg, true);
+
+    build_chain(kDefaultIntraQ, flat_niq(), seg, seg.size());
+    g_dma = true;
+    /* Static, because g_pass points at it and outlives the loop: every
+     * fatal after this function returns would otherwise name a dead
+     * stack buffer. */
+    static char name[96];
+    static const size_t kBatch[] = {1, 2, 5};
+    for (size_t batch : kBatch) {
+        std::snprintf(name, sizeof(name), "stuffing dma batch %zu slot%s", batch, batch == 1 ? "" : "s");
+        g_pass = name;
+        g_slot_batch_want = batch;
+        PassResult r = decode_pass(seg, true);
+        if (r.i_hash != ref.i_hash || r.y != ref.y) {
+            rt_fatal("selftest", nullptr, "%s: the picture differs from the direct feed "
+                "(hash 0x%016" PRIx64 " vs 0x%016" PRIx64 ", %" PRIu64 " ring extensions)",
+                g_pass, r.i_hash, ref.i_hash, g_refills);
+        }
+        rt_log("selftest", "%s: the scan crossed the stuffing and the picture matches "
+            "(%u macroblocks, %" PRIu64 " ring extensions, peak %zu qwords / %zu bits resident)",
+            g_pass, r.i_mbs, g_refills, g_max_resident_qw, g_max_avail_bits);
+    }
+    g_dma = false;
+    g_slot_batch_want = prev_batch;
+    g_restart_bytes = prev_restart;
+    g_restart_mid_cmd = prev_mid;
+    g_pass = prev_pass;
+}
+
+/* ---- the trailing scan's resume point ------------------------------------
+ *
+ * A BDEC's trailing start-code scan commits every byte it skips, so a stall
+ * inside it resumes where it had reached instead of replaying the command.
+ * The point it resumes at carries state that the bitstream alone does not
+ * describe.
+ *
+ * The scan opens by testing whether the next 8 bits are zero, read at
+ * whatever bit position the macroblock ended on, and then aligns to the
+ * following byte. Only the leading bits of that byte were part of the test:
+ * the rest of it can be anything. A scan that starves right after the
+ * alignment therefore has to remember that it is already inside the zero
+ * run. Re-reading the opening test at the aligned byte can answer
+ * differently, and the command then returns with IPU_CTRL.ECD clear where
+ * an uninterrupted decode sets it, which is the difference between libmpeg
+ * seeing the end of a slice and not seeing it.
+ *
+ * The retail stream cannot be steered onto that position on demand, so this
+ * case builds the eight bytes that stand on it and decodes them three ways:
+ * with the whole segment in front of the decoder, with the feed cut at the
+ * byte the stalled scan needs next, and through the ch4 chain with the
+ * macroblock at the end of the first published slot so the DMA starves at
+ * the same place. All three have to agree on ECD, SCD and the macroblock. */
+
+/* One intra macroblock, every block DC only with dct_dc_size 0: luma '100'
+ * (Table B-12) plus EOB '10' (Table B-14) is 5 bits, chroma '00' (B-13)
+ * plus EOB is 4, so the six blocks are 4 * 5 + 2 * 4 = 28 bits and the
+ * command ends four bits short of a byte. Bits 28..31 are zero and so is
+ * the top nibble of the byte after them, which is what makes the scan's
+ * opening 8-bit test read zero; the low nibble is not, so the aligned byte
+ * the scan commits onto is 0x0F. The 24 bits there are neither 0 nor 1, so
+ * an uninterrupted scan sets ECD and stops. */
+const uint8_t kTailMb[] = {0x94, 0xA5, 0x22, 0x20, 0x0F, 0x00, 0x00, 0x01};
+
+/* How much of it the starved feed hands over: the macroblock, the zero gate
+ * and the aligned byte, but not the third byte the scan's 24-bit read needs
+ * after it has aligned and committed. */
+constexpr size_t kTailStall = 6;
+
+constexpr uint32_t kTailBdec = 0x2C000000u; /* BDEC, MBI = 1, DCR = 1, QSC = 0 */
+constexpr size_t kMbBytes = 768;            /* Y 16x16 + Cb 8x8 + Cr 8x8, 16-bit */
+
+struct TailResult {
+    uint32_t ecd = 0, scd = 0;
+    std::vector<uint8_t> mb;
+};
+
+/* Drops both queues and programs IPU_CTRL the way libmpeg does before an I
+ * picture's slices: 8-bit DC precision, zigzag scan, table B-14, linear
+ * quantiser scale. */
+void tail_reset_model() {
+    w32(IPU_CTRL, 1u << 30);   /* soft reset */
+    w32(IPU_CMD, 0x00000000u); /* BCLR */
+    g_out_held.clear();
+    w32(IPU_CTRL, 1u << 24);   /* PCT = 1 (I picture), every other field 0 */
+}
+
+TailResult tail_collect() {
+    TailResult r;
+    const uint32_t ctrl = ipu_ctrl();
+    r.ecd = (ctrl >> 14) & 1;
+    r.scd = (ctrl >> 15) & 1;
+    drain_out();
+    r.mb = g_out_held;
+    g_out_held.clear();
+    return r;
+}
+
+void tail_feed_direct(const std::vector<uint8_t>& es, size_t bytes) {
+    rt_ipu_test_feed(kDefaultIntraQ, 64);
+    rt_ipu_test_feed(flat_niq(), 64);
+    rt_ipu_test_feed(es.data(), bytes);
+}
+
+/* The two SETIQ commands that take the matrices out of the head of the
+ * feed, then the FDEC walk up to the crafted macroblock. */
+void tail_seek(size_t mb_at) {
+    ipu_cmd(0x50000000u);
+    cmd_result();
+    ipu_cmd(0x58000000u);
+    cmd_result();
+    advance((unsigned)(mb_at * 8));
+}
+
+/* Issues the BDEC and requires it to stall with the macroblock already
+ * out, which is the state the trailing scan stalls in and nothing else
+ * does. */
+void tail_bdec_must_stall(size_t fed) {
+    w32(IPU_CMD, kTailBdec);
+    if (!(r64(IPU_CMD) >> 63)) {
+        rt_fatal("selftest", nullptr, "%s: the BDEC completed with %zu bytes of the segment in front "
+            "of the decoder; this case only covers anything while it stalls inside the trailing scan",
+            g_pass, fed);
+    }
+    if (rt_ipu_test_out_avail() != kMbBytes) {
+        rt_fatal("selftest", nullptr, "%s: the stalled BDEC has %zu output bytes queued, expected the "
+            "%zu-byte macroblock; the stall is before the trailing scan, not inside it",
+            g_pass, rt_ipu_test_out_avail(), kMbBytes);
+    }
+}
+
+void tail_compare(const TailResult& ref, const TailResult& r) {
+    if (r.ecd != ref.ecd || r.scd != ref.scd) {
+        rt_fatal("selftest", nullptr, "%s: the trailing scan ended with ECD=%u SCD=%u; the "
+            "uninterrupted decode of the same bits ends with ECD=%u SCD=%u. The retry re-read the "
+            "scan's opening test at the byte the alignment committed onto instead of resuming "
+            "inside the zero run", g_pass, r.ecd, r.scd, ref.ecd, ref.scd);
+    }
+    if (r.mb != ref.mb) {
+        rt_fatal("selftest", nullptr, "%s: the macroblock differs from the uninterrupted decode "
+            "(%zu bytes against %zu)", g_pass, r.mb.size(), ref.mb.size());
+    }
+}
+
+void bdec_tail_resume_check() {
+    const char* prev_pass = g_pass;
+    const size_t prev_batch = g_slot_batch_want;
+    const uint32_t prev_restart = g_restart_bytes;
+    const bool prev_mid = g_restart_mid_cmd;
+    const bool prev_dma = g_dma;
+    g_restart_bytes = 0;
+    g_restart_mid_cmd = false;
+
+    /* The macroblock sits at the end of the first 2048-byte chain slot, so
+     * the dma pass runs out of input at the same read the direct one is cut
+     * at: the bytes the 24-bit read wants are in the slot behind it. The
+     * 128 bytes are the two quantiser matrices build_chain puts in front of
+     * the stream. */
+    const size_t kSlot = (size_t)kTagQwc * 16;
+    const size_t mb_at = kSlot - 128 - kTailStall;
+    std::vector<uint8_t> es(mb_at + sizeof kTailMb + 64, 0);
+    std::memcpy(&es[mb_at], kTailMb, sizeof kTailMb);
+    rt_log("selftest", "tail resume: one crafted macroblock at stream byte %zu, ending 28 bits in "
+        "with the byte after the alignment nonzero (0x%02x); the feed is cut %zu bytes later",
+        mb_at, kTailMb[4], kTailStall);
+
+    /* Reference: the whole segment in front of the decoder, no stall. */
+    g_dma = false;
+    g_pass = "bdec tail resume, direct";
+    tail_reset_model();
+    tail_feed_direct(es, es.size());
+    tail_seek(mb_at);
+    ipu_cmd(kTailBdec);
+    cmd_result();
+    TailResult ref = tail_collect();
+    if (!ref.ecd || ref.scd) {
+        rt_fatal("selftest", nullptr, "%s: the uninterrupted scan ended with ECD=%u SCD=%u; the "
+            "crafted bytes are meant to put nonzero data at the aligned byte, which sets ECD",
+            g_pass, ref.ecd, ref.scd);
+    }
+    if (ref.mb.size() != kMbBytes) {
+        rt_fatal("selftest", nullptr, "%s: the BDEC produced %zu output bytes, expected %zu",
+            g_pass, ref.mb.size(), kMbBytes);
+    }
+    rt_log("selftest", "%s: ECD set on the aligned byte, %zu-byte macroblock out", g_pass, ref.mb.size());
+
+    /* The same bits, with the feed cut at the byte the scan needs next. */
+    g_pass = "bdec tail resume, starved direct";
+    tail_reset_model();
+    tail_feed_direct(es, mb_at + kTailStall);
+    tail_seek(mb_at);
+    tail_bdec_must_stall(mb_at + kTailStall);
+    rt_ipu_test_feed(es.data() + mb_at + kTailStall, es.size() - mb_at - kTailStall);
+    if (r64(IPU_CMD) >> 63) {
+        rt_fatal("selftest", nullptr, "%s: the BDEC is still pending with the rest of the segment fed",
+            g_pass);
+    }
+    TailResult starved = tail_collect();
+    tail_compare(ref, starved);
+    rt_log("selftest", "%s: the scan resumed inside the zero run and agrees with the direct decode "
+        "(ECD=%u SCD=%u)", g_pass, starved.ecd, starved.scd);
+
+    /* And through the chain, one slot at a time. */
+    g_pass = "bdec tail resume, dma";
+    g_dma = true;
+    g_slot_batch_want = 1;
+    build_chain(kDefaultIntraQ, flat_niq(), es, es.size());
+    tail_reset_model();
+    reset_chain(g_slot_batch_want);
+    ch4_start();
+    tail_seek(mb_at);
+    if (g_published != 1) {
+        rt_fatal("selftest", nullptr, "%s: %zu slots were published before the BDEC; this case needs "
+            "the crafted macroblock to be the last bytes of the first one", g_pass, g_published);
+    }
+    tail_bdec_must_stall(kSlot);
+    if (!publish_more()) {
+        rt_fatal("selftest", nullptr, "%s: the chain had nothing left to publish", g_pass);
+    }
+    cmd_result();
+    TailResult dma = tail_collect();
+    tail_compare(ref, dma);
+    rt_log("selftest", "%s: the scan crossed the slot boundary and agrees with the direct decode "
+        "(ECD=%u SCD=%u, %" PRIu64 " ring extensions)", g_pass, dma.ecd, dma.scd, g_refills);
+
+    g_dma = prev_dma;
+    g_slot_batch_want = prev_batch;
+    g_restart_bytes = prev_restart;
+    g_restart_mid_cmd = prev_mid;
+    g_pass = prev_pass;
+}
+
+/* ---- host cost of one IPU register access --------------------------------
+ *
+ * The movie is register-bound: the MPEG library scans the stream's zero
+ * stuffing one byte at a time with FDEC, and the 22:45 Windows log measured
+ * about 33000 register accesses per host field with the "ipu" and "mmio"
+ * prof buckets together taking 9.8 ms of a 16.7 ms field. At the rate a
+ * real-time movie needs, roughly two million accesses a second, the host
+ * cost per access is what decides whether the port holds 59.94 fields/s.
+ *
+ * This replays that scan against the real decoder state fed from the disc
+ * and reports it. Only the IPU handler is measured, not the mmio.cpp
+ * wrapper around it (this target does not link it), so the number to
+ * compare it against is the log's "ipu" bucket, 0.18 us per access. The
+ * second and third loops price the two things the wrapper adds on top: the
+ * profiler's clock reads and log_access's per-address hash map. */
+void register_access_benchmark(const std::vector<uint8_t>& es) {
+    const size_t kIters = 262144;
+    size_t bytes = 128 + kIters + (64u << 10);
+    if (bytes > es.size()) bytes = es.size();
+    build_chain(kDefaultIntraQ, flat_niq(), es, bytes);
+    g_dma = true;
+    g_restart_bytes = 0;
+    g_restart_mid_cmd = false;
+    g_pass = "register access benchmark";
+    w32(IPU_CTRL, 1u << 30);
+    w32(IPU_CMD, 0x00000000u);
+    g_out_held.clear();
+    reset_chain(0); /* whole chain published: the walk never runs dry */
+    ch4_start();
+
+    /* The library's per-byte sequence: issue FDEC with a skip of 8, read
+     * the result and the status back, and peek IPU_TOP. Four accesses, the
+     * ratio the log's per-register access counts show. */
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t sink = 0;
+    size_t n = 0;
+    for (; n < kIters; ++n) {
+        w32(IPU_CMD, 0x40000008u);
+        sink += r64(IPU_CMD);
+        if (sink >> 63) break; /* stalled: the chain ran out, stop here */
+        sink += r64(IPU_CTRL);
+        sink += r64(IPU_TOP);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    const double ns = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    const uint64_t accesses = (uint64_t)n * 4;
+    if (n < kIters / 2) {
+        rt_fatal("selftest", nullptr, "benchmark stalled after %zu of %zu iterations; the chain ran "
+            "dry and the number would be meaningless", n, kIters);
+    }
+    const double per = ns / (double)accesses;
+    /* Two million accesses a second is what a real-time movie asks for; a
+     * field is 1/59.94 s. */
+    const double ms_per_field = 2.0e6 * per / 1.0e9 / 59.94 * 1000.0;
+    rt_log("selftest", "register access benchmark: %" PRIu64 " accesses (%zu FDEC bytes scanned) in "
+        "%.1f ms = %.1f ns per access; at two million accesses a second that is %.2f ms of host time "
+        "per field (sink 0x%016" PRIx64 ")",
+        accesses, n, ns / 1.0e6, per, ms_per_field, sink);
+
+    /* What the profiler costs when it is on: two clock reads per zone. The
+     * movie path used to open two nested zones per access (mmio.cpp's plus
+     * hw/ipu.cpp's own) and now opens one, so both are timed here. */
+    const bool was_on = g_rt_prof_on;
+    g_rt_prof_on = true;
+    auto p0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kIters; ++i) {
+        RT_PROF_ZONE(RT_PROF_MMIO);
+        RT_PROF_ZONE(RT_PROF_IPU);
+    }
+    auto p1 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kIters; ++i) {
+        RT_PROF_ZONE(RT_PROF_IPU);
+    }
+    auto p2 = std::chrono::steady_clock::now();
+    g_rt_prof_on = was_on;
+    rt_log("selftest", "profiler cost: %.1f ns per access for two nested zones (four clock reads), "
+        "%.1f ns for the one zone mmio.cpp now opens",
+        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(p1 - p0).count() / (double)kIters,
+        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(p2 - p1).count() / (double)kIters);
+
+    /* What mmio.cpp's per-address access counter costs: the hash map probe
+     * it used to do on every access, against the direct-mapped front now in
+     * front of it. Five registers in rotation, as the movie uses. */
+    {
+        struct Stat { uint64_t count = 0; uint64_t last = 0; };
+        std::unordered_map<uint32_t, Stat> stats;
+        auto h0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < kIters; ++i) {
+            Stat& st = stats[0x10002000u + ((i % 5) << 4)];
+            ++st.count;
+            st.last = i;
+        }
+        auto h1 = std::chrono::steady_clock::now();
+        uint32_t caddr[128] = {0};
+        Stat* cst[128] = {nullptr};
+        for (size_t i = 0; i < kIters; ++i) {
+            const uint32_t a = 0x10002000u + (uint32_t)((i % 5) << 4);
+            const size_t k = (a >> 4) & 127;
+            Stat* st = (cst[k] && caddr[k] == a) ? cst[k] : nullptr;
+            if (!st) { st = &stats[a]; caddr[k] = a; cst[k] = st; }
+            ++st->count;
+            st->last = i;
+        }
+        auto h2 = std::chrono::steady_clock::now();
+        rt_log("selftest", "per-address access counter: %.1f ns per access through the hash map, "
+            "%.1f ns through the direct-mapped front",
+            (double)std::chrono::duration_cast<std::chrono::nanoseconds>(h1 - h0).count() / (double)kIters,
+            (double)std::chrono::duration_cast<std::chrono::nanoseconds>(h2 - h1).count() / (double)kIters);
+    }
+    g_dma = false;
+}
+
 } // namespace
 
 int main() {
@@ -1077,8 +1554,9 @@ int main() {
             rt_ipu_test_feed(mb8, sizeof(mb8));
             ipu_cmd(0x70000001u); /* CSC, 1 macroblock */
             cmd_result();
-            size_t got = rt_ipu_test_read_out(rgbmb, sizeof(rgbmb));
-            if (got != sizeof(rgbmb)) rt_fatal("selftest", nullptr, "CSC produced %zu bytes, expected 1024", got);
+            if (!take_out(rgbmb, sizeof(rgbmb))) {
+                rt_fatal("selftest", nullptr, "CSC produced %zu bytes, expected 1024", g_out_held.size());
+            }
             for (int yy = 0; yy < 16; ++yy)
                 std::memcpy(&rgba[((my * 16 + yy) * g_seq.width + mx * 16) * 4], &rgbmb[yy * 64], 64);
         }
@@ -1147,6 +1625,9 @@ int main() {
     /* ---- the two chain-restart shapes ------------------------------------ */
     restart_continues_chain_check();
     drained_chain_restart_check();
+    stuffing_tail_scan_check();
+    bdec_tail_resume_check();
+    register_access_benchmark(es);
 
     g_dma = false;
     g_restart_mid_cmd = false;

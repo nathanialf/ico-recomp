@@ -276,6 +276,26 @@ This is deliberate: it keeps every existing script, CI job, or manual
 invocation that already sets one of these variables running exactly as it
 did before `settings.json` existed.
 
+### Variables with no settings key
+
+The two cycle-billing knobs are environment only. They set how much virtual
+time the guest is charged for running its own code, which is a property of
+the hardware model rather than a user preference, so neither has a
+`settings.json` key or a menu control. Both are read once by `rt_sched_init`
+(`src/runtime/ee/sched.cpp`), which logs the value in force under the
+`sched` channel at startup.
+
+| variable | range | default | what it bills |
+|---|---|---|---|
+| `ICORECOMP_EE_LOOP_CYCLES` | 1 to 64 | 2 | bus cycles per taken backward branch in translated EE code. Higher is a slower emulated EE against the field clock; too low and the game's sound tick runs too often per field and over-refills the sndn2 stream ring. |
+| `ICORECOMP_MMIO_CYCLES` | 1 to 4096 | 32 | bus cycles per EE hardware-register access. This is what paces register-driven guest code such as the MPEG player: at the default a field of 2460060 cycles holds 76876 accesses. |
+
+Both are sweep knobs, not tuning the port expects a user to do. A value
+outside the range leaves the compiled-in default in place;
+`ICORECOMP_MMIO_CYCLES` says so in a log line naming the value and the
+range, `ICORECOMP_EE_LOOP_CYCLES` does not and only the startup line shows
+which value took effect.
+
 ## 4. Bad values and broken files
 
 None of this is ever fatal. A `settings.json` a user or a hand-edit can break
@@ -441,10 +461,22 @@ and 2D transforms. It does **not** implement:
   gradients, and container opacity, all of which RmlUi implements via layers
 - filters and shaders (`CompileFilter`, `RenderShader`, and their `Release*`
   counterparts)
-- file images (`LoadTexture`): only textures generated at runtime
-  (`GenerateTexture`, i.e. text and RmlUi's own rasterized shapes) are drawn
+- file images: `LoadTexture` serves exactly one scheme, `logo:` (the
+  launcher's title image, section 8), out of memory. Nothing reads an image
+  file off disk. Every other `src` logs once, naming the source, and the
+  element draws untextured.
+
+Textured geometry itself is implemented, so `<img>` and image decorators do
+draw, but only against a texture this renderer can produce: one generated at
+runtime (`GenerateTexture`, which is how text and RmlUi's own rasterized
+shapes arrive) or the `logo:` image.
 
 Anyone editing a stylesheet under `ui/` should stay inside that subset.
+The drop-down arrow is one consequence of it: RmlUi's own samples draw
+`selectarrow` with `decorator: image(...)`, which this renderer would draw
+as nothing, so `ui/style/base.rcss` makes the arrow out of a zero-sized box
+with a coloured top border and transparent side borders, which RmlUi mitres
+into a triangle.
 Reaching one of the unimplemented functions is not a crash: each one logs a
 single line the first time it is hit, naming itself
 (`RenderInterface::<Function>`), and the affected element simply draws
@@ -551,6 +583,98 @@ The launcher window (`ui/launcher.rml`, model and logic in
 - **Quit**: closes the process without booting anything.
 - **show-at-startup**: the on-screen checkbox for `launcher.show_at_startup`.
 
+### The title image
+
+The title block shows the game's own logo, built from the user's disc at run
+time, and falls back to the word "ICO" in Playfair Display whenever it
+cannot be. `.title-mark` in `ui/style/base.rcss` has a fixed height, so the
+two states are the same size and nothing below moves when the image arrives.
+
+The wordmark is drawn from the game's own art. Four files come out of the
+`STGLOG.DF` archive of `DFDATAS/DATA.DF`: the letter meshes `model/I.p2o`,
+`model/C.p2o` and `model/O.p2o`, and the title animation
+`anim/title_start.bga`. `src/runtime/ui/title_logo.cpp` reads the outer table
+of `DATA.DF`, inflates enough of `STGLOG.DF` to reach them
+(`src/runtime/host/inflate.cpp`, a raw DEFLATE decoder written for this,
+since nothing else in the tree links one), parses the PS2O meshes and the
+three node transforms, and reduces them to a triangle list in a box that is
+1.0 tall and as wide as the wordmark's own aspect, with a 4 percent border
+included. The triangle count, the span and the aspect are whatever the
+mounted disc gives; the `ui` log lines name them for the run, and no number
+read off a disc is written down in this repository. That triangle list, not
+an image, is what the cache holds.
+
+The raster is a separate, cheap step: the list filled at whatever pixel size
+is asked for, under one uniform scale, centred. There is no antialiasing. The
+GS draws these polygons with it off, so the fill rule here is the hardware's:
+a pixel belongs to the triangle containing its centre, and a centre on a
+shared edge goes to whichever of the two triangles has it as a top or left
+edge. Coverage is binary, so premultiplied alpha is just the colour or
+nothing. The vertex colour is applied the way the GS does,
+`Cv = Ct * Cf / 128` with saturation; all three meshes carry `0xFFFFFFFF`, so
+the letters come out white.
+
+The launcher asks for exactly the pixel box the overlay will draw across:
+`.title-logo` is 238 by 56dp, mirrored as `kRtTitleLogoDpWidth`/`Height` in
+`src/runtime/ui/title_logo.h`, times the context's dp ratio (the surface
+height over 480, clamped to 1..4). A 2560x1920 surface is ratio 4, so 952 by
+224 pixels; a box whose aspect does not match the wordmark's leaves a thin
+margin rather than stretching it. One texel a pixel means the overlay's
+`LinearClamp` sampler,
+which is left as it is, has nothing to interpolate. A window-scale change
+re-rasterises at the new size rather than scaling the image, which costs
+about a millisecond because the geometry is already in memory, and the image
+element's `src` gets a new suffix so RmlUi asks for the new texture instead
+of reusing the cached one.
+
+The node transforms are used as the file gives them and no fitted constant is
+applied anywhere. That was settled with the glow sprites the title screen
+draws behind the letters: each `_f` object is a unit quad carrying its
+letter's glow, and the glow lands exactly on its letter only at the scale the
+file carries. A search of the decomp found no scale applied to these objects
+either. The letters are small next to their spacing because the wordmark is
+tracked that widely. The glow itself is not drawn: it read as misaligned on a
+real window and did not earn its place in a launcher panel. There is no
+fallback placement: a title animation that cannot be read fails the build, and
+the launcher keeps its text title, because standing in numbers written into
+the source would both put disc-derived data in this repository and draw a
+wordmark the mounted disc did not describe.
+
+It runs on the launcher's own frame loop, not on a worker: the ISO reader is
+a single unlocked file handle and the same loop can remount it from the disc
+picker. When a disc is already resolved at startup, from `--disc`,
+`settings.json`, `config/local.toml` or the folder next to the executable, the
+whole thing happens **before the first frame is presented**
+(`launcher_prepare_first_frame`), so the launcher's first painted frame
+already carries the image and the panel is never seen to adjust. That holds
+the window for about 85 ms on a cold cache and about 2 ms on a warm one. A
+disc chosen later, through Browse or the path field, still goes the deferred
+way, since the window has to be up for the user to choose it; the swap costs
+nothing in layout terms because `.title-mark`, `.title-logo` and `.title-name`
+are all the same fixed 238 by 56dp box with no margin, padding or border.
+
+The cold cost is almost all in reaching the animation, which is stored near
+the end of `STGLOG.DF`: the meshes are well inside the archive, but the
+placement is read rather than hardcoded, so nearly all of it is inflated. The
+cache that follows is a few kilobytes of geometry, not an image, so it stays
+valid across window sizes.
+
+The cache is `saves/title_logo.cache` next to the executable, falling back
+to the per-user state directory when that folder is not writable. `saves/`
+is in `.gitignore` and `tools/check_no_rom.sh` refuses it outright, so
+decoded game pixels cannot reach a commit. The file is keyed on the disc
+image's sector count, the location and size of `DATA.DF` on it, and a
+version number that is bumped whenever the geometry or the cache encoding
+changes; a key that does not match is rebuilt rather than drawn. The header
+also carries a checksum over the payload, so a file of the right length for
+the right disc with a torn body is rebuilt instead of being read as
+geometry.
+
+Every step logs under `ui` with its timing: `title logo: cache hit`,
+`title logo: building from`, the offsets and sizes the run read for the
+archive and the three meshes, `title logo: geometry built in`, and `no title
+logo from this disc:` with the reason when it fails.
+
 Any disc a user picks, through Browse or the typed path, is validated
 (mounted and checked for `SCUS_971.13`) before it is written anywhere: only
 a disc that mounts successfully is saved to `settings.json`'s
@@ -608,6 +732,8 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `scanout internal` | the scanout geometry; its `ss=` and `hires=` fields are the super-sampling rate in force and whether the renderer actually scanned out at high resolution |
 | `profiling on:` | the frame-time profiler is active, and how often it reports |
 | `RenderInterface::` | a stylesheet under `ui/` used something the overlay renderer cannot draw |
+| `title logo:` | the launcher's title image: a cache hit, or each step of building one from the disc, with timings (section 8) |
+| `no title logo from this disc:` | the title image could not be built and the launcher kept its text title; the line says why |
 | `launcher gate:` | which of the two boot orderings this run took, and why (section 8) |
 | `rebind ` | a capture starting, ending, being accepted or rejected (section 7) |
 | `previous run's log kept as` | the last run's `icorecomp.log` was renamed to `icorecomp.prev.log` before this run's log was opened |

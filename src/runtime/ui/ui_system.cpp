@@ -4,9 +4,11 @@
  * uses it for animations and double-click timing, both of which belong to
  * the person at the keyboard, not to the emulated timeline.
  *
- * JoinPath is left at the base class default (RmlUi's own relative-path
- * joining), which is what resolves a document's stylesheet references
- * against the absolute document path ui.cpp hands it.
+ * JoinPath is the base class default (RmlUi's own relative-path joining,
+ * which is what resolves a document's stylesheet references against the
+ * absolute document path ui.cpp hands it) with one addition: the "logo:"
+ * texture scheme the overlay renderer serves is passed through untouched
+ * instead of being treated as a file next to the document.
  */
 #include "ui.h"
 
@@ -43,6 +45,19 @@ bool UiSystemInterface::LogMessage(Rml::Log::Type type, const Rml::String& messa
      * true continues execution (false would break into the debugger). */
     rt_log("ui", "RmlUi %s: %s", level, message.c_str());
     return true;
+}
+
+void UiSystemInterface::JoinPath(Rml::String& translated_path, const Rml::String& document_path,
+                                 const Rml::String& path) {
+    /* ui_render.cpp's LoadTexture answers this scheme out of memory; there is
+     * no file to resolve. Without this the default would either mangle it or
+     * pass it through by accident (its Windows drive-letter rule), and the
+     * renderer would be relying on that accident. */
+    if (path.compare(0, sizeof(kLogoScheme) - 1, kLogoScheme) == 0) {
+        translated_path = path;
+        return;
+    }
+    Rml::SystemInterface::JoinPath(translated_path, document_path, path);
 }
 
 void UiSystemInterface::SetMouseCursor(const Rml::String& /*cursor_name*/) {

@@ -62,6 +62,16 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size);
  * that stream_addr already does. */
 bool rt_snd_stream_ring(uint32_t addr, uint32_t* base, uint32_t* ring, uint32_t* cursor);
 
+/* Write-side witness for the SgStPcm ring (commands 0x46-0x4F). sif/rpc.cpp
+ * calls this for every EE to IOP DMA entry, with the destination masked into
+ * IOP RAM and the number of bytes actually staged, because the movie refills
+ * that ring with raw SIF DMA rather than through this service. The engine
+ * stamps the interleave blocks the transfer covered, which is what lets its
+ * starvation counter tell "the EE never wrote this block" from "the EE wrote
+ * the same bytes again". A transfer outside the open ring returns on the
+ * first compare. */
+void rt_snd_pcm_note_iop_write(uint32_t iop_addr, uint32_t size);
+
 /* ---- reverb.cpp ---------------------------------------------------------- */
 
 void rt_reverb_reset();

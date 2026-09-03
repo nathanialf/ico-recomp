@@ -70,8 +70,13 @@ void rt_sif_run_due();
 uint64_t rt_alarms_next_event();
 void rt_alarms_run_due();
 
-/* Called by mmio.cpp on every MMIO access: small clock advance so guest
- * poll loops make time progress, then pending-interrupt delivery. */
+/* Called by mmio.cpp on every MMIO access: a clock advance of the
+ * per-access bus cycle count (g_mmio_cycles in ee/sched.cpp, which is where
+ * the figure is argued) so guest poll loops make time progress, then
+ * pending-interrupt delivery. rt_kernel_mmio_bill does the advance and its
+ * source accounting without dispatching handlers, which is what the read
+ * path needs: it samples the register between the two. */
+void rt_kernel_mmio_bill();
 void rt_kernel_mmio_tick();
 
 /* ---- scheduler (sched.cpp) ---------------------------------------------- */

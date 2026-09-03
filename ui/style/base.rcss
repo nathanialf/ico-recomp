@@ -344,9 +344,17 @@ select {
  * right of a very wide bar, which reads as a table row rather than as a
  * control. 220dp is the width of the longest option string it has to hold,
  * "Fullscreen (exclusive)": 22 characters of 10dp mono (6dp each, 132dp)
- * plus 12dp of padding, the 16dp arrow and 2dp of border, so 162dp, with
- * room left for a longer one. "3840 x 2880 (6x)", the widest window size,
- * is 96dp of text. The label stays on its own line above. */
+ * plus 14dp of border and padding on both sides and the 24dp kept clear on
+ * the right for the arrow, so 170dp, with room left for a longer one.
+ * "3840 x 2880 (6x)", the widest window size, is 96dp of text. The label
+ * stays on its own line above.
+ *
+ * The vertical padding is 3dp and not 4dp: 20dp of border box less 2dp of
+ * border leaves 18dp, and one 10dp line at the inherited line-height of
+ * 1.2 is 12dp, so 3dp above and below centres that line on the control.
+ * With 4dp the content box was 10dp, two short of the line it holds, and
+ * the text sat 1dp low in a text field and 5dp low in a select (see the
+ * selectvalue rule below). */
 input.text,
 select {
 	display: block;
@@ -354,7 +362,7 @@ select {
 	width: 220dp;
 	max-width: 100%;
 	height: 20dp;
-	padding: 4dp 6dp;
+	padding: 3dp 6dp;
 	font-size: 10dp;
 	background-color: #171717;
 	border: 1dp #262626;
@@ -375,31 +383,74 @@ input.range:disabled {
 	border-color: #1a1a1a;
 }
 
-/* The widget sets overflow: hidden on this element itself
- * (WidgetDropDown.cpp), which is what lets text-overflow resolve here. */
+/* WidgetDropDown builds the select's three children and places two of them
+ * itself, both against the select's content box and not its border box:
+ * the value element is offset to the content origin (WidgetDropDown.cpp
+ * OnRender, SetOffset right after FormatElement) and the arrow is anchored
+ * TOP_RIGHT within the content box (ElementUtilities::PositionElement).
+ * The select's own padding therefore already moved both of them; whatever
+ * they set for themselves is measured from a 206x12dp content area at
+ * (7,4) inside the 220x20dp border box. Repeating the select's 20dp height
+ * and 4dp 6dp padding here is what pushed the value text to a centre of
+ * 15dp in a control whose centre is 10dp, and hung the last 5dp of the box
+ * below the bottom border.
+ *
+ * The widget sets overflow: hidden on this element itself, which is what
+ * lets text-overflow resolve here. */
 select selectvalue {
 	width: auto;
-	height: 20dp;
-	margin-right: 16dp;
-	padding: 4dp 6dp;
-	box-sizing: border-box;
+	/* FormatElement is handed the select's border box, so width: auto
+	 * resolves against 220dp: 24dp of margin leaves 196dp, ending the text
+	 * at x=203dp where the arrow begins rather than under it. */
+	margin-right: 24dp;
+	/* Exactly the 12dp line box, with no padding of its own: the select's
+	 * padding has already placed this box at (7,4), so the line runs from
+	 * 4dp to 16dp and its centre is the control's centre. */
+	height: 12dp;
+	padding: 0dp;
 	color: #e5e5e5;
 	white-space: nowrap;
 	text-overflow: ellipsis;
 }
 
+/* A downward triangle drawn out of borders on a zero-sized box. The
+ * overlay renderer has no file images, no gradients and no shaders
+ * (docs/SETTINGS.md, supported RCSS subset), so an image or gradient
+ * decorator would draw nothing at all; borders are plain triangles and are
+ * drawn. RmlUi mitres border corners, and with a 0x0 padding box the two
+ * inner corners of the top edge collapse onto the same point
+ * (GeometryBackgroundBorder::ComputeBorderMetrics), which leaves the top
+ * border as a 10dp wide, 6dp tall triangle pointing down. The side borders
+ * are transparent, so they are skipped rather than blended.
+ *
+ * The arrow is anchored to the top right of the content box, so its right
+ * edge lands at 213dp, the same 7dp in from the border box as the text is
+ * on the left. margin-top centres it: 4dp of content origin plus 3dp puts
+ * the 6dp triangle at 7dp to 13dp, centred on the control's 10dp. */
 select selectarrow {
-	width: 16dp;
-	height: 20dp;
-	background-color: #262626;
+	width: 0dp;
+	height: 0dp;
+	margin-top: 3dp;
+	border-top: 6dp #a3a3a3;
+	border-left: 5dp transparent;
+	border-right: 5dp transparent;
 }
 
 select:hover selectarrow {
-	background-color: #404040;
+	border-top-color: #e5e5e5;
 }
 
+select:disabled selectarrow {
+	border-top-color: #404040;
+}
+
+/* box-sizing keeps the open list exactly as wide as the control: the
+ * widget formats this element against the select's border box and offsets
+ * it to the border box origin, so a content-box 100% would be 222dp under
+ * a 220dp control. */
 select selectbox {
 	margin-left: 0;
+	box-sizing: border-box;
 	width: 100%;
 	max-height: 120dp;
 	background-color: #171717;
@@ -408,7 +459,10 @@ select selectbox {
 
 /* display: block is also what the widget sets on each option as it adopts
  * it; stating it here means an option laid out before that still reads as
- * a row rather than as inline text. */
+ * a row rather than as inline text. 3dp above and below the 12dp line box
+ * makes an 18dp row with the text centred in it, and the 6dp inset behind
+ * the list's own 1dp border puts a row's text at the same 7dp from the
+ * left edge as the closed value above it. */
 select selectbox option {
 	display: block;
 	width: auto;
@@ -743,14 +797,59 @@ body.launcher {
 	border-bottom: 1dp #262626;
 }
 
+/* Holds whichever of the two title states is up: the image built from the
+ * user's disc, or the word ICO when there is none. Fixed at exactly the size
+ * both of its children are given, so the box does not depend on which one is
+ * in the document. */
+.title-mark {
+	display: block;
+	width: 238dp;
+	height: 56dp;
+	margin: 0;
+	padding: 0;
+}
+
+/*
+	The two title states, and they must stay the same box: 238 by 56dp, no
+	margin, no padding, no border. A swap then changes pixels and never
+	layout, whether it happens before the first frame (the usual case) or
+	after a disc is chosen in the window.
+
+	238 by 56 is also the size src/runtime/ui/title_logo.cpp rasterises the
+	wordmark at, scaled by the overlay's dp ratio: 238dp is the wordmark's own
+	aspect (4.2522, measured) at the 56dp height the title block reserves, and
+	the letters come out about as tall as the 34dp text they replace, the rest
+	being the 4 percent border the geometry carries. Both numbers are mirrored
+	as kRtTitleLogoDpWidth and kRtTitleLogoDpHeight in
+	src/runtime/ui/title_logo.h and must agree with these, or the image is
+	rasterised for one box and drawn across another, which resamples it and
+	softens the edges. ui_launcher.cpp logs a line naming both if they ever
+	disagree.
+
+	No width or height is left to the texture: an img sized from its own
+	intrinsic dimensions would change size with the raster.
+*/
+.title-logo {
+	display: block;
+	width: 238dp;
+	height: 56dp;
+	margin: 0;
+	padding: 0;
+}
+
 .title-name {
 	display: block;
+	width: 238dp;
+	height: 56dp;
+	margin: 0;
+	padding: 0;
 	font-family: "Playfair Display";
 	font-weight: 700;
 	font-size: 34dp;
 	letter-spacing: 0.12em;
 	color: #f9fafb;
-	line-height: 1.1;
+	/* Centres the one line in the 56dp box above. */
+	line-height: 56dp;
 	white-space: nowrap;
 	overflow: hidden;
 }

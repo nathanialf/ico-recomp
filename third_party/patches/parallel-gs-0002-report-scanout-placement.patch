@@ -1,0 +1,70 @@
+From bdf13c75992fe4629e65d7e54dc3e62b9b54fbe5 Mon Sep 17 00:00:00 2001
+From: Nathanial Fine <nathanial.fine@gmail.com>
+Date: Thu, 3 Sep 2026 00:31:45 +0000
+Subject: [PATCH] Report where each CRTC window landed in the scanout
+
+ScanoutResult gains the final placement of each enabled CRTC window in the
+output image, in the single-sampled domain, after the CRTC shift and the
+horizontal adaptation. Without it a caller cannot tell a window that fills
+the mode area from one that was cropped by it, and that is exactly the
+difference between a game window and a wider movie window on the same
+raster.
+
+ICO measured: gameplay programs DISPLAY2 DW+1 2560 with MAGH+1 5 and DH+1
+448 at DX 636 / DY 50, which is the renderer's NTSC active area exactly, and
+lands at (0,0) 512x224 in a 512x224 frame. The attract movie programs DW+1
+2880 with MAGH+1 4 and DH+1 480 at the same DX and DY, and lands at (0,0)
+720x240 in a 640x224 frame: the same origin, 80 columns and 16 lines per
+field wider than the frame holds. Whether a set shows any of that excess is
+a separate question from whether the mode area is the right frame; reporting
+the numbers is what makes either one checkable from a log.
+
+Reporting only. No existing caller renders anything differently.
+---
+ gs/gs_renderer.cpp |  9 +++++++++
+ gs/gs_renderer.hpp | 12 ++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 7eb93e6..cad982f 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4787,6 +4787,15 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+ 		}
+ 	}
+ 
++	for (int i = 0; i < 2; i++)
++	{
++		result.circuit_enabled[i] = crtc_rects[i].extent.width != 0 && crtc_rects[i].extent.height != 0;
++		result.circuit_x[i] = crtc_rects[i].offset.x;
++		result.circuit_y[i] = crtc_rects[i].offset.y;
++		result.circuit_width[i] = crtc_rects[i].extent.width;
++		result.circuit_height[i] = crtc_rects[i].extent.height;
++	}
++
+ 	result.internal_width = mode_width;
+ 	result.internal_height = mode_height;
+ 	image_info.width = mode_width << int(high_resolution_scanout);
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index ac90aff..c6d8a03 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -50,6 +50,18 @@ struct ScanoutResult
+ 	// Pixel clock rate. Generally 13.5 MHz for interlaced 640x480 video and 27 MHz for progressive 640x480.
+ 	// If high_resolution_scanout is used, this may lower a bit to compensate. E.g. 512x448 might be 10.8 MHz.
+ 	float sampling_rate_mhz;
++
++	// Where each enabled CRTC window ended up in the output image, in the
++	// single-sampled domain, after the CRTC shift and the horizontal
++	// adaptation. Reporting only: a caller cannot otherwise tell a window that
++	// fills the mode area from one that was cropped by it, which is the
++	// difference between a game window and a wider movie window on the same
++	// raster. Index 0 is circuit 1, index 1 is circuit 2.
++	bool circuit_enabled[2];
++	int32_t circuit_x[2];
++	int32_t circuit_y[2];
++	uint32_t circuit_width[2];
++	uint32_t circuit_height[2];
+ };
+ 
+ struct FlushStats

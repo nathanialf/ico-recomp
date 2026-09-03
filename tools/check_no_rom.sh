@@ -24,7 +24,7 @@ for f in "${files[@]}"; do
 
     # Forbidden extensions: game binaries, disc images, extracted assets.
     case "${f,,}" in
-        *.iso|*.bin|*.cue|*.elf|*.rom|*.irx|*.img|*.vag|*.tm2|*.pss|*.hd|*.bd|*.int|*.df)
+        *.iso|*.bin|*.cue|*.elf|*.rom|*.irx|*.img|*.vag|*.tm2|*.pss|*.hd|*.bd|*.int|*.df|*.png)
             err "$f (game-data file extension)" ;;
     esac
 

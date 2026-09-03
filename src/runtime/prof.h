@@ -21,6 +21,20 @@
  *   - "ee" is translated EE code only. The DMA, VIF1, GIF, VU1, syscall
  *     and MMIO work the EE triggers is subtracted out into its own
  *     bucket.
+ *   - "ipu" holds a whole IPU register access, mmio.cpp's dispatch
+ *     included, not just hw/ipu.cpp's handler: the movie makes tens of
+ *     thousands of those a field, and a second nested zone for the handler
+ *     would double the clock readings on the hottest path in the port.
+ *     "mmio" is therefore every access that is not an IPU one. The IPU's
+ *     DMA entry points keep their own zone; they are reached from a DMAC
+ *     register write and run per transfer, not per access.
+ *     The zone opens before rt_kernel_mmio_bill, so it also holds the
+ *     virtual clock tick every access bills and everything that tick
+ *     raises (timer compares, vblank edges, deferred SIF work) and, on the
+ *     write path, the interrupt delivery after it. That was not true of
+ *     logs written before this change, where the clock tick was billed to
+ *     "mmio" for IPU accesses too, so the two are not comparable
+ *     bucket for bucket.
  *   - "log" is not populated in this build; see RT_PROF_LOG below.
  *
  * Header only on purpose: adding a translation unit means editing
@@ -181,6 +195,36 @@ private:
  * on the hot path. Returns 0 with the instrument off. */
 inline uint64_t rt_prof_zone_ns(int zone) { return rt_prof_detail::g_ns[zone]; }
 
+/* Cost of one clock reading on this host, in nanoseconds, measured once.
+ *
+ * The instrument bills a zone by reading the clock at its edges, so on the
+ * movie's register-driven path, where a field holds tens of thousands of
+ * zones, the clock source is a first-order term in every bucket it prints.
+ * On a host where the reading is cheap it disappears; on one where it is
+ * not, an "ipu" bucket is mostly the instrument. Nothing in a log tells the
+ * two apart unless the log says what a reading costs on the host it came
+ * from, so it says.
+ *
+ * Measured over a short burst of 20000 readings. That burst is host time
+ * like any other, so the caller decides where it lands: rt_prof_init runs
+ * it at startup before the first window opens, and rt_prof_report runs it
+ * after the window it is closing has been billed, inside the block whose
+ * cost is deliberately outside both windows. */
+inline void rt_prof_measure_clock() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    constexpr int kN = 20000;
+    const uint64_t t0 = rt_prof_detail::now_ns();
+    uint64_t acc = 0;
+    for (int i = 0; i < kN; ++i) acc += rt_prof_detail::now_ns();
+    const uint64_t t1 = rt_prof_detail::now_ns();
+    const double per = (double)(t1 - t0) / (double)kN;
+    rt_log("prof", "clock source: %.1f ns per reading, so one profiled MMIO access carries about "
+                   "%.1f ns of instrument on this host (sum 0x%016llx)",
+        per, 2.0 * per, (unsigned long long)acc);
+}
+
 /* Parses ICORECOMP_PROFILE. Call once from main, after rt_log_init.
  *
  * Set: identical to before debug.profile_fields existed, including being
@@ -213,6 +257,7 @@ inline void rt_prof_init() {
         rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE=%s)."
                        " Buckets are exclusive self time and sum to wall clock.",
             rt_prof_detail::g_every, e);
+        rt_prof_measure_clock();
         return;
     }
 #ifndef ICORECOMP_HAVE_SETTINGS
@@ -228,6 +273,7 @@ inline void rt_prof_init() {
     rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE unset, default)."
                    " Buckets are exclusive self time and sum to wall clock.",
         rt_prof_detail::g_every);
+    rt_prof_measure_clock();
 #endif
 }
 
@@ -249,6 +295,19 @@ inline void rt_prof_report() {
     const uint64_t t = now_ns();
     g_ns[g_cur] += t - g_last_ns;
     const uint64_t wall = t - g_window_ns;
+    /* One shot, and only for a run that got here without rt_prof_init
+     * having done it: with ICORECOMP_PROFILE set, or in a build with no
+     * settings (the selftest targets), rt_prof_init measured the clock at
+     * startup and this returns immediately. What is left is the
+     * debug.profile_fields path, where rt_prof_field turns the instrument
+     * on mid-run and this is the first place that can measure.
+     *
+     * Called after the window above has been billed and before the report
+     * lines, so the 20000 readings land in the same gap the report itself
+     * does: everything from here to the counter reset at the end of this
+     * function is outside both the window just closed and the one reopened
+     * there. */
+    rt_prof_measure_clock();
     const double wall_ms = (double)wall / 1e6;
     const double fields = (double)g_window_fields;
 
