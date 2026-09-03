@@ -171,9 +171,11 @@ Rml::Element* first_by_class(Rml::Element* root, const char* class_name) {
 void log_menu_metrics() {
     Rml::Element* shell = first_by_class(g_ui.menu, "shell");
     Rml::Element* pane = first_by_class(g_ui.menu, "pane");
-    if (!g_ui.menu || !shell || !pane) {
+    /* g_ui.menu is never null here: rt_ui_init fails without menu.rml, and
+     * the flag that brings this here is set right after menu->Show(). */
+    if (!shell || !pane) {
         rt_log("ui", "menu heights: no %s in the menu document; this file and menu.rml disagree",
-            !g_ui.menu ? "body" : (!shell ? ".shell" : ".pane"));
+            !shell ? ".shell" : ".pane");
         return;
     }
     rt_log("ui", "menu heights: body %.1f, shell %.1f, pane %.1f (client %.1f, scroll %.1f)",

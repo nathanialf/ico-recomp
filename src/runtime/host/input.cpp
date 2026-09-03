@@ -351,16 +351,17 @@ void sdl_poll() {
     }
 
     if (g_gamepad) {
-        /* Raw axis value past which an axis bind counts as pressed, in the
-         * bound direction. This is the pre-settings build's hardcoded
-         * `> 8192` on the two triggers. It is not a setting because an axis
-         * bound to a pad slot is a button as far as the game is concerned
-         * (the L2 and R2 defaults are lefttrigger+ and righttrigger+). */
-        constexpr float kTriggerPressRaw = 8192.0f;
+        /* Raw axis value past which an axis bind (any axis, not only the
+         * lefttrigger+ and righttrigger+ defaults on L2 and R2) counts as
+         * pressed in the bound direction. This is the pre-settings build's
+         * hardcoded `> 8192` on the two triggers. It is not a setting
+         * because RtPadState carries no analog trigger channel: the point
+         * only ever chooses where the digital bit flips. */
+        constexpr float kAxisPressRaw = 8192.0f;
         for (const PadBind& b : g_pad_binds) {
             if (b.axis != SDL_GAMEPAD_AXIS_INVALID) {
                 const float v = (float)SDL_GetGamepadAxis(g_gamepad, b.axis) * (float)b.dir;
-                if (v > kTriggerPressRaw) s.buttons |= b.bit;
+                if (v > kAxisPressRaw) s.buttons |= b.bit;
             } else if (SDL_GetGamepadButton(g_gamepad, b.button)) {
                 s.buttons |= b.bit;
             }

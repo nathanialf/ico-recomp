@@ -105,8 +105,12 @@ An axis bind (the `lefttrigger+` / `righttrigger+` defaults for L2 and R2)
 counts as pressed when the raw axis reads past 8192 of 32767 in the bound
 direction, the same `> 8192` check the pre-settings build hardcoded. The
 press point is a compiled-in constant in `sdl_poll()`
-(`src/runtime/host/input.cpp`), not a setting: to the game a trigger is a
-button, and the retail pad reports it as one. The keys
+(`src/runtime/host/input.cpp`), not a setting: the host pad state
+(`RtPadState`, `src/runtime/host/input.h`) carries sixteen digital bits and
+the two sticks and no analog trigger channel, so the point only ever chose
+where a digital bit flips. The pad HLE quantises that bit to a 0 or 255
+pressure byte (`src/runtime/sif/pad.cpp`); whether ICO reads L2 or R2
+pressure is not established. The keys
 `input.trigger_threshold` and `input.rumble` from earlier builds are
 retired; a file that still carries them keeps them, unchanged, and the load
 logs each one as retired. Rumble follows the game's own actuator requests,
@@ -581,7 +585,7 @@ The launcher window (`ui/launcher.rml`, model and logic in
 - **show-at-startup**: the on-screen checkbox for `launcher.show_at_startup`.
 - **Footer**: the build identity on the left (the running executable's size
   and modification time, `rt_exe_identity()`), and on the right the credit
-  "Nathanial Fine" behind the defnf mark, which opens `https://defnf.com`
+  "Nathanial Fine" after the defnf mark, which opens `https://defnf.com`
   through `SDL_OpenURL`. A build with no SDL, or a platform `SDL_OpenURL`
   cannot hand off to, logs why and shows that in the status line instead of
   doing nothing. The mark is drawn from plain boxes in the stylesheet,
@@ -717,7 +721,7 @@ These are exact prefixes and phrases, all under the `main`, `settings`,
 | `is overridden by` | an environment variable is winning over settings.json for one key |
 | `kept default` | a bad value in the file was rejected; the key stayed at its default |
 | `settings.json.bad` | the file failed to parse and was preserved under this name |
-| `no longer a setting` | the file still holds `display.hires_scanout`; render scale 4 and up now requests high-resolution scanout |
+| `no longer a setting` | the file still holds a retired key (`display.hires_scanout`, `input.trigger_threshold` or `input.rumble`); the line names it and what replaced it |
 | `super-sampling` | the render scale the paraLLEl-GS backend was created with, whether super-sampled textures are on, and whether it asked for high-resolution scanout |
 | `render scale applied live` | a render scale change from the menu reached the backend |
 | `scanout internal` | the scanout geometry; its `ss=` and `hires=` fields are the super-sampling rate in force and whether the renderer actually scanned out at high resolution |

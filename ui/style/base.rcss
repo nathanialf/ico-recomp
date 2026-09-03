@@ -27,8 +27,9 @@
  *
  * Column widths are derived from the longest string each column can hold,
  * at the mono advance of 0.6em plus that rule's letter-spacing. The three
- * that decide a width are "Right stick right" (binding slot), "Right stick
- * deadzone" (control label) and "Fullscreen (exclusive)" (select value).
+ * that decide a width are "Right stick right" (binding slot), "Profiler
+ * period, fields" (control label) and "Fullscreen (exclusive)" (select
+ * value).
  *
  * Overflow: anything whose text is not bounded by this file (a settings
  * path, a disc path, a binding name, a version string) either wraps or is
@@ -229,10 +230,14 @@ body.menu {
  * either end. That gap comes from the width, not from padding, which is why
  * the padding here is 1dp and not the portfolio's 0.4em: before rotation
  * that padding sits above and below the text, and after it the same padding
- * is width across the bar. At 0.4em (3.2dp a side) the rotated box was
- * 16dp laid across the 14dp column and its black overhung the nav buttons;
- * at 1dp it is 11.6dp (one 8dp line at line-height 1.2, plus 1dp a side)
- * and clears the column by 1dp on each side. */
+ * is width across the bar. The box is centred on the line, not on the
+ * column: the -35dp margin puts the 70dp box's centre at the line's left
+ * edge, and the rotation is about that centre, so the rotated box reaches
+ * the same distance either side of the line. At 0.4em (3.2dp a side) that
+ * reach was 8dp, past the 6dp gap to the nav buttons, and the black
+ * overhung them; at 1dp the box is 11.6dp across (one 8dp line at
+ * line-height 1.2, plus 1dp a side), reaching 5.8dp either way, which
+ * clears the buttons by 0.2dp and leaves the right of the column empty. */
 .bracket-label {
 	display: block;
 	width: 70dp;
@@ -258,13 +263,16 @@ body.menu {
  * it escapes the pane's clip region. At the baseline the pane's content is
  * 434dp wide, less the 6dp scrollbar.
  *
- * height: 100% of the shell, which is a definite height because the shell
- * is anchored top and bottom. Without it the pane is laid out at its
- * content height, nothing overflows as far as RmlUi is concerned, no
- * scrollbar is built and the wheel finds no scrollable container
- * (Element.cpp, GetClosestScrollableContainer). With it, a tab taller than
- * the shell goes through the block overflow path
- * (Layout/ContainerBox.cpp, CatchOverflow) and scrolls. */
+ * The pane is as tall as the shell, and the shell has a definite height
+ * because it is anchored top and bottom. That is what makes a tab taller
+ * than the shell overflow as far as RmlUi is concerned, build a scrollbar
+ * and give the wheel a scrollable container (Element.cpp,
+ * GetClosestScrollableContainer): before the shell was anchored, its own
+ * height followed its content and nothing overflowed. The height: 100%
+ * below restates what the shell's default align-items: stretch already
+ * gives a flex item; it is kept so the pane's height does not depend on
+ * the shell's alignment. The measured figures come out on the "menu
+ * heights:" log line ui.cpp writes when the menu opens. */
 
 .pane {
 	display: block;
@@ -342,9 +350,9 @@ scrollbarvertical sliderbar:hover {
 /* ---- controls -----------------------------------------------------------
  *
  * A label is 9dp mono with 0.05em of letter-spacing, so 5.85dp a character:
- * "Right stick deadzone", the longest at 20 characters, is 117dp of the
- * 428dp the pane leaves. Labels therefore never need to wrap, and are not
- * told to. */
+ * "Profiler period, fields", the longest at 23 characters, is 134.6dp of
+ * the 428dp the pane leaves. Labels therefore never need to wrap, and are
+ * not told to. */
 
 .control {
 	display: block;
@@ -841,22 +849,30 @@ body.fps {
  *
  * The launcher draws over an empty backbuffer: there is no scanout behind
  * it, so its body is opaque #0a0a0a rather than the menu's translucent
- * panel. Everything else is the same restricted set of boxes and text. */
+ * panel. Everything else is the same restricted set of boxes and text.
+ *
+ * Same construction as the menu: the shell and the footer are anchored to
+ * the body's edges rather than stacked in a flex column, so the shell's
+ * height is definite and the footer stays on the window's bottom edge
+ * however long the disc path, the status line and the precheck message
+ * grow. The 18dp and 22dp insets were this body's padding. */
 
 body.launcher {
 	width: 100%;
 	height: 100%;
 	box-sizing: border-box;
-	padding: 18dp 22dp;
-	display: flex;
-	flex-direction: column;
+	display: block;
 	background-color: #0a0a0a;
 }
 
+/* bottom: 44dp clears the footer, whose top edge is 36.6dp up (see
+ * .launcher-footer), by 7.4dp. */
 .launcher-shell {
-	display: block;
-	flex-grow: 1;
-	min-height: 0;
+	position: absolute;
+	top: 18dp;
+	left: 22dp;
+	right: 22dp;
+	bottom: 44dp;
 	overflow-x: hidden;
 	overflow-y: auto;
 }
@@ -1033,13 +1049,18 @@ body.launcher {
 
 /* The build identity on the left, the author credit on the right. Only the
  * version line shrinks: it is the one item whose text this file cannot
- * bound, so it is the one that ellipsizes. */
+ * bound, so it is the one that ellipsizes. Pinned 18dp up from the bottom
+ * edge; the box is 18.6dp tall (one 8dp line at line-height 1.2, which is
+ * taller than the 8dp mark beside it, under 8dp of padding and the 1dp
+ * rule), so its top edge is 36.6dp up. */
 .launcher-footer {
+	position: absolute;
+	left: 22dp;
+	right: 22dp;
+	bottom: 18dp;
 	display: flex;
 	flex-direction: row;
 	align-items: center;
-	flex-shrink: 0;
-	margin-top: 10dp;
 	padding-top: 8dp;
 	border-top: 1dp #262626;
 }

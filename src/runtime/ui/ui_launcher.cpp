@@ -513,29 +513,18 @@ void on_open_url(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& argu
  * holds the disc state and the precheck result and has no business holding
  * a URL. It gets a plain click listener wired here instead.
  */
-class ClickAction final : public Rml::EventListener {
-public:
-    enum class What { OpenUrl };
-    ClickAction(What what, const char* argument) : m_what(what), m_argument(argument ? argument : "") {}
-
-    void ProcessEvent(Rml::Event&) override {
-        switch (m_what) {
-        case What::OpenUrl: open_url(m_argument); break;
-        }
-    }
-
-private:
-    What m_what;
-    std::string m_argument;
-};
-
 const char kSiteUrl[] = "https://defnf.com";
 
-ClickAction g_open_site(ClickAction::What::OpenUrl, kSiteUrl);
+class OpenSiteAction final : public Rml::EventListener {
+public:
+    void ProcessEvent(Rml::Event&) override { open_url(kSiteUrl); }
+};
+
+OpenSiteAction g_open_site;
 
 /* Missing ids are logged rather than ignored: they mean the document and
  * this file disagree, which costs the user a dead-looking link. */
-void attach_click(Rml::ElementDocument* doc, const char* id, ClickAction* action) {
+void attach_click(Rml::ElementDocument* doc, const char* id, Rml::EventListener* action) {
     if (!doc) return;
     Rml::Element* el = doc->GetElementById(id);
     if (!el) {
