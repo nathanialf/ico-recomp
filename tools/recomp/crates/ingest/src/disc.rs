@@ -125,8 +125,10 @@ pub fn load(cfg: &RecompConfig, image: ElfImage) -> Result<DiscIngest> {
             continue;
         };
         let data_words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         for (target, _holder) in scan::data_pointers_to_prologues(&data_words, sec.vram, &text_words, text.vram) {
             data_prologue_targets.push(target);
@@ -487,8 +489,10 @@ fn words_of(image: &ElfImage, section: &ElfSection) -> Result<Vec<u32>> {
         .read_at(section.vram, section.size as usize)
         .with_context(|| format!("reading {} at {:#x}", section.name, section.vram))?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 
