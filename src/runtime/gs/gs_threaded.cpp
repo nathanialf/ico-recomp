@@ -44,10 +44,13 @@
  *   SetRenderScale  super-sampling factor                   none
  *   SetRaster       RT_PGS_RASTER_* value                   none
  *   SetDeinterlace  RT_PGS_DEINTERLACE_* value              none
+ *   SetWideAspect   the widescreen present aspect, double bits  none
+ *   SetPresentRate  display.present_rate as a double's bits    none
  *   OverlaySetFrame 0 = clear, 1 = frame follows            FramePayload + arrays
  *   OverlayTexDestroy texture id                            none
  *   OverlayTexCreate call sequence number                   TexPayload + RGBA8 texels
  *   PresentUi       call sequence number                    none
+ *   RequestShot     screenshot slots to arm (1 or 2)        none
  *
  * OverlaySetFrame's payload is a FramePayload counts header followed by the
  * vertex, index and command arrays back to back, at the offsets
@@ -107,6 +110,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <cstdlib>
 #include <new>
 
@@ -133,6 +137,13 @@ constexpr auto kWaitStep = std::chrono::milliseconds(2);
  * who sees the picture freeze finds the reason in the log. */
 constexpr uint64_t kFieldSyncStuckNs = 5ull * 1000 * 1000 * 1000;
 
+/* How long one present may take before the consumer says so. A present on
+ * a healthy device is bounded by the refresh interval; seconds means the
+ * driver is waiting on something that is not coming. Two seconds is well
+ * past a shader compile or a swapchain rebuild and well short of a user
+ * deciding the program has hung. */
+constexpr uint64_t kSlowPresentNs = 2ull * 1000 * 1000 * 1000;
+
 /* How long quiesce() waits for the worker to park before giving up on it.
  * Only reachable when the worker cannot return: parked inside Granite with
  * an unusable swapchain, or wedged in a driver call. */
@@ -158,20 +169,31 @@ enum RecordKind : uint32_t {
     kSetRenderScale,
     kSetRaster,
     kSetDeinterlace,
+    kSetWideAspect,
+    kSetPresentRate,
     kOverlaySetFrame,
     kOverlayTexDestroy,
     kOverlayTexCreate,
     kPresentUi,
+    kRequestShot,
     kKindCount,
 };
 
 const char* kind_name(uint32_t kind) {
-    static const char* const kNames[kKindCount] = {
+    /* One name per RecordKind, in enum order. The bound is deduced and
+     * asserted rather than written as [kKindCount]: an explicit bound lets a
+     * short initialiser list compile, which is how every name past a missing
+     * one came to be off by one and the last one a null pointer, inside the
+     * oversized-record fatal that exists to explain what went wrong. */
+    static const char* const kNames[] = {
         "wrap", "gif", "priv", "vsync", "set-presentation",
         "set-present-mode", "set-render-scale", "set-raster", "set-deinterlace",
-        "overlay-set-frame", "overlay-tex-destroy", "overlay-tex-create",
-        "present-ui",
+        "set-wide-aspect", "set-present-rate", "overlay-set-frame",
+        "overlay-tex-destroy", "overlay-tex-create", "present-ui",
+        "request-screenshot",
     };
+    static_assert(std::size(kNames) == size_t(kKindCount),
+                  "kind_name needs one name per RecordKind, in enum order");
     return kind < kKindCount ? kNames[kind] : "?";
 }
 
@@ -290,7 +312,7 @@ ThreadedBackend::~ThreadedBackend() {
          * being replayed did run and its bytes are still counted as live
          * because the tail never advanced past it. Anything else is a real
          * loss and says so. */
-        rt_log("gs", "GS ring: %llu bytes still queued at teardown%s",
+        rt_log_info("gs", "GS ring: %llu bytes still queued at teardown%s",
                (unsigned long long)pending,
                from_replay ? " (exit from inside a replayed call; the record ran)"
                            : ", discarded");
@@ -346,8 +368,10 @@ void ThreadedBackend::back_pressure(uint64_t bytes) {
             if (closed_window_timeout(t0)) {
                 m_space_waiting.fetch_sub(1, std::memory_order_relaxed);
                 lk.unlock();
-                rt_log("gs", "GS ring: full for a second with the window closed and the"
+                rt_log_info("gs", "GS ring: full for a second with the window closed and the"
                              " consumer parked; exiting");
+                rt_run_set_exit_reason(true, "the window closed while the GS consumer was parked"
+                    " and the command ring filled up behind it");
                 std::exit(0);
             }
             wait_step(lk);
@@ -516,8 +540,10 @@ uint64_t ThreadedBackend::await_reply(uint64_t seq) {
             if (closed_window_timeout(t0)) {
                 m_progress_waiting.fetch_sub(1, std::memory_order_relaxed);
                 lk.unlock();
-                rt_log("gs", "GS ring: waited a second for a reply with the window closed and"
+                rt_log_info("gs", "GS ring: waited a second for a reply with the window closed and"
                              " the consumer parked; exiting");
+                rt_run_set_exit_reason(true, "the window closed while the GS consumer was parked,"
+                    " and the EE gave up waiting for reply %llu", (unsigned long long)seq);
                 std::exit(0);
             }
             wait_step(lk);
@@ -637,6 +663,40 @@ void ThreadedBackend::set_deinterlace(uint32_t deinterlace) {
     commit();
 }
 
+/* The aspect travels as the double's own bits, the way set_present_rate's
+ * rate does, and for the same reason it rides the ring at all: it changes
+ * what a present does and has to reach the consumer in order with the fields
+ * it applies to. */
+void ThreadedBackend::set_widescreen_aspect(double aspect) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(aspect), "a double must fit a record arg");
+    std::memcpy(&bits, &aspect, sizeof(bits));
+    begin_record(kSetWideAspect, bits, 0);
+    commit();
+}
+
+/* The rate travels as the double's own bits in the header's arg. It is a
+ * host pacing knob and not a value the guest supplied, so nothing is
+ * rounded or clamped on the way: what settings.json holds is what the
+ * consumer divides 1 by. */
+void ThreadedBackend::set_present_rate(double max_hz) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(max_hz), "a double must fit a record arg");
+    std::memcpy(&bits, &max_hz, sizeof(bits));
+    begin_record(kSetPresentRate, bits, 0);
+    commit();
+}
+
+/* Ordered against the GIF and vsync traffic like every other call that
+ * changes what a present does, so the capture lands on the field the user
+ * pressed the key on rather than one either side of it. The pixels come back
+ * the other way (GsBackend::take_screenshot, passed straight through), never
+ * through this ring: see the threading contract in gs_threaded.h. */
+void ThreadedBackend::request_screenshot(uint32_t slots) {
+    begin_record(kRequestShot, slots, 0);
+    commit();
+}
+
 void ThreadedBackend::overlay_texture_destroy(uint32_t texture) {
     begin_record(kOverlayTexDestroy, texture, 0);
     commit();
@@ -729,7 +789,11 @@ void ThreadedBackend::field_sync() {
         if (!m_field_sync_stuck_logged &&
             now_ns() - t0 >= kFieldSyncStuckNs) {
             m_field_sync_stuck_logged = true;
-            rt_log("gs", "GS ring: the EE has waited %.1f s for vsync %llu (consumer at %llu,"
+            /* warn, not info: at the shipped default level this is the only
+             * line that would say the picture has stopped, and a frozen run
+             * whose log says nothing is the failure this file's diagnostics
+             * exist to remove. */
+            rt_log_warn("gs", "GS ring: the EE has waited %.1f s for vsync %llu (consumer at %llu,"
                          " %llu bytes queued, consumer %s, window open); still waiting",
                    double(now_ns() - t0) / 1e9, (unsigned long long)want,
                    (unsigned long long)m_vsync_done.load(std::memory_order_relaxed),
@@ -753,7 +817,8 @@ bool ThreadedBackend::window_closed() {
 }
 
 void ThreadedBackend::report_stats() {
-    rt_log("gs", "GS ring: %llu records (%llu replayed), %llu bytes, %llu wrap markers,"
+    rt_log_info("gs", "GS ring: %llu records (%llu replayed), %llu bytes of ring written"
+                 " (wrap padding included), %llu wrap markers,"
                  " %llu back-pressure stalls, %zu-byte ring",
            (unsigned long long)m_records_written,
            (unsigned long long)m_records_replayed.load(std::memory_order_relaxed),
@@ -762,12 +827,11 @@ void ThreadedBackend::report_stats() {
     m_inner->report_stats();
 }
 
-void ThreadedBackend::present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
-                                      uint64_t* present_ns, uint64_t* fields) {
+void ThreadedBackend::present_timings(RtGsPresentTimings* out) {
     /* Read from the EE thread while the consumer may be inside a present:
-     * the four counters are atomics on the library side for exactly this
-     * call (gs_parallel_impl.h). */
-    m_inner->present_timings(flush_ns, scanout_ns, present_ns, fields);
+     * every counter is an atomic on the library side for exactly this call
+     * (gs_parallel_impl.h). */
+    m_inner->present_timings(out);
 }
 
 void ThreadedBackend::consumer_timings(RtGsConsumerTimings* out) {
@@ -800,11 +864,56 @@ void ThreadedBackend::start_worker() {
     /* Releases the worker, which spins on this until the id above is stored:
      * its very first drain() checks that it is the consumer. */
     m_worker_started.store(true, std::memory_order_release);
-    rt_log("gs", "GS worker thread started: the command ring is drained off the EE thread"
+    rt_log_info("gs", "GS worker thread started: the command ring is drained off the EE thread"
                  " (packet parse, flush, scanout and present move there, one field in flight)");
 }
 
+/* Consumer side, both of them. See gs_threaded.h.
+ *
+ * The stamp is taken before the call and not after it: what has to happen at
+ * the interval is the asking, and a present that overran its own interval
+ * must not immediately owe another one. The library takes the same view of
+ * its own last-present stamp (gs_parallel_present.cpp), which is what
+ * actually paces the picture; this only decides when to knock. */
+void ThreadedBackend::pump_present() {
+    m_last_pump_ns = now_ns();
+    rt_run_note_gs_worker("inside a present");
+    m_inner->present_pump(m_present_rate);
+    /* A present is a swapchain acquire, a submit and a queue present, and on
+     * a healthy device the longest of those is one refresh interval. Seconds
+     * means the driver is waiting on something that is not coming: a lost
+     * device, a display that went away, a compositor that stopped answering.
+     * Said once, with how long it took, because a run that is doing this
+     * every field would otherwise fill the log with the same line and a run
+     * that did it once would say nothing at all. */
+    const uint64_t took = now_ns() - m_last_pump_ns;
+    if (took >= kSlowPresentNs && !m_slow_present_logged) {
+        m_slow_present_logged = true;
+        rt_log_warn("gs", "the GS consumer spent %.1f s inside one present. That is a driver or"
+                     " display stall, not a slow frame: the picture is frozen for as long as it"
+                     " lasts. The backend, device and graphics API are on the \"GS backend:\" and"
+                     " \"Renderer:\" lines earlier in this log. Said once per run.",
+              double(took) / 1e9);
+    }
+    rt_run_note_gs_worker("between records");
+}
+
+uint64_t ThreadedBackend::repeat_wait_ns() const {
+    if (!(m_present_rate > 0.0)) return UINT64_MAX;
+    const uint64_t interval = (uint64_t)(1e9 / m_present_rate);
+    const uint64_t since = now_ns() - m_last_pump_ns;
+    return since >= interval ? 0 : interval - since;
+}
+
 void ThreadedBackend::worker_main() {
+    /* Named before anything else it does: a crash report and the end-of-run
+     * summary both say which thread they are on, and "GS ring worker" is
+     * the difference between reading the renderer and reading the EE side
+     * (host/run_state.cpp). */
+    rt_thread_set_name("GS ring worker");
+    /* Per thread, and this is the other thread in the process that runs
+     * driver code deep enough to overflow a stack (runtime.h). */
+    rt_crash_reserve_stack();
     while (!m_worker_started.load(std::memory_order_acquire)) std::this_thread::yield();
     /* Registers this thread with whatever the inner backend needs it
      * registered with before the first replay (Granite's thread-index table
@@ -817,19 +926,53 @@ void ThreadedBackend::worker_main() {
             break;
         }
         const uint64_t t0 = now_ns();
+        /* Time spent presenting from inside this park, so it lands on the
+         * worker's present line rather than being reported as idle. */
+        uint64_t pump_ns = 0;
         std::unique_lock<std::mutex> lk(m_mu);
         m_consumer_waiting.store(true, std::memory_order_relaxed);
+        rt_run_note_gs_worker("parked on an empty ring");
         /* Pairs with the fence in wake_consumer; between publishing the flag
          * and re-testing the ring, which is what makes a producer that
          * commits right now either see this flag or be seen by this test. */
         std::atomic_thread_fence(std::memory_order_seq_cst);
         while (m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_relaxed) &&
                !m_shutdown.load(std::memory_order_acquire)) {
-            m_cv_consumer.wait_for(lk, kWaitStep);
+            /* With display.present_rate off, repeat_wait_ns is UINT64_MAX and
+             * this is the 2 ms poll it has always been. With a rate set, the
+             * step shortens to whatever is left of the repeat interval, so
+             * the repeat lands on the interval instead of on the next 2 ms
+             * boundary: at 144 Hz that is three 2 ms steps and then a 0.9 ms
+             * one, and the presents come out 6.9 ms apart rather than 8. The
+             * 2 ms cap stays because it is the ceiling on how long a lost
+             * wakeup can delay this thread (see the Wakeups section above). */
+            auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(kWaitStep);
+            const uint64_t left = repeat_wait_ns();
+            const auto left_d = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::nanoseconds(left < (uint64_t)INT64_MAX ? left : (uint64_t)INT64_MAX));
+            if (left_d < step) step = left_d;
+            m_cv_consumer.wait_for(lk, step);
+            if (repeat_wait_ns() != 0) continue;
+            /* The interval expired with the ring still empty. Present
+             * outside the mutex: it is the whole swapchain path, and holding
+             * m_mu across it would make every producer commit wait on a
+             * present, which is the coupling this thread exists to remove.
+             * The waiting flag goes down for the same reason it is up here
+             * at all, so a producer that commits during the present wakes
+             * nobody and is seen by the loop test on the way back round. */
+            m_consumer_waiting.store(false, std::memory_order_relaxed);
+            lk.unlock();
+            const uint64_t p0 = now_ns();
+            pump_present();
+            pump_ns += now_ns() - p0;
+            lk.lock();
+            m_consumer_waiting.store(true, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
         }
         m_consumer_waiting.store(false, std::memory_order_relaxed);
         lk.unlock();
-        m_worker_idle_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        m_worker_present_ns.fetch_add(pump_ns, std::memory_order_relaxed);
+        m_worker_idle_ns.fetch_add(now_ns() - t0 - pump_ns, std::memory_order_relaxed);
     }
     m_worker_exited.store(true, std::memory_order_release);
     { std::lock_guard<std::mutex> lk(m_mu); }
@@ -881,7 +1024,7 @@ void ThreadedBackend::quiesce() {
      * the destructor, a stray call from another atexit handler) replays on
      * this thread again. */
     m_mode = Mode::Inline;
-    rt_log("gs", "GS worker thread joined: %llu records replayed, %llu bytes still queued",
+    rt_log_info("gs", "GS worker thread joined: %llu records replayed, %llu bytes still queued",
            (unsigned long long)m_records_replayed.load(std::memory_order_relaxed),
            (unsigned long long)(m_head.load(std::memory_order_relaxed) -
                                 m_tail.load(std::memory_order_relaxed)));
@@ -901,9 +1044,18 @@ void ThreadedBackend::abandon_worker(const char* why) {
      * gone and the run is over, only the tidy teardown is lost. Exiting 0
      * out of a worker-side fatal would report success for a crash. */
     const int code = rt_fatal_exit_code();
-    rt_log("gs", "GS ring: %s; ending the process (status %d) without the backend teardown"
+    rt_log_info("gs", "GS ring: %s; ending the process (status %d) without the backend teardown"
                  " (no Vulkan wait-idle and no pipeline cache write this run)",
            why, code >= 0 ? code : 0);
+    /* _Exit runs no atexit handler, so the end-of-run summary has to be
+     * written here: this is one of the two paths in the whole process that
+     * leaves without the atexit chain, and it is the one taken when the GS
+     * side is what went wrong. Idempotent, so a fatal that already wrote it
+     * loses nothing. A quiesce timeout is not itself a failure (the window
+     * is gone and only the tidy teardown is lost), which is what the status
+     * says here. */
+    rt_run_set_exit_reason(code >= 0 ? false : true, "%s", why);
+    rt_run_summary();
     /* The log writer is another thread and _Exit runs no atexit handler, so
      * the queue has to be pushed out here or the lines above are lost. */
     rt_log_drain();
@@ -946,6 +1098,11 @@ void ThreadedBackend::replay(uint32_t kind, uint64_t arg, const uint8_t* payload
         /* Release: publishes this field's completion to the EE's field_sync,
          * after everything the vsync did. */
         m_vsync_done.store(m_vsync_seen, std::memory_order_release);
+        /* Published before the present, not after it. The inner backend's
+         * vsync() latches the finished field and presents nothing
+         * (gs_parallel_api.h), so by here the scanout the EE is waiting on
+         * is done and field_sync() can return. The present that follows is
+         * this thread's alone; the EE never waits on a swapchain again. */
         if (m_mode == Mode::Worker) {
             /* Worker mode only, like the two nanosecond counters drain()
              * keeps: this is the divisor they are reported against, so a
@@ -954,6 +1111,10 @@ void ThreadedBackend::replay(uint32_t kind, uint64_t arg, const uint8_t* payload
             m_worker_fields.fetch_add(1, std::memory_order_relaxed);
             wake_producer();
         }
+        /* The new field goes up at once rather than waiting for the repeat
+         * interval: the rate is a floor on how often the window is
+         * refreshed, not a ceiling on the guest's pictures. */
+        pump_present();
         break;
     }
     case kSetPresentation:
@@ -971,6 +1132,18 @@ void ThreadedBackend::replay(uint32_t kind, uint64_t arg, const uint8_t* payload
     case kSetDeinterlace:
         m_inner->set_deinterlace(uint32_t(arg));
         break;
+    case kSetWideAspect: {
+        double aspect = 0.0;
+        std::memcpy(&aspect, &arg, sizeof(aspect));
+        m_inner->set_widescreen_aspect(aspect);
+        break;
+    }
+    case kSetPresentRate: {
+        double hz = 0.0;
+        std::memcpy(&hz, &arg, sizeof(hz));
+        m_present_rate = hz;
+        break;
+    }
     case kOverlayTexDestroy:
         m_inner->overlay_texture_destroy(uint32_t(arg));
         break;
@@ -983,6 +1156,9 @@ void ThreadedBackend::replay(uint32_t kind, uint64_t arg, const uint8_t* payload
     }
     case kPresentUi:
         post_reply(arg, m_inner->present_ui());
+        break;
+    case kRequestShot:
+        m_inner->request_screenshot(uint32_t(arg));
         break;
     case kOverlaySetFrame: {
         if (arg == 0) {
@@ -1053,7 +1229,17 @@ void ThreadedBackend::drain() {
         }
         if (h.kind != kWrap) {
             m_records_replayed.fetch_add(1, std::memory_order_relaxed);
+            /* Two relaxed stores per record, read by the field watchdog and
+             * by the end-of-run summary from another thread entirely
+             * (host/run_state.cpp). kind_name returns a string literal, so
+             * storing the pointer is safe across threads. This is what makes
+             * "the consumer stopped inside a Gif record with 8 MB queued"
+             * sayable at all: pulling the same state would mean calling into
+             * a consumer that is, by hypothesis, stuck. */
+            rt_run_note_gs_record(kind_name(h.kind));
+            rt_run_note_gs_worker("inside a record");
             replay(h.kind, h.arg, rec + sizeof(RecHeader));
+            rt_run_note_gs_queued(head - tail, m_records_replayed.load(std::memory_order_relaxed));
         }
         /* Published only after the record has been consumed: the payload is
          * still the producer's to overwrite the moment the tail moves past

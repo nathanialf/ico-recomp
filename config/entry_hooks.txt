@@ -1,0 +1,32 @@
+# config/entry_hooks.txt -- guest function entry addresses the runtime wants a
+# callback at, in the retail boot ELF SCES_507.60.
+#
+# Contains ONLY address facts: one guest function entry address per line, the
+# name the disc's own listing gives that function, and a short reason. No
+# disassembly, no instruction bytes, no constants and no game bytes. This is
+# the class of fact the ROM-derived data gate in CLAUDE.md allows here; this
+# table is named in that rule.
+#
+# The emitter (tools/recomp/crates/ee-emit) prefixes the body of each listed
+# function with rt_entry_hook(ctx, <entry address>), declared in
+# include/recomp_api.h. The call is a plain prefix: no instruction is added,
+# removed or changed, so our disassembly and the per-op three-way tests are
+# untouched. An address here that is not a known function entry in the retail
+# boot ELF is a hard error, not a silently dropped line: the coverage policy
+# is that nothing speculative reaches the emitter.
+#
+# Where the evidence lives, all of it outside this repository. Both names are
+# the disc's own: SRCFILE.TXT labels the donor bodies, and the ingest
+# correlates them onto the retail ELF by masked fingerprint. Running
+#
+#     icorecomp ee --config config/recomp.toml
+#
+# prints what the correlation placed and writes the whole function table to
+# the gitignored generated/ee tree, where funcs.h names the function at each
+# address below. Neither that output nor any part of it is committed here.
+#
+# Format: 0xADDRESS  // reason
+# Lines starting with '#' and blank lines are ignored.
+
+0x001146F0  // gsb_SetVSMatrixSub, named by the correlation from the disc listing's donor at 0x001145E8. The matrix composer, the one point where the projection block named in src/runtime/guest/ico_syms.h is complete and not yet consumed.
+0x001B6230  // debug_assertMessage, the name the disc listing gives the donor body at 0x001B8D40. The retail build's assert sink; the hook names the assert (file, line, message) and ends the run.

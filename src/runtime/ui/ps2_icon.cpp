@@ -158,7 +158,7 @@ bool rt_ps2_icon_parse(const uint8_t* d, size_t len, RtPs2Icon& out, char* err, 
     out.anim_playoffset = playoffset;
     out.anim_nbframes = nbframes;
 
-    rt_log("ui", "ps2 icon: %zu bytes, %u shapes, attrib %u (%s), %u vertices, anim framelength %u"
+    rt_log_info("ui", "ps2 icon: %zu bytes, %u shapes, attrib %u (%s), %u vertices, anim framelength %u"
                 " speed %g playoffset %u nbframes %u",
         len, shapes, attrib, attrib == kTexNone ? "untextured" : "textured, texture not read", verts,
         framelength, double(speed), playoffset, nbframes);
@@ -197,7 +197,7 @@ bool rt_ps2_icon_sys_parse(const uint8_t* d, size_t len, RtPs2IconSys& out, char
     out.copy_icon = read_name(0x144);
     out.delete_icon = read_name(0x184);
 
-    rt_log("ui", "icon.sys: transparency %u, corner 0 (%u,%u,%u,%u), view icon '%s', copy icon '%s',"
+    rt_log_info("ui", "icon.sys: transparency %u, corner 0 (%u,%u,%u,%u), view icon '%s', copy icon '%s',"
                 " delete icon '%s'",
         out.transparency, out.bg_corner[0][0], out.bg_corner[0][1], out.bg_corner[0][2],
         out.bg_corner[0][3], out.view_icon.c_str(), out.copy_icon.c_str(), out.delete_icon.c_str());

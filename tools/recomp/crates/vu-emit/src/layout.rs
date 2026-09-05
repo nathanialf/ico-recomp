@@ -30,7 +30,7 @@
 //! byte length. The runtime's VIF1 MPG path sees the same MPG commands and
 //! must hash the same bytes.
 //!
-//! Measured per program (retail US ELF):
+//! Measured per program (retail PAL ELF):
 //!   cluster  435 instructions (MPG 256 @0 + 179 @256), no pad
 //!   mesh     312 instructions (256 + 56), one NOP-pair pad
 //!   normal_c 726 instructions (256 + 256 + 214), one pad

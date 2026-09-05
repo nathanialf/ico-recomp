@@ -1,0 +1,251 @@
+/* ui/style/achievements.rcss: the Achievements tab in ui/menu.rml and the
+ * unlock toast in ui/achievement_toast.rml.
+ *
+ * Loaded on top of base.rcss, which sets the palette, the two families and
+ * every element's display value. Only what those two views add lives here,
+ * so nothing in base.rcss has to change for this feature.
+ *
+ * Inside the same restricted set base.rcss states: solid and translucent
+ * boxes, text, scissored regions. No border-radius, box-shadow, gradient,
+ * filter, container opacity or clip mask; each of those reaches a
+ * RenderInterface function this build does not implement
+ * (docs/SETTINGS.md, "Supported RCSS subset"), and every one of them would
+ * log a line and draw nothing.
+ *
+ * Sizes are in dp against the same 640x480 baseline as everything else.
+ * Column widths come from the longest string each column can hold at the
+ * mono advance of 0.6em plus the rule's letter-spacing: the tier column is
+ * "Platinum" at 8 characters of 8dp mono with 0.08em (8 * 0.68 = 5.44dp
+ * each, 44dp), and the state column is "Unavailable" at 11 characters of
+ * 9dp mono with 0.05em (5.85dp each, 65dp).
+ */
+
+/* ---- the Achievements tab ------------------------------------------------ */
+
+.ach-summary {
+	display: flex;
+	flex-direction: row;
+	align-items: baseline;
+	margin-bottom: 8dp;
+}
+
+.ach-count {
+	display: block;
+	font-family: "Playfair Display";
+	font-size: 12dp;
+	font-weight: 700;
+	color: #141414;
+	flex-shrink: 0;
+	margin-right: 10dp;
+}
+
+.ach-counters {
+	display: block;
+	font-size: 9dp;
+	color: #4a3f2c;
+	min-width: 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* The same treatment as .override and .bind-status in base.rcss, which are
+ * the other two lines in this menu the reader has to actually read. */
+.ach-caveat {
+	display: block;
+	font-size: 9dp;
+	line-height: 1.4;
+	color: #3d2600;
+	background-color: #e9cf8e;
+	border: 1dp #1a1a1a;
+	padding: 4dp 5dp;
+	margin-bottom: 8dp;
+}
+
+.ach-table {
+	display: block;
+	border-top: 1dp #a8997a;
+}
+
+.ach-row {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	padding: 5dp 0;
+	border-bottom: 1dp #a8997a;
+}
+
+.ach-tier {
+	display: block;
+	width: 44dp;
+	flex-shrink: 0;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #8a7d63;
+	white-space: nowrap;
+	overflow: hidden;
+}
+
+/* The middle column takes what the two fixed ones leave and wraps: a
+ * description is not a string this file can bound. */
+.ach-cell {
+	display: block;
+	flex-grow: 1;
+	flex-shrink: 1;
+	min-width: 0;
+	margin-right: 8dp;
+}
+
+.ach-name {
+	display: block;
+	font-family: "Playfair Display";
+	font-size: 11dp;
+	font-weight: 700;
+	color: #4a3f2c;
+}
+
+/* An unlocked row's name is the primary type; a locked one stays secondary,
+ * so the list reads at a glance without any colour but the palette's. The
+ * class is on the name and the state themselves rather than on the row: the
+ * row carries data-for, which cancels every other data view on its own
+ * element (see the comment beside it in ui/menu.rml). */
+.ach-name.unlocked {
+	color: #141414;
+}
+
+.ach-desc {
+	display: block;
+	font-size: 9dp;
+	line-height: 1.4;
+	color: #4a3f2c;
+	margin-top: 2dp;
+}
+
+/* Nothing in this port can unlock this row yet (the empty trophy bit table,
+ * see docs/ACHIEVEMENTS.md). Deliberately not styled as an error: it is a
+ * statement about the port, not about the player. */
+.ach-note {
+	display: block;
+	font-size: 8dp;
+	line-height: 1.4;
+	color: #8a7d63;
+	margin-top: 2dp;
+}
+
+.ach-status {
+	display: block;
+	width: 66dp;
+	flex-shrink: 0;
+	text-align: right;
+}
+
+.ach-state {
+	display: block;
+	font-size: 9dp;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: #8a7d63;
+	white-space: nowrap;
+	overflow: hidden;
+}
+
+.ach-state.unlocked {
+	color: #141414;
+}
+
+.ach-when {
+	display: block;
+	font-size: 8dp;
+	color: #8a7d63;
+	margin-top: 2dp;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* ---- the unlock toast ----------------------------------------------------
+ *
+ * Bottom right, clear of the fps readout in the top right corner. 200dp is
+ * the longest trophy name ("Split the Watermelon", 20 characters of 11dp
+ * Playfair) plus the panel's padding, with the description wrapping under
+ * it; the height is fixed so the box sits on the bottom inset whatever the
+ * description's length, and a longer one is clipped rather than pushing the
+ * panel off the window.
+ */
+
+body.ach-toast {
+	right: 8dp;
+	bottom: 8dp;
+	width: 216dp;
+	height: 74dp;
+	/* A notice, never a control: a click belongs to the game or to the menu
+	 * underneath. */
+	pointer-events: none;
+	background-color: transparent;
+}
+
+.ach-toast-panel {
+	display: block;
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	/* The same sand panel as the menu, at the menu's own opacity, on the
+	 * background colour rather than on the element: container opacity needs
+	 * a render layer this build does not have. */
+	background-color: rgba(216, 199, 161, 235);
+	border: 1dp #1a1a1a;
+	padding: 6dp 8dp;
+	overflow: hidden;
+}
+
+.ach-toast-head {
+	display: flex;
+	flex-direction: row;
+	align-items: baseline;
+	border-bottom: 1dp #a8997a;
+	padding-bottom: 3dp;
+	margin-bottom: 4dp;
+}
+
+.ach-toast-tier {
+	display: block;
+	flex-shrink: 0;
+	margin-right: 6dp;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: #141414;
+}
+
+.ach-toast-label {
+	display: block;
+	min-width: 0;
+	font-size: 8dp;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: #4a3f2c;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.ach-toast-name {
+	display: block;
+	font-family: "Playfair Display";
+	font-size: 12dp;
+	font-weight: 700;
+	color: #141414;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.ach-toast-desc {
+	display: block;
+	font-size: 8dp;
+	line-height: 1.4;
+	color: #4a3f2c;
+	margin-top: 2dp;
+	overflow: hidden;
+}

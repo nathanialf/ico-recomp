@@ -86,7 +86,7 @@ uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 void log_unsupported_once(bool& logged, const char* function) {
     if (logged) return;
     logged = true;
-    rt_log("ui", "RenderInterface::%s is not implemented in this build;"
+    rt_log_warn("ui", "RenderInterface::%s is not implemented in this build;"
                  " the affected element draws without that effect."
                  " A stylesheet under ui/ asked for something this renderer cannot draw.",
         function);
@@ -170,7 +170,7 @@ void UiRenderInterface::RenderGeometry(Rml::CompiledGeometryHandle geometry, Rml
                                        Rml::TextureHandle texture) {
     const size_t slot = size_t(geometry) - 1;
     if (geometry == 0 || slot >= m_pool.size() || !m_pool[slot].in_use) {
-        rt_log("ui", "RenderGeometry: unknown geometry handle %llu; the draw is dropped",
+        rt_log_warn("ui", "RenderGeometry: unknown geometry handle %llu; the draw is dropped",
             (unsigned long long)geometry);
         return;
     }
@@ -219,7 +219,7 @@ void UiRenderInterface::RenderGeometry(Rml::CompiledGeometryHandle geometry, Rml
 void UiRenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
     const size_t slot = size_t(geometry) - 1;
     if (geometry == 0 || slot >= m_pool.size() || !m_pool[slot].in_use) {
-        rt_log("ui", "ReleaseGeometry: unknown geometry handle %llu",
+        rt_log_warn("ui", "ReleaseGeometry: unknown geometry handle %llu",
             (unsigned long long)geometry);
         return;
     }
@@ -235,19 +235,19 @@ void UiRenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
 bool ui_render_set_image(const char* scheme, const uint8_t* rgba, uint32_t width, uint32_t height) {
     NamedImage* img = image_by_scheme(scheme);
     if (!img) {
-        rt_log("ui", "no in-memory texture scheme named \"%s\"; nothing to publish",
+        rt_log_warn("ui", "no in-memory texture scheme named \"%s\"; nothing to publish",
             scheme ? scheme : "(null)");
         return false;
     }
     if (!rgba || width == 0 || height == 0) {
-        rt_log("ui", "the \"%s\" image is %ux%u; nothing to publish", img->scheme, width, height);
+        rt_log_warn("ui", "the \"%s\" image is %ux%u; nothing to publish", img->scheme, width, height);
         return false;
     }
     img->rgba.assign(rgba, rgba + size_t(width) * size_t(height) * 4u);
     img->width = width;
     img->height = height;
     img->upload_failed = false; /* a new image gets a fresh answer */
-    rt_log("ui", "published under the \"%s\" scheme: %ux%u, %zu bytes", img->scheme, width, height,
+    rt_log_info("ui", "published under the \"%s\" scheme: %ux%u, %zu bytes", img->scheme, width, height,
         img->rgba.size());
     return true;
 }
@@ -293,26 +293,26 @@ Rml::TextureHandle UiRenderInterface::LoadTexture(Rml::Vector2i& texture_dimensi
              * logo_available flag in ui_launcher.cpp, image_cursor in
              * ui_menu_cursor.cpp). Reaching this means those two went out of
              * step. */
-            rt_log("ui", "LoadTexture(%s): no \"%s\" image has been published;"
+            rt_log_warn("ui", "LoadTexture(%s): no \"%s\" image has been published;"
                          " the element draws untextured", source.c_str(), img->scheme);
             img->upload_failed = true;
             return Rml::TextureHandle(0);
         }
         const uint32_t id = backend_texture_create(img->rgba.data(), img->width, img->height);
         if (id == 0) {
-            rt_log("ui", "LoadTexture(%s): the %ux%u upload failed; the element draws untextured",
+            rt_log_warn("ui", "LoadTexture(%s): the %ux%u upload failed; the element draws untextured",
                 source.c_str(), img->width, img->height);
             img->upload_failed = true;
             return Rml::TextureHandle(0);
         }
         texture_dimensions = Rml::Vector2i(int(img->width), int(img->height));
-        rt_log("ui", "LoadTexture(%s): %ux%u uploaded as overlay texture %u", source.c_str(),
+        rt_log_info("ui", "LoadTexture(%s): %ux%u uploaded as overlay texture %u", source.c_str(),
             img->width, img->height, id);
         return Rml::TextureHandle(id);
     }
 
     if (m_missing_textures.insert(std::string(source)).second) {
-        rt_log("ui", "LoadTexture(%s): file images are not implemented in this build;"
+        rt_log_warn("ui", "LoadTexture(%s): file images are not implemented in this build;"
                      " the element draws untextured", source.c_str());
     }
     return Rml::TextureHandle(0);
@@ -321,12 +321,12 @@ Rml::TextureHandle UiRenderInterface::LoadTexture(Rml::Vector2i& texture_dimensi
 Rml::TextureHandle UiRenderInterface::GenerateTexture(Rml::Span<const Rml::byte> source,
                                                       Rml::Vector2i source_dimensions) {
     if (source_dimensions.x <= 0 || source_dimensions.y <= 0) {
-        rt_log("ui", "GenerateTexture: refusing %dx%d texture", source_dimensions.x, source_dimensions.y);
+        rt_log_warn("ui", "GenerateTexture: refusing %dx%d texture", source_dimensions.x, source_dimensions.y);
         return Rml::TextureHandle(0);
     }
     const size_t expected = size_t(source_dimensions.x) * size_t(source_dimensions.y) * 4u;
     if (source.size() < expected) {
-        rt_log("ui", "GenerateTexture: %zu bytes for a %dx%d RGBA texture (%zu needed)",
+        rt_log_warn("ui", "GenerateTexture: %zu bytes for a %dx%d RGBA texture (%zu needed)",
             source.size(), source_dimensions.x, source_dimensions.y, expected);
         return Rml::TextureHandle(0);
     }

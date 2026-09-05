@@ -26,7 +26,7 @@
  * immediately before every Vsync packet.
  *
  * When ICORECOMP_GS_DUMP is unset this class still runs as the priv
- * register shadow and statistics collector, it just writes no file.
+ * register shadow and statistics collector, it writes no file.
  * The dump path must be outside the repository (check_no_rom is a
  * mechanical gate; GS packets are ROM-derived data).
  */
@@ -63,17 +63,17 @@ public:
                 if (from && from[0]) m_from = std::strtoull(from, nullptr, 10);
                 if (count && count[0]) m_count = std::strtoull(count, nullptr, 10);
                 if (m_from || m_count) {
-                    rt_log("gs", "dump writer: recording paraLLEl-GS raw stream to %s "
+                    rt_log_info("gs", "dump writer: recording paraLLEl-GS raw stream to %s "
                         "(window: fields %" PRIu64 "..%" PRIu64 ")",
                         path, m_from, m_count ? m_from + m_count : UINT64_MAX);
                 } else {
-                    rt_log("gs", "dump writer: recording paraLLEl-GS raw stream to %s", path);
+                    rt_log_info("gs", "dump writer: recording paraLLEl-GS raw stream to %s", path);
                 }
             } else {
-                rt_log("gs", "dump writer: FAILED to open %s, recording disabled", path);
+                rt_log_warn("gs", "dump writer: FAILED to open %s, recording disabled", path);
             }
         } else {
-            rt_log("gs", "dump writer: ICORECOMP_GS_DUMP not set, shadow/stats only");
+            rt_log_info("gs", "dump writer: ICORECOMP_GS_DUMP not set, shadow/stats only");
         }
     }
 
@@ -100,7 +100,7 @@ public:
             std::fwrite(data, 1, size, m_file);
         }
         if (is_pow2(m_packets[path])) {
-            rt_log("gs", "PATH%d packet #%" PRIu64 ": %u qw (total %" PRIu64 " qw)",
+            rt_log_debug("gs", "PATH%d packet #%" PRIu64 ": %u qw (total %" PRIu64 " qw)",
                 path + 1, m_packets[path], qwords, m_qwords[path]);
         }
     }
@@ -137,24 +137,24 @@ public:
              * stays a clean [from, from+count) slice. */
             std::fclose(m_file);
             m_file = nullptr;
-            rt_log("gs", "dump writer: window complete at field %" PRIu64 ", file closed", m_vsyncs);
+            rt_log_info("gs", "dump writer: window complete at field %" PRIu64 ", file closed", m_vsyncs);
         }
         m_transfer_since_vsync = false;
         return presented;
     }
 
     void report_stats() override {
-        rt_log("gs", "---- GS backend stats ----");
-        rt_log("gs", "  packets: PATH1=%" PRIu64 " (%" PRIu64 " qw)  PATH2=%" PRIu64 " (%" PRIu64 " qw)  PATH3=%" PRIu64 " (%" PRIu64 " qw)",
+        rt_log_info("gs", "---- GS backend stats ----");
+        rt_log_info("gs", "  packets: PATH1=%" PRIu64 " (%" PRIu64 " qw)  PATH2=%" PRIu64 " (%" PRIu64 " qw)  PATH3=%" PRIu64 " (%" PRIu64 " qw)",
             m_packets[0], m_qwords[0], m_packets[1], m_qwords[1], m_packets[2], m_qwords[2]);
-        rt_log("gs", "  priv writes=%" PRIu64 " vsyncs=%" PRIu64, m_priv_writes, m_vsyncs);
+        rt_log_info("gs", "  priv writes=%" PRIu64 " vsyncs=%" PRIu64, m_priv_writes, m_vsyncs);
         static const struct { uint32_t off; const char* name; } kShow[] = {
             {0x0000, "PMODE"}, {0x0020, "SMODE2"}, {0x0070, "DISPFB1"}, {0x0080, "DISPLAY1"},
             {0x0090, "DISPFB2"}, {0x00A0, "DISPLAY2"}, {0x00E0, "BGCOLOR"}, {0x1000, "CSR"},
         };
         for (const auto& s : kShow) {
             uint64_t v = (s.off < 0x1000) ? m_lo[(s.off >> 4) * 2] : m_hi[((s.off - 0x1000) >> 4) * 2];
-            rt_log("gs", "  %-8s = 0x%016" PRIx64, s.name, v);
+            rt_log_info("gs", "  %-8s = 0x%016" PRIx64, s.name, v);
         }
     }
 

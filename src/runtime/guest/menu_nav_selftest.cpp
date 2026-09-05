@@ -5,7 +5,7 @@
  *
  * Links menu_nav.cpp against the two runtime externs it calls (rt_log and
  * the g_pages array rt_gptr indexes), stubbed below. It is built with
- * neither ICORECOMP_PGS_SDL nor ICORECOMP_HAVE_PARALLEL_GS, so there is no
+ * neither ICORECOMP_HAVE_SDL nor ICORECOMP_HAVE_PARALLEL_GS, so there is no
  * window and no GS library to ask for a cursor; ICORECOMP_MENU_NAV_TEST
  * compiles in the injection hook that stands in for them.
  *
@@ -34,13 +34,19 @@
  * The two gates on menu_nav.cpp's pointer half are visible here: the SDL
  * provider gate is rt_input_sdl_active(), stubbed below so a test can shut
  * it, and rt_ui_wants_input() is ui/ui.h's inline stub returning false,
- * because this target is built without ICORECOMP_UI and has no overlay.
+ * because this executable is built without ICORECOMP_UI and has no
+ * overlay.
  *
  *     ./icorecomp-menu-nav-selftest
  *
  * Exit code 0 = every check passed; 2 on the first failing CHECK.
  */
 #include "guest/ico_syms.h"
+/* One executable, icorecomp-menu-nav-selftest (CMakeLists.txt), built
+ * against the one set of constants in guest/ico_syms.h. Every address,
+ * structure offset and flag bit below comes from those constants, so the
+ * scene object's 0x70 stride, its fields from +0x24 up and its hidden bit at
+ * 0x10 are all under test rather than described. */
 #include "guest/menu_nav.h"
 #include "host/input.h"
 #include "recomp_api.h"
@@ -80,12 +86,26 @@ bool g_sdl_active = true;
 
 bool rt_input_sdl_active() { return g_sdl_active; }
 
-void rt_log(const char* component, const char* fmt, ...) {
+/* The runtime's four level entry points, all onto one line here: a
+ * selftest has one reader and no level to filter by. */
+void rt_log_line(const char* component, const char* fmt, va_list ap);
+
+void rt_log_error(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_warn(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_info(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_debug(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+
+void rt_log_line(const char* component, const char* fmt, va_list ap) {
     char buf[1024];
-    va_list ap;
-    va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
     std::printf("[%s] %s\n", component, buf);
     g_log += buf;
     g_log += '\n';
@@ -148,10 +168,14 @@ void map_pages() {
         own_page(RT_ICO_LAYOUT_ID);
         own_page(RT_ICO_ITEM_ID);
         own_page(RT_ICO_FADE_STATE);
-        own_page(RT_ICO_MC_SELECT);
+        own_page(RT_ICO_BRIGHTNESS);
         /* Both ends of both tables: neither fits in one page. */
         own_page(RT_ICO_LAYOUT_TABLE);
         own_page(RT_ICO_LAYOUT_TABLE + RT_ICO_LAYOUT_COUNT * RT_ICO_LAYOUT_STRIDE);
+        own_page(RT_ICO_KANBAN_ACTIVE);
+        own_page(RT_ICO_KANBAN_NODES);
+        own_page(RT_ICO_KANBAN_NODES +
+                 RT_ICO_KANBAN_NODE_COUNT * RT_ICO_KANBAN_NODE_STRIDE - 1);
         for (uint32_t i = 0; i <= 0x400; ++i) {
             own_page(RT_ICO_SCENE_OBJECTS + i * RT_ICO_SCENE_STRIDE);
         }
@@ -235,9 +259,9 @@ void put_object(int32_t index, const Obj& o) {
 
 /* ---- the game's side of a press -------------------------------------------- */
 
-uint32_t g_layout = 0x32;
+uint32_t g_layout = 0x36;
 uint32_t g_fade = 2;
-bool g_mc_screen = false;
+bool g_adjust_screen = false;
 uint64_t g_field = 0;
 /* The layouts lt_next_layout would run lt_switch_layout for: the current
  * one and its ancestors. The sim applies a press to each, as the game
@@ -246,16 +270,16 @@ std::vector<uint32_t> g_sim_chain;
 
 /* What lt_switch_layout does with one pressed-this-frame D-pad bit: follow
  * the current object's link for that direction and store it, when it is not
- * negative. The memory card check screen's own handler instead steps its
- * selector on LEFT and RIGHT, clamped to 0 and 14. The selection lives in
+ * negative. The screen adjustment screen's own handler instead steps its
+ * level on LEFT and RIGHT, clamped to 0 and 14. The selection lives in
  * guest memory, where the pointer's own writes land, so the two cannot
  * drift apart here in a way they could not in the runtime. */
 void sim_press(uint16_t bits) {
-    if (g_mc_screen) {
-        const int32_t v = peek(RT_ICO_MC_SELECT);
-        if ((bits & RT_PAD_LEFT) && v > 0) poke(RT_ICO_MC_SELECT, v - 1);
-        else if ((bits & RT_PAD_RIGHT) && v < (int32_t)RT_ICO_MC_COUNT - 1) {
-            poke(RT_ICO_MC_SELECT, v + 1);
+    if (g_adjust_screen) {
+        const int32_t v = peek(RT_ICO_BRIGHTNESS);
+        if ((bits & RT_PAD_LEFT) && v > 0) poke(RT_ICO_BRIGHTNESS, v - 1);
+        else if ((bits & RT_PAD_RIGHT) && v < (int32_t)RT_ICO_ADJUST_COUNT - 1) {
+            poke(RT_ICO_BRIGHTNESS, v + 1);
         }
         return;
     }
@@ -326,17 +350,22 @@ void game_frame() {
     poke(RT_ICO_LAYOUT_ID, (int32_t)g_layout);
     poke(RT_ICO_FADE_STATE, (int32_t)g_fade);
 
-    /* Phase 1: for every object of every layout in the chain, copy +0x68 bit
-     * 0 into bit 1. Bit 0 is the persistent per-object flag GetRealModelId
-     * writes; bit 1 is the per-frame "lt_link_layout draws nothing" one. */
+    /* Phase 1: for every object of every layout in the chain, copy the
+     * persistent flag GetRealModelId writes (RT_ICO_OBJ_FLAG_PERSISTENT)
+     * into the per-frame "lt_link_layout draws nothing" one
+     * (RT_ICO_OBJ_FLAG_HIDDEN). Those are bits 4 and 5 on this build and not
+     * the 0 and 1 the decomp's structure has, which is why the constants are
+     * used rather than literals. */
     for (uint32_t layout : g_sim_chain) {
         const int32_t first = peek(entry_of(layout) + RT_ICO_LAYOUT_FIRST_OBJ);
         const int32_t end = peek(entry_of(layout) + RT_ICO_LAYOUT_END_OBJ);
         for (int32_t i = first; i < end; ++i) {
             const uint32_t b = object_of(i) + RT_ICO_OBJ_FLAGS;
             int32_t f = peek(b);
-            f = (f & ~(int32_t)RT_ICO_OBJ_FLAG_HIDDEN) |
-                ((f & 1) << 1);
+            f &= ~(int32_t)RT_ICO_OBJ_FLAG_HIDDEN;
+            if (f & (int32_t)RT_ICO_OBJ_FLAG_PERSISTENT) {
+                f |= (int32_t)RT_ICO_OBJ_FLAG_HIDDEN;
+            }
             /* Then the action function's own func_001B7218 calls. */
             if (contains_i32(g_hidden, i)) f |= (int32_t)RT_ICO_OBJ_FLAG_HIDDEN;
             poke(b, f);
@@ -474,17 +503,22 @@ bool cadence_ok(const std::vector<uint16_t>& seq) {
  * so the module derives its items the way it does in a real run.
  */
 
-/* The title screen's continue or new game choice: layout 0x9, two centred
- * items in a column, objects 14 and 15.
+/* The title screen's continue or new game choice: layout 0x0C, two centred
+ * items in a column, scene objects 49 and 50. Those are the retail ids (the
+ * listing's la_title_continue_or_new), which is what makes this the
+ * calibration case menu_nav.cpp's header quotes.
  *
- * The four placement numbers are the ones the user's two measured boxes
- * invert to under the mapping in menu_nav.cpp: a 128 wide, 20 tall sprite
+ * The four placement numbers are the retail objects' own: a 20 tall sprite
  * (the height field counts half units, so 40) centred horizontally, at
- * layout-space y 135 and 165. test_title_rects holds the rectangles they
- * produce against the boxes themselves. */
-constexpr uint32_t kTitleLayout = 0x9;
-constexpr int32_t kTitleItemA = 14;
-constexpr int32_t kTitleItemB = 15;
+ * layout-space y 135 and 165. The one number that is not theirs is the
+ * second item's texture width, 128 here against 172 in the ELF: this case
+ * holds the module's arithmetic against the user's measured boxes, and the
+ * shipped 172 does not reproduce the second box. menu_nav.cpp's header
+ * records that disagreement and what would settle it; this test is about
+ * the arithmetic, not about the object. */
+constexpr uint32_t kTitleLayout = 0x0C;
+constexpr int32_t kTitleItemA = 49;
+constexpr int32_t kTitleItemB = 50;
 
 void screen_title() {
     Obj a;
@@ -574,15 +608,24 @@ void screen_page() {
     set_entry(kPageLayout, kPageDecorA, kPageDecorB + 1, -1, -1, (int32_t)kGridLayout);
 }
 
-/* The memory card check screen: layout 0x38 owns a long range that covers
- * the fifteen card positions 0x158..0x166, and its own default item is a
- * 1 by 1 placeholder at the layout space origin, which lands off the
- * picture and is not an item. */
-constexpr uint32_t kMcLayout = 0x38;
-constexpr int32_t kMcPlaceholder = 0x171;
+/* The screen adjustment screen: layout 0x3C owns a long range that covers
+ * the fifteen bar positions starting at RT_ICO_ADJUST_FIRST_OBJ, and its
+ * own default item is a 1 by 1 placeholder at the layout space origin,
+ * which lands off the picture and is not an item. 0x3C is the id the retail
+ * layout table gives la_adjust_screen; the sim builds its own table, so the
+ * id matters only in that it is the one the runtime would see.
+ *
+ * The range and the placeholder are stated relative to that first object,
+ * not as literals: RT_ICO_ADJUST_FIRST_OBJ is 0x18B on this build, and a range
+ * written as a literal would stop covering the fifteen positions the moment
+ * that constant moved. */
+constexpr uint32_t kAdjustLayout = 0x3C;
+constexpr int32_t kAdjustFirst = (int32_t)RT_ICO_ADJUST_FIRST_OBJ - 3;
+constexpr int32_t kAdjustEnd = (int32_t)RT_ICO_ADJUST_FIRST_OBJ + 0x1A;
+constexpr int32_t kAdjustPlaceholder = (int32_t)RT_ICO_ADJUST_FIRST_OBJ + 0x19;
 
-void screen_mc() {
-    for (uint32_t i = 0; i < RT_ICO_MC_COUNT; ++i) {
+void screen_adjust() {
+    for (uint32_t i = 0; i < RT_ICO_ADJUST_COUNT; ++i) {
         Obj c;
         c.w = 32;
         c.h = 30;
@@ -590,19 +633,61 @@ void screen_mc() {
         c.y = 90;
         c.tex_w = 32;
         c.tex_h = 15;
-        put_object((int32_t)(RT_ICO_MC_FIRST_OBJ + i), c);
+        put_object((int32_t)(RT_ICO_ADJUST_FIRST_OBJ + i), c);
     }
     Obj p;
     p.h = 1;
     p.w = 1;
-    put_object(kMcPlaceholder, p);
-    set_entry(kMcLayout, 0x155, 0x172, kMcPlaceholder, kMcPlaceholder);
+    put_object(kAdjustPlaceholder, p);
+    set_entry(kAdjustLayout, kAdjustFirst, kAdjustEnd, kAdjustPlaceholder, kAdjustPlaceholder);
 }
 
-/* Gameplay and the pre-title cinematic: an empty scene object range and no
- * item at all, which is how the retail layout table ships them. */
-constexpr uint32_t kGameplayLayout = 0x32;
-constexpr uint32_t kCinematicLayout = 0x33;
+/* One of the kanban system's screens: the 50/60 Hz choice, layout entry 1,
+ * two items side by side that the game's own boot state machine reads the
+ * video mode out of. Nothing about it is in the layout state words: the node
+ * at RT_ICO_KANBAN_ACTIVE is what says it is up, its +0x00 is the layout
+ * table entry, and its +0x0C bit 0 would say it is fading out.
+ *
+ * The two placement numbers are the ones the retail ELF ships for objects
+ * 0x21 and 0x22, so the rectangle checks below are against the screen the
+ * game actually draws. */
+constexpr uint32_t kKanbanLayout = RT_ICO_KANBAN_LAYOUT_VIDEO_MODE;
+constexpr int32_t kKanbanFirst = 0x20;
+constexpr int32_t kKanbanEnd = 0x26;
+constexpr int32_t kKanbanItemA = 0x21;
+constexpr int32_t kKanbanItemB = 0x22;
+/* Any of the thirty slots; the fourth, so that a node address of zero or of
+ * the array's base cannot pass by accident. */
+constexpr uint32_t kKanbanNode = RT_ICO_KANBAN_NODES + 3 * RT_ICO_KANBAN_NODE_STRIDE;
+
+void screen_kanban() {
+    Obj a;
+    a.right = kKanbanItemB;
+    a.h = 40;          /* the height field counts half units, so 20 drawn */
+    a.x = 190;
+    a.y = 65;
+    a.tex_w = 80;      /* w is zero, so the texture's width stands in */
+    a.tex_h = 20;
+    put_object(kKanbanItemA, a);
+
+    Obj b = a;
+    b.right = -1;
+    b.left = kKanbanItemA;
+    b.x = 370;
+    put_object(kKanbanItemB, b);
+
+    set_entry(kKanbanLayout, kKanbanFirst, kKanbanEnd, kKanbanItemA, kKanbanItemA);
+}
+
+/* The gameplay loop and one of the cinematics: an empty scene object range
+ * and no item at all, which is how the retail layout table ships every
+ * entry whose action function the disc listing names for one of those
+ * states. 0x36 is la_game_loop and 0x37 is la_game_demo; which id the
+ * layout id word actually reports while the player is playing is still not
+ * measured (guest/ico_syms.h, RT_ICO_LAYOUT_GAMEPLAY), which is exactly why
+ * this module excludes them structurally and not by id. */
+constexpr uint32_t kGameplayLayout = 0x36;
+constexpr uint32_t kCinematicLayout = 0x37;
 
 void screen_empty(uint32_t layout) {
     set_entry(layout, 261, 261, -1, -1);
@@ -615,7 +700,7 @@ void arm(uint32_t layout, int32_t start) {
     map_pages();
     g_layout = layout;
     g_fade = 2;
-    g_mc_screen = (layout == kMcLayout);
+    g_adjust_screen = (layout == kAdjustLayout);
     g_field = 0;
     g_pending.clear();
     g_hidden.clear();
@@ -625,11 +710,16 @@ void arm(uint32_t layout, int32_t start) {
     g_sdl_active = true;
     poke(RT_ICO_NAV_SWALLOW, 0);
 
-    poke(RT_ICO_MC_SELECT, 0);
+    poke(RT_ICO_BRIGHTNESS, 0);
+    /* No kanban screen unless a test asks for one: the pages are reused
+     * between tests, so this word has to be put back rather than assumed. */
+    poke(RT_ICO_KANBAN_ACTIVE, 0);
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_FLAGS, 0);
     screen_title();
     screen_row();
     screen_page();
-    screen_mc();
+    screen_kanban();
+    screen_adjust();
     screen_empty(kGameplayLayout);
     screen_empty(kCinematicLayout);
 
@@ -637,13 +727,31 @@ void arm(uint32_t layout, int32_t start) {
     g_sim_chain.push_back(layout);
     if (layout == kPageLayout) g_sim_chain.push_back(kGridLayout);
 
-    if (g_mc_screen) poke(RT_ICO_MC_SELECT, start);
+    if (g_adjust_screen) poke(RT_ICO_BRIGHTNESS, start);
     else if (start >= 0) poke(entry_of(layout) + RT_ICO_LAYOUT_CUR_ITEM, start);
 
     poke(RT_ICO_LAYOUT_ID, (int32_t)layout);
     poke(RT_ICO_FADE_STATE, 2);
     poke(RT_ICO_ITEM_ID, entry_item(layout));
     rt_guest_menu_test_set_cursor(false, 0.0f, 0.0f);
+}
+
+/* The same, with one of the kanban system's screens up instead. The layout
+ * state words are left saying gameplay, which has no items and holds fade 2,
+ * so anything the module then finds came from the node and not from them.
+ * `layout_word` puts the layout id word on the kanban screen's own entry id
+ * instead, which is the case the item mirror has to be kept out of. */
+void arm_kanban(int32_t start, bool layout_word = false) {
+    arm(layout_word ? kKanbanLayout : kGameplayLayout, -1);
+    if (layout_word) {
+        g_sim_chain.clear();
+        g_sim_chain.push_back(kKanbanLayout);
+        poke(RT_ICO_LAYOUT_ID, (int32_t)kKanbanLayout);
+    }
+    poke(entry_of(kKanbanLayout) + RT_ICO_LAYOUT_CUR_ITEM, start);
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_LAYOUT, (int32_t)entry_of(kKanbanLayout));
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_FLAGS, 0);
+    poke(RT_ICO_KANBAN_ACTIVE, (int32_t)kKanbanNode);
 }
 
 /* The derived item with this id, or a failed check. */
@@ -731,9 +839,9 @@ void test_title_rects() {
 
     /* Every screen says its rectangles once, so a log from a real run can
      * be held against what was on the screen. */
-    CHECK(log_has("guest menu: layout 0x9 item 0xe rect 0.4000,0.5982,0.6000,0.6875"));
-    CHECK(log_has("guest menu: layout 0x9 item 0xf rect 0.4000,0.7321,0.6000,0.8214"));
-    CHECK(log_has("guest menu: layout 0x9 chain 0x9: 2 items"));
+    CHECK(log_has("guest menu: layout 0xc item 0x31 rect 0.4000,0.5982,0.6000,0.6875"));
+    CHECK(log_has("guest menu: layout 0xc item 0x32 rect 0.4000,0.7321,0.6000,0.8214"));
+    CHECK(log_has("guest menu: layout 0xc chain 0xc: 2 items"));
     CHECK(log_count(" rect 0.") == 2);
 
     log_clear();
@@ -827,11 +935,11 @@ void test_hidden_and_offscreen_are_skipped() {
     CHECK(rt_guest_menu_items().size() == 1);
     CHECK(rt_guest_menu_items()[0].item == (uint32_t)kTitleItemA);
 
-    /* Bit 0 alone hides it too, because phase 1 copies bit 0 into bit 1.
-     * That is the whole of what bit 0 means: the retail title screen ships
-     * items 0xe and 0xf with it set. */
+    /* The persistent bit alone hides it too, because phase 1 copies it into
+     * the hidden one. That is the whole of what it means: the retail title
+     * screen ships items 0xe and 0xf with it set. */
     g_hidden.clear();
-    poke(object_of(kTitleItemB) + RT_ICO_OBJ_FLAGS, 1);
+    poke(object_of(kTitleItemB) + RT_ICO_OBJ_FLAGS, (int32_t)RT_ICO_OBJ_FLAG_PERSISTENT);
     run_field();
     CHECK(rt_guest_menu_items().size() == 1);
 
@@ -866,7 +974,7 @@ void test_hover_selects() {
     /* The mirror is written alongside, so a reader before the game's own
      * frame refreshes it sees the two agree. */
     CHECK(peek(RT_ICO_ITEM_ID) == kTitleItemB);
-    CHECK(log_has("guest menu: select item 0xf on layout 0x9 (was 0xe)"));
+    CHECK(log_has("guest menu: select item 0x32 on layout 0xc (was 0x31)"));
     CHECK(log_count("guest menu: select item") == 1);
 
     /* Staying inside the item does not write again, even after the game
@@ -910,8 +1018,8 @@ void test_click() {
 
     const std::vector<uint16_t> seq = run_fields(6);
     CHECK(entry_item(kTitleLayout) == kTitleItemB);
-    CHECK(log_has("guest menu: select item 0xf on layout 0x9 (was 0xe)"));
-    CHECK(log_has("guest menu: click item 0xf on layout 0x9"));
+    CHECK(log_has("guest menu: select item 0x32 on layout 0xc (was 0x31)"));
+    CHECK(log_has("guest menu: click item 0x32 on layout 0xc"));
     CHECK(log_count("guest menu: select item") == 1);
 
     /* The cross is in the bits of the field the click arrived on, not the
@@ -1127,18 +1235,18 @@ void test_chain_layout_without_a_selection() {
 }
 
 void test_memory_card_screen() {
-    begin("the memory card check screen is keyed by its selector");
-    arm(kMcLayout, 7);
+    begin("the screen adjustment screen is keyed by its own level");
+    arm(kAdjustLayout, 7);
     run_field();
 
     /* Fifteen positions, in selector order, and the layout's own default
      * item (a 1 by 1 placeholder off the picture) is not among them. */
-    CHECK(rt_guest_menu_items().size() == RT_ICO_MC_COUNT);
-    for (uint32_t i = 0; i < RT_ICO_MC_COUNT; ++i) {
+    CHECK(rt_guest_menu_items().size() == RT_ICO_ADJUST_COUNT);
+    for (uint32_t i = 0; i < RT_ICO_ADJUST_COUNT; ++i) {
         CHECK(rt_guest_menu_items()[i].item == i);
     }
     const RtGuestMenuItem& first = rt_guest_menu_items()[0];
-    const RtGuestMenuItem& last = rt_guest_menu_items()[RT_ICO_MC_COUNT - 1];
+    const RtGuestMenuItem& last = rt_guest_menu_items()[RT_ICO_ADJUST_COUNT - 1];
     CHECK(near_enough(first.x0, 0.5f - 240.0f / 640.0f, 0.0005f));
     CHECK(near_enough(last.x1, 0.5f + 240.0f / 640.0f, 0.0005f));
     CHECK(near_enough(first.y0, 0.5f - 23.0f / 224.0f, 0.0005f));
@@ -1146,12 +1254,12 @@ void test_memory_card_screen() {
     CHECK(rt_guest_menu_active());
 
     /* The hover writes the selector, not the layout entry. */
-    const int32_t entry_before = entry_item(kMcLayout);
+    const int32_t entry_before = entry_item(kAdjustLayout);
     hover(3);
     run_field();
-    CHECK(peek(RT_ICO_MC_SELECT) == 3);
-    CHECK(entry_item(kMcLayout) == entry_before);
-    CHECK(log_has("guest menu: select item 0x3 on layout 0x38 (was 0x7)"));
+    CHECK(peek(RT_ICO_BRIGHTNESS) == 3);
+    CHECK(entry_item(kAdjustLayout) == entry_before);
+    CHECK(log_has("guest menu: select item 0x3 on layout 0x3c (was 0x7)"));
 
     /* Its handler only reads LEFT and RIGHT. */
     unhover();
@@ -1162,29 +1270,30 @@ void test_memory_card_screen() {
     for (uint16_t b : seq) {
         if (b) CHECK(b == RT_PAD_RIGHT);
     }
-    CHECK(peek(RT_ICO_MC_SELECT) == 4);
+    CHECK(peek(RT_ICO_BRIGHTNESS) == 4);
 
-    /* _la_memory_card_check calls GetRealModelId to set bit 0 on all fifteen
-     * every frame and clear it on the one its selector names; phase 1 of the
-     * next frame copies bit 0 into bit 1, so all but the selected read as
-     * hidden. Bit 0 is the general per-object flag and this screen is using
-     * it as a lit marker, which says nothing about where the fifteen places
-     * are, so all fifteen stay hoverable. */
-    for (uint32_t i = 0; i < RT_ICO_MC_COUNT; ++i) {
-        const int32_t lit = (int32_t)i == peek(RT_ICO_MC_SELECT) ? 0 : 1;
-        poke(object_of((int32_t)(RT_ICO_MC_FIRST_OBJ + i)) + RT_ICO_OBJ_FLAGS, lit);
+    /* la_adjust_screen calls GetRealModelId to set the persistent flag
+     * on all fifteen every frame and clear it on the one its selector names;
+     * phase 1 of the next frame copies it into the hidden one, so all but the
+     * selected read as hidden. That flag is the general per-object one and
+     * this screen is using it as a lit marker, which says nothing about where
+     * the fifteen places are, so all fifteen stay hoverable. */
+    for (uint32_t i = 0; i < RT_ICO_ADJUST_COUNT; ++i) {
+        const int32_t lit = (int32_t)i == peek(RT_ICO_BRIGHTNESS)
+                                ? 0 : (int32_t)RT_ICO_OBJ_FLAG_PERSISTENT;
+        poke(object_of((int32_t)(RT_ICO_ADJUST_FIRST_OBJ + i)) + RT_ICO_OBJ_FLAGS, lit);
     }
     run_field();
-    for (uint32_t i = 0; i < RT_ICO_MC_COUNT; ++i) {
-        const int32_t f = peek(object_of((int32_t)(RT_ICO_MC_FIRST_OBJ + i)) +
+    for (uint32_t i = 0; i < RT_ICO_ADJUST_COUNT; ++i) {
+        const int32_t f = peek(object_of((int32_t)(RT_ICO_ADJUST_FIRST_OBJ + i)) +
                                RT_ICO_OBJ_FLAGS);
-        const bool selected = (int32_t)i == peek(RT_ICO_MC_SELECT);
+        const bool selected = (int32_t)i == peek(RT_ICO_BRIGHTNESS);
         CHECK(((f & (int32_t)RT_ICO_OBJ_FLAG_HIDDEN) != 0) != selected);
     }
-    CHECK(rt_guest_menu_items().size() == RT_ICO_MC_COUNT);
+    CHECK(rt_guest_menu_items().size() == RT_ICO_ADJUST_COUNT);
     hover(11);
     run_field();
-    CHECK(peek(RT_ICO_MC_SELECT) == 11);
+    CHECK(peek(RT_ICO_BRIGHTNESS) == 11);
 }
 
 void test_item_outside_the_layout() {
@@ -1204,7 +1313,7 @@ void test_item_outside_the_layout() {
      * the tick and the click with no guest code in between. The check is
      * defensive and this is the only way to reach it. */
     rt_guest_menu_on_button(1, true);
-    CHECK(log_has("is outside layout 0x9's items"));
+    CHECK(log_has("is outside layout 0xc's items"));
     CHECK(!log_has("guest menu: click"));
     CHECK(entry_item(kTitleLayout) == kTitleItemA);
     CHECK(count_presses(run_fields(8)) == 0);
@@ -1386,7 +1495,7 @@ void test_negative_size_is_logged() {
     poke(object_of(kTitleItemB) + RT_ICO_OBJ_TEX_W, -128);
     run_fields(3);
     CHECK(rt_guest_menu_items().size() == 1);
-    CHECK(log_has("guest menu: layout 0x9 object 0xf has a negative drawn size"));
+    CHECK(log_has("guest menu: layout 0xc object 0x32 has a negative drawn size"));
     /* Once, whatever the screen does afterwards. */
     CHECK(log_count("has a negative drawn size") == 1);
 }
@@ -1515,6 +1624,131 @@ void test_drawn_cursor_hovers() {
     CHECK(entry_item(kTitleLayout) == kTitleItemB);
 }
 
+void test_kanban_boot_screen() {
+    begin("a kanban boot screen is found through its node, not the layout id word");
+    arm_kanban(kKanbanItemA);
+    run_field();
+
+    /* The layout state words say gameplay at fade 2, which has no items at
+     * all, so everything below came out of the node. */
+    CHECK(rt_guest_menu_state().layout == kGameplayLayout);
+    CHECK(rt_guest_menu_state().fade == 2);
+    CHECK(rt_guest_menu_active());
+    CHECK(rt_guest_menu_state().kanban);
+    CHECK(rt_guest_menu_state().kanban_layout == kKanbanLayout);
+    CHECK(rt_guest_menu_items().size() == 2);
+    CHECK(all_items_belong_to(kKanbanLayout));
+    CHECK(rt_guest_menu_items()[0].item == (uint32_t)kKanbanItemA);
+    CHECK(rt_guest_menu_items()[1].item == (uint32_t)kKanbanItemB);
+    CHECK(log_has("guest menu: kanban layout 0x1 (the 50/60 Hz screen): 2 items"));
+
+    /* This emitter's y bias is 112, not the layout path's 113: a y of 65 and
+     * a height field of 40 run from 65 - 112 to 65 - 112 + 20. */
+    const RtGuestMenuItem& a = item_of((uint32_t)kKanbanItemA);
+    CHECK(near_enough(a.x0, 0.5f + (190.0f - 320.0f) / 640.0f, 0.0005f));
+    CHECK(near_enough(a.x1, 0.5f + (190.0f + 80.0f - 320.0f) / 640.0f, 0.0005f));
+    CHECK(near_enough(a.y0, 0.5f + (65.0f - 112.0f) / 224.0f, 0.0005f));
+    CHECK(near_enough(a.y1, 0.5f + (65.0f - 112.0f + 20.0f) / 224.0f, 0.0005f));
+
+    /* Hovering writes the layout entry's own current item, which is the word
+     * func_001B8B10 re-derives the highlight from every frame. */
+    hover((uint32_t)kKanbanItemB);
+    run_field();
+    CHECK(entry_item(kKanbanLayout) == kKanbanItemB);
+    CHECK(log_has("guest menu: select item 0x22 on layout 0x1 (was 0x21)"));
+
+    /* A click confirms it with a cross on the virtual pad, in the field the
+     * click arrived on, because display_layout reads a pressed-this-frame
+     * word exactly as lt_switch_layout does. */
+    log_clear();
+    float x = 0.0f, y = 0.0f;
+    centre_of((uint32_t)kKanbanItemA, &x, &y);
+    move_cursor_in_field(true, x, y);
+    press_button(1, true);
+    const std::vector<uint16_t> seq = run_fields(6);
+    CHECK(entry_item(kKanbanLayout) == kKanbanItemA);
+    CHECK(log_has("guest menu: click item 0x21 on layout 0x1"));
+    CHECK(seq[0] == RT_PAD_CROSS);
+    CHECK(count_presses(seq) == 1);
+    CHECK(cadence_ok(seq));
+
+    /* The wheel steps along the links this screen has, which is a row. */
+    log_clear();
+    wheel_ticks(-1);
+    const std::vector<uint16_t> wheel = run_fields(4);
+    CHECK(wheel[0] == RT_PAD_RIGHT);
+}
+
+void test_kanban_screen_ignores_the_layout_words() {
+    begin("a kanban screen writes no item mirror and does not wait for the swallow flag");
+    arm_kanban(kKanbanItemA, /*layout_word=*/true);
+    run_field();
+    CHECK(rt_guest_menu_state().kanban);
+    CHECK(rt_guest_menu_state().layout == kKanbanLayout);
+
+    /* The layout id word names this same entry, so the only thing keeping
+     * the item mirror out of it is that this is a kanban screen:
+     * lt_next_layout is what refreshes that word and it does not run here. */
+    const int32_t mirror = peek(RT_ICO_ITEM_ID);
+    hover((uint32_t)kKanbanItemB);
+    run_field();
+    CHECK(entry_item(kKanbanLayout) == kKanbanItemB);
+    CHECK(peek(RT_ICO_ITEM_ID) == mirror);
+
+    /* And the swallow flag is the layout system's: display_layout never
+     * reads it, so a hover here writes on its own field. */
+    log_clear();
+    unhover();
+    run_field();
+    poke(entry_of(kKanbanLayout) + RT_ICO_LAYOUT_CUR_ITEM, kKanbanItemA);
+    g_swallow = true;
+    hover((uint32_t)kKanbanItemB);
+    run_field();
+    CHECK(peek(RT_ICO_NAV_SWALLOW) != 0);
+    CHECK(entry_item(kKanbanLayout) == kKanbanItemB);
+    CHECK(log_count("guest menu: select item") == 1);
+}
+
+void test_kanban_screen_ends() {
+    begin("a kanban screen that is fading out or gone hands the mouse back");
+    arm_kanban(kKanbanItemA);
+    run_field();
+    CHECK(log_has("pointer takes the mouse on kanban layout 0x1 (the 50/60 Hz screen)"));
+
+    /* kanbanReqDelFade sets bit 0 of the node's flag word, and
+     * display_layout gives such a node no input at all. */
+    log_clear();
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_FLAGS, (int32_t)RT_ICO_KANBAN_FLAG_FADING);
+    run_field();
+    CHECK(!rt_guest_menu_active());
+    CHECK(rt_guest_menu_items().empty());
+    CHECK(log_has("pointer hands the mouse back to mouse look on kanban layout 0x1"));
+
+    /* And a word that is not one of the thirty node slots is refused with a
+     * line naming it, rather than read as a node. */
+    log_clear();
+    poke(RT_ICO_KANBAN_ACTIVE, 0x12345678);
+    run_field();
+    CHECK(!rt_guest_menu_active());
+    CHECK(log_has("is not one of the thirty node slots"));
+
+    /* Once, however many fields it stays wrong for. */
+    log_clear();
+    run_fields(4);
+    CHECK(log_count("is not one of the thirty node slots") == 0);
+
+    /* An entry pointer that is not a row of the layout table is refused the
+     * same way. */
+    log_clear();
+    poke(RT_ICO_KANBAN_ACTIVE, (int32_t)kKanbanNode);
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_FLAGS, 0);
+    poke(kKanbanNode + RT_ICO_KANBAN_NODE_LAYOUT,
+         (int32_t)(RT_ICO_LAYOUT_TABLE + RT_ICO_LAYOUT_STRIDE / 2));
+    run_field();
+    CHECK(!rt_guest_menu_active());
+    CHECK(log_has("is not a row of the layout table"));
+}
+
 void test_drawn_cursor_handover() {
     begin("the log carries the pointer taking the mouse and handing it back");
     arm_drawn(kTitleItemA);
@@ -1580,6 +1814,9 @@ int main() {
     test_hover_writes_the_ancestors_word();
     test_chain_layout_without_a_selection();
     test_memory_card_screen();
+    test_kanban_boot_screen();
+    test_kanban_screen_ignores_the_layout_words();
+    test_kanban_screen_ends();
     test_item_outside_the_layout();
     test_pulse_bits_contract();
     test_without_the_sdl_provider();

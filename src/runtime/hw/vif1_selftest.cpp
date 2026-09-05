@@ -58,15 +58,29 @@ uint8_t* g_pages[0x10000]; /* unused here: no command reaches a hexdump */
 static bool g_verbose = false;
 static uint64_t g_log_lines = 0;
 
-void rt_log(const char* component, const char* fmt, ...) {
+/* The runtime's four level entry points, all onto one line here: a
+ * selftest has one reader and no level to filter by. */
+void rt_log_line(const char* component, const char* fmt, va_list ap);
+
+void rt_log_error(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_warn(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_info(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_debug(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+
+void rt_log_line(const char* component, const char* fmt, va_list ap) {
     ++g_log_lines;
     if (!g_verbose) return;
-    va_list ap;
-    va_start(ap, fmt);
     std::printf("[%s] ", component);
     std::vprintf(fmt, ap);
     std::printf("\n");
-    va_end(ap);
 }
 
 void rt_fatal(const char* component, const R5900Context*, const char* fmt, ...) {

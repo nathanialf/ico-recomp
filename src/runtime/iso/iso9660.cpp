@@ -24,6 +24,8 @@
  */
 #include "iso9660.h"
 
+#include "../target.h"
+
 #include "../prof.h"
 
 #include <vector>
@@ -153,7 +155,7 @@ bool probe_layout(long long file_size) {
             g_sector_size = c.ss;
             g_data_offset = c.off;
             g_total_sectors = (uint32_t)(file_size / c.ss);
-            rt_log("iso", "sector layout probed: %s (PVD found at LBA 16), %u sectors",
+            rt_log_info("iso", "sector layout probed: %s (PVD found at LBA 16), %u sectors",
                 c.what, g_total_sectors);
             return true;
         }
@@ -232,7 +234,7 @@ enum class MountFail {
     Open,    /* not openable/seekable: candidate absent */
     Layout,  /* no ISO9660 PVD at any known sector layout */
     Pvd,     /* PVD sector unreadable after a successful layout probe */
-    NoBoot,  /* mounted, but SCUS_971.13 is not on it */
+    NoBoot,  /* mounted, but the boot ELF is not on it */
 };
 
 void unmount() {
@@ -250,7 +252,7 @@ void unmount() {
 }
 
 /* The one mount implementation: opens `path`, probes the sector layout,
- * reads the PVD and verifies the disc by locating SCUS_971.13 (and warning
+ * reads the PVD and verifies the disc by locating the boot ELF (and warning
  * about a missing DFDATAS/DATA.DF). Unmounts whatever was mounted before,
  * first thing, and leaves nothing mounted on any failure. Never fatal:
  * every caller decides for itself whether a failure is loud. `err` gets one
@@ -271,14 +273,14 @@ MountFail mount_path(const std::string& path, const char* how, std::string* err)
     long long size = rt_ftell64(f);
     g_disc = f;
     if (!probe_layout(size)) {
-        rt_log("iso", "'%s' (%s): no ISO9660 PVD found at any known sector layout; skipping",
+        rt_log_warn("iso", "'%s' (%s): no ISO9660 PVD found at any known sector layout; skipping",
             path.c_str(), how);
         unmount();
         *err = "'" + path + "' has no ISO9660 volume descriptor at any known sector layout "
                "(plain 2048, raw 2352); not a disc image?";
         return MountFail::Layout;
     }
-    rt_log("iso", "mounted '%s' (%s), %lld bytes", path.c_str(), how, size);
+    rt_log_info("iso", "mounted '%s' (%s), %lld bytes", path.c_str(), how, size);
 
     /* PVD: root directory record at offset 156; volume id at 40. */
     uint8_t pvd[2048];
@@ -294,22 +296,26 @@ MountFail mount_path(const std::string& path, const char* how, std::string* err)
         std::memcpy(volid, &pvd[40], 32);
         volid[32] = 0;
         for (int i = 31; i >= 0 && volid[i] == ' '; --i) volid[i] = 0;
-        rt_log("iso", "PVD: volume id '%s', root dir LBA=%u size=%u", volid, g_root_lba, g_root_size);
+        rt_log_info("iso", "PVD: volume id '%s', root dir LBA=%u size=%u", volid, g_root_lba, g_root_size);
     }
 
     /* Mount verification: the boot ELF and the game's data archive must
      * resolve (paths are public facts from the disc's own filesystem). */
     RtIsoFile file;
-    if (!rt_iso_search("\\SCUS_971.13;1", &file)) {
+    if (!rt_iso_search(RT_TARGET_BOOT_ELF_ISO_PATH, &file)) {
+        /* One build serves one disc: the generated code is a translation of
+         * one ELF, so an image without that ELF cannot be run here whatever
+         * else is on it. */
         unmount();
-        *err = "'" + path + "' has no SCUS_971.13; it is not an ICO (US) disc image";
+        *err = "'" + path + "' has no " + RT_TARGET_BOOT_ELF + "; it is not an ICO "
+             + RT_TARGET_REGION + " disc image";
         return MountFail::NoBoot;
     }
-    rt_log("iso", "verify: SCUS_971.13 at LBA %u, %u bytes", file.lsn, file.size);
+    rt_log_info("iso", "verify: %s at LBA %u, %u bytes", RT_TARGET_BOOT_ELF, file.lsn, file.size);
     if (rt_iso_search("\\DFDATAS\\DATA.DF;1", &file)) {
-        rt_log("iso", "verify: DFDATAS/DATA.DF at LBA %u, %u bytes", file.lsn, file.size);
+        rt_log_info("iso", "verify: DFDATAS/DATA.DF at LBA %u, %u bytes", file.lsn, file.size);
     } else {
-        rt_log("iso", "WARNING: DFDATAS/DATA.DF not found on the mounted image");
+        rt_log_warn("iso", "WARNING: DFDATAS/DATA.DF not found on the mounted image");
     }
 
     g_mounted_path = path;
@@ -323,7 +329,7 @@ MountFail mount_path(const std::string& path, const char* how, std::string* err)
  * for anyone grepping the log. */
 const char* candidate_fatal_text(MountFail f) {
     return f == MountFail::Pvd ? "failed to read the PVD sector"
-                               : "mounted image has no SCUS_971.13; wrong disc?";
+                               : "mounted image has no " RT_TARGET_BOOT_ELF "; wrong disc?";
 }
 
 /* Walks the resolution order documented in iso9660.h. `fatal` selects
@@ -354,7 +360,7 @@ bool probe_and_mount(bool fatal, std::string* err) {
             return;
         }
         if (soft) {
-            rt_log("iso", "%s: %s; continuing the disc search", how, e.c_str());
+            rt_log_warn("iso", "%s: %s; continuing the disc search", how, e.c_str());
         } else if (f == MountFail::Pvd || f == MountFail::NoBoot) {
             give_up(candidate_fatal_text(f), e);
             return;
@@ -402,11 +408,11 @@ bool probe_and_mount(bool fatal, std::string* err) {
 
     if (outcome == 0) {
         /* Dev checkout only: the sibling decomp tree's baserom. A packaged
-         * run has no decomp_root, and probing one there would just put a
+         * run has no decomp_root, and probing one there would put a
          * meaningless path in the "tried:" list below. */
         LoaderConfig cfg;
         if (rt_load_config(&cfg) && cfg.decomp_root[0]) {
-            std::string base = std::string(rt_base_dir()) + "/" + cfg.decomp_root + "/baserom/Ico_USA";
+            std::string base = std::string(rt_base_dir()) + "/" + cfg.decomp_root + "/baserom/Ico_PAL";
             attempt(base + ".bin", "decomp baserom bin/cue", false);
             attempt(base + ".iso", "decomp baserom iso", false);
         }
@@ -416,7 +422,7 @@ bool probe_and_mount(bool fatal, std::string* err) {
         /* Packaged convention: the disc sits in the same folder as the
          * executable. rt_base_dir() is that folder for a packaged run, so
          * this holds however the exe was launched. */
-        static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_USA.iso", "Ico_USA.bin" };
+        static const char* const kLocal[] = { "ico.iso", "ico.bin", "Ico_PAL.iso", "Ico_PAL.bin" };
         for (const char* name : kLocal) {
             attempt(std::string(rt_base_dir()) + "/" + name, "next to the executable", false);
         }

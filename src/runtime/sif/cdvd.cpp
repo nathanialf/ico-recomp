@@ -35,9 +35,9 @@ namespace {
 
 /* libcdvd-common.h constants (public SDK facts). */
 constexpr uint32_t SCECdPS2DVD = 0x14;
-constexpr uint32_t SCECdComplete = 2;    /* sceCdDiskReady: ready */
+constexpr uint32_t SCECdComplete = 2;    /* sceCdDiskReady / sceCdNcmdDiskReady: ready */
+constexpr uint32_t SCECdNotReady = 6;    /* sceCdDiskReady / sceCdNcmdDiskReady: drive busy */
 constexpr uint32_t SCECdStatPause = 0x0A;
-constexpr uint32_t SCECdStatRead = 0x06; /* drive is mid-transfer */
 constexpr uint32_t SCECdErNO = 0;
 
 uint32_t rd32(const uint8_t* p, uint32_t off) { uint32_t v; std::memcpy(&v, p + off, 4); return v; }
@@ -50,7 +50,7 @@ uint8_t bcd(unsigned v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
 void svc_init(uint32_t fno, const uint8_t* send, uint32_t send_size,
               uint8_t* recv, uint32_t recv_size) {
     uint32_t mode = send_size >= 4 ? rd32(send, 0) : 0;
-    rt_log("cdvd", "init fno=%u sceCdInit(mode=%u) -> 1 (recv_size=%u)", fno, mode, recv_size);
+    rt_log_info("cdvd", "init fno=%u sceCdInit(mode=%u) -> 1 (recv_size=%u)", fno, mode, recv_size);
     /* CdInitPkt: {result, cdvdfsv_version, cdvdman_version, verbose}; the
      * 2001-era EE library only consumes result. */
     if (recv_size >= 4) wr32(recv, 0, 1);
@@ -78,47 +78,47 @@ void svc_scmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 recv[10] = bcd((unsigned)tmv.tm_mon + 1);
                 recv[11] = bcd(y2k % 100);
             }
-            rt_log("cdvd", "scmd fno=0x01 sceCdReadClock -> %04u-%02u-%02u %02u:%02u:%02u (BCD)",
+            rt_log_info("cdvd", "scmd fno=0x01 sceCdReadClock -> %04u-%02u-%02u %02u:%02u:%02u (BCD)",
                 year, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
             break;
         }
         case 0x03: /* sceCdGetDiskType */
             wr32(recv, 0, SCECdPS2DVD);
-            rt_log("cdvd", "scmd fno=0x03 sceCdGetDiskType -> SCECdPS2DVD (0x%02x)", SCECdPS2DVD);
+            rt_log_info("cdvd", "scmd fno=0x03 sceCdGetDiskType -> SCECdPS2DVD (0x%02x)", SCECdPS2DVD);
             break;
         case 0x04: /* sceCdGetError */
             wr32(recv, 0, SCECdErNO);
-            rt_log("cdvd", "scmd fno=0x04 sceCdGetError -> SCECdErNO");
+            rt_log_info("cdvd", "scmd fno=0x04 sceCdGetError -> SCECdErNO");
             break;
         case 0x05: /* sceCdTrayReq: recv {result, traychk} */
             wr32(recv, 0, 1);
             if (recv_size >= 8) wr32(recv, 4, 0);
-            rt_log("cdvd", "scmd fno=0x05 sceCdTrayReq(mode=%u) -> 1, traychk=0",
+            rt_log_info("cdvd", "scmd fno=0x05 sceCdTrayReq(mode=%u) -> 1, traychk=0",
                 send_size >= 4 ? rd32(send, 0) : 0);
             break;
         case 0x0C: /* sceCdStatus */
             wr32(recv, 0, SCECdStatPause);
-            rt_log("cdvd", "scmd fno=0x0c sceCdStatus -> SCECdStatPause (0x%02x)", SCECdStatPause);
+            rt_log_info("cdvd", "scmd fno=0x0c sceCdStatus -> SCECdStatPause (0x%02x)", SCECdStatPause);
             break;
         case 0x16: /* sceCdBreak */
             wr32(recv, 0, 1);
-            rt_log("cdvd", "scmd fno=0x16 sceCdBreak -> 1");
+            rt_log_info("cdvd", "scmd fno=0x16 sceCdBreak -> 1");
             break;
         case 0x22: /* sceCdMmode */
             wr32(recv, 0, 1);
-            rt_log("cdvd", "scmd fno=0x22 sceCdMmode(media=%u) -> 1",
+            rt_log_info("cdvd", "scmd fno=0x22 sceCdMmode(media=%u) -> 1",
                 send_size >= 4 ? rd32(send, 0) : 0);
             break;
         case 0x23: /* sceCdChangeThreadPriority */
             wr32(recv, 0, 1);
-            rt_log("cdvd", "scmd fno=0x23 sceCdChangeThreadPriority(%u) -> 1",
+            rt_log_info("cdvd", "scmd fno=0x23 sceCdChangeThreadPriority(%u) -> 1",
                 send_size >= 4 ? rd32(send, 0) : 0);
             break;
         default:
             /* Optimistic success, but loud: an fno outside the modeled set
              * is a signal to extend this switch (ps2sdk scmd.c enum). */
             if (recv_size >= 4) wr32(recv, 0, 1);
-            rt_log("cdvd", "WARNING scmd fno=0x%02x NOT MODELED (send_size=%u recv_size=%u): "
+            rt_log_warn("cdvd", "WARNING scmd fno=0x%02x NOT MODELED (send_size=%u recv_size=%u): "
                 "answered result=1, rest zeroed", fno, send_size, recv_size);
             break;
     }
@@ -138,11 +138,18 @@ void svc_scmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
  * sectors=184 buf=0x2b8000 mode=2. 184 sectors is 0x5C000, exactly one
  * stream ring, which is the sound library's initial fill; later refills
  * are a third of a ring and move their destination along the ring. Layout
- * confirmed against the vendor libcdvd read entry points in the decomp
+ * confirmed against the vendor libcdvd read entry points in the retail ELF
  * repo's disassembly (behavioral reference; the fno assignments predate
  * the ps2sdk table, where 0x0C is readiopmem and 0x0D is diskready). */
-/* Virtual clock value until which the drive reports itself as reading. */
+/* Virtual clock value until which the drive reports itself as reading, the
+ * guest thread that started that read, and how many fno 0x0E polls have
+ * been answered "not ready" over the run. The last two are what the busy
+ * line and the inventory need: a poll from the reading thread is the shape
+ * that froze the 2026-09-04 boot, and the count is what survives the log
+ * folding. */
 uint64_t g_drive_busy_until = 0;
+int g_read_thread = 0;
+uint64_t g_diskready_busy = 0;
 
 uint32_t iop_alloc_room(uint32_t addr);
 
@@ -243,7 +250,7 @@ uint64_t seek_cycles() {
         const char* e = std::getenv("ICORECOMP_CDVD_SEEK_MS");
         double ms = e ? std::strtod(e, nullptr) : 100.0;
         if (ms < 0.0) {
-            rt_log("cdvd", "ICORECOMP_CDVD_SEEK_MS=%s is negative; keeping the 100 ms default", e);
+            rt_log_warn("cdvd", "ICORECOMP_CDVD_SEEK_MS=%s is negative; keeping the 100 ms default", e);
             ms = 100.0;
         }
         return (uint64_t)(ms / 1000.0 * (double)RT_BUSCLK_HZ);
@@ -263,7 +270,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
     uint32_t intr_addr = rd32(send, 16) & 0x1FFFFFFFu;
     uint32_t pos_addr = rd32(send, 20) & 0x1FFFFFFFu;
     uint32_t datapattern = (mode >> 16) & 0xFF;
-    rt_log("cdvd", "ncmd fno=0x%02x sceCdRead%s(lbn=%u sectors=%u buf=0x%08x mode=0x%06x) intr=0x%08x pos=0x%08x",
+    rt_log_info("cdvd", "ncmd fno=0x%02x sceCdRead%s(lbn=%u sectors=%u buf=0x%08x mode=0x%06x) intr=0x%08x pos=0x%08x",
         fno, to_iop ? "IOPm" : "", lbn, sectors, buf, mode, intr_addr, pos_addr);
     if (to_iop && (uint64_t)buf + (uint64_t)sectors * 2048 > RT_IOP_RAM_SIZE) {
         rt_fatal("cdvd", rt_sched_current_ctx(),
@@ -280,7 +287,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
      * the streamer shrugs it off; here we zero-fill and log so the run
      * stays alive without hiding the event. */
     if ((uint64_t)lbn + sectors > rt_iso_total_sectors()) {
-        rt_log("cdvd", "read past end of disc (lbn=%u sectors=%u, disc has %u): zero-filling %u sectors",
+        rt_log_warn("cdvd", "read past end of disc (lbn=%u sectors=%u, disc has %u): zero-filling %u sectors",
             lbn, sectors, rt_iso_total_sectors(),
             (uint32_t)((uint64_t)lbn + sectors - (lbn < rt_iso_total_sectors() ? rt_iso_total_sectors() : lbn)));
     }
@@ -317,7 +324,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
         uint32_t ring_base = 0, ring = 0, cursor = 0;
         if (rt_snd_stream_ring(buf, &ring_base, &ring, &cursor)) {
             uint32_t at = buf - ring_base;
-            rt_log("cdvd", "stream refill: ring 0x%06x+0x%05x, write +0x%05x..+0x%05x "
+            rt_log_info("cdvd", "stream refill: ring 0x%06x+0x%05x, write +0x%05x..+0x%05x "
                            "(%zu bytes, %u sectors from lbn %u), voice cursor +0x%05x%s",
                 ring_base, ring, at, (uint32_t)(at + want), want, sectors, lbn, cursor,
                 at + want > ring ? ", past the ring end" : "");
@@ -333,7 +340,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
             static uint64_t untracked = 0;
             ++untracked;
             if (rt_trace() || (untracked & (untracked - 1)) == 0) {
-                rt_log("cdvd", "read into untracked IOP buffer 0x%06x (%zu bytes); "
+                rt_log_debug("cdvd", "read into untracked IOP buffer 0x%06x (%zu bytes); "
                                "extent unknown [#%" PRIu64 "]",
                     buf, want, untracked);
             }
@@ -342,7 +349,7 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
             /* Never sampled: with the ring model correct this cannot happen,
              * so every occurrence is a real divergence and all of them have
              * to be visible, not one in a power of two. */
-            rt_log("cdvd", "read into IOP buffer 0x%06x runs past its allocation: "
+            rt_log_warn("cdvd", "read into IOP buffer 0x%06x runs past its allocation: "
                            "%zu bytes requested, allocation has %u left",
                 buf, want, room);
         }
@@ -358,41 +365,57 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
         rt_gwrite_bytes(intr_addr, zero, sizeof(zero));
     }
     if (pos_addr) {
-        /* The +0x14 word is the library's read-position word. Writing a byte
-         * count here made the streaming scheduler walk backwards: successive
-         * reads went lbn 112994 -> 112433 -> 111884 while the requested size
-         * crept up ~13 sectors each time, so the ring was refilled from a
-         * position that jumped around. The natural reading is the disc
-         * position the drive reached. ICORECOMP_CDVD_POS selects the
-         * semantic while this is being pinned down:
-         *   end    (default) lbn + sectors, the position after the transfer
-         *   sectors          count of sectors transferred
-         *   bytes            previous behaviour, sectors * 2048 */
-        static const int mode = [] {
-            const char* e = std::getenv("ICORECOMP_CDVD_POS");
-            if (!e) return 0;
-            if (std::strcmp(e, "sectors") == 0) return 1;
-            if (std::strcmp(e, "bytes") == 0) return 2;
-            return 0;
-        }();
-        uint32_t pos = mode == 2 ? sectors * 2048
-                     : mode == 1 ? sectors
-                                 : lbn + sectors;
+        /* The +0x14 word is the library's read-position word: the disc
+         * position the drive reached, lbn + sectors.
+         *
+         * One of the two other readings was rejected by observation: a byte
+         * count (sectors * 2048) made the streaming scheduler walk
+         * backwards, successive reads going lbn 112994 -> 112433 -> 111884
+         * while the requested size crept up about 13 sectors each time, so
+         * the ring was refilled from a position that jumped around. The
+         * third, a plain count of sectors transferred, is rejected by
+         * argument rather than by a run: it is not a position at all, and
+         * the caller uses this word as one.
+         *
+         * This word is read back by the guest, so it is an accuracy
+         * question and has one answer, not a switch: the environment
+         * variable that used to pick between the three is gone. What is
+         * still open is a reading of cdvdfsv's readee handler and the
+         * EE-side writeback in the disc's own listing, which would settle
+         * it from the code rather than from behaviour. */
+        uint32_t pos = lbn + sectors;
         rt_gwrite_bytes(pos_addr, &pos, 4);
     }
 
-    /* Hold the virtual drive busy for as long as the transfer would take.
-     * The data is already in place and the RPC completes immediately, so
-     * nothing blocks; what this restores is the back pressure the library
-     * already looks for. Its read entry points poll fno 0x0E and refuse to
-     * start while the drive reports SCECdStatRead, so answering "idle"
-     * unconditionally let the streaming prefetch window slide as fast as
-     * the EE loop runs and rewrite the sound ring under the voices, which
-     * sounds like fast forward. ICORECOMP_CDVD_MBPS sets the rate, 0
-     * restores the unthrottled behaviour. */
+    /* The data is in place, but the read is not over: cdvdfsv's EE read
+     * handler (ps2sdk iop/cdvd/cdvdfsv/src/cdvdfsv.c, cdvdfsv_rpc5_01_readee)
+     * reads and DMAs every sector inside the RPC handler and returns, which
+     * is what sends the RPC END, only when the last transfer has completed.
+     * So the END is what carries the transfer time, and the client thread
+     * waits for it: libcdvd sceCdSync(0) (PAL 0x00266700, a function
+     * entry in the retail ELF) loops on
+     * _sceCd_c_cb_sem, which the END's callback _sceCd_cd_read_intr
+     * clears, sleeping 0x3C hsyncs per turn through sceCdDelayThread
+     * (SetAlarm + WaitSema, in the same libcdvd object).
+     *
+     * Holding the completion is also the back pressure the streaming
+     * prefetch needs: with the END immediate, the prefetch window slid as
+     * fast as the EE loop ran and rewrote the sound ring under the voices,
+     * which sounded like fast forward. That used to be modelled by
+     * answering "busy" to the fno 0x0E poll for this long after the END
+     * had already gone out, which the PAL library does not tolerate (see
+     * fno 0x0E below): a drive that has ended the read is not busy.
+     * ICORECOMP_CDVD_MBPS sets the rate; 0 makes the END immediate.
+     *
+     * Only the transfer is charged. A seek before the read is not: it is
+     * not measured for this drive, and the stream model's seek_cycles is
+     * a stream-start figure, not a per-read one. */
     const uint64_t per_sector = sector_cycles();
     if (per_sector) {
-        g_drive_busy_until = rt_clock_now() + (uint64_t)sectors * per_sector;
+        const uint64_t hold = (uint64_t)sectors * per_sector;
+        g_drive_busy_until = rt_clock_now() + hold;
+        g_read_thread = rt_thread_current_id();
+        rt_rpc_hold_completion(hold);
     }
     cd_req_record(to_iop ? kCdReqIopRead : kCdReqEeRead, lbn, sectors, buf, got, 0);
 }
@@ -402,8 +425,8 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
  * cdvdman owns a ring of sectors in IOP RAM which the drive fills in the
  * background. sceCdStRead hands the caller only what has already arrived
  * and returns that count packed as (error << 16) | sectors. Measured in the
- * decomp: the game's own copy of sceCdStRead is func_0024DAB8 (decomp
- * asm/nonmatchings/src/cod/vendor_24AAC8/func_0024DAB8.s), which after the
+ * this port: the library's sceCdStRead is PAL 0x002676F0 (a function
+ * entry in the retail ELF), which after the
  * stream RPC does "srl $16, $2, 16" for the error and
  * "andi $19, $2, 0xFFFF" for the sector count. Same split as ps2sdk
  * ee/rpc/cdvd/src/ncmd.c, whose STMNBLK path returns "ret & 0xFFFF" under
@@ -413,17 +436,17 @@ void do_read(uint32_t fno, const uint8_t* send, uint32_t send_size) {
  *   - blocking mode (the movie, ito/mpeg readBufBeginPut -> ios/inflate.c
  *     inflate_start -> sceCdStRead(32 sectors, mode 1)) loops inside the EE
  *     library until the whole request is satisfied, sleeping 8 hsyncs
- *     through SetAlarm/WaitSema (func_0024BFD0, decomp
- *     src/cod/vendor_24AAC8.c) whenever a call returns 0 sectors;
- *   - non-blocking mode (the file loader, decomp
- *     asm/nonmatchings/ios/cdvd/iosCdvdManager.s around lines 96-131 and
- *     190-219) commits whatever came back, and on a zero-sector reply parks
+ *     through SetAlarm/WaitSema (sceCdDelayThread, PAL 0x00265B10)
+ *     whenever a call returns 0 sectors;
+ *   - non-blocking mode (the file loader, iosCdvdManager; INFERRED from
+ *     that function's disassembly, not re-verified against the retail ELF
+ *     here) commits whatever came back, and on a zero-sector reply parks
  *     the thread in SleepThread until the per-frame handler wakes it.
  * So a latency model only has to get the returned count right.
  *
  * Ring geometry comes from sceCdStInit and this title uses two of them
- * (decomp tough_nuts/func_00132FF0/func_00132FF0.c, the readable form of
- * ios/cdvd.c func_00132FF0 and func_00131480): the movie stream asks for
+ * (iosCdvdDirectStOpen, PAL 0x00135138, and iosCdvdMgrStStart,
+ * PAL 0x001336D0): the movie stream asks for
  * bufmax 0x240 sectors in 0x24 banks over a 0x120010-byte IOP allocation,
  * the file loader for bufmax 0x50 in 5 banks over 0x28010 bytes. Both are
  * bufmax * 2048 plus the 16-byte allocation tag, which is what fixes bufmax
@@ -486,7 +509,7 @@ uint32_t stream_capacity() {
     static bool told = false;
     if (!told) {
         told = true;
-        rt_log("cdvd", "stream started with no sceCdStInit seen: ring capacity is unknown, "
+        rt_log_warn("cdvd", "stream started with no sceCdStInit seen: ring capacity is unknown, "
                        "so the drive is never stalled on a full ring (rate and seek still modeled)");
     }
     return 0xFFFFFFFFu;
@@ -504,7 +527,7 @@ uint32_t stream_capacity() {
  * comes to here. With requests that are bank multiples, which is what this
  * title issues, that is bank granularity: 32 sectors asked with a bank and
  * a half filled returns 16. ICO's stage
- * loader depends on this (decomp ios/cdvd/iosCdvdManager.s): it refills a
+ * loader depends on this (iosCdvdManager): it refills a
  * staging window with requests that are multiples of the 16-sector bank and
  * takes the refilled count as the next window; a delivery that is not a
  * multiple of 16 sends it down a partial-window branch that reorders and
@@ -558,7 +581,7 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
     /* READ logs its own line below, with what it handed over. Every other
      * command keeps the one-line-per-command form. */
     if (cmd != 2) {
-        rt_log("cdvd", "ncmd fno=0x09 sceCdSt%s(lbn=%u n=%u buf=0x%08x)", name, lbn, nsectors, buf);
+        rt_log_info("cdvd", "ncmd fno=0x09 sceCdSt%s(lbn=%u n=%u buf=0x%08x)", name, lbn, nsectors, buf);
     }
     uint32_t result = 1;
     switch (cmd) {
@@ -581,13 +604,13 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
                  * remainder, but a ring that holds it would sit at "one
                  * bank still filling" for ever once full, so say so. Both
                  * of this title's rings divide exactly (80/5, 576/36). */
-                rt_log("cdvd", "stream ring: %u sectors do not divide into %u banks; %u sectors of "
+                rt_log_warn("cdvd", "stream ring: %u sectors do not divide into %u banks; %u sectors of "
                                "the ring are never used, as on the IOP driver",
                     g_st.bufmax, g_st.bankmax, g_st.bufmax % g_st.bankmax);
             }
             g_stread_calls_since_start = 0;
             g_stread_have_last = false;
-            rt_log("cdvd", "stream ring: %u sectors (%u KB) in %u banks of %u at IOP 0x%06x; "
+            rt_log_info("cdvd", "stream ring: %u sectors (%u KB) in %u banks of %u at IOP 0x%06x; "
                            "a bank is handed over once whole; "
                            "first sector %.1f ms after a seek, then one every %.2f ms",
                 g_st.bufmax, g_st.bufmax * 2, g_st.bankmax, g_st.bank, g_st.iop_buf,
@@ -613,7 +636,7 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
                  * sceCdStRead returns 0 when streamStatus is 0, before the
                  * RPC), so seeing it here means the stream state machine
                  * here and the game's disagree. Loud, not sampled. */
-                rt_log("cdvd", "sceCdStREAD with no stream running (n=%u): returning 0", nsectors);
+                rt_log_warn("cdvd", "sceCdStREAD with no stream running (n=%u): returning 0", nsectors);
             }
             stream_advance();
             const bool paced = sector_cycles() != 0;
@@ -635,7 +658,7 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
                 if (i < give) {
                     /* The stream ran off the end of the disc. Loud, not
                      * sampled: with a correct position this cannot happen. */
-                    rt_log("cdvd", "stream read short at lbn %u: %u of %u sectors on the disc (%u total)",
+                    rt_log_warn("cdvd", "stream read short at lbn %u: %u of %u sectors on the disc (%u total)",
                         g_st.pos, i, give, rt_iso_total_sectors());
                 }
                 g_st.pos += i;
@@ -652,7 +675,7 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
                 const bool stall_edge = g_stread_have_last && g_stread_last_delivered != 0 && i == 0;
                 if (rt_verbose("cdvd") || g_stread_calls_since_start <= 8 ||
                     (g_stread_calls_since_start % 64) == 0 || stall_edge) {
-                    rt_log("cdvd", "ncmd fno=0x09 sceCdStREAD(lbn=%u n=%u buf=0x%08x) "
+                    rt_log_info("cdvd", "ncmd fno=0x09 sceCdStREAD(lbn=%u n=%u buf=0x%08x) "
                                    "delivered %u of %u (buffered %u/%u), next lbn %u",
                         lbn, nsectors, buf, i, nsectors, g_st.buffered, g_st.bufmax, g_st.pos);
                 }
@@ -664,9 +687,10 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
         }
         case 3: /* STOP: the ring is discarded.
                  * Non-zero is success here: the game latches sceCdGetError
-                 * when this returns 0 (decomp ios/cdvd.c func_001331D8 and
-                 * func_00131560). Same for START, whose 0 return makes
-                 * func_00131480 latch the error. */
+                 * when this returns 0 (iosCdvdDirectStClose,
+                 * PAL 0x00135330, and iosCdvdMgrStStop,
+                 * PAL 0x001337A8). Same for START, whose 0 return makes
+                 * iosCdvdMgrStStart, PAL 0x001336D0, latch the error. */
             g_st.running = false;
             g_st.paused = false;
             g_st.buffered = 0;
@@ -683,10 +707,10 @@ void do_stream(const uint8_t* send, uint32_t send_size, uint8_t* recv, uint32_t 
              *   "get stream read status
              *    @return number of sectors read if successful, 0 otherwise"
              * and the game settles it: the movie player is the only caller
-             * of sceCdStStat in the binary (decomp
-             * asm/nonmatchings/src/stage_orient/OtherStagePositionGet.s
-             * lines 29-42, a splat file-split artifact holding the ito/mpeg
-             * main loop) and it uses the result as a signed threshold: the
+             * of sceCdStStat in the binary (the call sits inside the
+             * ito/mpeg main loop; INFERRED from that loop's disassembly,
+             * not re-verified against the retail ELF here) and it uses the
+             * result as a signed threshold: the
              * call is followed immediately by a set-on-less-than against 32,
              * asking whether fewer than 32 sectors are buffered, weighed
              * against the 0x10000 bytes it is about to request, printing
@@ -729,12 +753,12 @@ void svc_ncmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
             do_read(fno, send, send_size);
             break;
         case 0x05: /* sceCdSeek: async success, callback only */
-            rt_log("cdvd", "ncmd fno=0x05 sceCdSeek(lbn=%u) -> ok", send_size >= 4 ? rd32(send, 0) : 0);
+            rt_log_info("cdvd", "ncmd fno=0x05 sceCdSeek(lbn=%u) -> ok", send_size >= 4 ? rd32(send, 0) : 0);
             break;
         case 0x06: /* sceCdStandby */
         case 0x07: /* sceCdStop */
         case 0x08: /* sceCdPause */
-            rt_log("cdvd", "ncmd fno=0x%02x sceCd%s -> ok", fno,
+            rt_log_info("cdvd", "ncmd fno=0x%02x sceCd%s -> ok", fno,
                 fno == 0x06 ? "Standby" : (fno == 0x07 ? "Stop" : "Pause"));
             break;
         case 0x09: /* sceCdStream */
@@ -755,26 +779,87 @@ void svc_ncmd(uint32_t fno, const uint8_t* send, uint32_t send_size,
             }
             break;
         case 0x0E:
-            /* Drive status poll (sync, 4-byte recv). The library's read
-             * entry points call this before issuing a read and refuse to
-             * start while it returns SCECdStatRead (0x06). Reads complete
-             * synchronously inside the RPC call here, so the virtual drive
-             * is never mid-read: always paused. */
+            /* sceCdNcmdDiskReady (sync, 4-byte recv): the EE library's
+             * sceCdNcmdDiskReady (PAL 0x00266668, a function entry in the
+             * retail ELF) sends fno 0xE and returns the word.
+             * cdvdfsv answers it with cdvdfsv_rpc5_0E_diskready (ps2sdk
+             * iop/cdvd/cdvdfsv/src/cdvdfsv.c): SCECdComplete (2) when the
+             * drive is ready, SCECdNotReady (6) while it is not. Not a
+             * drive status word: this runtime used to answer
+             * SCECdStatPause / SCECdStatRead here, and only survived
+             * because the library tests one value.
+             *
+             * That value is 6, and it is not a retry: sceCdRead (PAL
+             * 0x00266F20, sceCdRead.s at 0x00266F68..0x00266F74) calls
+             * sceCdNcmdDiskReady first unless _sceCd_ee_read_mode bit 0 is
+             * set, and returns 0 (failed) the moment the answer is 6. The
+             * PAL DATA.DF producer (the function at 0x00133250, at
+             * 0x0013340C) asserts on a failed sceCdRead, and its retail
+             * assert handler debug_assertMessage (0x001B6230) is a branch
+             * to itself: the thread spins at priority 27 for ever, the CD
+             * manager at 28 never runs again, and the boot menu is never
+             * drawn. That was the PAL boot freeze of 2026-09-04: the
+             * answer was 6 because the drive was held "busy" for the
+             * transfer time after the read's END had already been
+             * delivered. A drive that has ended a read is ready; now the
+             * END itself waits for the transfer (do_read), so a poll from
+             * the thread that issued the read cannot see busy, and one
+             * from another thread sees it exactly while the read runs. */
             {
                 const bool busy = rt_clock_now() < g_drive_busy_until;
-                const uint32_t st = busy ? SCECdStatRead : SCECdStatPause;
+                const uint32_t st = busy ? SCECdNotReady : SCECdComplete;
                 if (recv_size >= 4) wr32(recv, 0, st);
+                /* info, with the same power-of-two folding it always had.
+                 * Every cdvd command the client issues belongs at the
+                 * default level with its result, because a boot that stops
+                 * after one read has to be readable without a rerun; the
+                 * folding is what keeps a poll the library makes every
+                 * field from being the whole file. rt_verbose("cdvd") or
+                 * ICORECOMP_TRACE prints every one.
+                 *
+                 * A busy answer matters more than a ready one: each one
+                 * makes the caller's sceCdRead return 0 and the library
+                 * does not say so. It used to be printed every time, which
+                 * is a warn flood during streaming: a 184-sector read holds
+                 * the drive for about 70 ms at the default rate, and
+                 * libcdvd's retry loop sleeps 0x3C hsyncs, so another
+                 * thread polling across one read produces of the order of
+                 * 18 lines. So the first kBusyUnfolded are printed as they
+                 * happen and the rest fold by powers of two on their own
+                 * counter; the total is in the cdvd inventory dump either
+                 * way, so nothing is lost.
+                 *
+                 * Which thread polled is the fact that separates the two
+                 * shapes: a poll from the thread that issued the read is
+                 * the failure that caused the 2026-09-04 boot freeze, and a
+                 * poll from any other thread is normal traffic while a read
+                 * runs. Both thread ids are named. */
+                constexpr uint64_t kBusyUnfolded = 8;
                 static uint64_t polls = 0;
                 ++polls;
-                if (rt_trace() || (polls & (polls - 1)) == 0) {
-                    rt_log("cdvd", "ncmd fno=0x0e drive status poll -> %s (0x%02x) [#%" PRIu64 "]",
-                        busy ? "SCECdStatRead" : "SCECdStatPause", st, polls);
+                if (busy) {
+                    ++g_diskready_busy;
+                    const bool fold = g_diskready_busy > kBusyUnfolded
+                        && (g_diskready_busy & (g_diskready_busy - 1)) != 0;
+                    if (!fold || rt_trace() || rt_verbose("cdvd")) {
+                        rt_log_warn("cdvd", "ncmd fno=0x0e sceCdNcmdDiskReady -> SCECdNotReady (6) "
+                            "[busy answer #%" PRIu64 " of %" PRIu64 " polls]: "
+                            "the drive is %.3f ms from ending its read; the caller's sceCdRead returns 0 "
+                            "(failed) on this answer (polled by thread %d, the read was issued by "
+                            "thread %d)",
+                            g_diskready_busy, polls,
+                            (double)(g_drive_busy_until - rt_clock_now()) * 1000.0 / (double)RT_BUSCLK_HZ,
+                            rt_thread_current_id(), g_read_thread);
+                    }
+                } else if (rt_trace() || rt_verbose("cdvd") || (polls & (polls - 1)) == 0) {
+                    rt_log_info("cdvd", "ncmd fno=0x0e sceCdNcmdDiskReady -> SCECdComplete (2) [#%" PRIu64 "]",
+                        polls);
                 }
             }
             break;
         default:
             if (recv_size >= 4) wr32(recv, 0, 1);
-            rt_log("cdvd", "WARNING ncmd fno=0x%02x NOT MODELED (send_size=%u recv_size=%u): "
+            rt_log_warn("cdvd", "WARNING ncmd fno=0x%02x NOT MODELED (send_size=%u recv_size=%u): "
                 "answered result=1, rest zeroed", fno, send_size, recv_size);
             break;
     }
@@ -801,7 +886,7 @@ void svc_searchfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
         dest_off = 292;
     }
     if (send_size != 292 && send_size != 296) {
-        rt_log("cdvd", "WARNING searchfile send_size=%u (not a known layout); "
+        rt_log_warn("cdvd", "WARNING searchfile send_size=%u (not a known layout); "
             "using offsets %u/%u", send_size, name_off, dest_off);
     }
     char path[257];
@@ -811,7 +896,7 @@ void svc_searchfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
 
     RtIsoFile f;
     bool found = rt_iso_search(path, &f);
-    rt_log("cdvd", "searchfile fno=%u '%s' -> %s%s LBA=%u size=%u (writeback to 0x%08x)",
+    rt_log_info("cdvd", "searchfile fno=%u '%s' -> %s%s LBA=%u size=%u (writeback to 0x%08x)",
         fno, path, found ? "FOUND " : "not found", found ? f.name : "",
         f.lsn, f.size, eedest);
 
@@ -830,7 +915,7 @@ void svc_diskready(uint32_t fno, const uint8_t* send, uint32_t send_size,
                    uint8_t* recv, uint32_t recv_size) {
     uint32_t mode = send_size >= 4 ? rd32(send, 0) : 0;
     if (recv_size >= 4) wr32(recv, 0, SCECdComplete);
-    rt_log("cdvd", "diskready fno=%u sceCdDiskReady(mode=%u) -> SCECdComplete", fno, mode);
+    rt_log_info("cdvd", "diskready fno=%u sceCdDiskReady(mode=%u) -> SCECdComplete", fno, mode);
 }
 
 /* ---- 0x80000003: iopheap ------------------------------------------------- */
@@ -842,7 +927,8 @@ void svc_diskready(uint32_t fno, const uint8_t* send, uint32_t send_size,
  * Real allocations matter here: the EE stages data into these buffers with
  * SifSetDma and later asks IOP-side services to consume them, and the
  * addresses are not opaque to the game (the MPEG helper rejects any IOP
- * address above 0x1FFFFF, decomp src/cod/vendor_258CC0.c func_0025E050).
+ * address above 0x1FFFFF: SgStPcmOpen, PAL
+ * 0x00278640).
  *
  * On hardware the IOP side of this is AllocSysMemory(SMEM_LOW, size, 0):
  * lowest-address-first fit, 256-byte granularity, out of the RAM left above
@@ -907,10 +993,10 @@ uint32_t iop_heap_largest_free() {
 }
 
 void iop_heap_dump() {
-    rt_log("iopheap", "live block list: %d blocks, %u bytes",
+    rt_log_info("iopheap", "live block list: %d blocks, %u bytes",
         g_iop_alloc_count, iop_heap_live());
     for (int i = 0; i < g_iop_alloc_count; ++i) {
-        rt_log("iopheap", "  block %d: 0x%06x size %u (span %u)",
+        rt_log_info("iopheap", "  block %d: 0x%06x size %u (span %u)",
             i, g_iop_allocs[i].addr, g_iop_allocs[i].size, g_iop_allocs[i].span);
     }
 }
@@ -921,7 +1007,7 @@ uint32_t iop_heap_alloc(uint32_t size) {
     if (size == 0) {
         /* What the IOP kernel returns for a zero-byte AllocSysMemory is not
          * verified here, and the game never asks for one. */
-        rt_log("iopheap", "WARNING: alloc(0) requested; the IOP kernel's answer to a "
+        rt_log_warn("iopheap", "WARNING: alloc(0) requested; the IOP kernel's answer to a "
             "zero-byte allocation is unverified. Returning NULL.");
         return 0;
     }
@@ -972,10 +1058,10 @@ void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
             uint32_t size = send_size >= 4 ? rd32(send, 0) : 0;
             uint32_t addr = iop_heap_alloc(size);
             if (recv_size >= 4) wr32(recv, 0, addr);
-            rt_log("iopheap", "alloc(%u) -> 0x%06x (live %u bytes, largest free %u)",
+            rt_log_info("iopheap", "alloc(%u) -> 0x%06x (live %u bytes, largest free %u)",
                 size, addr, iop_heap_live(), iop_heap_largest_free());
             if (!addr && size) {
-                rt_log("iopheap", "WARNING: virtual IOP heap exhausted (%u byte request)", size);
+                rt_log_warn("iopheap", "WARNING: virtual IOP heap exhausted (%u byte request)", size);
                 /* Once per run: enough to see a leak, not enough to bury the
                  * log if the game retries in a loop. */
                 static bool dumped = false;
@@ -988,9 +1074,9 @@ void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
             int result = iop_heap_free(addr);
             if (recv_size >= 4) wr32(recv, 0, (uint32_t)result);
             if (result == 0) {
-                rt_log("iopheap", "free(0x%06x) -> 0 (live %u bytes)", addr, iop_heap_live());
+                rt_log_info("iopheap", "free(0x%06x) -> 0 (live %u bytes)", addr, iop_heap_live());
             } else {
-                rt_log("iopheap", "WARNING free(0x%06x) -> -1: not the base of a live block. "
+                rt_log_warn("iopheap", "WARNING free(0x%06x) -> -1: not the base of a live block. "
                     "The game does not do this on hardware, so either an address was "
                     "corrupted or a block was freed twice.", addr);
                 iop_heap_dump();
@@ -999,7 +1085,7 @@ void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
         }
         default:
             if (recv_size >= 4) wr32(recv, 0, (uint32_t)-1);
-            rt_log("iopheap", "WARNING fno=%u NOT MODELED (send_size=%u): returned -1",
+            rt_log_warn("iopheap", "WARNING fno=%u NOT MODELED (send_size=%u): returned -1",
                 fno, send_size);
             break;
     }
@@ -1008,6 +1094,128 @@ void svc_iopheap(uint32_t fno, const uint8_t* send, uint32_t send_size,
 /* ---- 0x80000006: loadfile (sceSifLoadModule) ----------------------------- */
 
 int g_next_module_id = 1;
+
+/* ---- the IOP modules this disc carries ------------------------------------
+ *
+ * The IOP is HLE'd, so nothing here is loaded. The table exists so that a
+ * LoadModule the game issues can be named in the log together with what the
+ * mounted disc's copy of that file actually is, and so that a path outside
+ * the set is loud rather than silently successful.
+ *
+ * Every field is read from the retail PAL disc (SCES-50760): the file size
+ * from its ISO 9660 directory record, the module name and version from the
+ * 16-bit version field of the file's .iopmod section (offset 0x74 in each of
+ * these files, version at +0x18 within the section, name from +0x1A).
+ *
+ * The six paths below are the complete set of module paths SCES_507.60
+ * contains, in the order the strings appear in its data (at 0x0054DBC0
+ * through 0x0054DC38); the IOPRP image at 0x0054DB90 is not loaded through
+ * loadfile, it is the argument of the SIF_CMD_RESET_CMD reboot. The US disc's
+ * boot ELF names the same six paths and the same image.
+ *
+ * All six files, and the IOPRP image, are byte for byte identical on the PAL
+ * and US discs with one exception: SNDN2DRV.IRX differs (PAL 20941 bytes,
+ * US 20925). Its .iopmod header is the same on both, including the version,
+ * and its .text and .data are the same size; the PAL build carries two more
+ * text relocations, which is where the 16 bytes go. That module is the
+ * game's own sound server rather than a Sony one, and what the runtime
+ * models is the EE-side client protocol, which is identical: see the PAL/US
+ * comparison in docs/TARGET.md.
+ *
+ * The PAL disc additionally carries MCXMAN.IRX (mcxman 2.1), MCXSERV.IRX
+ * (mcxserv 2.1) and PANICSYS.IRX (System_Panic_Reporter 1.1), which the US
+ * disc does not. SCES_507.60 never names any of them, so nothing loads them
+ * and no RPC server of theirs is ever bound. They are mastering payload, not
+ * a protocol difference. If one of them ever appears in a LoadModule the
+ * warn branch below will say so. */
+struct IopModule {
+    const char* path;          /* exactly as SCES_507.60 spells it */
+    const char* iopmod_name;   /* .iopmod module name field */
+    uint16_t version;          /* .iopmod version field */
+    uint32_t file_size;        /* bytes, from the PAL disc */
+};
+
+const IopModule kIopModules[] = {
+    {"cdrom0:\\SIO2MAN.IRX;1",  "sio2man",              0x0204,  6161},
+    {"cdrom0:\\PADMAN.IRX;1",   "padman",               0x0402, 43861},
+    {"cdrom0:\\MCMAN.IRX;1",    "mcman_tool",           0x0215, 87789},
+    {"cdrom0:\\MCSERV.IRX;1",   "mcserv",               0x020C,  6777},
+    {"cdrom0:\\LIBSD.IRX;1",    "Sound_Device_Library", 0x0104, 26285},
+    {"cdrom0:\\SNDN2DRV.IRX;1", "sndn2_driver",         0x0100, 20941},
+};
+
+const IopModule* find_iop_module(const char* path) {
+    for (const IopModule& m : kIopModules) {
+        if (std::strcmp(m.path, path) == 0) return &m;
+    }
+    return nullptr;
+}
+
+/* ---- 0x80000001: the EE fileio server ------------------------------------
+ *
+ * Reached through sceOpen, which lazily runs sceFsInit (PAL 0x00260C70,
+ * a function entry in the retail ELF): that binds server id 0x80000001 and sends
+ * fno 0xFF (a version query) first. The callers in SCES_507.60:
+ *
+ *   - Every PAL boot, once: sceScfGetLanguage (0x00272958) calls IsT10K
+ *     (jal at 0x00272968), which calls GetRomName (0x00272878), which
+ *     opens "rom0:ROMVER" (rodata 0x006371D0) through sceOpen at
+ *     0x002728AC to tell a TOOL from a retail console. On a real console
+ *     that file exists and the open succeeds; what matches retail here is
+ *     the derived answer, not the open, because IsT10K reports "not a
+ *     TOOL" whether the open worked or not. Measured on the 22:07 UTC 2026-09-04 log: the
+ *     BIND and one fno 0xFF sit between sceScfGetLanguage's two
+ *     GetOsdConfigParam calls (0x00272960 and 0x00272980), on the thread
+ *     running kanbanBootMcCheck, with every thread alive afterwards.
+ *   - The EE exception handler debugEEExceptionMain (0x001B5BD0) calls
+ *     initLineTraceTable (0x001B4FA0), which
+ *     opens TRTABLE.BIN off the disc root to turn the faulting PC into a
+ *     source line. That handler destroys every other thread first
+ *     (Emergency_DestroyAllThread at 0x001B5C28), so a run that reaches
+ *     fileio this way has an inventory of dead threads.
+ *   - The GsBase editing leftovers (gsb_LoadStageSettings 0x001163B0,
+ *     the lock and log files) open through debugSceOpen and skip the
+ *     file on a failed open (0x001163F4); no jal in .text reaches them
+ *     and no run has been seen to.
+ *
+ * Both boot ELFs contain the same code; only the PAL disc ships
+ * TRTABLE.BIN, SRCFILE.TXT, TRFILE.TXT and MAIN.MAP, the US master left
+ * them off.
+ *
+ * Nothing here is modeled. The point of registering the server at all is
+ * that an unregistered BIND is a fatal in handle_bind, which used to bury
+ * whichever path was running. Every call is answered with -1, which the
+ * EE library turns into a failed open: GetRomName reports no ROM name,
+ * the exception handler prints its register dump without a source line.
+ *
+ * The version query, fno 0xFF, is answered -1 with the rest. Whether that
+ * matters is NOT established: svc_loadfile below documents that answering
+ * a loadfile version query wrongly makes every later loadfile call fail
+ * for good, and this library's own version check has not been read. It is
+ * left as it is because the one path that reaches this server on this disc
+ * (GetRomName) is content with a failed open either way, and inventing a
+ * version this runtime cannot check would be a guess with the same
+ * standing. If a fileio call ever has to succeed, this is the first thing
+ * to settle. */
+void svc_fileio(uint32_t fno, const uint8_t* send, uint32_t send_size,
+                uint8_t* recv, uint32_t recv_size) {
+    (void)send;
+    /* Every call is a fact worth a line, and no run has made more than a
+     * handful. Fold after the first few anyway, on this server's own
+     * counter: the EE exception handler reaches this server in a loop, and
+     * a crash report is exactly when the log must stay readable. */
+    static uint64_t calls = 0;
+    ++calls;
+    if (calls <= 8 || (calls & (calls - 1)) == 0 || rt_verbose("cdvd")) {
+        rt_log_warn("iopmod", "WARNING fileio (0x80000001) fno=0x%02x NOT MODELED "
+            "(send_size=%u recv_size=%u): answered -1 (a failed open). One call per PAL boot "
+            "is sceScfGetLanguage's GetRomName opening rom0:ROMVER, harmless; the EE exception "
+            "handler also comes here, after destroying every other thread: the thread "
+            "inventory says which (thread %d here) [call #%" PRIu64 "]",
+            fno, send_size, recv_size, rt_thread_current_id(), calls);
+    }
+    if (recv_size >= 4) wr32(recv, 0, 0xFFFFFFFFu);
+}
 
 void svc_loadfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
                   uint8_t* recv, uint32_t recv_size) {
@@ -1024,8 +1232,22 @@ void svc_loadfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
         std::memcpy(path, send + 8, plen);
         path[252] = 0;
         int id = g_next_module_id++;
-        rt_log("iopmod", "loadfile fno=0 LoadModule('%s' arg_len=%u) -> module id %d (HLE, nothing loaded)",
-            path, rd32(send, 0), id);
+        const IopModule* m = find_iop_module(path);
+        if (m) {
+            rt_log_info("iopmod", "loadfile fno=0 LoadModule('%s' arg_len=%u) -> module id %d. "
+                "That file on the mounted disc is \"%s\" version %u.%u (.iopmod section, "
+                "%u bytes); HLE, nothing is loaded and the driver it would install is served "
+                "at the RPC layer instead",
+                path, rd32(send, 0), id, m->iopmod_name, m->version >> 8, m->version & 0xFF,
+                m->file_size);
+        } else {
+            rt_log_warn("iopmod", "WARNING loadfile fno=0 LoadModule('%s' arg_len=%u) -> module "
+                "id %d: this path is NOT in the measured module set of SCES_507.60. That ELF "
+                "names exactly six IRX paths plus the IOPRP image, all listed in "
+                "kIopModules above. The load is answered as success and nothing is loaded, so "
+                "whatever RPC server this module would have registered will fail its BIND",
+                path, rd32(send, 0), id);
+        }
         if (recv_size >= 4) wr32(recv, 0, (uint32_t)id);
         if (recv_size >= 8) wr32(recv, 4, 0); /* modres: RESIDENT END */
         return;
@@ -1039,10 +1261,10 @@ void svc_loadfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
          * handshake fact, discovered by running the version check; newer
          * ps2sdk loadfile answers "3100" the same way). */
         if (recv_size >= 4) std::memcpy(recv, "2240", 4);
-        rt_log("iopmod", "loadfile fno=0xff GetVersion -> \"2240\"");
+        rt_log_info("iopmod", "loadfile fno=0xff GetVersion -> \"2240\"");
         return;
     }
-    rt_log("iopmod", "WARNING loadfile fno=0x%x NOT MODELED (send_size=%u recv_size=%u): "
+    rt_log_warn("iopmod", "WARNING loadfile fno=0x%x NOT MODELED (send_size=%u recv_size=%u): "
         "answered result=1, rest zeroed", fno, send_size, recv_size);
     if (recv_size >= 4) wr32(recv, 0, 1);
 }
@@ -1051,32 +1273,36 @@ void svc_loadfile(uint32_t fno, const uint8_t* send, uint32_t send_size,
 
 void rt_cdvd_dump_state() {
     const uint64_t now = rt_clock_now();
-    rt_log("cdvd", "stream: inited=%d running=%d paused=%d pos=%u buffered=%u ready=%u "
+    rt_log_info("cdvd", "stream: inited=%d running=%d paused=%d pos=%u buffered=%u ready=%u "
                    "arrived=%" PRIu64 " bufmax=%u bankmax=%u bank=%u iop_buf=0x%06x",
         g_st.inited, g_st.running, g_st.paused, g_st.pos, g_st.buffered, stream_ready(),
         g_st.arrived, g_st.bufmax, g_st.bankmax, g_st.bank, g_st.iop_buf);
     if (g_st.next_arrival > now) {
-        rt_log("cdvd", "  next_arrival: vclk=%" PRIu64 " (+%.3f ms)", g_st.next_arrival,
+        rt_log_info("cdvd", "  next_arrival: vclk=%" PRIu64 " (+%.3f ms)", g_st.next_arrival,
             (double)(g_st.next_arrival - now) * 1000.0 / (double)RT_BUSCLK_HZ);
     } else {
-        rt_log("cdvd", "  next_arrival: vclk=%" PRIu64 " (past due)", g_st.next_arrival);
+        rt_log_info("cdvd", "  next_arrival: vclk=%" PRIu64 " (past due)", g_st.next_arrival);
     }
     if (g_drive_busy_until > now) {
-        rt_log("cdvd", "drive_busy_until: vclk=%" PRIu64 " (+%.3f ms)", g_drive_busy_until,
+        rt_log_info("cdvd", "drive_busy_until: vclk=%" PRIu64 " (+%.3f ms)", g_drive_busy_until,
             (double)(g_drive_busy_until - now) * 1000.0 / (double)RT_BUSCLK_HZ);
     } else {
-        rt_log("cdvd", "drive_busy_until: vclk=%" PRIu64 " (past due)", g_drive_busy_until);
+        rt_log_info("cdvd", "drive_busy_until: vclk=%" PRIu64 " (past due)", g_drive_busy_until);
     }
-    rt_log("cdvd", "sector_cycles=%.3f ms seek_cycles=%.3f ms disc_sectors=%u",
+    /* The total the busy line's folding hides after the first few. */
+    rt_log_info("cdvd", "diskready busy answers: %" PRIu64 " over the run (each one made a "
+        "caller's sceCdRead return 0); last read issued by thread %d",
+        g_diskready_busy, g_read_thread);
+    rt_log_info("cdvd", "sector_cycles=%.3f ms seek_cycles=%.3f ms disc_sectors=%u",
         (double)sector_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
         (double)seek_cycles() * 1000.0 / (double)RT_BUSCLK_HZ,
         rt_iso_total_sectors());
     const uint64_t n = g_req_count < kCdReqRingSize ? g_req_count : (uint64_t)kCdReqRingSize;
-    rt_log("cdvd", "request ring: %" PRIu64 " total, last %" PRIu64 ":", g_req_count, n);
+    rt_log_info("cdvd", "request ring: %" PRIu64 " total, last %" PRIu64 ":", g_req_count, n);
     for (uint64_t k = 0; k < n; ++k) {
         const uint64_t idx = (g_req_count - n + k) % kCdReqRingSize;
         const CdReq& r = g_req_ring[idx];
-        rt_log("cdvd", "  %-13s vclk=%" PRIu64 " lbn=%-8u n=%-6u buf=0x%08x delivered=%-6u "
+        rt_log_info("cdvd", "  %-13s vclk=%" PRIu64 " lbn=%-8u n=%-6u buf=0x%08x delivered=%-6u "
             "buffered_after=%-6u thread=%d ra=0x%08x",
             cd_req_kind_name(r.kind), r.vclk, r.lbn, r.n, r.buf, r.delivered, r.buffered_after,
             r.thread, r.ra);
@@ -1095,6 +1321,7 @@ void rt_cdvd_register_services() {
     /* Non-cdvd IOP servers the boot path touches. */
     rt_rpc_register_service(0x80000003, "iopheap", svc_iopheap);
     rt_rpc_register_service(0x80000006, "loadfile", svc_loadfile);
+    rt_rpc_register_service(0x80000001, "fileio", svc_fileio);
 
     /* Remaining cdvdfsv-family servers this library may bind. 0x80000596 is
      * the extra/poweroff server (CD_SERVER_POFF in ps2sdk libcdvd.c); the

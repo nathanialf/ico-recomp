@@ -1,0 +1,191 @@
+/* gs/render/shaders/shadow.comp: the two passes that keep the super-sampled
+ * shadow of local memory and native local memory in step.
+ *
+ * Ours (MIT). One shader with two modes, because both are a few lines over
+ * the same addressing and a second pipeline costs a second SPIR-V blob for
+ * nothing:
+ *
+ *   seed     a page of native local memory is broadcast into every sample
+ *            plane of the shadow. Run for the pages a batch is about to draw
+ *            into that have no valid shadow yet, so the samples a primitive
+ *            does not cover hold what the hardware would have held there.
+ *   resolve  the sample planes of a rectangle of pixels are collapsed back
+ *            into native local memory. Run after every batch, so the native
+ *            copy is always what a transfer, a texture fetch or the CRTC will
+ *            read next.
+ *
+ * The resolve rules, and they are the whole of what render scale changes
+ * about a picture the game reads back:
+ *
+ *   colour   the average of the N samples, rounded to nearest. That is the
+ *            anti-aliased pixel, and it is what a later pass sampling this
+ *            buffer as a texture sees, at native resolution.
+ *   depth    the sample nearest the pixel centre (gs_center_sample), not an
+ *            average: a depth is a position on a plane, and averaging two
+ *            surfaces gives a value neither of them has. The centre sample is
+ *            the one the hardware would have taken.
+ *
+ * FBMSK is applied here as well as per sample, because a mask that protects
+ * part of a channel leaves the protected bits equal in every sample and the
+ * average of the channel would still disturb them.
+ *
+ * gs_shadow.h holds the CPU half: which pages have a valid shadow, when one is
+ * dropped, and what the whole thing costs.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define GS_PRIM_GLSL
+#include "gs_prim.h"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* rhi.h's fixed binding layout. The slots this pass uses:
+ *
+ *   0  GS local memory, read by a seed and written by a resolve
+ *   1  the page list a seed walks, one page index per workgroup
+ *   5  the super-sampled shadow, one GS_VRAM_WORDS plane per sample
+ */
+layout(set = 0, binding = 1, std430) buffer GsBuffer {
+    uint data[];
+} g_buf[16];
+
+#define VRAM   0
+#define PAGES  1
+#define SHADOW 5
+
+layout(push_constant) uniform Push {
+    uint mode;              /* 0 seed, 1 resolve */
+    uint samples;
+    uint frame_base_block;
+    uint frame_bw;
+    uint frame_psm;
+    uint frame_mask;        /* FBMSK: set bits are not written */
+    uint z_base_block;
+    uint z_psm;
+    uint z_write;
+    uint x0, y0, x1, y1;    /* the pixel rectangle a resolve covers, inclusive */
+} pc;
+
+#define GSR_SHADOW_SEED    0u
+#define GSR_SHADOW_RESOLVE 1u
+
+/* One page is 8192 bytes, which is 2048 words whatever the pixel format. */
+#define GSR_PAGE_WORDS 2048u
+
+uint plane_word(uint word, uint s) {
+    return (word & (GS_VRAM_WORDS - 1u)) + s * GS_VRAM_WORDS;
+}
+
+/* Two atomics with a mask no other thread shares, the same rule and the same
+ * reason as the fine pass's store_masked. Two pixels of a 16-bit format share
+ * a word and are resolved by two different threads. */
+void native_store_masked(uint word, uint value, uint mask) {
+    if (mask == 0u) return;
+    uint i = word & (GS_VRAM_WORDS - 1u);
+    if (mask == 0xFFFFFFFFu) {
+        g_buf[VRAM].data[i] = value;
+        return;
+    }
+    atomicAnd(g_buf[VRAM].data[i], ~mask);
+    atomicOr(g_buf[VRAM].data[i], value & mask);
+}
+
+uint shadow_frame_pixel(uint addr, uint s) {
+    uint psm = pc.frame_psm;
+    if (psm == GS_PSMCT16 || psm == GS_PSMCT16S) {
+        uint w = g_buf[SHADOW].data[plane_word(addr >> 1, s)];
+        uint hw = ((addr & 1u) != 0u) ? (w >> 16) : (w & 0xFFFFu);
+        return gs_expand16(hw);
+    }
+    return g_buf[SHADOW].data[plane_word(addr, s)];
+}
+
+uint shadow_z_pixel(uint addr, uint s) {
+    uint psm = pc.z_psm;
+    if (psm == GS_PSMZ16 || psm == GS_PSMZ16S) {
+        uint w = g_buf[SHADOW].data[plane_word(addr >> 1, s)];
+        return ((addr & 1u) != 0u) ? (w >> 16) : (w & 0xFFFFu);
+    }
+    uint w = g_buf[SHADOW].data[plane_word(addr, s)];
+    return (psm == GS_PSMZ24) ? (w & 0x00FFFFFFu) : w;
+}
+
+/* The 16-bit FBMSK mapping, the same one the fine pass uses and the same
+ * inference: the bits the 5-5-5-1 fields occupy in the expanded pixel. */
+uint frame_write_mask16() {
+    uint m = ((pc.frame_mask >> 3) & 0x1Fu)
+           | (((pc.frame_mask >> 11) & 0x1Fu) << 5)
+           | (((pc.frame_mask >> 19) & 0x1Fu) << 10)
+           | (((pc.frame_mask >> 31) & 1u) << 15);
+    return (~m) & 0xFFFFu;
+}
+
+void native_frame_store(uint addr, uint rgba) {
+    uint psm = pc.frame_psm;
+    if (psm == GS_PSMCT16 || psm == GS_PSMCT16S) {
+        uint shift = (addr & 1u) * 16u;
+        native_store_masked(addr >> 1, gs_pack16(rgba) << shift,
+                            frame_write_mask16() << shift);
+        return;
+    }
+    uint mask = (psm == GS_PSMCT24) ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    native_store_masked(addr, rgba, mask & ~pc.frame_mask);
+}
+
+void native_z_store(uint addr, uint z) {
+    uint psm = pc.z_psm;
+    if (psm == GS_PSMZ16 || psm == GS_PSMZ16S) {
+        uint shift = (addr & 1u) * 16u;
+        native_store_masked(addr >> 1, (z & 0xFFFFu) << shift, 0xFFFFu << shift);
+        return;
+    }
+    uint mask = (psm == GS_PSMZ24) ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    native_store_masked(addr, z & mask, mask);
+}
+
+void seed() {
+    uint page = g_buf[PAGES].data[gl_WorkGroupID.x];
+    uint base = (page & 511u) * GSR_PAGE_WORDS;
+    for (uint w = gl_LocalInvocationIndex; w < GSR_PAGE_WORDS; w += 64u) {
+        uint v = g_buf[VRAM].data[base + w];
+        for (uint s = 0u; s < pc.samples; ++s) {
+            g_buf[SHADOW].data[plane_word(base + w, s)] = v;
+        }
+    }
+}
+
+void resolve() {
+    /* 64 threads as an 8 by 8 block of pixels. */
+    uint px = pc.x0 + gl_WorkGroupID.x * 8u + (gl_LocalInvocationIndex & 7u);
+    uint py = pc.y0 + gl_WorkGroupID.y * 8u + (gl_LocalInvocationIndex >> 3);
+    if (px > pc.x1 || py > pc.y1) return;
+
+    uint faddr = gs_pixel_addr(pc.frame_psm, pc.frame_base_block, pc.frame_bw, px, py);
+    uint acc0 = 0u, acc1 = 0u, acc2 = 0u, acc3 = 0u;
+    for (uint s = 0u; s < pc.samples; ++s) {
+        uint c = shadow_frame_pixel(faddr, s);
+        acc0 += c & 0xFFu;
+        acc1 += (c >> 8) & 0xFFu;
+        acc2 += (c >> 16) & 0xFFu;
+        acc3 += (c >> 24) & 0xFFu;
+    }
+    /* Round to nearest, the same choice every other rounding in this
+     * renderer makes. `half` is a reserved word in GLSL, hence the name. */
+    uint bias = pc.samples >> 1;
+    uint rgba = ((acc0 + bias) / pc.samples)
+              | (((acc1 + bias) / pc.samples) << 8)
+              | (((acc2 + bias) / pc.samples) << 16)
+              | (((acc3 + bias) / pc.samples) << 24);
+    native_frame_store(faddr, rgba);
+
+    if (pc.z_write != 0u) {
+        uint zaddr = gs_pixel_addr(pc.z_psm, pc.z_base_block, pc.frame_bw, px, py);
+        native_z_store(zaddr, shadow_z_pixel(zaddr, gs_center_sample(pc.samples)));
+    }
+}
+
+void main() {
+    if (pc.mode == GSR_SHADOW_SEED) seed();
+    else resolve();
+}

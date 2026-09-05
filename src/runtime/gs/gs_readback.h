@@ -1,6 +1,6 @@
-/* gs/gs_readback.h: scanout image -> PPM file, shared by the live backend
- * (gs_parallel.cpp, ICORECOMP_GS_SCREENSHOT) and the headless replay tool
- * (gs_replay_main.cpp).
+/* gs/gs_readback.h: scanout image -> PPM file, shared by the live backend's
+ * ICORECOMP_GS_SCREENSHOT path (gs_parallel_scanout.cpp) and the headless
+ * replay entry point (gs_parallel_abi.cpp).
  *
  * Only compiled into targets that link libicorecomp-parallel-gs.so. The
  * image must already be in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL (both
@@ -22,23 +22,37 @@
 #include "device.hpp"
 #include "image.hpp"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 /* Returns true on success. Expects an R8G8B8A8_UNORM 2D image in
  * current_layout (a barrier to TRANSFER_SRC is inserted when needed; the
- * image is left in TRANSFER_SRC_OPTIMAL). */
+ * image is left in TRANSFER_SRC_OPTIMAL).
+ *
+ * `why` receives the reason on a false return, so the caller's log line can
+ * say which of the seven ways this can fail happened rather than "failed".
+ * Every write is checked and a partial file is removed: this is the
+ * regression baseline for rendering parity, so a truncated PPM that reported
+ * success would be compared against as if it were a picture. */
 inline bool rt_gs_write_scanout_ppm(Vulkan::Device& device, Vulkan::Image& image, const char* path,
-                                    VkImageLayout current_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+                                    VkImageLayout current_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    std::string* why = nullptr) {
+    auto fail = [why](std::string reason) {
+        if (why) *why = std::move(reason);
+        return false;
+    };
     const uint32_t w = image.get_width();
     const uint32_t h = image.get_height();
-    if (!w || !h) return false;
+    if (!w || !h) return fail("the scanout image is empty");
 
     Vulkan::BufferCreateInfo bi = {};
     bi.domain = Vulkan::BufferDomain::CachedHost;
     bi.size = VkDeviceSize(w) * h * 4;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Vulkan::BufferHandle buf = device.create_buffer(bi, nullptr);
-    if (!buf) return false;
+    if (!buf) return fail("the readback staging buffer could not be created");
 
     auto cmd = device.request_command_buffer();
     if (current_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
@@ -56,19 +70,34 @@ inline bool rt_gs_write_scanout_ppm(Vulkan::Device& device, Vulkan::Image& image
 
     const uint8_t* px = static_cast<const uint8_t*>(
         device.map_host_buffer(*buf, Vulkan::MEMORY_ACCESS_READ_BIT));
-    if (!px) return false;
+    if (!px) return fail("the readback staging buffer would not map");
 
+    errno = 0;
     FILE* f = std::fopen(path, "wb");
     if (!f) {
+        const int e = errno;
         device.unmap_host_buffer(*buf, Vulkan::MEMORY_ACCESS_READ_BIT);
-        return false;
+        return fail(std::string("the file could not be opened for writing: ")
+                    + std::strerror(e));
     }
-    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-    for (uint32_t i = 0; i < w * h; ++i) {
-        std::fwrite(px + i * 4, 1, 3, f); /* drop alpha */
+    bool ok = std::fprintf(f, "P6\n%u %u\n255\n", w, h) > 0;
+    for (uint32_t i = 0; ok && i < w * h; ++i) {
+        ok = std::fwrite(px + i * 4, 1, 3, f) == 3; /* drop alpha */
     }
-    std::fclose(f);
+    const int write_errno = ok ? 0 : errno;
+    /* fclose flushes, so a full disk can fail here and nowhere else. */
+    if (std::fclose(f) != 0 && ok) {
+        ok = false;
+    }
     device.unmap_host_buffer(*buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+    if (!ok) {
+        /* A short PPM is worse than no PPM: the parity comparison would read
+         * it as a picture. */
+        std::remove(path);
+        return fail(std::string("the pixels could not be written and the partial file was "
+                                "removed: ")
+                    + std::strerror(write_errno ? write_errno : ENOSPC));
+    }
     return true;
 }
 

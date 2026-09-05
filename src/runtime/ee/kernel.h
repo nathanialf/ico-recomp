@@ -40,21 +40,11 @@ bool rt_trace(); /* ICORECOMP_TRACE=1: full-volume logging */
 
 /* ---- virtual clock (sched.cpp) ------------------------------------------ */
 
-/* Unit: EE bus cycles (BUSCLK = 147.456 MHz; the CPU core runs at 2x). */
-constexpr uint64_t RT_BUSCLK_HZ = 147456000ull;
-/* NTSC field rate 59.94 Hz: 147456000 / 59.94 = 2460060 bus cycles/field. */
-constexpr uint64_t RT_CYCLES_PER_FIELD = 2460060ull;
-/* Vertical blank ~22 lines of a 262.5-line field. */
-constexpr uint64_t RT_CYCLES_VBLANK = 206184ull;
-/* One NTSC H-blank in bus cycles. Both the timers' HBLNK prescale and the
- * EE kernel's alarm clock count these. Derived from the field timeline
- * (262.5 lines per field): 2460060 * 2 / 525 = 9371 cycles, so
- * 147456000 / 9371 = 15735.7 Hz against the NTSC line rate of 15734.26 Hz,
- * the difference being the rounding of the field length. Deriving it from
- * the field rather than from 147456000 / 15734.26 = 9372 keeps one clock
- * authority: the alarm clock, the H-blank timers and the vblank timeline
- * all count the same line. */
-constexpr uint64_t RT_CYCLES_PER_HBLANK = RT_CYCLES_PER_FIELD * 2 / 525;
+/* Unit: EE bus cycles (BUSCLK = 147.456 MHz; the CPU core runs at 2x). How
+ * many of them a field, a vblank and an H-blank are is the programmed video
+ * mode's business: ../video_mode.h, which runtime.h includes, holds
+ * rt_cycles_per_field(), rt_cycles_vblank() and rt_cycles_per_hblank(), and
+ * every user here reads the current value rather than a constant. */
 
 uint64_t rt_clock_now();
 /* Advances virtual time; raises due timeline events (vblank INTC bits, timer
@@ -86,7 +76,15 @@ void rt_sched_init();
 R5900Context* rt_sched_current_ctx(); /* may be null (scheduler context) */
 int rt_thread_current_id();
 void rt_sched_maybe_preempt();
+/* Whether the caller is the thread that owns the scheduler's tables (the
+ * one rt_sched_boot was called on). False before boot and on every other
+ * thread. Anything that reads guest thread state from a path a fatal can
+ * reach on the GS worker or a crash handler has to ask this first. */
+bool rt_sched_on_ee_thread();
 void rt_sched_dump_inventory(const char* why);
+/* Per-thread "last syscall", recorded by syscalls.cpp for the inventory.
+ * `name` must have static lifetime (the dispatch table's own string). */
+void rt_sched_note_syscall(int num, const char* name);
 [[noreturn]] void rt_sched_exit_game(int code, const char* why);
 
 /* Thread ops. id 0 = current thread where the kernel accepts that. Return
@@ -209,6 +207,8 @@ int rt_alarm_release(int id);
  * handlers are dispatched from rt_intc_deliver(), not from rt_clock_tick. */
 bool rt_alarms_pending();
 void rt_alarms_dispatch_pending();
+/* The armed/pending alarm table, printed by rt_sched_dump_inventory. */
+void rt_alarms_dump();
 
 /* ---- SIF (../sif/sif.cpp) ----------------------------------------------- */
 
@@ -220,6 +220,16 @@ int rt_sif_dma_stat(uint32_t id);
 bool rt_sif_mmio_read(uint32_t addr, uint32_t* out);
 bool rt_sif_mmio_write(uint32_t addr, uint32_t v);
 void rt_sif_dump_inventory();
+
+/* The virtual IOP has finished the reboot a SIF_CMD_RESET_CMD packet asked
+ * for: sets SIFINIT|CMDINIT|BOOTEND in SMFLAG, which is what the EE's
+ * sceSifSyncIop and sceSifInitCmd spins wait on. Called from the rpc.cpp
+ * delivery timeline, deferred, never inside the SifSetDma that carried the
+ * reset packet: the EE clears SIFINIT and CMDINIT immediately after that
+ * DMA returns (sceSifResetIop, PAL 0x00264838, a function entry in the
+ * retail ELF), so setting them synchronously would just be
+ * undone by the caller. */
+void rt_sif_iop_boot_end();
 
 /* Last-chance hook for rt_call_indirect: the EE sifcmd library's system
  * command handlers are data-referenced sub-entries inside a handwritten

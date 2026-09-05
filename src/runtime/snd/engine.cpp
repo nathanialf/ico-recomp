@@ -3,7 +3,7 @@
  * 48 voices (SPU2 hardware count, 2 cores x 24; the EE library's own table
  * has 0x30 entries) rendered at the SPU2 native 48 kHz into stereo float.
  * Per voice: streaming VAG ADPCM decode out of fake SPU RAM (algorithm per
- * the public Sony VAG spec, same as the decomp repo's tools/decode_vag.py),
+ * the public Sony VAG spec),
  * linear-interpolation resampling driven by the SPU2 pitch register unit
  * (0x1000 = one input sample per 48 kHz output tick), SPU2 ADSR envelope
  * from the two ADSR register words, linear left/right volumes, a reverb
@@ -17,13 +17,37 @@
  * synchronous; rt_snd_flush_tick is called from the sndn2 fno 0x64 handler
  * once per vblank field). host/audio.cpp owns the handoff to the audio
  * device thread.
+ *
+ * Host output gains. Three of the settings' volume keys are applied in this
+ * file, at the points below where each category is summed, because this is
+ * the only place in the port that knows which category a sample came from:
+ *
+ *   audio.music_volume    the stream voices, the ones the game opened with
+ *                         SgStAdpcmOpen (cmd 0x3E). MEASURED: which voices
+ *                         those are, from the command stream itself.
+ *   audio.effects_volume  every other voice, the ones keyed on out of SPU
+ *                         RAM.
+ *   audio.movie_volume    the SgStPcm channels (commands 0x46-0x4F), which
+ *                         in this binary are the attract movie's audio and
+ *                         nothing else (sif/SNDN2_NOTES.md).
+ *
+ * A gain multiplies the category's whole contribution, its reverb send
+ * included: the reverb is linear, so scaling the send is exactly scaling
+ * that category's share of the wet output, and a category turned down takes
+ * its tail with it. Nothing the game supplied moves. The voice volumes, the
+ * envelopes, the master volume and the reverb depth are all still the values
+ * the command stream set, and at the default of 100 the multiply is by 1.0f
+ * and the mix is what it always was.
  */
 #include "snd.h"
 
 #include "pcm_stream.h"
 
+#include "../guest/gmem.h"    /* read-only guest RAM, for the zero-level report */
+#include "../guest/ico_syms.h"
 #include "../host/audio.h"
 #include "../host/portable.h"
+#include "../host/settings.h"
 #include "../prof.h"
 #include "../runtime.h"
 #include "../sif/rpc.h" /* rt_iop_ptr: streams decode out of the IOP ring */
@@ -36,7 +60,7 @@
 
 namespace {
 
-/* ---- VAG ADPCM (public Sony spec; cf. decomp tools/decode_vag.py) -------- */
+/* ---- VAG ADPCM (public Sony spec) --------------------------------------- */
 
 constexpr int kF1[5] = { 0, 60, 115, 98, 122 };
 constexpr int kF2[5] = { 0, 0, -52, -55, -60 };
@@ -73,8 +97,13 @@ struct Voice {
     uint16_t adsr1 = 0, adsr2 = 0;
 
     /* volumes: SPU2 VOLL/VOLR-style values from cmd 0x01, 0..0x3FFF linear
-     * (bit 15 = sweep-mode word; approximated, see rt_snd_command). */
+     * (bit 15 = sweep-mode word; approximated, see rt_snd_command).
+     * vol_writes counts the cmd 0x01 records this voice has received, so a
+     * key-on reporting 0/0 can say whether the game sent that level or
+     * never sent one at all. Both start the voice silent and they are
+     * different faults. */
     uint16_t voll = 0, volr = 0;
+    uint64_t vol_writes = 0;
     bool rev_on = false;       /* effect-send enable, cmd 0x0C mask */
 
     /* cmd 0x04 note parameters; pitch above is derived from these. */
@@ -111,18 +140,24 @@ uint16_t g_rev_depth_r[2] = { 0, 0 };
 uint32_t g_rev_type = 0;
 
 uint64_t g_keyons = 0;
+/* Counters for the two key-on warns below. Each condition gets its own, so
+ * that neither is folded on a count it has nothing to do with: the first
+ * few occurrences are printed as they happen and the rest by powers of
+ * two. */
+uint64_t g_keyon_no_bank = 0;
+uint64_t g_keyon_zero_vol = 0;
 uint64_t g_frames_rendered = 0;
 uint32_t g_frame_frac = 0; /* fractional frames-per-field accumulator, 16.16 */
 
 bool g_selftest_done = false;
-bool g_unity_vol = false;  /* ICORECOMP_SND_UNITY_VOL: pipeline debug aid */
 
 /* ---- SgStPcm streams (commands 0x46-0x4F) --------------------------------
  *
  * A separate namespace from the 48 SPU2 voices above. The command block
- * addresses channels 0..0xF of its own (func_0025E050 and func_0025E238 both
- * bound the index with `sltiu $2, $x, 0x10`) and the 0x4A/0x4B/0x4C masks are
- * over those channels, not over SPU2 voices, so mapping them onto g_voices
+ * addresses channels 0..0xF of its own (SgStPcmOpen and SgStPcmIopReadAddr
+ * both bound the index with `sltiu $2, $x, 0x10`) and the 0x4A/0x4B/0x4C
+ * masks are over those channels, not over SPU2 voices, so mapping them onto
+ * g_voices
  * would invent a correspondence the game never states and would collide with
  * the ADPCM ambience on voices 0 and 1. Ring geometry lives in
  * pcm_stream.h; this file owns decode, volume and mixing.
@@ -136,7 +171,7 @@ RtPcmChannel g_pcm[RT_PCM_CHANNELS];
  *
  * The reasoning, so it can be checked rather than trusted: the ADPCM family
  * carries an explicit playback rate (cmd 0x41, capped at 0x2EE00 = 192000 Hz,
- * retail func_0025DE78) because its source material varies. The SgStPcm
+ * SgStAdpcmChannelPitch) because its source material varies. The SgStPcm
  * family has no rate command at all, which only works if the driver plays at
  * one fixed rate, and the only rate that needs no SPU2 pitch programming is
  * the hardware's own 48 kHz. 16 bit is what "PCM" means on this hardware and
@@ -155,17 +190,19 @@ int16_t pcm_sample(const RtPcmChannel& c) {
     return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-/* cmd 0x4A volumes are 0..0x7FFF (func_0025E1E8 rejects anything above), one
+/* cmd 0x4A volumes are 0..0x7FFF (SgStPcmVolume rejects anything above), one
  * bit wider than the 0..0x3FFF the voice commands use.
  *
  * The movie sends 0x3FFF, and that number is a constant in the caller, not a
- * measurement: StageOrientInit is called with `addiu $10, $0, 0x3FFF` in the
- * delay slot (asm/nonmatchings/src/stage_orient/func_0019D678.s, 0019D7F4),
- * which is its seventh argument; it keeps that register in $22 (0019D2A0) and
- * passes it as argument 3 to func_0023D8A8 (0019D398 with `daddu $6, $22, $0`
- * in the delay slot); func_0023D8A8 stores argument 3 at self+0x5C (`daddu
- * $20, $6, $0` at 0023D8CC, `sw $20, 0x5C($16)` at 0023D9BC); func_0023E298
- * loads self+0x5C at 0023E2CC and hands it to func_0025E1E8.
+ * measurement: initAll is called with `addiu $10, $0, 0x3FFF` in the delay
+ * slot (movie_init, PAL 0x001A64C0, at 001A663C), which is its seventh
+ * argument; initAll (PAL
+ * 0x001A60C0; that name is provisional) keeps that register in
+ * $22 (001A60E8) and passes it as argument 3 to audioDecCreate (001A61E0
+ * with `daddu $6, $22, $0` in the delay slot); audioDecCreate stores
+ * argument 3 at self+0x5C (`daddu $20, $6, $0` at 00257574, `sw $20,
+ * 0x5C($16)` at 00257664); audioDecStart loads self+0x5C at 00257F5C and
+ * hands it to SgStPcmVolume.
  *
  * 0x3FFF is unity on the engine's 0x3FFF scale; a larger value is carried
  * through as the gain above unity it denotes rather than clamped. */
@@ -174,10 +211,11 @@ float pcm_gain(uint16_t v) { return (float)v / 16383.0f; }
 /* Per channel play-through tracking.
  *
  * The sound service never sees the EE's write pointer: the movie fills the
- * ring with raw SIF DMA (ito/mpeg/mv_sub.c func_0023DB80), not through this
- * service, and the only number that crosses the boundary the other way is the
- * cursor this side reports. The DMA itself does pass through the runtime,
- * though: every EE to IOP transfer entry reaches sif/rpc.cpp
+ * ring with raw SIF DMA (ito/mpeg/mv_audiodec.c sendToIOP2area), not
+ * through this service, and the only number that crosses the boundary the
+ * other way is the cursor this side reports. The DMA itself does pass
+ * through the runtime, though: every EE to IOP transfer entry reaches
+ * sif/rpc.cpp
  * rt_rpc_on_dma_entry, which calls rt_snd_pcm_note_iop_write below. That is
  * the write-side witness, and it is what makes starvation detectable without
  * guessing from content.
@@ -309,9 +347,10 @@ uint32_t stream_addr(const Voice& v, uint32_t i) {
  * back; see rt_snd_fill_status.
  *
  * The rounding is not a convenience. The retail refill converts the byte
- * delta to sectors by truncation (func_00132DC0: `sra $22, 11`, with the
- * +0x7FF only on the negative branch) while ACTSetEnvAllmighty advances its
- * own PREV by the untruncated delta. Any delta that is not a whole number
+ * delta to sectors by truncation (iosCdvdBackGroundReadIOPm, PAL 0x00134F58,
+ * that name is provisional): `sra $22, 11`, with the
+ * +0x7FF only on the negative branch, while adpcmTickProc advances its own
+ * PREV by the untruncated delta. Any delta that is not a whole number
  * of sectors therefore leaves `delta % 2048` bytes of the ring holding the
  * previous lap's audio, permanently. Reporting a 16-byte-granular decoder
  * position would do exactly that, roughly every 2.3 s. The hardware cursor
@@ -377,7 +416,33 @@ void env_step(Voice& v, int shift, int step_val, bool mode_exp, bool decrease) {
     uint32_t cycles = 1u << (shift > 11 ? shift - 11 : 0);
     int32_t step = step_val << (shift < 11 ? 11 - shift : 0);
     if (mode_exp && !decrease && v.env > 0x6000) cycles *= 4; /* slow attack tail */
-    if (mode_exp && decrease) step = (int32_t)(((int64_t)step * v.env) >> 15);
+    if (mode_exp && decrease) {
+        step = (int32_t)(((int64_t)step * v.env) >> 15);
+        /* The scaled step rounds to 0 once env is small, and the level would
+         * then never reach 0: the library's release-end pass waits for it
+         * to drop below 2. Whether the SPU2 clamps the same way is not
+         * measured here; the runtime's choice is a floor of one so that an
+         * exponential release terminates.
+         *
+         * A substituted value is loud, per CLAUDE.md, so the first time the
+         * floor actually bites says so with the voice, the shift and the
+         * level. One line for the run: this is about whether the case is
+         * reached at all, which is also what says whether the floor is what
+         * makes the looping-SE fix work. The count is in the line the next
+         * time it is printed. */
+        if (step == 0) {
+            static bool floor_reported = false;
+            if (!floor_reported) {
+                floor_reported = true;
+                rt_log_info("snd", "the exponential-decrease floor bit for the first time: voice "
+                    "%d, shift %d, level 0x%04x. The scaled step rounded to zero and the runtime "
+                    "substituted 1 so the release can reach zero; the hardware's own behaviour "
+                    "here is not measured",
+                    (int)(&v - g_voices), shift, (unsigned)v.env);
+            }
+            step = 1;
+        }
+    }
     if (++v.env_div < cycles) return;
     v.env_div = 0;
     v.env += decrease ? -step : step;
@@ -399,7 +464,12 @@ void env_tick(Voice& v) {
         }
         case EnvPhase::Decay: {
             int shift = (v.adsr1 >> 4) & 0x0F;
-            int sustain_level = (((v.adsr1 & 0x0F) + 1) << 11) - 1;
+            /* Sustain level = (n + 1) * 0x800, the documented value (nocash
+             * SPU documentation), with the phase ending at env <= it. This
+             * used to subtract one, which only ever mattered for an
+             * envelope landing exactly on the boundary; the spec's value is
+             * what the hardware compares against. */
+            int sustain_level = ((v.adsr1 & 0x0F) + 1) << 11;
             env_step(v, shift, 8, true, true);
             if (v.env <= sustain_level) { v.phase = EnvPhase::Sustain; v.env_div = 0; }
             return;
@@ -457,9 +527,105 @@ void key_on(Voice& v) {
     v.env_div = 0;
     ++v.keyon_count;
     ++g_keyons;
+    /* At info, folded by powers of two over the run: the state a key-on
+     * starts from, so a run in which the game keyed voices and nothing was
+     * heard can be read from the default log.
+     *
+     * Whether a bank reached the start address is answered by the transfer
+     * history (rt_spu_covered_by), not by the bytes there. Reading 16 bytes
+     * and calling a zero run "no bank uploaded" was wrong on 2026-09-04:
+     * voice 4's start 0x081f70 sat inside bank transfer #12
+     * (0x03ee90..0x08db10) in the very same run. The byte scan is kept as a
+     * separate figure, over the first 256 bytes (16 ADPCM blocks), because
+     * an all-zero run that long inside a covered range is worth seeing; it
+     * is reported as a count, not as a verdict.
+     *
+     * The summary line keeps the global fold. The two warns below do not:
+     * each one reports a condition that has nothing to do with how many
+     * key-ons the run has made, so folding them on g_keyons meant a voice
+     * keyed with no bank, or with zero volume, as key-on #5, #6 or #7 was
+     * never reported at all. Each has its own counter, which is what
+     * report_zero_level already does per voice. */
+    const bool keyon_summary = (g_keyons & (g_keyons - 1)) == 0;
+    {
+        const uint8_t* ram = rt_spu_ram();
+        uint32_t window = 256;
+        if (v.start_addr >= RT_SPU_RAM_SIZE) window = 0;
+        else if (window > RT_SPU_RAM_SIZE - v.start_addr) window = RT_SPU_RAM_SIZE - v.start_addr;
+        uint32_t nonzero = 0;
+        for (uint32_t i = 0; i < window; ++i) nonzero += ram[v.start_addr + i] != 0;
+        uint32_t transfer = rt_spu_covered_by(v.start_addr, 16);
+        char bank[128];
+        if (transfer) {
+            std::snprintf(bank, sizeof(bank), "bank transfer #%u covered it, %u/%u bytes nonzero",
+                transfer, nonzero, window);
+        } else {
+            std::snprintf(bank, sizeof(bank), "NO bank transfer ever covered it, %u/%u bytes nonzero",
+                nonzero, window);
+        }
+        if (keyon_summary) {
+            rt_log_info("snd", "key-on #%" PRIu64 ": voice %d start=0x%06x (%s) pitch=0x%04x vol L/R=0x%04x/0x%04x "
+                "(%" PRIu64 " cmd 0x01 so far) adsr=0x%04x/0x%04x master core0 L/R=0x%04x/0x%04x",
+                g_keyons, (int)(&v - g_voices), v.start_addr, bank,
+                v.pitch, v.voll, v.volr, v.vol_writes, v.adsr1, v.adsr2, g_master_l[0], g_master_r[0]);
+        }
+        if (!transfer) {
+            ++g_keyon_no_bank;
+            if (g_keyon_no_bank <= 4 || (g_keyon_no_bank & (g_keyon_no_bank - 1)) == 0) {
+                rt_log_warn("snd", "WARNING key-on on voice %d starts at SPU 0x%06x, which no cmd 0x20 "
+                    "bank transfer ever wrote. Either the game keyed a voice before its bank arrived, "
+                    "or a transfer was lost on the way in (sif/sndn2.cpp reports an unstaged 0x20 "
+                    "separately). This voice can only play zeros [#%" PRIu64 "]",
+                    (int)(&v - g_voices), v.start_addr, g_keyon_no_bank);
+            }
+        }
+    }
+    /* A key-on whose voice volume is zero is silent whatever the bank holds.
+     * The value is the EE's own: _SgSeqSeVolume (PAL 0x00275250) multiplies
+     * six u16 fields of the slot context, a byte of a seventh and a word
+     * from the caller's own structure, shifts the 64-bit product right by
+     * 46 and halves it, then sends the result as cmd 0x01. The command order
+     * is not in doubt: _SgCalledTickProc (PAL 0x00273300) runs the whole
+     * voice state machine,
+     * including _SgSetRealtimeVolume at 00273650, before it queues the 0x0A
+     * key-on mask at 00273734, and this runtime processes a batch in the
+     * order the ring holds it. So a zero here is a zero the game computed or
+     * a level it never sent, and the runtime must not invent one to replace
+     * it. Counted on its own counter, not on g_keyons: this condition is
+     * the open question about the boot cursor SE, and folding it on the
+     * global key-on count hid every occurrence that did not happen to land
+     * on a power of two. */
+    if (v.voll == 0 && v.volr == 0) {
+        ++g_keyon_zero_vol;
+        if (g_keyon_zero_vol > 4 && (g_keyon_zero_vol & (g_keyon_zero_vol - 1)) != 0) return;
+        rt_log_warn("snd", "WARNING key-on #%" PRIu64 " on voice %d has voice volume 0/0, so it is "
+            "inaudible no matter what the bank holds. cmd 0x01 has been received %" PRIu64 " time(s) "
+            "for this voice: 0 means no level ever arrived, more than 0 means the EE's own product "
+            "(_SgSeqSeVolume, PAL 0x00275250) came out zero. _SgCalledTickProc (PAL 0x00273300) "
+            "queues the whole voice state machine before the 0x0A key-on mask at 00273734 and this "
+            "runtime processes a batch in ring order, so neither case is a command it reordered "
+            "[zero-volume key-on #%" PRIu64 "]",
+            g_keyons, (int)(&v - g_voices), v.vol_writes, g_keyon_zero_vol);
+    }
 }
 
+uint64_t g_keyoffs = 0;
+
 void key_off(Voice& v) {
+    ++g_keyoffs;
+    /* At info, folded by powers of two: the state the release starts from.
+     * A looping effect the game stopped but the player still hears (the
+     * box push and trolley loops, reported 2026-09-05) is either a key-off
+     * that never arrived (no line here) or one whose release does not end
+     * the voice (the line shows the phase, envelope and release rate). */
+    if ((g_keyoffs & (g_keyoffs - 1)) == 0) {
+        static const char* const kPhase[] = {"off", "attack", "decay", "sustain", "release"};
+        rt_log_info("snd", "key-off #%" PRIu64 ": voice %d phase %s env=0x%04x adsr2=0x%04x "
+            "(release rate %u, %s) vol L/R=0x%04x/0x%04x stream=%d",
+            g_keyoffs, (int)(&v - g_voices), kPhase[(int)v.phase], (unsigned)v.env, v.adsr2,
+            (unsigned)(v.adsr2 & 0x1F), (v.adsr2 & 0x20) ? "exponential" : "linear",
+            v.voll, v.volr, (int)v.is_stream);
+    }
     if (v.phase != EnvPhase::Off) {
         v.phase = EnvPhase::Release;
         v.env_div = 0;
@@ -471,7 +637,7 @@ void key_off(Voice& v) {
 /* ICORECOMP_SND_SELFTEST=prefix: at the first key-on, dump the voice's raw
  * VAG bytes (up to the end flag, capped) to <prefix>.vag and our decode of
  * the same bytes to <prefix>.s16 (mono s16le), for external comparison with
- * the decomp repo's tools/decode_vag.py (see snd/tests/vag_compare.py).
+ * an independent reference decoder (see snd/tests/vag_compare.py).
  * Output files are ROM-derived: keep them out of the repo (untracked paths
  * only; check_no_rom is the gate). */
 void selftest_dump(const Voice& v) {
@@ -513,13 +679,16 @@ void selftest_dump(const Voice& v) {
         }
         std::fclose(f);
     }
-    rt_log("snd", "selftest: dumped %u VAG bytes at SPU 0x%06x -> %s.{vag,s16}",
+    rt_log_info("snd", "selftest: dumped %u VAG bytes at SPU 0x%06x -> %s.{vag,s16}",
         len, v.start_addr, prefix);
 }
 
 /* ---- rendering ------------------------------------------------------------ */
 
-float mix_voice(Voice& v, float* out_l, float* out_r, float* out_rev) {
+/* `gain` is the host-side category gain for this voice (see the file
+ * header): audio.music_volume for a stream voice, audio.effects_volume for
+ * every other one. */
+float mix_voice(Voice& v, float gain, float* out_l, float* out_r, float* out_rev) {
     float e;
     if (v.is_stream) {
         if (!v.st_playing) return 0.0f;
@@ -545,18 +714,23 @@ float mix_voice(Voice& v, float* out_l, float* out_r, float* out_rev) {
     float s = ((float)v.s_prev + ((float)v.s_cur - (float)v.s_prev) * t) / 32768.0f;
 
     float sample = s * e;
-    float vl = g_unity_vol ? 0.5f : (float)v.voll / 16383.0f;
-    float vr = g_unity_vol ? 0.5f : (float)v.volr / 16383.0f;
-    *out_l += sample * vl;
-    *out_r += sample * vr;
-    if (v.rev_on) *out_rev += sample * (vl + vr) * 0.5f;
+    float vl = (float)v.voll / 16383.0f;
+    float vr = (float)v.volr / 16383.0f;
+    /* The host gain goes on before the dry mix and the send alike, so it
+     * scales this voice's whole contribution and not just its dry half. The
+     * returned sample is the engine's own, without it: it is the voice's
+     * decoded audio, which is what the callers of this function mean. */
+    const float hs = sample * gain;
+    *out_l += hs * vl;
+    *out_r += hs * vr;
+    if (v.rev_on) *out_rev += hs * (vl + vr) * 0.5f;
     return sample;
 }
 
 /* One output frame of every playing SgStPcm channel. No envelope and no
  * reverb send: the command block has neither, so the driver plays the ring
  * flat through the channel volumes and the core master volume. */
-void mix_pcm(float* out_l, float* out_r) {
+void mix_pcm(float gain, float* out_l, float* out_r) {
     for (int i = 0; i < RT_PCM_CHANNELS; ++i) {
         RtPcmChannel& c = g_pcm[i];
         if (!c.open || !c.playing || c.chunk == 0) continue;
@@ -592,22 +766,33 @@ void mix_pcm(float* out_l, float* out_r) {
          * check is not aliased by the lap. */
         if (c.lap && c.pos >= c.lap) c.pos -= c.lap;
 
-        *out_l += s * (g_unity_vol ? 0.5f : pcm_gain(c.voll));
-        *out_r += s * (g_unity_vol ? 0.5f : pcm_gain(c.volr));
+        /* audio.movie_volume, host-side, on top of the channel volumes the
+         * game sent with cmd 0x4A. Those words are not touched. */
+        *out_l += s * gain * pcm_gain(c.voll);
+        *out_r += s * gain * pcm_gain(c.volr);
     }
 }
 
 void render(uint32_t frames) {
     /* Render in small stack chunks. */
     float buf[256 * 2];
+    /* The host category gains, read once per chunk. Fresh on every call,
+     * like every other consumer of the settings: a change from the menu is
+     * heard on the next rendered field with no applier in between. */
+    const RtSettings& cfg = rt_settings();
+    const float music_gain = (float)cfg.audio.music_volume / 100.0f;
+    const float effects_gain = (float)cfg.audio.effects_volume / 100.0f;
+    const float movie_gain = (float)cfg.audio.movie_volume / 100.0f;
     while (frames) {
         uint32_t n = frames > 256 ? 256 : frames;
-        float mast_l = g_unity_vol ? 1.0f : (float)g_master_l[0] / 16383.0f;
-        float mast_r = g_unity_vol ? 1.0f : (float)g_master_r[0] / 16383.0f;
+        float mast_l = (float)g_master_l[0] / 16383.0f;
+        float mast_r = (float)g_master_r[0] / 16383.0f;
         for (uint32_t i = 0; i < n; ++i) {
             float l = 0.0f, r = 0.0f, rev = 0.0f;
-            for (auto& v : g_voices) mix_voice(v, &l, &r, &rev);
-            mix_pcm(&l, &r);
+            for (auto& v : g_voices) {
+                mix_voice(v, v.is_stream ? music_gain : effects_gain, &l, &r, &rev);
+            }
+            mix_pcm(movie_gain, &l, &r);
             rt_reverb_run(rev, &l, &r);
             l *= mast_l;
             r *= mast_r;
@@ -649,11 +834,9 @@ void rt_snd_engine_init(uint32_t voice_budget) {
         g_rev_depth_l[c] = g_rev_depth_r[c] = 0;
     }
     g_rev_type = 0;
-    g_unity_vol = std::getenv("ICORECOMP_SND_UNITY_VOL") != nullptr;
     rt_reverb_reset();
     rt_audio_init();
-    rt_log("snd", "engine init: %d voices modeled (EE budget %u)%s", kNumVoices, voice_budget,
-        g_unity_vol ? "; ICORECOMP_SND_UNITY_VOL: game volume commands overridden" : "");
+    rt_log_info("snd", "engine init: %d voices modeled (EE budget %u)", kNumVoices, voice_budget);
 }
 
 void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
@@ -661,10 +844,11 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
      * RING, 0 .. ring - 1, not an IOP address. Reporting an address here is
      * what made the boot ambience play as fragments from all over its file.
      *
-     * Ground truth is ACTSetEnvAllmighty, the read callback AdpcmOpen hands
-     * to iosCdvdChgFileName. Per tick it does:
+     * Ground truth is adpcmTickProc (PAL 0x00143430, sound/adpcm_init), the
+     * per-tick refill adpcmDataSet registers with iosCdvdBackGroundMgrAdd.
+     * Per tick it does:
      *
-     *   CUR      = func_0025DFB0(slot->0x08)      // this word, channel-0 voice
+     *   CUR      = SgStAdpcmIopReadAddr(slot->0x08)  // this word, voice 0
      *   PREV     = slot->0x10                     // 0 at open, kept < slot->0x1C
      *   consumed = CUR >= PREV ? CUR - PREV : slot->0x1C - PREV
      *   if (consumed > 0x1EAAA || CUR < PREV)     // a third of the ring, or wrap
@@ -674,6 +858,44 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
      * slot->0x1C is the ring size (0x5C000), so CUR is compared and
      * subtracted against a ring offset throughout. Feed it an address and
      * every refill asks for `address` bytes and lands back at offset 0. */
+    /* Per-voice envelope level at +0x00 + (voice % 24) * 4 + (voice / 24)
+     * * 0x60, the word the library's release-end pass reads. Measured in
+     * _SgSeqSeRrEnd, PAL 0x002766F0: that address holds the function's
+     * prologue in the retail ELF (27bdff60 ffb10010 ffbe0080 0080882d), and
+     * an earlier note here said 0x00276714, which is 0x24 into the same
+     * function. For each voice it divides by 24, forms exactly that offset
+     * off the
+     * status pointer, loads the word, and when it is below 2 (and the slot is
+     * not in state 3 and its +0x08 is below 2) it memsets the slot free.
+     * _SgCalledTickProc (PAL 0x00273300) calls it before it queues the
+     * tick's key-offs. This
+     * runtime left the words at zero, so every voice read as dead the field
+     * it was keyed on: a stopped loop's slot was wiped before its key-off was
+     * queued and the voice looped on unowned (the box push and trolley
+     * sounds that never stopped, reported 2026-09-05). The IOP driver copies
+     * the SPU2 ENVX here; this reports the engine's envelope, 0 when off.
+     *
+     * A playing SgStAdpcm stream voice reports 0 here, because a stream has
+     * no envelope in this engine (mix_voice holds e = 1.0 and never enters
+     * an envelope phase). What keeps its slot from being freed at ENVX 0 is
+     * the rest of _SgSeqSeRrEnd's test: the free needs the slot's +0x51 to
+     * be other than 3 and its +0x08 to be below 2, which is the SE state a
+     * stream slot is not in. That is INFERRED from the function's own
+     * guards, not from a run in which a stream slot survived a tick, so if
+     * a stream is ever cut short mid-playback this is the first thing to
+     * check. The alternative, reporting 0x7FFF for a playing stream, would
+     * be a value the engine does not have.
+     *
+     * The offset arithmetic below is the library's own form. For 48 voices
+     * and a 24-word core stride it comes to plain i * 4; the two coincide,
+     * so there is no gap in the block to hunt for. */
+    for (int i = 0; i < kNumVoices; ++i) {
+        const Voice& v = g_voices[i];
+        const uint32_t off = (uint32_t)(i % 24) * 4 + (uint32_t)(i / 24) * 0x60;
+        if (off + 4 > recv_size) continue;
+        const uint32_t envx = v.phase == EnvPhase::Off ? 0u : (uint32_t)(v.env < 0 ? 0 : v.env);
+        std::memcpy(recv + off, &envx, 4);
+    }
     for (int i = 0; i < kNumVoices; ++i) {
         const Voice& v = g_voices[i];
         if (!v.is_stream) continue;
@@ -683,11 +905,12 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
         std::memcpy(recv + off, &cur, 4);
     }
 
-    /* SgStPcm channel cursors at +0x180 + channel * 4. Retail func_0025E238
-     * (asm/matchings/src/cod/vendor_25E1E8/func_0025E238.s) reads exactly
-     * that word through the same uncached status pointer func_0025DFB0 uses,
-     * for channels 0..0xF, and ito/mpeg/mv_sub.c func_0023DEB0 turns it into
-     * the movie's refill size. Leaving it at zero, as this runtime did before
+    /* SgStPcm channel cursors at +0x180 + channel * 4. SgStPcmIopReadAddr
+     * (PAL 0x00278828, a function entry in the retail ELF) reads exactly
+     * that word through the same uncached
+     * status pointer SgStAdpcmIopReadAddr uses, for channels 0..0xF, and
+     * audioDecSendToIOP turns it into the movie's
+     * refill size. Leaving it at zero, as this runtime did before
      * the block was modelled, tells the movie the driver has consumed nothing
      * and the whole ring minus one 0x400 block is free, every tick. */
     for (int i = 0; i < RT_PCM_CHANNELS; ++i) {
@@ -698,11 +921,11 @@ void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size) {
         if (!c.consistent) {
             /* rt_pcm_regroup could not place this channel, so there is no
              * cursor to report. A number computed from an undefined slot and
-             * chunk would become a refill size in func_0023DEB0; the word is
-             * left exactly as the guest last saw it instead. */
+             * chunk would become a refill size in audioDecSendToIOP; the
+             * word is left exactly as the guest last saw it instead. */
             if (!g_pcm_cursor_warned[i]) {
                 g_pcm_cursor_warned[i] = true;
-                rt_log("snd", "pcm channel %d: no cursor written at status +0x%03x, the open "
+                rt_log_warn("snd", "pcm channel %d: no cursor written at status +0x%03x, the open "
                               "set is not self consistent so this channel has no derived "
                               "placement (slot 0x%x chunk 0x%x block 0x%x ring 0x%x)",
                     i, off, c.slot, c.chunk, c.block, c.ring);
@@ -729,8 +952,11 @@ bool rt_snd_stream_ring(uint32_t addr, uint32_t* base, uint32_t* ring, uint32_t*
 }
 
 void rt_snd_pcm_note_iop_write(uint32_t iop_addr, uint32_t size) {
-    /* Called for every EE to IOP DMA entry (sif/rpc.cpp). Anything outside the
-     * open SgStPcm ring leaves here on the first compare. */
+    /* Called for every EE to IOP DMA entry (sif/rpc.cpp). Two consumers:
+     * the bank staging witness in spu.cpp, which needs every entry because a
+     * cmd 0x20 can name any IOP address, and the SgStPcm ring stamps below,
+     * which leave on the first compare for anything outside the open ring. */
+    rt_spu_note_iop_write(iop_addr, size);
     if (g_pcm_ring_size == 0 || size == 0) return;
     uint64_t first = iop_addr;
     uint64_t last = (uint64_t)iop_addr + size; /* exclusive */
@@ -747,9 +973,14 @@ void rt_snd_pcm_note_iop_write(uint32_t iop_addr, uint32_t size) {
 
 void rt_snd_flush_tick() {
     RT_PROF_ZONE(RT_PROF_AUDIO);
-    /* One vblank field of audio: 48000 / 59.94 = 800.80 frames. 16.16
-     * fixed-point accumulator carries the fraction. */
-    constexpr uint64_t kStep = ((uint64_t)RT_AUDIO_RATE << 16) * 1001 / 60000; /* 59.94 Hz */
+    /* One vblank field of audio, at the field rate of the video mode the
+     * game programmed: 48000 / 59.94 = 800.80 frames on NTSC and
+     * 48000 / 50 = 960 exactly on PAL. The 16.16 fixed-point accumulator
+     * carries the fraction. The NTSC expression is unchanged, so a US run
+     * mixes exactly the frame counts it always did. */
+    constexpr uint64_t kStepNtsc = ((uint64_t)RT_AUDIO_RATE << 16) * 1001 / 60000; /* 59.94 Hz */
+    constexpr uint64_t kStepPal  = ((uint64_t)RT_AUDIO_RATE << 16) / 50;           /* 50 Hz */
+    const uint64_t kStep = rt_video_mode() == RT_VIDEO_PAL ? kStepPal : kStepNtsc;
     g_frame_frac += (uint32_t)kStep;
     uint32_t frames = g_frame_frac >> 16;
     g_frame_frac &= 0xFFFF;
@@ -777,7 +1008,7 @@ void rt_snd_flush_tick() {
              * ring. Report it with the rate it implies. */
             uint32_t advanced = v.st_pos - g_last_stream_pos[i];
             g_last_stream_pos[i] = v.st_pos;
-            rt_log("snd", "stream voice %d: pitch=0x%04x (%.0f Hz) pos=0x%x "
+            rt_log_info("snd", "stream voice %d: pitch=0x%04x (%.0f Hz) pos=0x%x "
                           "(+%u bytes/s = %.0f Hz effective) cursor=+0x%05x nonzero=%u",
                 i, v.pitch, (double)v.pitch * RT_AUDIO_RATE / 4096.0, v.st_pos,
                 advanced, (double)advanced * 28.0 / 16.0,
@@ -795,7 +1026,7 @@ void rt_snd_flush_tick() {
         g_last_clip = g_clip_frames;
         g_last_frames = g_frames_rendered;
         if (clipped) {
-            rt_log("snd", "mix clipped %" PRIu64 " of %" PRIu64 " frames since the last report",
+            rt_log_info("snd", "mix clipped %" PRIu64 " of %" PRIu64 " frames since the last report",
                 clipped, framed);
         }
 
@@ -822,7 +1053,7 @@ void rt_snd_flush_tick() {
             for (uint32_t b = 0; b < span; ++b) {
                 nonzero += rt_iop_ptr(rt_pcm_addr(c, c.pos + b))[0] != 0;
             }
-            rt_log("snd", "pcm channel %d: consumed %" PRIu64 " bytes over %u fields "
+            rt_log_info("snd", "pcm channel %d: consumed %" PRIu64 " bytes over %u fields "
                           "(%.1f samples per field, 48 kHz is 800.8) pos=0x%x cursor=+0x%05x "
                           "vol=%u/%u peak=%d stale %u of %u blocks entered nonzero=%u/%u",
                 i, advanced, kHealthFields, (double)advanced / 2.0 / (double)kHealthFields,
@@ -835,11 +1066,342 @@ void rt_snd_flush_tick() {
     }
 }
 
+/* ---- why a cmd 0x01 level came out zero ----------------------------------
+ *
+ * cmd 0x01 carries only the product. `_SgSeqSeVolume` (PAL 0x00275250)
+ * builds it from eight terms, and any one of them at zero makes the voice
+ * silent whatever the bank holds, so a zero level on the wire says nothing
+ * about which term failed. The terms are still in EE RAM when the record
+ * arrives: the fno 0x64 handler runs synchronously inside the EE's own
+ * flush call, which `_SgCalledTickProc` (PAL 0x00273300) makes after the
+ * whole tick has run, so what is read here is the tick's end state. Within
+ * one tick the library can send a level twice, once from `_SgSeMain` and
+ * once from `_SgSetRealtimeVolume`, and only the second one is guaranteed
+ * to match this read; a term that is zero in both is zero here either way.
+ * Read only: nothing below writes guest memory.
+ *
+ * Six terms are halfwords of the keyed voice's slot context and one is its
+ * pan halfword, whose two bytes are the left and right factors; the eighth
+ * is one of a pair of words the owning sequence entry holds, again one per
+ * channel. Two of the six were copied at key-on out of the opened bank's SE
+ * table, which is reached vab id -> vab entry -> .hd image -> hd[+0x40].
+ * Those two, and the SE master byte, are the only terms that live in the
+ * .hd rather than in the ELF or in a value the game computed, so the report
+ * gives their .hd file offsets as well as their EE addresses.
+ *
+ * What put those bytes in EE RAM on a PAL boot: `ReadSoundHdFile`
+ * (0x001AB1E8, the "hd" entry of the char-file handler table at 0x0055F9D4)
+ * takes an EE buffer from `iosMallocDebug`, fills it with one
+ * `iosCdvdHandlerRead` of the packed file entry, and hands it to
+ * `soundHDDataSet` (0x00146248). MEASURED: the seven bank bodies land while
+ * the loader streams COMMON.DF, DATA.DF entry 0 (SNDN2_NOTES.md); the .hd
+ * of the same record goes through the same char-file reader, which is why
+ * the container is named here, but only the .bd side of that was timed.
+ * So the .hd sits in a heap allocation, not
+ * at a fixed address, and the way to test a zero byte against the read path
+ * is the file offset this report prints against the DF entry, plus the EE
+ * address against the pack loader's own staging reads in the cdvd log
+ * (buf 0x00319a00 and 0x00321a00 on the PAL boot). The offset says where in
+ * the .hd the byte lives; whether the byte that arrived there is the byte
+ * the disc holds is what those reads settle.
+ *
+ * Two reports per voice for the life of the run: the level is resent every
+ * tick while a voice is on, so an uncapped report would fill the log, and
+ * the first records are the ones that matter. Two rather than one because
+ * `_SgSeMain` and `_SgSetRealtimeVolume` each send a level in the key-on's
+ * own tick and they read the slot at different points in it. */
+#if RT_ICO_SND_FACTORS_KNOWN
+constexpr int kZeroLevelReports = 2;
+int g_zero_level_reported[kNumVoices] = {};
+
+bool guest_u8(uint32_t addr, uint8_t* out) { return rt_gmem::read_bytes(addr, out, 1); }
+bool guest_u16(uint32_t addr, uint16_t* out) { return rt_gmem::read_bytes(addr, out, 2); }
+
+/* The level `SgSetSeVolDirect` put in the sequence entry comes from one slot
+ * of the game's own SE table, so when that level is the zero factor this
+ * follows it back to the three inputs `soundSeVolSet` (PAL 0x001443F0) used.
+ * The slot is the one holding this sequence entry's index at +0x10.
+ *
+ * MEASURED on the PAL boot, 2026-09-05 (dist/logs/handoff-2026-09-04/
+ * native-tracker.log): every bank byte behind voice 4's level was intact
+ * (expression 0x64, channel volume 0x64, tone volume 0x1E, velocity 0x5F,
+ * program volume 0x7F, SE master 0x7F, pan 0x7878) and the caller level was
+ * the only zero, so this is where the remaining question is.
+ *
+ * What can make it zero, read off the game's own code at the addresses
+ * below, in the order this checks them:
+ *   flag +0x04 bit 29    the game's own mute. `_soundSeDefPlay` clears it at
+ *                        0x001453C8 and `soundReqTickProc` (PAL 0x00146778)
+ *                        only sets it for a slot whose +0x08 is neither -1
+ *                        nor -2; the boot cursor SE passes -2, so a set bit
+ *                        here would itself be the surprise.
+ *   +0x12 or +0x14 zero  `sound3DParamSet` writes 0x1000 into both on entry
+ *                        (0x00144C90 / 0x00144C9C) and only zeroes them when
+ *                        the caller supplied a callback that returned 0,
+ *                        which the boot cursor SE does not.
+ *   +0x18 not positive   the volume rate. `soundSeDefPlay` (PAL 0x00146508)
+ *                        passes -1.0f as the rate argument, and
+ *                        `_soundSeDefPlay` treats a negative argument as
+ *                        "use the SE definition's own rate at +0x24"
+ *                        (`c.lt.s` 0x00145364, `bc1f` 0x0014537C, the SE
+ *                        definition load at 0x00145384). The definition for
+ *                        the boot cursor SE holds 1.0f. So a rate of exactly
+ *                        -1.0f here is not a value the game chose: it is the
+ *                        sentinel argument surviving into the field, which
+ *                        means that branch went the wrong way. The report
+ *                        says so rather than leaving it as a number. */
+void report_caller_level_zero(int voice, uint8_t seq_index) {
+    uint32_t found = RT_ICO_SYM_UNKNOWN;
+    uint32_t record = 0, flags = 0;
+    int32_t arg1 = 0;
+    for (uint32_t i = 0; i < RT_ICO_SE_SLOT_COUNT; ++i) {
+        const uint32_t base = RT_ICO_SE_SLOTS + i * RT_ICO_SE_SLOT_STRIDE;
+        uint32_t rec = 0;
+        uint16_t seq = 0;
+        if (!rt_gmem::read_word(base + RT_ICO_SE_SLOT_RECORD, &rec)) return;
+        if (rec == 0) continue;
+        if (!guest_u16(base + RT_ICO_SE_SLOT_SEQ, &seq)) return;
+        if ((int16_t)seq != (int16_t)seq_index) continue;
+        found = base;
+        record = rec;
+        break;
+    }
+    if (found == RT_ICO_SYM_UNKNOWN) {
+        rt_log_warn("snd", "voice %d: no slot of the game's SE table (0x%08x, 0x%x entries of "
+            "0x%x) is in use and holding sequence entry %u, so the level that reached "
+            "SgSetSeVolDirect cannot be traced back to its inputs",
+            voice, RT_ICO_SE_SLOTS, RT_ICO_SE_SLOT_COUNT, RT_ICO_SE_SLOT_STRIDE,
+            (unsigned)seq_index);
+        return;
+    }
+
+    uint16_t level_l = 0, scale_l = 0, scale_r = 0;
+    uint32_t rate_bits = 0, se_def = 0, pos = 0, caller = 0, actuator = 0;
+    float rate = 0.0f;
+    const bool ok =
+        guest_u16(found + RT_ICO_SE_SLOT_LEVEL_L, &level_l) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_FLAGS, &flags) &&
+        rt_gmem::read_i32(found + RT_ICO_SE_SLOT_ARG1, &arg1) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_ACTUATOR, &actuator) &&
+        guest_u16(found + RT_ICO_SE_SLOT_SCALE_L, &scale_l) &&
+        guest_u16(found + RT_ICO_SE_SLOT_SCALE_R, &scale_r) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_RATE, &rate_bits) &&
+        rt_gmem::read_f32(found + RT_ICO_SE_SLOT_RATE, &rate) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_POS, &pos) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_DEF, &se_def) &&
+        rt_gmem::read_word(found + RT_ICO_SE_SLOT_CALLER, &caller);
+    if (!ok) {
+        rt_log_warn("snd", "voice %d: the game's SE slot at 0x%08x is only partly mapped",
+            voice, found);
+        return;
+    }
+
+    /* Which SE this is, and the one global level that can scale it. */
+    uint32_t se_num = RT_ICO_SYM_UNKNOWN;
+    if (se_def >= RT_ICO_SE_DEF_TABLE) {
+        const uint32_t delta = se_def - RT_ICO_SE_DEF_TABLE;
+        if (delta % RT_ICO_SE_DEF_STRIDE == 0) se_num = delta / RT_ICO_SE_DEF_STRIDE;
+    }
+    uint32_t def_rate_bits = 0;
+    float def_rate = 0.0f;
+    const bool def_ok = se_def != 0 &&
+        rt_gmem::read_word(se_def + RT_ICO_SE_DEF_RATE, &def_rate_bits) &&
+        rt_gmem::read_f32(se_def + RT_ICO_SE_DEF_RATE, &def_rate);
+    float global_rate = 0.0f;
+    const bool global_ok = rt_gmem::read_f32(RT_ICO_SE_GLOBAL_RATE, &global_rate);
+    const bool takes_global = (arg1 == -1) && caller != 0;
+
+    const char* why;
+    if (flags & RT_ICO_SE_SLOT_FLAG_MUTE) {
+        why = "the slot's own mute bit (+0x04 bit 29) is set, so soundSeVolSet sent (0, 0) "
+              "without computing anything";
+    } else if (scale_l == 0 || scale_r == 0) {
+        why = "a 3D scale word (+0x12 / +0x14) is zero, which sound3DParamSet only writes "
+              "when the caller's own callback returned 0";
+    } else if (takes_global && global_ok && !(global_rate > 0.0f)) {
+        why = "the slot takes soundSeVolSet's global scale (its +0x08 is -1 and its +0x3C is "
+              "not 0) and that float is not positive. ExecIcoMisc is its only writer and one "
+              "of its stores is a plain zero, so this is the game's own fade and not a fault";
+    } else if (rate_bits == 0xBF800000u) {
+        why = "the volume rate (+0x18) is exactly -1.0f, which is soundSeDefPlay's OWN "
+              "sentinel argument and never a rate the game stores: _soundSeDefPlay should "
+              "have replaced it with the SE definition's +0x24 (c.lt.s 0x00145364, bc1f "
+              "0x0014537C, load 0x00145384). This value means that branch took the wrong "
+              "arm, and the level then clamped from negative to zero at 0x001444A0. That is "
+              "an EE branch fault, not a state the game chose";
+    } else if (!(rate > 0.0f)) {
+        why = "the volume rate (+0x18) is not positive, so the product clamped to zero at "
+              "0x001444A0";
+    } else {
+        why = "every input above is usable, so the zero came from the float multiply or the "
+              "conversion in soundSeVolSet rather than from an input";
+    }
+
+    rt_log_warn("snd", "voice %d: the caller level came from the game's SE slot %u at 0x%08x. "
+        "record(+0x30)=0x%08x flags(+0x04)=0x%08x (mute=%d 3d=%d direct=%d) arg1(+0x08)=%d "
+        "actuator(+0x0C)=0x%08x seq(+0x10)=%u scale(+0x12/+0x14)=0x%04x/0x%04x "
+        "rate(+0x18)=0x%08x (%f) lastlevel(+0x02)=0x%04x pos(+0x34)=0x%08x def(+0x38)=0x%08x "
+        "caller(+0x3C)=0x%08x; SE number %d, its definition's rate %s0x%08x (%f); global "
+        "scale at 0x%08x = %f, applied=%d. WHY ZERO: %s",
+        voice, (unsigned)((found - RT_ICO_SE_SLOTS) / RT_ICO_SE_SLOT_STRIDE), found,
+        record, flags,
+        (flags & RT_ICO_SE_SLOT_FLAG_MUTE) ? 1 : 0,
+        (flags & RT_ICO_SE_SLOT_FLAG_3D) ? 1 : 0,
+        (flags & RT_ICO_SE_SLOT_FLAG_DIRECT) ? 1 : 0,
+        (int)arg1, actuator, (unsigned)seq_index, scale_l, scale_r,
+        rate_bits, (double)rate, level_l, pos, se_def, caller,
+        se_num == RT_ICO_SYM_UNKNOWN ? -1 : (int)se_num,
+        def_ok ? "" : "UNREADABLE ", def_rate_bits, (double)def_rate,
+        RT_ICO_SE_GLOBAL_RATE, global_ok ? (double)global_rate : 0.0,
+        takes_global ? 1 : 0, why);
+}
+
+void report_zero_level(int voice) {
+    if (voice < 0 || voice >= kNumVoices) return;
+    if (g_zero_level_reported[voice] >= kZeroLevelReports) return;
+    ++g_zero_level_reported[voice];
+
+    const uint32_t slot = RT_ICO_SG_SLOT_CTX + (uint32_t)voice * RT_ICO_SG_SLOT_STRIDE;
+    uint16_t expression = 0, chan_vol = 0, tone_vol = 0, velocity = 0, prog_vol = 0;
+    uint16_t se_master = 0, pan = 0;
+    uint8_t state = 0, se_index = 0, seq_index = 0, vab = 0;
+    const bool slot_ok =
+        guest_u16(slot + RT_ICO_SG_SLOT_CHAN_EXPRESSION, &expression) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_CHAN_VOLUME, &chan_vol) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_TONE_VOLUME, &tone_vol) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_VELOCITY, &velocity) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_PROGRAM_VOLUME, &prog_vol) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_SE_MASTER, &se_master) &&
+        guest_u16(slot + RT_ICO_SG_SLOT_PAN, &pan) &&
+        guest_u8(slot + RT_ICO_SG_SLOT_STATE, &state) &&
+        guest_u8(slot + RT_ICO_SG_SLOT_SE_INDEX, &se_index) &&
+        guest_u8(slot + RT_ICO_SG_SLOT_SEQ_INDEX, &seq_index) &&
+        guest_u8(slot + RT_ICO_SG_SLOT_VAB_ID, &vab);
+    if (!slot_ok) {
+        rt_log_warn("snd", "cmd 0x01 gave voice %d a level of zero, and the slot context at "
+            "0x%08x (_SgGetSlotContext, PAL 0x00273228) is not mapped, so which of the eight "
+            "factors was zero cannot be said", voice, slot);
+        return;
+    }
+
+    /* The caller's own level. For an SE the owning sequence entry is the one
+     * whose index the key-on left in slot +0x50. */
+    uint32_t level_l = 0, level_r = 0;
+    bool seq_ok = false;
+    uint32_t seq = 0;
+    if (seq_index < RT_ICO_SG_SEQ_COUNT) {
+        seq = RT_ICO_SG_SEQ_CTX + (uint32_t)seq_index * RT_ICO_SG_SEQ_STRIDE;
+        seq_ok = rt_gmem::read_word(seq + RT_ICO_SG_SEQ_LEVEL_L, &level_l) &&
+                 rt_gmem::read_word(seq + RT_ICO_SG_SEQ_LEVEL_R, &level_r);
+    }
+
+    /* The SE table the two channel terms and the master byte were copied
+     * from, and the .hd file offset of the table inside it. */
+    uint32_t hd = 0, se_table = 0, se_file_off = 0;
+    bool hd_ok = false;
+    if (vab != 0 && vab < RT_ICO_SG_VAB_MAX) {
+        const uint32_t vab_entry = RT_ICO_SG_VAB_CTX + (uint32_t)vab * RT_ICO_SG_VAB_STRIDE;
+        hd_ok = rt_gmem::read_word(vab_entry + RT_ICO_SG_VAB_HD, &hd) && hd != 0 &&
+                rt_gmem::read_word(hd + RT_ICO_SG_HD_SE_TABLE_PTR, &se_table) &&
+                rt_gmem::read_word(hd + RT_ICO_SG_HD_SE_TABLE_OFF, &se_file_off) &&
+                se_table >= hd;
+    }
+
+    /* Which terms are zero. The pan halfword is one term per channel, so it
+     * only zeroes both channels when both of its bytes are zero. */
+    char zeros[256];
+    zeros[0] = '\0';
+    size_t used = 0;
+    auto note_zero = [&](const char* name) {
+        int n = std::snprintf(zeros + used, sizeof(zeros) - used, "%s%s",
+                              used ? ", " : "", name);
+        if (n > 0 && (size_t)n < sizeof(zeros) - used) used += (size_t)n;
+    };
+    if (expression == 0) note_zero("SE-table expression (slot +0x16)");
+    if (chan_vol == 0) note_zero("SE-table channel volume (slot +0x22)");
+    if (tone_vol == 0) note_zero("tone volume (slot +0x1C)");
+    if (velocity == 0) note_zero("note velocity (slot +0x1A)");
+    if (prog_vol == 0) note_zero("program volume (slot +0x18)");
+    if (se_master == 0) note_zero("SE master (slot +0x1E)");
+    if ((pan >> 8) == 0 && (pan & 0xFF) == 0) note_zero("pan, both bytes (slot +0x20)");
+    if (seq_ok && level_l == 0 && level_r == 0) note_zero("caller level (seq +0x44/+0x48)");
+    if (!used) {
+        std::snprintf(zeros, sizeof(zeros),
+            "NONE of them, which would mean the product itself is wrong");
+    }
+
+    rt_log_warn("snd", "cmd 0x01 gave voice %d a level of zero. _SgSeqSeVolume's factors, read "
+        "out of the game's own slot context at 0x%08x: expression(+0x16)=0x%04x "
+        "chanvol(+0x22)=0x%04x tonevol(+0x1C)=0x%04x velocity(+0x1A)=0x%04x "
+        "progvol(+0x18)=0x%04x semaster(+0x1E)=0x%04x pan(+0x20)=0x%04x (L=0x%02x R=0x%02x); "
+        "state(+0x51)=%u (2 = an SE voice) se-index(+0x4F)=%u seq(+0x50)=%u vab(+0x54)=%u; "
+        "caller level %s at 0x%08x L=0x%08x R=0x%08x. ZERO FACTORS: %s",
+        voice, slot, expression, chan_vol, tone_vol, velocity, prog_vol, se_master, pan,
+        (unsigned)(pan >> 8), (unsigned)(pan & 0xFF),
+        (unsigned)state, (unsigned)se_index, (unsigned)seq_index, (unsigned)vab,
+        seq_ok ? "from seq entry" : "UNREADABLE, seq index out of range or unmapped",
+        seq, level_l, level_r, zeros);
+
+    /* The one factor the bank cannot explain: follow it back to the game. */
+    if (seq_ok && level_l == 0 && level_r == 0) {
+        report_caller_level_zero(voice, seq_index);
+    }
+
+    if (state != RT_ICO_SG_SLOT_STATE_SE) {
+        rt_log_warn("snd", "voice %d is not in the SE state (slot +0x51 = %u, not %u), so the "
+            "SE-table terms above were not taken from a bank SE table and the .hd offsets "
+            "below do not apply", voice, (unsigned)state, (unsigned)RT_ICO_SG_SLOT_STATE_SE);
+        return;
+    }
+    if (!hd_ok) {
+        rt_log_warn("snd", "voice %d: the opened bank behind vab id %u could not be followed "
+            "(vab table 0x%08x, hd 0x%08x), so the SE-table bytes cannot be placed in the .hd",
+            voice, (unsigned)vab, RT_ICO_SG_VAB_CTX + (uint32_t)vab * RT_ICO_SG_VAB_STRIDE, hd);
+        return;
+    }
+    if (se_index >= RT_ICO_SG_SEQ_COUNT) {
+        rt_log_warn("snd", "voice %d: SE index %u is outside the 0x%x-entry SE table, so the two "
+            "channel terms were read from outside it", voice, (unsigned)se_index,
+            RT_ICO_SG_SEQ_COUNT);
+        return;
+    }
+
+    const uint32_t entry = (uint32_t)se_index * RT_ICO_SG_SE_ENTRY_STRIDE;
+    const uint32_t expr_ee = se_table + entry + RT_ICO_SG_SE_ENTRY_EXPRESSION;
+    const uint32_t vol_ee = se_table + entry + RT_ICO_SG_SE_ENTRY_VOLUME;
+    /* hd[+0x20] is the table's offset inside the .hd file, so file offset =
+     * that plus the byte's offset inside the table. hd itself is the EE
+     * address ReadSoundHdFile's iosMallocDebug returned. */
+    /* The bytes as they stand in the bank now, beside the copies the key-on
+     * left in the slot. Equal is the expected case; a difference says the
+     * slot copy is stale rather than the bank empty. */
+    uint8_t live_expr = 0, live_vol = 0, live_master = 0;
+    const bool live_ok = guest_u8(expr_ee, &live_expr) && guest_u8(vol_ee, &live_vol) &&
+                         guest_u8(se_table, &live_master);
+    rt_log_warn("snd", "voice %d SE-table bytes: .hd image at EE 0x%08x, SE table at EE 0x%08x "
+        "(file offset 0x%06x, hd[+0x20]); expression byte EE 0x%08x = .hd offset 0x%06x, "
+        "channel volume byte EE 0x%08x = .hd offset 0x%06x, master byte EE 0x%08x = .hd offset "
+        "0x%06x. Values in the bank right now: %s expression=0x%02x volume=0x%02x "
+        "master=0x%02x. ReadSoundHdFile (PAL 0x001AB1E8) iosMallocDebug's that image and fills "
+        "it with one iosCdvdHandlerRead of the packed file entry, so a zero at one of those file "
+        "offsets is either a byte the file carries or a byte this runtime's read path failed to "
+        "deliver; the cdvd log's sceCdRead lines are what separates the two",
+        voice, hd, se_table, se_file_off,
+        expr_ee, se_file_off + entry + RT_ICO_SG_SE_ENTRY_EXPRESSION,
+        vol_ee, se_file_off + entry + RT_ICO_SG_SE_ENTRY_VOLUME,
+        se_table, se_file_off,
+        live_ok ? "" : "(UNREADABLE)",
+        (unsigned)live_expr, (unsigned)live_vol, (unsigned)live_master);
+}
+#else
+void report_zero_level(int) {}
+#endif
+
 /* Converts a cmd 0x01 volume word to a linear 0..0x3FFF level. Plain values
  * are already linear; bit 15 marks the SPU2 sweep-mode encoding
- * ((mode << 8) | (vol >> 7), retail func_0025AC60 tail), which this model
- * flattens to its 7-bit level without the ramp. Negative (phase-invert)
- * values use their magnitude. */
+ * ((mode << 8) | (vol >> 7), the _SgSeqSeVolume tail, PAL 0x00275250),
+ * which this model flattens to its 7-bit level without the ramp. Negative
+ * (phase-invert) values use their magnitude. */
 uint16_t vol_word(uint32_t w) {
     int32_t s = (int16_t)(w & 0xFFFF);
     if (s < 0 && (w & 0x8000)) {
@@ -862,14 +1424,15 @@ void for_mask(uint32_t w2, uint32_t w3, Fn fn) {
 }
 
 /* cmd 0x4A/0x4B/0x4C carry a channel mask in w1, not a channel number:
- * func_0025E118 and func_0025E158 reject an argument with bits 31:24 set and
+ * SgStPcmPlay and SgStPcmStop reject an argument with bits 31:24 set and
  * pass the low 32 bits straight through, and the movie sends 1, 2 and 3 for
- * channel 0, channel 1 and both (ito/mpeg/mv_sub.c func_0023E298). Only 16
- * channels exist, so a bit above 15 is reported rather than acted on. */
+ * channel 0, channel 1 and both (ito/mpeg/mv_audiodec.c audioDecStart).
+ * Only 16 channels exist, so a bit above 15 is reported rather than acted
+ * on. */
 template <typename Fn>
 void for_pcm_mask(uint32_t mask, const char* what, Fn fn) {
     if (mask >> RT_PCM_CHANNELS) {
-        rt_log("snd", "pcm %s: mask 0x%08x names channels above %d, which the driver does "
+        rt_log_warn("snd", "pcm %s: mask 0x%08x names channels above %d, which the driver does "
                       "not have; those bits do nothing here", what, mask, RT_PCM_CHANNELS - 1);
     }
     for (int i = 0; i < RT_PCM_CHANNELS; ++i) {
@@ -879,29 +1442,38 @@ void for_pcm_mask(uint32_t mask, const char* what, Fn fn) {
 
 void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
     RT_PROF_ZONE(RT_PROF_AUDIO);
-    /* Semantics per SNDN2_NOTES.md (EE emitters in the retail vendor
-     * library; aug6 names in parentheses). */
+    /* Semantics per SNDN2_NOTES.md (the EE emitter in the vendor library is
+     * named in parentheses, with its PAL address). */
     uint32_t voice = w1 & 0xFF;
     switch (cmd) {
         /* ---- per-voice (w1 = voice number 0..0x2F) ---- */
-        case 0x01: /* voice volume left/right (func_0025AC60) */
-            if (voice >= kNumVoices) { rt_log("snd", "cmd 0x01 voice %u out of range", voice); return; }
+        case 0x01: /* voice volume left/right (_SgSeqSeVolume) */
+            if (voice >= kNumVoices) { rt_log_warn("snd", "cmd 0x01 voice %u out of range", voice); return; }
             g_voices[voice].voll = vol_word(w2);
             g_voices[voice].volr = vol_word(w3);
+            ++g_voices[voice].vol_writes;
+            /* Both channels zero is a silent voice however good the bank is,
+             * and the record does not say which of the eight factors did it.
+             * Read them out of the game's own tables while the EE is still
+             * inside the flush that produced this record. */
+            if (g_voices[voice].voll == 0 && g_voices[voice].volr == 0) {
+                report_zero_level((int)voice);
+            }
             break;
         case 0x02: /* ADSR1/ADSR2, raw SPU2 register words from the bank */
-            if (voice >= kNumVoices) { rt_log("snd", "cmd 0x02 voice %u out of range", voice); return; }
+            if (voice >= kNumVoices) { rt_log_warn("snd", "cmd 0x02 voice %u out of range", voice); return; }
             g_voices[voice].adsr1 = (uint16_t)(w2 & 0xFFFF);
             g_voices[voice].adsr2 = (uint16_t)(w3 & 0xFFFF);
             break;
         case 0x03: /* VAG start address, SPU RAM byte address */
-            if (voice >= kNumVoices) { rt_log("snd", "cmd 0x03 voice %u out of range", voice); return; }
-            if (w2 >= RT_SPU_RAM_SIZE) { rt_log("snd", "cmd 0x03 addr 0x%08x out of SPU RAM", w2); return; }
+            if (voice >= kNumVoices) { rt_log_warn("snd", "cmd 0x03 voice %u out of range", voice); return; }
+            if (w2 >= RT_SPU_RAM_SIZE) { rt_log_warn("snd", "cmd 0x03 addr 0x%08x out of SPU RAM", w2); return; }
             g_voices[voice].start_addr = w2 & ~15u;
             break;
-        case 0x04: { /* note params (func_0025AC18): w2 = center<<24 | note<<16
-                      * | fine<<8 | bend-center, w3 = moddepth<<24 | scale12.12 */
-            if (voice >= kNumVoices) { rt_log("snd", "cmd 0x04 voice %u out of range", voice); return; }
+        case 0x04: { /* note params (_SgPitchTableVag, PAL 0x00275208):
+                      * w2 = center<<24 | note<<16 | fine<<8 | bend-center,
+                      * w3 = moddepth<<24 | scale12.12 */
+            if (voice >= kNumVoices) { rt_log_warn("snd", "cmd 0x04 voice %u out of range", voice); return; }
             Voice& v = g_voices[voice];
             v.center = (uint8_t)(w2 >> 24);
             v.note = (uint8_t)(w2 >> 16);
@@ -953,7 +1525,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
         case 0x3D: /* SgStAdpcmQuit */
             break;
         /* ---- ADPCM streaming (SgStAdpcm*) ---- */
-        case 0x3E: { /* Open (func_0025DD20): claims a voice for a stream.
+        case 0x3E: { /* Open (SgStAdpcmOpen): claims a voice for a stream.
                       * w1 = vc<<24 | mode | blk[15:8] | spu[23:16],
                       * w2 = spu[15:0]<<16 | ring[23:8],
                       * w3 = ring[7:0]<<24 | iopBuf[23:0].
@@ -975,7 +1547,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
              * would read VAG blocks across the interleave boundary into the
              * next channel's data. Reject rather than guess. */
             if (vc >= kNumVoices || (nch != 1 && nch != 2 && nch != 4)) {
-                rt_log("snd", "stream open rejected: voice=%u nch=%u "
+                rt_log_warn("snd", "stream open rejected: voice=%u nch=%u "
                               "(w1=0x%08x w2=0x%08x w3=0x%08x)", vc, nch, w1, w2, w3);
                 return;
             }
@@ -983,7 +1555,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
              * at the one point they enter, so playback, the health scan and
              * the play-time peek can all index it without re-checking. */
             if ((uint64_t)(iop & ~0x7FFu) + ring > RT_IOP_RAM_SIZE) {
-                rt_log("snd", "stream open rejected: voice=%u ring 0x%06x+0x%x leaves "
+                rt_log_warn("snd", "stream open rejected: voice=%u ring 0x%06x+0x%x leaves "
                               "IOP RAM", vc, iop & ~0x7FFu, ring);
                 return;
             }
@@ -991,7 +1563,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
              * block is a whole number of sectors and tiles the ring exactly.
              * ICO: blk 0x4000, ring 0x5C000 = 23 blocks. */
             if (blk == 0 || blk % 2048 != 0 || ring == 0 || ring % blk != 0) {
-                rt_log("snd", "stream open: voice=%u block 0x%x does not tile ring 0x%x in "
+                rt_log_warn("snd", "stream open: voice=%u block 0x%x does not tile ring 0x%x in "
                               "whole sectors; reporting an unquantized cursor, so refills "
                               "will leave gaps", vc, blk, ring);
                 blk = 0;
@@ -1004,7 +1576,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
             v.st_chunk = 0x800 / nch;
             v.st_stride = 0x800;
             v.st_blk = blk;
-            rt_log("snd", "stream open: voice=%u nch=%u iop=0x%06x ring=0x%x blk=0x%x "
+            rt_log_info("snd", "stream open: voice=%u nch=%u iop=0x%06x ring=0x%x blk=0x%x "
                           "spu=0x%06x", vc, nch, iop, ring, blk, ((w1 & 0xFF) << 16) | (w2 >> 16));
             break;
         }
@@ -1034,43 +1606,44 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                 v.frac = 0;
                 v.s_prev = v.s_cur = 0;
                 const uint8_t* p = rt_iop_ptr(v.st_iop_buf);
-                rt_log("snd", "stream play: iop=0x%06x first bytes %02x %02x %02x %02x %02x %02x %02x %02x",
+                rt_log_info("snd", "stream play: iop=0x%06x first bytes %02x %02x %02x %02x %02x %02x %02x %02x",
                     v.st_iop_buf, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
             });
             break;
         case 0x43: /* Stop(handle) */
             for_mask(w1, w2, [](Voice& v) { v.st_playing = false; });
             break;
-        /* ---- PCM streaming (SgStPcm*, retail func_0025E020 to
-         * func_0025E280). The attract movie is the only user of this block in
-         * this binary; ito/mpeg/mv_sub.c drives it. Per command derivation and
-         * the evidence for each field are in SNDN2_NOTES.md. ---- */
-        case 0x46: /* Init (func_0025E020, no operands) */
-        case 0x47: /* Quit (func_0025E038, no operands) */
+        /* ---- PCM streaming (SgStPcm*, PAL 0x00278610 SgStPcmInit to
+         * 0x00278870 SgStPcmBufMode). The attract movie is the only user of
+         * this block in this binary; ito/mpeg/mv_audiodec.c drives it. The
+         * per command derivation and the evidence for each field are in
+         * SNDN2_NOTES.md. ---- */
+        case 0x46: /* Init (SgStPcmInit, no operands) */
+        case 0x47: /* Quit (SgStPcmQuit, no operands) */
             for (auto& c : g_pcm) c = RtPcmChannel();
             for (auto& t : g_pcm_track) t = PcmTrack();
             for (auto& w : g_pcm_cursor_warned) w = false;
             pcm_refresh_ring();
-            rt_log("snd", "pcm %s (cmd 0x%02x)", cmd == 0x46 ? "init" : "quit", cmd);
+            rt_log_info("snd", "pcm %s (cmd 0x%02x)", cmd == 0x46 ? "init" : "quit", cmd);
             break;
-        case 0x48: { /* Open (func_0025E050): w1 = channel << 24 | flags,
+        case 0x48: { /* Open (SgStPcmOpen): w1 = channel << 24 | flags,
                       * w2 = this channel's first byte in IOP RAM, w3 = the
                       * shared ring size in bytes. */
             uint32_t vc = w1 >> 24;
             uint32_t flags = w1 & 0xFFFFFF;
             uint32_t blk = w1 & 0xFF00;
             if (vc >= (uint32_t)RT_PCM_CHANNELS) {
-                rt_log("snd", "pcm open rejected: channel %u is above the driver's 0x10 "
+                rt_log_warn("snd", "pcm open rejected: channel %u is above the driver's 0x10 "
                               "(w1=0x%08x w2=0x%08x w3=0x%08x)", vc, w1, w2, w3);
                 return;
             }
             if (w3 == 0 || w2 >= RT_IOP_RAM_SIZE) {
-                rt_log("snd", "pcm open rejected: channel %u buffer 0x%06x size 0x%x is not "
+                rt_log_warn("snd", "pcm open rejected: channel %u buffer 0x%06x size 0x%x is not "
                               "inside IOP RAM", vc, w2, w3);
                 return;
             }
             if (blk == 0) {
-                rt_log("snd", "pcm open: channel %u flags 0x%06x carry no interleave block in "
+                rt_log_warn("snd", "pcm open: channel %u flags 0x%06x carry no interleave block in "
                               "bits 15:8. The block is what separates the channels inside the "
                               "shared ring and what the EE quantizes its refills to, so this "
                               "channel cannot be placed; it is left closed", vc, flags);
@@ -1087,7 +1660,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
             g_pcm_cursor_warned[vc] = false;
             bool consistent = rt_pcm_regroup(g_pcm, RT_PCM_CHANNELS);
             if ((uint64_t)c.base + c.ring > RT_IOP_RAM_SIZE) {
-                rt_log("snd", "pcm open rejected: channel %u ring 0x%06x+0x%x leaves IOP RAM",
+                rt_log_warn("snd", "pcm open rejected: channel %u ring 0x%06x+0x%x leaves IOP RAM",
                     vc, c.base, c.ring);
                 c = RtPcmChannel();
                 rt_pcm_regroup(g_pcm, RT_PCM_CHANNELS);
@@ -1095,54 +1668,62 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                 return;
             }
             pcm_refresh_ring();
-            rt_log("snd", "pcm open: channel %u flags=0x%06x iop=0x%06x ring=0x%x block=0x%x "
-                          "-> base=0x%06x slot=0x%x chunk=0x%x%s",
-                vc, flags, c.iop_buf, c.ring, c.block, c.base, c.slot, c.chunk,
-                consistent ? "" : " (INCONSISTENT: the open channels disagree on ring or block "
-                                  "size, or a channel's run is not a whole number of 16 bit "
-                                  "samples; the interleave below is not trustworthy)");
+            /* A successful open is a fact, not a fault: the attract movie
+             * opens two channels every time it plays. info. The
+             * inconsistent case is the fault, and it gets its own warn. */
+            rt_log_info("snd", "pcm open: channel %u flags=0x%06x iop=0x%06x ring=0x%x block=0x%x "
+                          "-> base=0x%06x slot=0x%x chunk=0x%x",
+                vc, flags, c.iop_buf, c.ring, c.block, c.base, c.slot, c.chunk);
+            if (!consistent) {
+                rt_log_warn("snd", "WARNING pcm open: channel %u leaves the open channels "
+                              "INCONSISTENT: they disagree on ring or block size, or a channel's "
+                              "run is not a whole number of 16 bit samples. The interleave this "
+                              "engine reads the ring with is not trustworthy from here", vc);
+            }
             break;
         }
-        case 0x49: /* Close(channel) (func_0025E0C0: w1 = channel, w2 = w3 = 0) */
+        case 0x49: /* Close(channel) (SgStPcmClose: w1 = channel,
+                    * w2 = w3 = 0) */
             if (w1 >= (uint32_t)RT_PCM_CHANNELS) {
-                rt_log("snd", "pcm close: channel %u is above the driver's 0x10", w1);
+                rt_log_warn("snd", "pcm close: channel %u is above the driver's 0x10", w1);
                 return;
             }
             g_pcm[w1] = RtPcmChannel();
             g_pcm_cursor_warned[w1] = false;
             rt_pcm_regroup(g_pcm, RT_PCM_CHANNELS);
             pcm_refresh_ring();
-            rt_log("snd", "pcm close: channel %u", w1);
+            rt_log_info("snd", "pcm close: channel %u", w1);
             break;
-        case 0x4A: /* ChannelVolume(mask, w2, w3) (func_0025E1E8, each operand
-                    * 0..0x7FFF). func_0025E1E8 has four callers in
-                    * ito/mpeg/mv_sub.c. The two play paths, func_0023E298 and
-                    * its near copy func_0023E368 (restart/resume), send
+        case 0x4A: /* ChannelVolume(mask, w2, w3) (SgStPcmVolume, each operand
+                    * 0..0x7FFF). SgStPcmVolume has four callers in
+                    * ito/mpeg/mv_audiodec.c. The two play paths,
+                    * audioDecStart and its near copy audioDecResume
+                    * (restart/resume), send
                     * (1, 0, vol) then (2, vol, 0), one hard pan per channel,
                     * or (3, vol/2, vol/2) when the byte at self+0x58 is set;
                     * vol is the word at self+0x5C. The two teardown paths,
-                    * func_0023E228 (0023E240) and func_0023E330 (0023E348),
+                    * audioDecReset (00257ED0) and audioDecPause (00257FD8),
                     * send (3, 0, 0) as a mute immediately before Stop(3).
                     *
                     * w2 is taken as left and w3 as right, matching cmd 0x01
                     * (w2 = VOLL, w3 = VOLR) and cmd 0x40's (left << 16) | right
                     * in the same command stream. That puts movie channel 0,
                     * the lower address in the ring, on the right. UNRESOLVED:
-                    * nothing in the decomp names the two operands, so the
+                    * nothing names the two operands, so the
                     * stereo image may be mirrored. Both readings give a
                     * correct stereo field; only the side differs, and the fix
                     * is swapping these two lines. */
             for_pcm_mask(w1, "volume", [w2, w3](RtPcmChannel& c, int i) {
                 if (w2 > 0x3FFF || w3 > 0x3FFF) {
-                    rt_log("snd", "pcm volume: channel %d asked for %u/%u, above the 0x3FFF "
+                    rt_log_warn("snd", "pcm volume: channel %d asked for %u/%u, above the 0x3FFF "
                                   "that is unity on this engine's scale; carried through as "
                                   "the gain it denotes", i, w2, w3);
                 }
-                /* func_0025E1E8 rejects anything above 0x7FFF, so this can
+                /* SgStPcmVolume rejects anything above 0x7FFF, so this can
                  * only arrive from a malformed command record. The stored
                  * field is 16 bits: say so rather than truncate quietly. */
                 if (w2 > 0xFFFF || w3 > 0xFFFF) {
-                    rt_log("snd", "pcm volume: channel %d asked for %u/%u, which the retail "
+                    rt_log_warn("snd", "pcm volume: channel %d asked for %u/%u, which the retail "
                                   "emitter could never send and does not fit the 16 bit "
                                   "volume field; TRUNCATED to %u/%u", i, w2, w3,
                         (uint32_t)(uint16_t)w2, (uint32_t)(uint16_t)w3);
@@ -1151,10 +1732,10 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                 c.volr = (uint16_t)w3;
             });
             break;
-        case 0x4B: /* Play(mask) (func_0025E118) */
+        case 0x4B: /* Play(mask) (SgStPcmPlay) */
             for_pcm_mask(w1, "play", [](RtPcmChannel& c, int i) {
                 if (!c.open) {
-                    rt_log("snd", "pcm play: channel %d was never opened", i);
+                    rt_log_warn("snd", "pcm play: channel %d was never opened", i);
                     return;
                 }
                 c.playing = true;
@@ -1171,7 +1752,7 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                     if (v < 0) v = -v;
                     if (v > peak) peak = v;
                 }
-                rt_log("snd", "pcm play: channel %d iop=0x%06x base=0x%06x slot=0x%x "
+                rt_log_info("snd", "pcm play: channel %d iop=0x%06x base=0x%06x slot=0x%x "
                               "chunk=0x%x block=0x%x ring=0x%x vol=%u/%u first bytes "
                               "%02x %02x %02x %02x %02x %02x %02x %02x, peak |s16| over the "
                               "first run = %d",
@@ -1179,15 +1760,15 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                     p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], peak);
             });
             break;
-        case 0x4C: /* Stop(mask) (func_0025E158) */
+        case 0x4C: /* Stop(mask) (SgStPcmStop) */
             for_pcm_mask(w1, "stop", [](RtPcmChannel& c, int) { c.playing = false; });
             break;
-        case 0x4D: { /* (channel, ring offset) (func_0025E198: w1 = channel
-                      * < 0x10, w2 <= 0x1FFFFF, w3 = 0). func_0025E198 has two
-                      * callers, both in ito/mpeg/mv_sub.c and both sending
-                      * (0, 0) then (1, 0) immediately before Play(3):
-                      * func_0023E298 (0023E2AC/0023E2B8) and its near copy
-                      * func_0023E368 (0023E37C/0023E388), the restart/resume
+        case 0x4D: { /* (channel, ring offset) (SgStPcmLseek: w1 = channel
+                      * < 0x10, w2 <= 0x1FFFFF, w3 = 0). SgStPcmLseek has two
+                      * callers, both in ito/mpeg/mv_audiodec.c and both
+                      * sending (0, 0) then (1, 0) just before Play(3):
+                      * audioDecStart (00257F3C/00257F48) and its near copy
+                      * audioDecResume (0025800C/00258018), the restart/resume
                       * path. So the only observed effect is "start this
                       * channel at the bottom of the ring".
                       * INFERRED: that w2 is a ring offset in the same units
@@ -1195,51 +1776,62 @@ void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3) {
                       * never been seen and is reported rather than acted on
                       * silently. */
             if (w1 >= (uint32_t)RT_PCM_CHANNELS) {
-                rt_log("snd", "pcm set position: channel %u is above the driver's 0x10", w1);
+                rt_log_warn("snd", "pcm set position: channel %u is above the driver's 0x10", w1);
                 return;
             }
             RtPcmChannel& c = g_pcm[w1];
             if (!c.open) {
                 /* Nothing to rewind, and writing pos would leave a value in a
                  * channel the next open resets anyway. */
-                rt_log("snd", "pcm set position: channel %u asked for 0x%x but was never "
+                rt_log_warn("snd", "pcm set position: channel %u asked for 0x%x but was never "
                               "opened", w1, w2);
                 return;
             }
             if (w2 == 0) {
-                rt_log("snd", "pcm set position: channel %u to 0, the bottom of the ring "
+                rt_log_info("snd", "pcm set position: channel %u to 0, the bottom of the ring "
                               "(was pos=0x%x)", w1, c.pos);
                 c.pos = 0;
                 break;
             }
-            rt_log("snd", "pcm set position: channel %u asked for 0x%x, and only 0 has ever "
+            rt_log_warn("snd", "pcm set position: channel %u asked for 0x%x, and only 0 has ever "
                           "been observed, so the meaning of a nonzero operand is unverified. "
                           "Reading it as a ring byte offset (block 0x%x, chunk 0x%x)",
                 w1, w2, c.block, c.chunk);
             if (c.block == 0 || c.chunk == 0) return;
             if (w2 % c.block != 0) {
-                rt_log("snd", "pcm set position: 0x%x is not a whole number of 0x%x blocks; "
+                rt_log_warn("snd", "pcm set position: 0x%x is not a whole number of 0x%x blocks; "
                               "the remainder has no defined channel", w2, c.block);
             }
             c.pos = (w2 / c.block) * c.chunk;
             break;
         }
-        case 0x4E: /* (func_0025E100: w1 forwarded with no validation at all).
+        case 0x4E: /* (SgStPcmSetEffect: w1 forwarded with no validation).
                     * The movie sends 8, once, right after opening both
-                    * channels (ito/mpeg/mv_sub.c func_0023D8A8), and nothing
-                    * else in this binary calls it. Not established. */
-            rt_log("snd", "pcm cmd 0x4E(0x%08x) is not modelled: the operand's meaning is not "
-                          "established from the decomp. The movie sends it once with 8 after "
+                    * channels (ito/mpeg/mv_audiodec.c audioDecCreate), and
+                    * nothing else in this binary calls it. Not
+                    * established. */
+            rt_log_warn("snd", "pcm cmd 0x4E(0x%08x) is not modelled: the operand's meaning is not "
+                          "established. The movie sends it once with 8 after "
                           "opening its two channels", w1);
             break;
-        case 0x4F: /* (func_0025E280: w1 = mask, w2 <= 0x1FFFFF, w3 < 2).
+        case 0x4F: /* (SgStPcmBufMode: w1 = mask, w2 <= 0x1FFFFF, w3 < 2).
                     * Never sent by this binary in any observed run. */
-            rt_log("snd", "pcm cmd 0x4F is not modelled: w1=0x%08x w2=0x%08x w3=0x%08x",
+            rt_log_warn("snd", "pcm cmd 0x4F is not modelled: w1=0x%08x w2=0x%08x w3=0x%08x",
                 w1, w2, w3);
             break;
-        default:
-            rt_log("snd", "cmd 0x%02x NOT MODELED: w1=0x%08x w2=0x%08x w3=0x%08x",
-                cmd, w1, w2, w3);
+        default: {
+            /* An unknown command id is a real gap and every distinct one
+             * has to be seen, but a command the game sends every field
+             * would otherwise be the whole log. Counted per id: the first
+             * four of each, then powers of two of that id's own count. */
+            static uint64_t unknown[256] = {0};
+            const uint8_t slot = (uint8_t)cmd;
+            const uint64_t n = ++unknown[slot];
+            if (n <= 4 || (n & (n - 1)) == 0) {
+                rt_log_warn("snd", "cmd 0x%02x NOT MODELED: w1=0x%08x w2=0x%08x w3=0x%08x "
+                    "[occurrence #%" PRIu64 " of this id]", cmd, w1, w2, w3, n);
+            }
             break;
+        }
     }
 }

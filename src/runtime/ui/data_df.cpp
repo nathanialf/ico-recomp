@@ -76,7 +76,7 @@ bool rt_data_df_find(const RtIsoFile& file, const char* name, uint32_t* offset, 
         if (std::strcmp(stored, name) != 0) continue;
         *offset = rd_u32(e + kDataDfOuterNameBytes);
         *size = rd_u32(e + kDataDfOuterNameBytes + 4);
-        rt_log("ui", "DATA.DF: outer table has %u entries; %s at offset %u, %u bytes", count, name,
+        rt_log_info("ui", "DATA.DF: outer table has %u entries; %s at offset %u, %u bytes", count, name,
             *offset, *size);
         return true;
     }

@@ -22,8 +22,9 @@
  *
  * The size is the hardware size. IOP addresses are not opaque tokens to the
  * EE: the game's MPEG helper validates every IOP address it is handed
- * against the retail IOP's 2 MB of RAM (decomp src/cod/vendor_258CC0.c
- * func_0025E050 returns -1 when an address is above 0x1FFFFF), so an
+ * against the retail IOP's 2 MB of RAM (SgStPcmOpen, PAL 0x00278640, a
+ * function entry in the retail ELF; it returns -1 when an address is above
+ * 0x1FFFFF), so an
  * address outside 2 MB fails the attract movie's init. Everything the
  * runtime mints therefore has to fit inside 2 MB alongside the heap.
  *
@@ -79,9 +80,24 @@ void rt_rpc_init();
  * sifcmd packet (INIT_CMD handshake, RPC BIND/CALL/RDATA). */
 void rt_rpc_on_dma_entry(uint32_t src_ee, uint32_t dest_iop, uint32_t size);
 
-/* Deferred-delivery timeline (wired into rt_sif_next_event/rt_sif_run_due). */
+/* Deferred-delivery timeline (wired into rt_sif_next_event/rt_sif_run_due).
+ * Deliveries go out in due order, not in the order they were queued: an
+ * IOP server that is still working on one request does not hold up the
+ * replies of every other server. */
 uint64_t rt_rpc_next_event();
 void rt_rpc_run_due();
+
+/* For a service handler, while it runs inside an RPC CALL: hold that call's
+ * completion (its END packet, or the packet release for rmode=0) back by
+ * this many bus cycles beyond the SIF latency. It models an IOP server that
+ * returns from its handler only when the work is done, so the EE client's
+ * sceSifCheckStatRpc / END callback cannot see the call finished before the
+ * device would have finished it. Only the completion is held; receive data
+ * and out-of-band writes the handler made land immediately, as before. The
+ * hold applies to the current call only and resets after it: two holds
+ * inside one handler add up, and a hold set outside a CALL handler is
+ * refused with a warn rather than carried into the next call. */
+void rt_rpc_hold_completion(uint64_t cycles);
 
 void rt_rpc_dump_inventory();
 
@@ -123,5 +139,15 @@ void rt_pad_run_due();
 /* mc.cpp: the mcserv server (old MCSERV wire protocol), backed by
  * config/local.toml [saves] dir on the host disk. */
 void rt_mc_register_service();
+
+/* The directory the virtual memory card sits in, which is where anything
+ * kept beside the card belongs (guest/achievements.cpp's store). Resolves
+ * and creates the card's backing directory on the first call, exactly as the
+ * first mcserv RPC would, so calling this early only moves that work (and
+ * its fatal, if the directory cannot be created) earlier in the run.
+ * Returns null when the card directory has no parent to name, which no
+ * resolution this runtime performs produces; callers pass that straight to
+ * rt_achievements_init, whose contract accepts null. */
+const char* rt_mc_saves_dir();
 
 #endif /* ICORECOMP_SIF_RPC_H */

@@ -10,6 +10,11 @@
  * context re-created without the descriptor-buffer bit. ICORECOMP_GS_NO_DESCBUF=1
  * forces the bit off on any device.
  *
+ * macOS: MoltenVK does not implement VK_EXT_descriptor_buffer at all, so
+ * the bit is cleared there before the device is ever created rather than
+ * after a device turns out not to support it. The env override still means
+ * what it means on every other platform.
+ *
  * Caller must have run Vulkan::Context::init_loader first.
  */
 #ifndef ICORECOMP_GS_PGS_CONTEXT_H
@@ -17,6 +22,7 @@
 
 #include "context.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 
@@ -33,6 +39,17 @@ inline RtGsContextResult rt_gs_make_pgs_context() {
 
     RtGsContextResult r;
     Vulkan::ContextCreationFlags flags = kFull;
+#ifdef __APPLE__
+    /* Printed rather than logged: this header is included by both the shim
+     * and the replay tool, and neither has a logging handle at this point.
+     * The runtime points fd 2 at icorecomp.log, so the line lands in the
+     * log on a normal run. */
+    flags &= ~Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
+    r.descriptor_buffer_disabled = true;
+    std::fprintf(stderr,
+        "paraLLEl-GS: macOS build, descriptor buffer left off "
+        "(VK_EXT_descriptor_buffer is not a MoltenVK extension)\n");
+#endif
     if (std::getenv("ICORECOMP_GS_NO_DESCBUF")) {
         flags &= ~Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
         r.descriptor_buffer_disabled = true;

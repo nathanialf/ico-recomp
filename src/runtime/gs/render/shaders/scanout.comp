@@ -1,0 +1,425 @@
+/* gs/render/shaders/scanout.comp: the CRTC, as a compute shader.
+ *
+ * Ours (MIT). Reads GS local memory out of a storage buffer and writes one
+ * output frame into a storage image. The addressing comes from gs_swizzle.h,
+ * the same header the C++ side uses, so a swizzle fixed in one place is fixed
+ * in both. The geometry comes from gs_crtc.cpp as push constants; the field
+ * layout here has to stay in step with struct ScanoutPush.
+ *
+ * Compiled ahead of time by tools/gen_gs_shaders.sh into a committed .spv.inc
+ * blob, for the same reason gs/overlay.vert is: this project's standalone
+ * build has no runtime shader compiler.
+ *
+ * Three things decide what an output pixel is:
+ *
+ *   the circuits   DISPLAY1 and DISPLAY2 put one or two windows on the frame
+ *                  and PMODE merges them. That part is the same at every
+ *                  render scale and in every deinterlace mode.
+ *   deinterlace    which buffer line an output row shows, and whether this
+ *                  field writes that row at all. bob, weave and adaptive.
+ *   render scale   at scale 4 and up, on a buffer the game drew into, the
+ *                  output is twice the frame on each axis and every output
+ *                  pixel is one quadrant of a pixel's sub-samples, read out
+ *                  of the super-sampled shadow (gs_shadow.h). That path is
+ *                  not deinterlaced: the buffer holds a whole frame because
+ *                  the game drew one.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define GS_PRIM_GLSL
+#include "gs_prim.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+/* The fixed binding layout of rhi.h. The storage buffer slots used here:
+ *
+ *   0  GS local memory
+ *   1  the super-sampled shadow, one GS_VRAM_WORDS plane per sample. Bound to
+ *      local memory itself and never read unless hires is set.
+ *   2  the previous field, one uint per output pixel, for adaptive.
+ *
+ * Storage image slot 0 is the output frame; the rest of each array is bound
+ * to the device's dummy resources.
+ */
+layout(set = 0, binding = 1, std430) buffer VramBuffer {
+    uint data[];
+} g_vram[16];
+
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D g_images[4];
+
+#define VRAM    0
+#define SHADOW  1
+#define HISTORY 2
+
+layout(push_constant) uniform Push {
+    uint frame_w;
+    uint frame_h;
+    uint field;
+    uint deinterlace;   /* 0 adaptive, 1 bob, 2 weave */
+
+    uint interlaced;
+    uint ffmd;
+    uint bgcolor;       /* 0x00BBGGRR */
+    uint merge;         /* EN1 | EN2<<1 | MMOD<<2 | AMOD<<3 | SLBG<<4 | ALP<<8 */
+
+    uint c1_enable, c1_base_block, c1_fbw, c1_psm;
+    uint c1_dbx, c1_dby, c1_x, c1_y;
+    uint c1_w, c1_h;
+
+    uint c2_enable, c2_base_block, c2_fbw, c2_psm;
+    uint c2_dbx, c2_dby, c2_x, c2_y;
+    uint c2_w, c2_h;
+
+    uint hires;
+    uint samples;
+    uint hist_valid;
+} pc;
+
+#define GSR_DEINTERLACE_ADAPTIVE 0u
+#define GSR_DEINTERLACE_BOB      1u
+#define GSR_DEINTERLACE_WEAVE    2u
+
+/* How different two pixels have to be before the adaptive filter calls it
+ * motion, as the largest difference of any of the three colour channels, on
+ * the 0 to 255 scale. A chosen constant, not a measured one: it is the one
+ * number in this file that decides how much comb a still picture keeps
+ * against how much shimmer a moving one gets. docs/GS_RENDERER.md says so. */
+#define GSR_ADAPTIVE_THRESHOLD 24u
+
+/* One word of local memory, from the native copy or from one sample plane of
+ * the super-sampled shadow. */
+uint vram_word(uint word, int plane) {
+    uint w = word & (GS_VRAM_WORDS - 1u);
+    if (plane < 0) return g_vram[VRAM].data[w];
+    return g_vram[SHADOW].data[w + uint(plane) * GS_VRAM_WORDS];
+}
+
+/* One texel of a display buffer, expanded to 0xAABBGGRR.
+ *
+ * DISPFB PSM is one of the four the CRTC can read. Anything else is caught on
+ * the C++ side and logged there; this reads it as PSMCT32 rather than
+ * inventing a conversion, and the log says so. */
+uint read_circuit(uint psm, uint base_block, uint fbw, uint x, uint y, int plane) {
+    uint addr = gs_pixel_addr(psm, base_block, fbw, x, y);
+    if (psm == GS_PSMCT16 || psm == GS_PSMCT16S) {
+        uint word = vram_word(addr >> 1, plane);
+        uint half_word = (addr & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu);
+        return gs_expand16(half_word);
+    }
+    uint word = vram_word(addr, plane);
+    if (psm == GS_PSMCT24) {
+        /* 24-bit buffers carry no alpha. The CRTC reads them as opaque, and
+         * 0x80 is the GS's own "one" for alpha. */
+        return (word & 0x00FFFFFFu) | 0x80000000u;
+    }
+    return word;
+}
+
+/* Blend one channel with the GS alpha unit, where 0x80 is one.
+ *
+ * The shift is arithmetic and not a divide, which is what raster.comp's pixel
+ * blend does with the same expression: a shift-and-add unit floors a negative
+ * intermediate where a signed divide truncates toward zero, and the two
+ * disagree by one for every negative product that is not a multiple of 128.
+ * There is one alpha unit on the GS, so there is one rounding here.
+ * docs/GS_RENDERER.md lists the merge blend as inferred, and this shared
+ * rounding is part of what that entry covers. */
+uint blend_channel(uint front, uint back, uint alpha) {
+    int f = int(front);
+    int b = int(back);
+    int a = int(alpha);
+    int v = b + (((f - b) * a) >> 7);
+    return uint(clamp(v, 0, 255));
+}
+
+/* The whole merge for one pixel of the frame: which circuits cover it, the
+ * texel each contributes, and PMODE's blend between them. `line` is the
+ * buffer line of the current field, which the deinterlacer picked; `plane` is
+ * -1 for native local memory or a sample index in the shadow. */
+uint merge_at(uint x, uint line, uint fld, int plane) {
+    uint en1  = pc.merge & 1u;
+    uint en2  = (pc.merge >> 1) & 1u;
+    uint mmod = (pc.merge >> 2) & 1u;
+    uint amod = (pc.merge >> 3) & 1u;
+    uint slbg = (pc.merge >> 4) & 1u;
+    uint alp  = (pc.merge >> 8) & 0xFFu;
+
+    /* Each circuit contributes only where its own window covers the pixel. */
+    bool in1 = pc.c1_enable != 0u && en1 != 0u
+            && x >= pc.c1_x && x < pc.c1_x + pc.c1_w
+            && line >= pc.c1_y && line < pc.c1_y + pc.c1_h;
+    bool in2 = pc.c2_enable != 0u && en2 != 0u
+            && x >= pc.c2_x && x < pc.c2_x + pc.c2_w
+            && line >= pc.c2_y && line < pc.c2_y + pc.c2_h;
+
+    uint texel1 = 0u;
+    uint texel2 = 0u;
+    if (in1) {
+        uint sx = pc.c1_dbx + (x - pc.c1_x);
+        uint sy = pc.c1_dby + (line - pc.c1_y);
+        /* FRAME mode (SMODE2 FFMD 1). Contested: see the "FFMD row rule"
+         * entry in gs_crtc.cpp and in docs/GS_RENDERER.md. Two rules are on
+         * the table and this renderer runs the second one:
+         *
+         *   stride 1  buffer row = DBY + (line - c_y), the same read as
+         *             FFMD 0. This is what paraLLEl-GS does: its
+         *             compute_circuit_rect sets phase_stride to 2 only when
+         *             INT && !FFMD (gs/gs_renderer.cpp:4176-4178), so FFMD
+         *             takes stride 1, and sample_circuit.frag:108-109
+         *             computes coord = single_sampled_coord * uvec2(1, stride)
+         *             + uvec2(dbx, dby + phase), which never scales DBY.
+         *             PCSX2 halves the frame rect for FFMD, which is the same
+         *             statement.
+         *   stride 2  buffer row = DBY + (line - c_y) * 2 + field, below.
+         *
+         * The rule is FFMD's alone and does not depend on INT. It used to be
+         * gated on `pc.interlaced != 0u && pc.ffmd != 0u`, and dropping that
+         * gate is what stopped the PAL picture being uniformly black: ICO PAL
+         * programs SMODE2 INT 0 with FFMD 1 and DH+1 256, draws a 512 row
+         * frame, and the gate made this read rows 0..255 of it. That much is
+         * measured (2026-09-04 cross check, which found the display buffer's
+         * coloured words at rows 337 to 339, outside the window this scanout
+         * read). It is a measurement of this renderer's own local memory,
+         * i.e. of its draw path, so it says the window was wrong; it does not
+         * choose between the two rules above.
+         *
+         * DBY is no longer doubled either way. `(DBY + L) * 2` scales a
+         * register the game supplied, and no hardware description or
+         * reference implementation supports it.
+         *
+         * The measurement that settles it: replay one captured gameplay field
+         * through both renderers and compare the top output row against
+         * buffer row 0 and against buffer row 1.
+         *
+         * Also not measured: the absolute sense of the parity when INT is 0.
+         * The reference derives it from the field counter as (field & 1) ^ 1
+         * and then refines it with a display copy snoop this renderer does
+         * not have, so `fld` is used directly here. Getting it the wrong way
+         * round is a one buffer row offset, not a missing picture. */
+        if (pc.ffmd != 0u) sy = pc.c1_dby + (line - pc.c1_y) * 2u + fld;
+        texel1 = read_circuit(pc.c1_psm, pc.c1_base_block, pc.c1_fbw, sx, sy, plane);
+    }
+    if (in2) {
+        uint sx = pc.c2_dbx + (x - pc.c2_x);
+        uint sy = pc.c2_dby + (line - pc.c2_y);
+        /* Same contested rule as circuit 1 above. */
+        if (pc.ffmd != 0u) sy = pc.c2_dby + (line - pc.c2_y) * 2u + fld;
+        texel2 = read_circuit(pc.c2_psm, pc.c2_base_block, pc.c2_fbw, sx, sy, plane);
+    }
+
+    /* The merge. Circuit 1 is the front layer; the background behind it is
+     * either circuit 2 or BGCOLOR, chosen by SLBG. BGCOLOR carries no alpha.
+     *
+     * SLBG says what circuit 1 is blended against, so it is a property of
+     * that blend, and there is no blend when circuit 1 is not being read.
+     * With EN1 0 the display is circuit 2's output where circuit 2's window
+     * covers the pixel and BGCOLOR everywhere else, whatever SLBG says.
+     *
+     * Reading SLBG unconditionally is what made every field of the 2026-09-04
+     * PAL run black. That run is measured: PMODE enabled circuit 2 only, the
+     * circuit's 512x256 window covered the top half of the frame, 92 per cent
+     * of the words of local memory it reads were nonzero, and the scanout
+     * image came out entirely black, which of the arms below only the BGCOLOR
+     * one produces. SLBG 1 with EN1 0 is the shape a display environment set
+     * up in the usual way leaves behind.
+     *
+     * The rule for EN1 0 is inferred, not measured on hardware, and
+     * corroborated two ways: paraLLEl-GS shows this game's picture from the
+     * same register writes on the same run, and a GS that blanked the screen
+     * for EN1 0 with SLBG 1 would blank it for every title that leaves its
+     * display environment at that setting. docs/GS_RENDERER.md carries it
+     * under "Measured versus inferred". */
+    uint back = (in2 && (slbg == 0u || en1 == 0u)) ? texel2
+                                                  : (pc.bgcolor | 0x80000000u);
+    if (in1 && en1 != 0u) {
+        uint alpha = mmod != 0u ? alp : ((texel1 >> 24) & 0xFFu);
+        uint r = blend_channel(texel1 & 0xFFu, back & 0xFFu, alpha);
+        uint g = blend_channel((texel1 >> 8) & 0xFFu, (back >> 8) & 0xFFu, alpha);
+        uint b = blend_channel((texel1 >> 16) & 0xFFu, (back >> 16) & 0xFFu, alpha);
+        /* AMOD picks which circuit's alpha leaves the merge. Nothing in the
+         * presented picture reads it; it is the value EXTBUF would record. */
+        uint a = amod != 0u ? ((texel2 >> 24) & 0xFFu) : ((texel1 >> 24) & 0xFFu);
+        return r | (g << 8) | (b << 16) | (a << 24);
+    }
+    return back;
+}
+
+/* The average of two colours, per channel, rounded to nearest. The vertical
+ * half of the adaptive filter's bob. */
+uint average2(uint a, uint b) {
+    uint out_c = 0u;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint ca = (a >> (i * 8u)) & 0xFFu;
+        uint cb = (b >> (i * 8u)) & 0xFFu;
+        out_c |= ((ca + cb + 1u) >> 1) << (i * 8u);
+    }
+    return out_c;
+}
+
+uint channel_distance(uint a, uint b) {
+    uint worst = 0u;
+    for (uint i = 0u; i < 3u; ++i) {
+        uint ca = (a >> (i * 8u)) & 0xFFu;
+        uint cb = (b >> (i * 8u)) & 0xFFu;
+        uint d = ca > cb ? (ca - cb) : (cb - ca);
+        worst = max(worst, d);
+    }
+    return worst;
+}
+
+/* One output pixel of a high-resolution scanout: the quadrant of a pixel's
+ * sub-samples that this output pixel stands for, averaged. Every allowed
+ * sample count has at least two columns and two rows of samples (gs_prim.h),
+ * so a quadrant is never empty:
+ *
+ *   4 samples    one sample per quadrant
+ *   8 samples    two across, one down
+ *   16 samples   two across, two down
+ */
+uint merge_quadrant(uint x, uint line, uint fld, uint sub_x, uint sub_y) {
+    uint cols = gs_sample_cols(pc.samples);
+    uint rows = gs_sample_rows(pc.samples);
+    uint cw = max(cols >> 1, 1u);
+    uint rh = max(rows >> 1, 1u);
+    uint cx = sub_x * cw;
+    uint ry = sub_y * rh;
+    uint acc0 = 0u, acc1 = 0u, acc2 = 0u, acc3 = 0u;
+    uint n = 0u;
+    for (uint dy = 0u; dy < rh; ++dy) {
+        for (uint dx = 0u; dx < cw; ++dx) {
+            uint c = merge_at(x, line, fld, int((ry + dy) * cols + cx + dx));
+            acc0 += c & 0xFFu;
+            acc1 += (c >> 8) & 0xFFu;
+            acc2 += (c >> 16) & 0xFFu;
+            acc3 += (c >> 24) & 0xFFu;
+            ++n;
+        }
+    }
+    uint bias = n >> 1;
+    return ((acc0 + bias) / n)
+         | (((acc1 + bias) / n) << 8)
+         | (((acc2 + bias) / n) << 16)
+         | (((acc3 + bias) / n) << 24);
+}
+
+/* The output pixel, into the frame image and into the history the next
+ * field's adaptive filter compares against. Both every time, so a mode change
+ * between two fields finds a history that matches what is on screen. */
+void store(uvec2 pix, uint out_w, uint result) {
+    g_vram[HISTORY].data[pix.y * out_w + pix.x] = result;
+    vec4 rgba = vec4(float(result & 0xFFu),
+                     float((result >> 8) & 0xFFu),
+                     float((result >> 16) & 0xFFu),
+                     float((result >> 24) & 0xFFu)) / 255.0;
+    imageStore(g_images[0], ivec2(pix), rgba);
+}
+
+void main() {
+    /* The two diagnostic scanout modes that used to run here, a gradient
+     * over the whole image and local memory read linearly, were removed on
+     * 2026-09-05 with the host-side probe that armed them (gs_native.cpp).
+     * They deliberately destroyed the picture, and nothing could reach them
+     * any more. If the "wrote nothing versus wrote black" question returns,
+     * they come back with the investigation and go with it. */
+
+    uint out_w = pc.hires != 0u ? pc.frame_w * 2u : pc.frame_w;
+    uint out_h = pc.hires != 0u ? pc.frame_h * 2u : pc.frame_h;
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    if (pix.x >= out_w || pix.y >= out_h) return;
+
+    /* High resolution first, because it answers the deinterlace question by
+     * not asking it: the buffer holds a whole frame the game drew, so every
+     * output row is a buffer row and no field is missing.
+     *
+     * The circuit's window is c1_h lines tall, and those lines are field
+     * lines: for an interlaced raster frame_h is twice that, and at hires the
+     * output image is twice frame_h again, so four output rows stand for one
+     * buffer line and pix.y >> 1 is not the line.
+     *
+     * With FFMD 1 the whole frame is the two fields interleaved in the
+     * buffer, so the native row ny selects a field line and a parity and the
+     * two together name the buffer row: that is a weave with no motion test,
+     * and it is not a deinterlace decision because both fields came out of
+     * one rendered frame. That arm covers all four output rows already,
+     * because ny runs over both parities.
+     *
+     * With FFMD 0 each field reads every line of the buffer from the same
+     * origin, so there is no second set of rows: the four output rows of one
+     * buffer line are the doubled field line, and the two sub-sample rows of
+     * that line take the top and bottom halves of the four. Taking the line
+     * from pix.y >> 1 instead ran off the end of the circuit's window and put
+     * BGCOLOR in the bottom half of the picture. */
+    if (pc.hires != 0u) {
+        uint ny = pix.y >> 1;
+        uint line = ny;
+        uint fld = pc.field;
+        uint sub_y = pix.y & 1u;
+        if (pc.interlaced != 0u) {
+            if (pc.ffmd != 0u) {
+                line = ny >> 1;
+                fld = ny & 1u;
+            } else {
+                line = pix.y >> 2;
+                sub_y = (pix.y >> 1) & 1u;
+            }
+        }
+        store(pix, out_w,
+              merge_quadrant(pix.x >> 1, line, fld, pix.x & 1u, sub_y));
+        return;
+    }
+
+    /* Which line of the current field this output row shows.
+     *
+     * weave: this field owns the rows whose parity matches it and leaves the
+     * other set standing from the previous field, so the shader does
+     * not write them.
+     *
+     * bob: the field fills the whole frame on its own, and the half raster
+     * line it sits at becomes a one-row offset at output resolution. That is
+     * as close as a frame-sized image gets to the half-line; a resampling bob
+     * would be a filter choice this milestone has not measured.
+     *
+     * adaptive: this renderer's own motion filter, and the one mode that is
+     * not a rule about the hardware. A row this field owns is its own. A row
+     * it does not own is standing from the previous field, one field time
+     * ago: this field's rows above and below it say what a bob would put
+     * there, and if the standing pixel is within GSR_ADAPTIVE_THRESHOLD of
+     * that, the two fields agree about this pixel and the standing one is
+     * kept, which is a weave and gives back the full vertical detail. Where
+     * they disagree something moved between the two fields and the bobbed
+     * value replaces it. Per pixel, so a still background keeps its detail
+     * while a moving figure does not comb.
+     *
+     * It will not match any other renderer, and it is excluded from the
+     * parity gate for that reason. */
+    uint line;
+    if (pc.interlaced != 0u) {
+        if (pc.deinterlace == GSR_DEINTERLACE_WEAVE) {
+            if ((pix.y & 1u) != pc.field) return;
+            line = pix.y >> 1;
+        } else if (pc.deinterlace == GSR_DEINTERLACE_ADAPTIVE) {
+            if ((pix.y & 1u) == pc.field) {
+                store(pix, out_w, merge_at(pix.x, pix.y >> 1, pc.field, -1));
+                return;
+            }
+            uint above = uint(max(int(pix.y) - 1, 0)) >> 1;
+            uint below = min(pix.y + 1u, out_h - 1u) >> 1;
+            uint bobbed = average2(merge_at(pix.x, above, pc.field, -1),
+                                   merge_at(pix.x, below, pc.field, -1));
+            if (pc.hist_valid != 0u) {
+                uint standing = g_vram[HISTORY].data[pix.y * out_w + pix.x];
+                if (channel_distance(standing, bobbed) <= GSR_ADAPTIVE_THRESHOLD) return;
+            }
+            store(pix, out_w, bobbed);
+            return;
+        } else {
+            uint shifted = pix.y >= pc.field ? (pix.y - pc.field) : 0u;
+            line = shifted >> 1;
+        }
+    } else {
+        line = pix.y;
+    }
+
+    store(pix, out_w, merge_at(pix.x, line, pc.field, -1));
+}

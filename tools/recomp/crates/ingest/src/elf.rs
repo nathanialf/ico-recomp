@@ -11,7 +11,7 @@ use sha1::{Digest, Sha1};
 use crate::model::ElfSection;
 
 /// The parsed boot ELF: section metadata plus a byte accessor. Intentionally
-/// not `Serialize` — this is a runtime helper for callers that need actual
+/// not `Serialize`: this is a runtime helper for callers that need actual
 /// bytes (e.g. the decoder), not something that belongs in `programdb.json`.
 pub struct ElfImage {
     pub entry_vram: u32,
@@ -20,8 +20,10 @@ pub struct ElfImage {
 }
 
 impl ElfImage {
-    /// Read, SHA-1-verify, and parse the boot ELF at `path`.
-    pub fn load(path: &Path, expected_sha1_hex: &str) -> Result<Self> {
+    /// Read, SHA-1-verify, and parse the boot ELF at `path`. `pin_source`
+    /// is the config file the pin came from, so a mismatch names the file
+    /// the reader has to look at rather than always naming the US one.
+    pub fn load(path: &Path, expected_sha1_hex: &str, pin_source: &Path) -> Result<Self> {
         let data =
             std::fs::read(path).with_context(|| format!("reading ELF at {}", path.display()))?;
 
@@ -32,9 +34,10 @@ impl ElfImage {
         if got != want {
             bail!(
                 "SHA-1 mismatch for {}: expected {want}, got {got}. \
-                 Refusing to parse a boot ELF that doesn't match config/recomp.toml's \
-                 [pins].elf_sha1 pin.",
-                path.display()
+                 Refusing to parse a boot ELF that doesn't match {}'s [pins].elf_sha1 \
+                 pin.",
+                path.display(),
+                pin_source.display()
             );
         }
 
@@ -107,6 +110,39 @@ impl ElfImage {
         }
         let start_off = section.file_offset as usize + (vram - section.vram) as usize;
         self.data.get(start_off..start_off + len)
+    }
+
+    /// The bytes of one section, addressed by its own file offset rather
+    /// than by vram.
+    ///
+    /// `read_at` resolves a section by vram, and two sections of this ELF
+    /// share one: `.DVP.ovlytab` and `.DVP.ovlystrtab` both start at
+    /// 0x736198. A vram read of the second therefore lands in the first and
+    /// fails its end test, so the section would be skipped, and a section
+    /// smaller than its overlapping neighbour would be read from the wrong
+    /// file offset entirely. Reading by file offset cannot confuse the two.
+    ///
+    /// `None` for a NOBITS section (nothing on disk) or a truncated file.
+    pub fn section_bytes(&self, section: &ElfSection) -> Option<&[u8]> {
+        if section.nobits {
+            return None;
+        }
+        let start = section.file_offset as usize;
+        let end = start.checked_add(section.size as usize)?;
+        self.data.get(start..end)
+    }
+
+    /// Build an image from parts, without an ELF file on disk. Tests only:
+    /// it is how the ingest's end-to-end test drives `disc::load` over a
+    /// handful of synthetic functions instead of over the retail binary,
+    /// which CI does not have.
+    #[cfg(test)]
+    pub(crate) fn from_parts(entry_vram: u32, sections: Vec<ElfSection>, data: Vec<u8>) -> Self {
+        ElfImage {
+            entry_vram,
+            sections,
+            data,
+        }
     }
 
     /// Read a single little-endian u32 at `vram` (MIPS EE is little-endian).

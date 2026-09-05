@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 #include <SDL3/SDL.h>
 #endif
 
@@ -29,16 +29,16 @@ enum class Provider { None, Script, Sdl };
 Provider g_provider = Provider::None;
 bool g_inited = false;
 
-RtPadState g_state;             /* port 0; port 1 never has a controller */
-uint8_t g_act_small = 0, g_act_big = 0;
-/* rt_input_set_actuators: the first 8 rumble changes are logged by
- * default (enough to see a cue land). That function already logs nothing
- * when the motor state is unchanged, and the game re-sends the same state
- * every field while a rumble is active, but a title that ramps or pulses
- * can still change it every field for seconds, so this caps the default
- * channel too. rt_verbose("input") keeps every change. */
-constexpr uint32_t kRumbleLogCap = 8;
-uint32_t g_rumble_logged = 0;
+/* One virtual pad per port (host/input.h RT_PAD_PORTS). Port 0 is player 1
+ * and is fed by the keyboard, the mouse and the first gamepad; port 1 is
+ * player 2 and is fed by the second gamepad alone, which is the pad the PAL
+ * disc's two-player mode reads for Yorda. Port 1 reports "no controller"
+ * until a second gamepad is actually open (rt_input_get below), so the game
+ * sees an empty port exactly as it would with nothing plugged into it.
+ * The scripted provider drives port 0 only. */
+RtPadState g_state[RT_PAD_PORTS];
+uint8_t g_act_small[RT_PAD_PORTS] = {};
+uint8_t g_act_big[RT_PAD_PORTS] = {};
 
 /* The device the player last used, and the only state behind
  * rt_input_last_device(). It boots as the controller by decision, so a run
@@ -64,7 +64,7 @@ size_t g_script_pos = 0;
 bool parse_script(const char* path) {
     std::FILE* f = std::fopen(path, "r");
     if (!f) {
-        rt_log("input", "ICORECOMP_INPUT_SCRIPT=%s: fopen failed", path);
+        rt_log_warn("input", "ICORECOMP_INPUT_SCRIPT=%s: fopen failed", path);
         return false;
     }
     char line[512];
@@ -121,32 +121,52 @@ bool parse_script(const char* path) {
         g_script.push_back(s);
     }
     std::fclose(f);
-    rt_log("input", "script provider: %zu steps from %s", g_script.size(), path);
+    rt_log_info("input", "script provider: %zu steps from %s", g_script.size(), path);
     return !g_script.empty();
 }
 
 void script_poll(uint64_t field) {
+    /* Port 0 only: the script format has one pad per line and a scripted run
+     * must stay bit-identical to what it was before port 1 existed. Port 1
+     * therefore stays a disconnected port for every scripted run. */
+    RtPadState& st = g_state[0];
     bool changed = false;
     while (g_script_pos < g_script.size() && g_script[g_script_pos].field <= field) {
         const Step& s = g_script[g_script_pos];
-        g_state.buttons = s.buttons;
-        g_state.lx = s.lx; g_state.ly = s.ly; g_state.rx = s.rx; g_state.ry = s.ry;
+        st.buttons = s.buttons;
+        st.lx = s.lx; st.ly = s.ly; st.rx = s.rx; st.ry = s.ry;
         changed = true;
         ++g_script_pos;
     }
     if (changed) {
-        rt_log("input", "script step -> field=%llu buttons=0x%04x sticks=%u,%u,%u,%u",
-            (unsigned long long)field, g_state.buttons,
-            g_state.lx, g_state.ly, g_state.rx, g_state.ry);
+        rt_log_debug("input", "script step -> field=%llu buttons=0x%04x sticks=%u,%u,%u,%u",
+            (unsigned long long)field, st.buttons, st.lx, st.ly, st.rx, st.ry);
     }
 }
 
 /* ---- SDL provider --------------------------------------------------------- */
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 
-SDL_Gamepad* g_gamepad = nullptr;
+/* One open SDL gamepad per pad port. [0] is player 1 and [1] is player 2;
+ * a null is a port with no pad, which rt_input_get reports as "no
+ * controller". The first pad SDL lists takes [0] and stays there: a pad
+ * attached later fills the first free entry, and a pad removed from [0] is
+ * replaced by whatever was in [1] (player 2's pad becomes player 1's rather
+ * than leaving the game with nobody on port 0). */
+SDL_Gamepad* g_gamepad[RT_PAD_PORTS] = {};
 bool g_sdl_probed = false;
+
+/* True while a pad is open on `port`. */
+bool gamepad_open(int port) { return port >= 0 && port < RT_PAD_PORTS && g_gamepad[port]; }
+
+/* The first port with no pad open, or -1 when both are taken. */
+int first_free_pad_port() {
+    for (int i = 0; i < RT_PAD_PORTS; ++i) {
+        if (!g_gamepad[i]) return i;
+    }
+    return -1;
+}
 
 /* SDL video is initialized by the paraLLEl-GS window path on the main
  * thread; everything here runs on the same OS thread (the scheduler and its
@@ -156,12 +176,23 @@ bool sdl_active() {
     return SDL_WasInit(SDL_INIT_VIDEO) != 0;
 }
 
-/* Opens `id`, replacing whatever g_gamepad already holds (the caller has
- * either checked that it is null or is deliberately replacing it). Logs the
- * name, or "(open failed)" the same way the pre-hot-plug probe did. */
-void open_gamepad(SDL_JoystickID id) {
-    g_gamepad = SDL_OpenGamepad(id);
-    rt_log("input", "SDL gamepad: %s", g_gamepad ? SDL_GetGamepadName(g_gamepad) : "(open failed)");
+/* Opens `id` onto `port`, replacing whatever that entry already holds (the
+ * caller has either checked that it is null or is deliberately replacing
+ * it). Logs the name, or "(open failed)" the same way the pre-hot-plug probe
+ * did; the port is named because which player a pad drives is the fact the
+ * player needs from this line. */
+void open_gamepad(int port, SDL_JoystickID id) {
+    g_gamepad[port] = SDL_OpenGamepad(id);
+    /* Two outcomes, two levels: which pad was opened is a device identity
+     * fact, and a pad that would not open is a pad the player will find
+     * dead. Same text either way, so the line reads as it always did. */
+    if (g_gamepad[port]) {
+        rt_log_info("input", "SDL gamepad on pad port %d (player %d): %s",
+            port, port + 1, SDL_GetGamepadName(g_gamepad[port]));
+    } else {
+        rt_log_warn("input", "SDL gamepad on pad port %d (player %d): %s",
+            port, port + 1, "(open failed)");
+    }
 }
 
 /* SDL_INIT_GAMEPAD plus the first-attached open, once. Split out of the old
@@ -173,15 +204,26 @@ void gamepad_subsystem_init() {
     if (g_sdl_probed) return;
     g_sdl_probed = true;
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
-        rt_log("input", "SDL gamepad subsystem init failed: %s (keyboard only)", SDL_GetError());
+        rt_log_warn("input", "SDL gamepad subsystem init failed: %s (keyboard only)", SDL_GetError());
         return;
     }
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     if (ids && count > 0) {
-        open_gamepad(ids[0]);
+        /* Up to one pad per port, in the order SDL lists them: the first is
+         * player 1 and the second is player 2. A third and beyond are named
+         * once and left closed; there are two pad ports and no multitap. */
+        for (int i = 0; i < count; ++i) {
+            const int port = first_free_pad_port();
+            if (port < 0) {
+                rt_log_info("input", "SDL: %d gamepads attached; the %d past the two pad ports"
+                    " are not opened", count, count - RT_PAD_PORTS);
+                break;
+            }
+            open_gamepad(port, ids[i]);
+        }
     } else {
-        rt_log("input", "SDL: no gamepad detected; keyboard map active (see host/input.h)");
+        rt_log_info("input", "SDL: no gamepad detected; keyboard map active (see host/input.h)");
     }
     SDL_free(ids);
 }
@@ -195,9 +237,12 @@ uint8_t axis_to_u8(Sint16 v) {
  *
  * The first sixteen RtKeyBind slots and the first sixteen RtPadBind slots are
  * the same sixteen DS2 buttons in the same order (host/settings.h), so one
- * bit table serves both. The keyboard's eight stick slots and each device's
- * menu slot are handled separately: the menu key is consumed by the UI pump
- * (ui/ui_events.cpp) and is not a pad binding at all.
+ * bit table serves both, and so does the mouse's first sixteen. The
+ * keyboard's eight stick slots and each device's two hotkey slots are handled
+ * separately: the menu key is consumed by the UI pump (ui/ui_events.cpp) and
+ * the screenshot key by host/screenshot.cpp, and neither is a pad binding at
+ * all. Every loop that indexes kSlotBits therefore stops at sixteen; a loop
+ * to a device's slot count would read past the end of it.
  */
 constexpr uint16_t kSlotBits[16] = {
     RT_PAD_UP, RT_PAD_DOWN, RT_PAD_LEFT, RT_PAD_RIGHT,
@@ -223,7 +268,7 @@ struct PadBind {
 
 /* A mouse slot resolves to one RtMouseInput (host/mouse_names.h): a button,
  * which is read as level state, or a wheel direction, which is a pulse. Only
- * bound slots are in the table; an unbound one is simply absent. */
+ * bound slots are in the table; an unbound one is absent. */
 struct MouseBind {
     uint16_t bit;
     RtMouseInput input;
@@ -232,7 +277,11 @@ struct MouseBind {
 std::vector<KeyBind> g_key_buttons;
 /* Indexed by slot - RT_KB_LSTICK_UP; SDL_SCANCODE_UNKNOWN means unbound. */
 SDL_Scancode g_key_stick[8] = {};
-std::vector<PadBind> g_pad_binds;
+/* One resolved bind table per pad port: [0] from input.gamepad, [1] from
+ * input.gamepad2. Both hold at most the sixteen DS2 slots; the two hotkey
+ * slots past them are never pad binds (see kSlotBits above), and player 2's
+ * device has neither. */
+std::vector<PadBind> g_pad_binds[RT_PAD_PORTS];
 std::vector<MouseBind> g_mouse_binds;
 
 /* The virtual stick the mouse drives (host/mouse_look.h): the camera stick's
@@ -284,11 +333,11 @@ SDL_Scancode resolve_scancode(int slot, const std::string& name) {
     if (sc != SDL_SCANCODE_UNKNOWN) return sc;
 
     const char* def = rt_settings_default_binding(RT_BIND_KEYBOARD, slot);
-    rt_log("input", "input.keyboard.%s = \"%s\" is not an SDL scancode name; using the default \"%s\"",
+    rt_log_warn("input", "input.keyboard.%s = \"%s\" is not an SDL scancode name; using the default \"%s\"",
         rt_settings_binding_key(RT_BIND_KEYBOARD, slot), name.c_str(), def);
     sc = SDL_GetScancodeFromName(def);
     if (sc == SDL_SCANCODE_UNKNOWN) {
-        rt_log("input", "input.keyboard.%s: the compiled-in default \"%s\" is not an SDL scancode"
+        rt_log_warn("input", "input.keyboard.%s: the compiled-in default \"%s\" is not an SDL scancode"
             " name either; this build's default table and SDL disagree, so that slot has no key"
             " this run", rt_settings_binding_key(RT_BIND_KEYBOARD, slot), def);
     }
@@ -347,25 +396,34 @@ void rebuild_tables() {
         g_key_stick[i] = resolve_scancode(RT_KB_LSTICK_UP + i, cfg.input.keyboard[RT_KB_LSTICK_UP + i]);
     }
 
-    g_pad_binds.clear();
-    g_pad_binds.reserve(16);
-    for (int slot = 0; slot < 16; ++slot) {
-        PadBind b;
-        b.bit = kSlotBits[slot];
-        if (!resolve_pad_name(cfg.input.gamepad[slot], &b)) {
-            const char* def = rt_settings_default_binding(RT_BIND_GAMEPAD, slot);
-            rt_log("input", "input.gamepad.%s = \"%s\" is not an SDL gamepad button or axis name;"
-                " using the default \"%s\"",
-                rt_settings_binding_key(RT_BIND_GAMEPAD, slot), cfg.input.gamepad[slot].c_str(), def);
-            if (!resolve_pad_name(def, &b)) {
-                rt_log("input", "input.gamepad.%s: the compiled-in default \"%s\" is not an SDL"
-                    " gamepad button or axis name either; this build's default table and SDL"
-                    " disagree, so that slot has no pad input this run",
-                    rt_settings_binding_key(RT_BIND_GAMEPAD, slot), def);
-                continue;
+    /* The two pads resolve the same way from two different sections, so the
+     * loop is one loop over the ports. RT_BIND_GAMEPAD2 shares the first
+     * pad's default table (host/settings.cpp), so a slot that falls back
+     * falls back to the same name on either port. */
+    for (int port = 0; port < RT_PAD_PORTS; ++port) {
+        const RtBindDevice device = port == 0 ? RT_BIND_GAMEPAD : RT_BIND_GAMEPAD2;
+        const char* section = port == 0 ? "input.gamepad" : "input.gamepad2";
+        const std::string* names = port == 0 ? cfg.input.gamepad : cfg.input.gamepad2;
+        g_pad_binds[port].clear();
+        g_pad_binds[port].reserve(16);
+        for (int slot = 0; slot < 16; ++slot) {
+            PadBind b;
+            b.bit = kSlotBits[slot];
+            if (!resolve_pad_name(names[slot], &b)) {
+                const char* def = rt_settings_default_binding(device, slot);
+                rt_log_warn("input", "%s.%s = \"%s\" is not an SDL gamepad button or axis name;"
+                    " using the default \"%s\"",
+                    section, rt_settings_binding_key(device, slot), names[slot].c_str(), def);
+                if (!resolve_pad_name(def, &b)) {
+                    rt_log_warn("input", "%s.%s: the compiled-in default \"%s\" is not an SDL"
+                        " gamepad button or axis name either; this build's default table and SDL"
+                        " disagree, so that slot has no pad input this run",
+                        section, rt_settings_binding_key(device, slot), def);
+                    continue;
+                }
             }
+            g_pad_binds[port].push_back(b);
         }
-        g_pad_binds.push_back(b);
     }
 
     /* The mouse is the one device with no compiled-in default to fall back
@@ -375,13 +433,17 @@ void rebuild_tables() {
      * the file, and there is nothing sensible to substitute for it, so the
      * slot stays unbound and the line names it once per rebuild. */
     g_mouse_binds.clear();
-    g_mouse_binds.reserve(RT_MB_COUNT);
-    for (int slot = 0; slot < RT_MB_COUNT; ++slot) {
+    g_mouse_binds.reserve(16);
+    /* Sixteen, not RT_MB_COUNT: the slots past the sixteenth are host hotkeys
+     * (RT_MB_SCREENSHOT) with no pad bit at all, so kSlotBits has no entry
+     * for them. Same bound as the keyboard and gamepad loops above, and for
+     * the same reason. host/screenshot.cpp reads the screenshot slot. */
+    for (int slot = 0; slot < 16; ++slot) {
         const std::string& name = cfg.input.mouse[slot];
         if (name.empty()) continue;
         RtMouseInput in = RT_MOUSE_LEFT;
         if (!rt_mouse_input_from_name(name, &in)) {
-            rt_log("input", "input.mouse.%s = \"%s\" is not a mouse input name (%s, %s, %s, %s,"
+            rt_log_warn("input", "input.mouse.%s = \"%s\" is not a mouse input name (%s, %s, %s, %s,"
                 " %s, %s, %s); that slot has no mouse input this run",
                 rt_settings_binding_key(RT_BIND_MOUSE, slot), name.c_str(),
                 rt_mouse_input_name(RT_MOUSE_LEFT), rt_mouse_input_name(RT_MOUSE_RIGHT),
@@ -467,7 +529,7 @@ void wheel_enqueue(int dir, int ticks) {
     if (ticks > room) {
         if (!g_wheel_cap_logged) {
             g_wheel_cap_logged = true;
-            rt_log("input", "mouse wheel press queue is full at %d pending presses; ticks past"
+            rt_log_warn("input", "mouse wheel press queue is full at %d pending presses; ticks past"
                 " that are dropped this field (a flick queues more presses than it can mean)",
                 kWheelQueueCap);
         }
@@ -489,7 +551,7 @@ void note_device(bool kbm, bool pad) {
     const RtInputDevice now = kbm ? RT_INPUT_DEVICE_KBM : RT_INPUT_DEVICE_CONTROLLER;
     if (now == g_last_device) return;
     g_last_device = now;
-    rt_log("input", "last device is now %s",
+    rt_log_info("input", "last device is now %s",
         now == RT_INPUT_DEVICE_KBM ? "keyboard and mouse" : "the controller");
 }
 
@@ -501,6 +563,82 @@ void mouse_events_drop() {
     while (rt_mouse_take_button_events(drop, 16) > 0) {}
     rt_mouse_take_wheel_ticks();
     wheel_queue_reset();
+}
+
+/* Samples the gamepad open on `port` into `st`, and answers whether the
+ * player was doing anything with it this field (a held bound button, an axis
+ * bind past its press point, or a stick a quarter of the way from centre).
+ *
+ * Every axis is written only where `st` is still centred at 0x80, so on port
+ * 0 the keyboard and mouse look, which ran first, keep the precedence
+ * host/input.h documents. On port 1 nothing ran first, so the pad fills all
+ * four.
+ *
+ * Both ports read the same input.left_deadzone, input.right_deadzone and
+ * gameplay.run_any_direction: those describe how a stick is reported, not
+ * which player holds it, and a second player on the same settings gets the
+ * same feel as the first. False, touching nothing, when that port has no pad
+ * open. */
+bool sample_gamepad(int port, RtPadState* st) {
+    SDL_Gamepad* pad = gamepad_open(port) ? g_gamepad[port] : nullptr;
+    if (!pad) return false;
+    const RtSettings& cfg = rt_settings();
+    bool seen = false;
+
+    /* Raw axis value past which an axis bind (any axis, not only the
+     * lefttrigger+ and righttrigger+ defaults on L2 and R2) counts as
+     * pressed in the bound direction. This is the pre-settings build's
+     * hardcoded `> 8192` on the two triggers. It is not a setting
+     * because RtPadState carries no analog trigger channel: the point
+     * only ever chooses where the digital bit flips. */
+    constexpr float kAxisPressRaw = 8192.0f;
+    for (const PadBind& b : g_pad_binds[port]) {
+        if (b.axis != SDL_GAMEPAD_AXIS_INVALID) {
+            const float v = (float)SDL_GetGamepadAxis(pad, b.axis) * (float)b.dir;
+            if (v > kAxisPressRaw) { st->buttons |= b.bit; seen = true; }
+        } else if (SDL_GetGamepadButton(pad, b.button)) {
+            st->buttons |= b.bit;
+            seen = true;
+        }
+    }
+
+    Sint16 lx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
+    Sint16 ly = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+    Sint16 rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX);
+    Sint16 ry = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+
+    /* A stick a quarter of the way from centre is a thumb on it. Read
+     * before the dead zone setting, because this is about the device
+     * being used and not about what the game should be told, and a
+     * quarter of full travel is far past any resting drift. */
+    constexpr float kStickActiveRaw = 32767.0f * 0.25f;
+    const float lmag = std::sqrt((float)lx * (float)lx + (float)ly * (float)ly);
+    const float rmag = std::sqrt((float)rx * (float)rx + (float)ry * (float)ry);
+    if (lmag > kStickActiveRaw || rmag > kStickActiveRaw) seen = true;
+
+    apply_deadzone(cfg.input.left_deadzone, &lx, &ly);
+    apply_deadzone(cfg.input.right_deadzone, &rx, &ry);
+
+    /* Left stick only. The camera stick goes through the same
+     * gate-divided magnitude in the game, but the toggle is scoped to
+     * movement by decision; the right stick stays as retail. */
+    if (cfg.gameplay.run_any_direction) {
+        if (!g_gate_expand_logged) {
+            g_gate_expand_logged = true;
+            rt_log_info("input", "gameplay.run_any_direction is on; the left stick is pre-scaled by"
+                " the game's octagonal-gate divisor so a full tilt runs in every direction");
+        }
+        rt_stick_gate_expand(&lx, &ly);
+    } else {
+        g_gate_expand_logged = false;
+    }
+
+    /* Keyboard sticks win only while deflected. */
+    if (st->lx == 0x80) st->lx = axis_to_u8(lx);
+    if (st->ly == 0x80) st->ly = axis_to_u8(ly);
+    if (st->rx == 0x80) st->rx = axis_to_u8(rx);
+    if (st->ry == 0x80) st->ry = axis_to_u8(ry);
+    return seen;
 }
 
 void sdl_poll(uint64_t field) {
@@ -542,9 +680,9 @@ void sdl_poll(uint64_t field) {
         }
     }
 
-    /* Mouse look. This is the first stick write outside the g_gamepad gate,
-     * and it is outside it on purpose: the mouse is a device of its own and
-     * must not need a pad plugged in to work.
+    /* Mouse look. This is the first stick write outside the gamepad sampling
+     * below, and it is outside it on purpose: the mouse is a device of its
+     * own and must not need a pad plugged in to work.
      *
      * The delta is drained whether or not the setting is on, so nothing can
      * pile up behind a disabled mouse look and arrive as one jump when it
@@ -670,61 +808,7 @@ void sdl_poll(uint64_t field) {
         }
     }
 
-    if (g_gamepad) {
-        /* Raw axis value past which an axis bind (any axis, not only the
-         * lefttrigger+ and righttrigger+ defaults on L2 and R2) counts as
-         * pressed in the bound direction. This is the pre-settings build's
-         * hardcoded `> 8192` on the two triggers. It is not a setting
-         * because RtPadState carries no analog trigger channel: the point
-         * only ever chooses where the digital bit flips. */
-        constexpr float kAxisPressRaw = 8192.0f;
-        for (const PadBind& b : g_pad_binds) {
-            if (b.axis != SDL_GAMEPAD_AXIS_INVALID) {
-                const float v = (float)SDL_GetGamepadAxis(g_gamepad, b.axis) * (float)b.dir;
-                if (v > kAxisPressRaw) { s.buttons |= b.bit; pad_seen = true; }
-            } else if (SDL_GetGamepadButton(g_gamepad, b.button)) {
-                s.buttons |= b.bit;
-                pad_seen = true;
-            }
-        }
-
-        Sint16 lx = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX);
-        Sint16 ly = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY);
-        Sint16 rx = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX);
-        Sint16 ry = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY);
-
-        /* A stick a quarter of the way from centre is a thumb on it. Read
-         * before the dead zone setting, because this is about the device
-         * being used and not about what the game should be told, and a
-         * quarter of full travel is far past any resting drift. */
-        constexpr float kStickActiveRaw = 32767.0f * 0.25f;
-        const float lmag = std::sqrt((float)lx * (float)lx + (float)ly * (float)ly);
-        const float rmag = std::sqrt((float)rx * (float)rx + (float)ry * (float)ry);
-        if (lmag > kStickActiveRaw || rmag > kStickActiveRaw) pad_seen = true;
-
-        apply_deadzone(cfg.input.left_deadzone, &lx, &ly);
-        apply_deadzone(cfg.input.right_deadzone, &rx, &ry);
-
-        /* Left stick only. The camera stick goes through the same
-         * gate-divided magnitude in the game, but the toggle is scoped to
-         * movement by decision; the right stick stays as retail. */
-        if (cfg.gameplay.run_any_direction) {
-            if (!g_gate_expand_logged) {
-                g_gate_expand_logged = true;
-                rt_log("input", "gameplay.run_any_direction is on; the left stick is pre-scaled by"
-                    " the game's octagonal-gate divisor so a full tilt runs in every direction");
-            }
-            rt_stick_gate_expand(&lx, &ly);
-        } else {
-            g_gate_expand_logged = false;
-        }
-
-        /* Keyboard sticks win only while deflected. */
-        if (s.lx == 0x80) s.lx = axis_to_u8(lx);
-        if (s.ly == 0x80) s.ly = axis_to_u8(ly);
-        if (s.rx == 0x80) s.rx = axis_to_u8(rx);
-        if (s.ry == 0x80) s.ry = axis_to_u8(ry);
-    }
+    if (sample_gamepad(0, &s)) pad_seen = true;
 
     /* The pointer's presses on the game's own menus (guest/menu_nav.h) ride
      * on top of whatever the devices produced this field, so the bits are
@@ -736,11 +820,22 @@ void sdl_poll(uint64_t field) {
      * script provider never reaches here, so a scripted run's input stays
      * bit-identical. */
     s.buttons |= rt_guest_menu_pulse_bits(field);
-    note_device(kbm_seen, pad_seen);
-    g_state = s;
+    g_state[0] = s;
+
+    /* Player 2's port. Nothing but the second gamepad writes it: the
+     * keyboard, the mouse, mouse look, the wheel queue and the pointer's
+     * menu pulses are all player 1's, so port 1 starts from a fresh
+     * untouched-controller report and the pad fills it. When no second pad
+     * is open this leaves a centred, button-free state that rt_input_get
+     * never hands out, because it answers false for a port with no pad. */
+    RtPadState p2;
+    const bool pad2_seen = sample_gamepad(1, &p2);
+    g_state[1] = p2;
+
+    note_device(kbm_seen, pad_seen || pad2_seen);
 }
 
-#endif /* ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_HAVE_SDL */
 
 } // namespace
 
@@ -752,15 +847,15 @@ void rt_input_init() {
         g_provider = Provider::Script;
         return;
     }
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     /* Deferred: SDL video may not be up yet at init time; the poll re-checks.
      * Marking the provider now keeps the selection log truthful. */
     g_provider = Provider::Sdl;
-    rt_log("input", "SDL provider selected (activates when the GS window path brings SDL up; "
+    rt_log_info("input", "SDL provider selected (activates when the GS window path brings SDL up; "
         "no window = no controller)");
 #else
     g_provider = Provider::None;
-    rt_log("input", "no input provider (no script, SDL not built): pads report no controller");
+    rt_log_info("input", "no input provider (no script, SDL not built): pads report no controller");
 #endif
 }
 
@@ -770,7 +865,7 @@ void rt_input_poll(uint64_t field) {
         case Provider::Script:
             script_poll(field);
             break;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         case Provider::Sdl:
             if (rt_ui_wants_input()) {
                 /* The menu owns the keyboard and the pad while it is up, so
@@ -784,7 +879,7 @@ void rt_input_poll(uint64_t field) {
                  * run never brings the UI up (main.cpp skips rt_ui_init when
                  * ICORECOMP_INPUT_SCRIPT is set) and its input must stay
                  * bit-identical. */
-                g_state = RtPadState{};
+                for (RtPadState& st : g_state) st = RtPadState{};
                 /* Same reason, for the one device that accumulates instead
                  * of being sampled: without this the motion made while the
                  * menu is up would be waiting for the game the moment the
@@ -817,13 +912,13 @@ void rt_input_poll(uint64_t field) {
 RtInputDevice rt_input_last_device() { return g_last_device; }
 
 void rt_input_sdl_gamepad_probe() {
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
     gamepad_subsystem_init();
 #endif
 }
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 void rt_input_on_sdl_event(const SDL_Event& e) {
     /* A scripted run has no devices to watch (see host/input.h) and must
      * stay bit-identical; it also never brings the UI up, so this would
@@ -836,28 +931,63 @@ void rt_input_on_sdl_event(const SDL_Event& e) {
         const SDL_JoystickID id = e.gdevice.which;
         /* SDL3 also reports every pad already attached at init as ADDED;
          * SDL_GetGamepadFromID answering non-null is what tells that apart
-         * from a fresh attach, so this does not reopen the one already
-         * open. */
+         * from a fresh attach, so this does not reopen one already open. */
         if (SDL_GetGamepadFromID(id)) return;
-        if (g_gamepad) {
+        const int port = first_free_pad_port();
+        if (port < 0) {
+            /* Both pad ports are taken. The pad is named and closed again
+             * rather than displacing a player mid-run; there is no multitap
+             * on either disc, so there is no third port to put it on. */
             SDL_Gamepad* candidate = SDL_OpenGamepad(id);
             const char* name = candidate ? SDL_GetGamepadName(candidate) : nullptr;
-            rt_log("input", "SDL gamepad attached: %s; keeping %s",
-                name ? name : "(open failed)", SDL_GetGamepadName(g_gamepad));
+            std::string taken;
+            for (int p = 0; p < RT_PAD_PORTS; ++p) {
+                if (!taken.empty()) taken += ", ";
+                const char* held = g_gamepad[p] ? SDL_GetGamepadName(g_gamepad[p]) : nullptr;
+                taken += held ? held : "(unnamed)";
+            }
+            rt_log_warn("input", "SDL gamepad attached: %s; all %d pad ports are taken (%s),"
+                " so it is not opened",
+                name ? name : "(open failed)", RT_PAD_PORTS, taken.c_str());
             if (candidate) SDL_CloseGamepad(candidate);
             return;
         }
-        open_gamepad(id);
+        open_gamepad(port, id);
         break;
     }
     case SDL_EVENT_GAMEPAD_REMOVED: {
-        if (!g_gamepad || SDL_GetGamepadID(g_gamepad) != e.gdevice.which) return;
-        rt_log("input", "SDL gamepad removed: %s", SDL_GetGamepadName(g_gamepad));
-        SDL_CloseGamepad(g_gamepad);
-        g_gamepad = nullptr;
+        int port = -1;
+        for (int i = 0; i < RT_PAD_PORTS; ++i) {
+            if (g_gamepad[i] && SDL_GetGamepadID(g_gamepad[i]) == e.gdevice.which) port = i;
+        }
+        if (port < 0) return;
+        rt_log_info("input", "SDL gamepad removed from pad port %d (player %d): %s",
+            port, port + 1, SDL_GetGamepadName(g_gamepad[port]));
+        SDL_CloseGamepad(g_gamepad[port]);
+        g_gamepad[port] = nullptr;
+        /* Close the gap: a pad on a higher port moves down, so unplugging
+         * player 1's pad leaves player 2's driving player 1 rather than
+         * leaving the game with nobody on port 0. The pad the game sees on
+         * the vacated port disconnects on the next field, which is what
+         * hardware does. */
+        for (int i = port + 1; i < RT_PAD_PORTS; ++i) {
+            if (!g_gamepad[i]) continue;
+            rt_log_info("input", "SDL gamepad %s moves from pad port %d to pad port %d (player %d)",
+                SDL_GetGamepadName(g_gamepad[i]), i, i - 1, i);
+            g_gamepad[i - 1] = g_gamepad[i];
+            g_gamepad[i] = nullptr;
+        }
+        /* A pad that was attached while both ports were full was never
+         * opened (the ADDED case above), so a freed port is filled from
+         * whatever SDL still lists and is not already open. */
         int count = 0;
         SDL_JoystickID* ids = SDL_GetGamepads(&count);
-        if (ids && count > 0) open_gamepad(ids[0]);
+        for (int i = 0; ids && i < count; ++i) {
+            if (SDL_GetGamepadFromID(ids[i])) continue;
+            const int free_port = first_free_pad_port();
+            if (free_port < 0) break;
+            open_gamepad(free_port, ids[i]);
+        }
         SDL_free(ids);
         break;
     }
@@ -868,7 +998,7 @@ void rt_input_on_sdl_event(const SDL_Event& e) {
 #endif
 
 bool rt_input_sdl_active() {
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     return g_inited && g_provider == Provider::Sdl && sdl_active();
 #else
     return false;
@@ -876,31 +1006,52 @@ bool rt_input_sdl_active() {
 }
 
 bool rt_input_get(int port, RtPadState* out) {
-    if (port != 0 || !g_inited) return false;
+    if (port < 0 || port >= RT_PAD_PORTS || !g_inited) return false;
     if (g_provider == Provider::None) return false;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     if (g_provider == Provider::Sdl && !sdl_active()) return false;
+    /* Port 1 exists only while a second gamepad is open. Reporting a
+     * centred pad there instead would tell the game a controller is plugged
+     * in when none is, and the PAL disc's two-player mode reads port 1 to
+     * decide whether a second player is present; sif/pad.cpp turns this
+     * false into the disconnected frame real hardware sends. Port 0 keeps
+     * answering true with no pad attached, because the keyboard and the
+     * mouse are player 1's controller. */
+    if (g_provider == Provider::Sdl && port > 0 && !gamepad_open(port)) return false;
+#else
+    /* No SDL: there is no device that could be on port 1. */
+    if (port > 0) return false;
 #endif
-    *out = g_state;
+    /* The scripted provider drives port 0 only (script_poll), so port 1 is
+     * a disconnected port for every scripted run. */
+    if (g_provider == Provider::Script && port > 0) return false;
+    *out = g_state[port];
     return true;
 }
 
 void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor) {
-    if (port != 0) return;
-    if (small_motor != g_act_small || big_motor != g_act_big) {
-        const bool within_cap = g_rumble_logged < kRumbleLogCap;
-        if (within_cap) ++g_rumble_logged;
-        if (within_cap || rt_verbose("input")) {
-            rt_log("input", "rumble: small=%u big=%u", small_motor, big_motor);
-        }
-        g_act_small = small_motor;
-        g_act_big = big_motor;
+    if (port < 0 || port >= RT_PAD_PORTS) return;
+    if (small_motor != g_act_small[port] || big_motor != g_act_big[port]) {
+        /* Changes only: the game re-sends the same motor state every field
+         * while a rumble is active, and an unchanged state says nothing.
+         * A count-based cap used to sit on top of this, from when the
+         * verbose channel was the only gate. rt_log_debug now carries its
+         * own gate (level debug, or "input" named in the ICORECOMP_VERBOSE
+         * channel spec that log.cpp parses in rt_log_init; debug.verbose was
+         * retired), which subsumes it: the cap could not admit a line the
+         * inner gate would refuse, so it was dead and only suppressed the
+         * first few. */
+        rt_log_debug("input", "rumble: port %d small=%u big=%u", port, small_motor, big_motor);
+        g_act_small[port] = small_motor;
+        g_act_big[port] = big_motor;
     }
-#ifdef ICORECOMP_PGS_SDL
-    if (g_provider == Provider::Sdl && g_gamepad) {
+#ifdef ICORECOMP_HAVE_SDL
+    if (g_provider == Provider::Sdl && gamepad_open(port)) {
+        /* Each port rumbles its own pad: a jolt the game sends to port 1 is
+         * player 2's, and a port with no pad open has nothing to rumble. */
         /* Small motor is on/off, big is 0..255; hold until the next update
          * (the game refreshes every frame while rumbling). */
-        SDL_RumbleGamepad(g_gamepad,
+        SDL_RumbleGamepad(g_gamepad[port],
             (Uint16)(big_motor * 257u),
             small_motor ? 0xFFFFu : 0u,
             100 /* ms; refreshed by the per-frame SET_ACTDIRECT stream */);

@@ -1,13 +1,14 @@
 /* snd/tests/pcm_stream_selftest.cpp: the SgStPcm ring geometry, checked
- * against the attract movie's own numbers.
+ * against the attract movie's own numbers, and the achievement unlock
+ * chime.
  *
- * The subject (snd/pcm_stream.h) is header only, so this links nothing: no
- * SDL, no runtime services, no IOP RAM. Same shape as
+ * Both subjects (snd/pcm_stream.h, snd/chime.h) are header only, so this
+ * links nothing: no SDL, no runtime services, no IOP RAM. Same shape as
  * host/stick_shape_selftest.cpp.
  *
  * The numbers below are the ones the retail game sends, read out of a Windows
- * run's log (dist/windows/icorecomp.log) and confirmed against the decomp's
- * ito/mpeg/mv_sub.c func_0023D8A8:
+ * run's log (dist/windows/icorecomp.log) and confirmed against
+ * audioDecCreate (PAL 0x00257550) in the retail ELF:
  *
  *   cmd 0x48  w1=0x00010400  w2=0x001b0100  w3=0x00006000
  *   cmd 0x48  w1=0x01010400  w2=0x001b0300  w3=0x00006000
@@ -20,10 +21,21 @@
  * report rather than repair (an odd run, no interleave block, a channel a
  * whole block above the base, two channels at one address) and the offset
  * fold the health scan in engine.cpp depends on.
+ *
+ * The second subject is snd/iop_stage.h, the witness for what the EE staged
+ * in virtual IOP RAM before it queued a bank transfer. Its numbers are the
+ * boot path's own, read out of dist/logs/handoff-2026-09-04/
+ * native-crosscheck.log: the sound heap block is 0x78000 bytes at IOP
+ * 0x090000 and the seven boot transfers read 237184, 322688, 209536, 136960,
+ * 34176, 434176 and 407552 bytes from its base.
  */
+#include "../chime.h"
+#include "../iop_stage.h"
 #include "../pcm_stream.h"
 
+#include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace {
 
@@ -45,6 +57,66 @@ void check_eq(uint32_t got, uint32_t want, const char* what) {
     } else {
         std::printf("ok    %s = 0x%x\n", what, got);
     }
+}
+
+/* ---- the unlock chime (snd/chime.h) --------------------------------------
+ *
+ * Nothing here is a hardware fact: the chime is the port's own sound, and
+ * what a selftest can settle about it is that the buffer host/audio.cpp
+ * sums into the output is well formed. Every sample finite, none of them
+ * past the headroom the mixer's saturation assumes, a real attack, and a
+ * tail that has reached silence before the buffer ends, at two different
+ * output rates so the envelope is a function of time and not of the sample
+ * index. Whether it is audible over the game, and at what level, only a run
+ * can say. */
+void test_chime_at(uint32_t rate) {
+    char what[128];
+    const uint32_t frames = rt_chime::frame_count(rate);
+    std::snprintf(what, sizeof what, "chime at %u Hz: nonempty buffer", rate);
+    check(frames > 0, what);
+    if (frames == 0) return;
+
+    /* The length is a duration, so it tracks the rate: within one frame of
+     * kLengthSeconds either way. */
+    const double ms = 1000.0 * (double)frames / (double)rate;
+    const double want_ms = 1000.0 * (double)rt_chime::kLengthSeconds;
+    std::snprintf(what, sizeof what, "chime at %u Hz: %.1f ms (want %.1f)", rate, ms, want_ms);
+    check(ms > want_ms - 1.0 && ms <= want_ms, what);
+
+    std::vector<float> buf(frames, 1.0f);
+    rt_chime::render(buf.data(), frames, rate);
+
+    bool finite = true;
+    bool bounded = true;
+    double peak = 0.0, first_half_peak = 0.0, second_half_peak = 0.0, tail_peak = 0.0;
+    const uint32_t tail_from = frames - frames / 10;   /* the last tenth */
+    for (uint32_t i = 0; i < frames; ++i) {
+        const float v = buf[i];
+        if (!std::isfinite(v)) finite = false;
+        const double a = std::fabs((double)v);
+        if (a > (double)rt_chime::kPeak) bounded = false;
+        if (a > peak) peak = a;
+        if (i < frames / 2) { if (a > first_half_peak) first_half_peak = a; }
+        else if (a > second_half_peak) { second_half_peak = a; }
+        if (i >= tail_from && a > tail_peak) tail_peak = a;
+    }
+
+    std::snprintf(what, sizeof what, "chime at %u Hz: every sample is finite", rate);
+    check(finite, what);
+    std::snprintf(what, sizeof what, "chime at %u Hz: no sample exceeds the %.2f headroom",
+        rate, (double)rt_chime::kPeak);
+    check(bounded, what);
+    /* A buffer of zeroes would pass both of the above. */
+    std::snprintf(what, sizeof what, "chime at %u Hz: peak %.3f is a real attack", rate, peak);
+    check(peak > 0.1, what);
+    std::snprintf(what, sizeof what, "chime at %u Hz: it decays (%.3f then %.3f)",
+        rate, first_half_peak, second_half_peak);
+    check(second_half_peak < first_half_peak, what);
+    std::snprintf(what, sizeof what,
+        "chime at %u Hz: the last tenth is silence (%.5f, under 1%% of the peak)", rate, tail_peak);
+    check(tail_peak <= 0.01 * peak, what);
+    std::snprintf(what, sizeof what, "chime at %u Hz: the buffer ends on exact zero", rate);
+    check(buf[frames - 1] == 0.0f, what);
 }
 
 /* Applies the two cmd 0x48 records the movie sends. */
@@ -133,8 +205,8 @@ int main() {
 
     /* The cursor the EE polls at status +0x180 is a ring offset quantized to
      * the interleave block, and it must stay below the ring size so that
-     * func_0023DEB0's `(cursor + ring - write_ptr - 0x400) mod ring` stays a
-     * sane free-space figure. */
+     * audioDecSendToIOP's `(cursor + ring - write_ptr - 0x400) mod ring`
+     * stays a sane free-space figure. */
     check_eq(rt_pcm_cursor(ch[0]), 0, "cursor at rest");
     ch[0].pos = 0x100;
     check_eq(rt_pcm_cursor(ch[0]), 0, "cursor stays in its block until the block is consumed");
@@ -166,7 +238,7 @@ int main() {
     /* Everything below is a geometry the runtime reports rather than repairs.
      * A channel left unplaced (consistent == false) gets no cursor written
      * into the status block, so these are the cases that keep a fabricated
-     * number out of func_0023DEB0's refill arithmetic. */
+     * number out of audioDecSendToIOP's refill arithmetic. */
     RtPcmChannel bad[RT_PCM_CHANNELS];
 
     open_movie_stream(bad);
@@ -201,6 +273,75 @@ int main() {
     bad[1].iop_buf = bad[0].iop_buf; /* two channels at one address */
     check(!rt_pcm_regroup(bad, RT_PCM_CHANNELS), "two channels at one address are reported");
     check(!bad[0].consistent && !bad[1].consistent, "neither of them is placed");
+
+    /* The staging witness (snd/iop_stage.h). The boot pattern is one
+     * SifSetDma of the whole chunk into the heap base, then one cmd 0x20
+     * reading it back, repeated; each transfer must see its own bytes and
+     * none of the previous transfer's marks. */
+    {
+        static RtIopStageMap map; /* 16 KB of bitmap: not a stack object */
+        const uint32_t heap = 0x090000;
+        const uint32_t sizes[] = { 237184, 322688, 209536, 136960, 34176, 434176, 407552 };
+        bool every_chunk_seen = true;
+        for (uint32_t sz : sizes) {
+            map.note_write(heap, sz);
+            every_chunk_seen &= map.fully_staged(heap, sz);
+            check_eq(map.staged_bytes(heap, sz), sz, "staged bytes match the chunk");
+            map.consume(heap, sz);
+            every_chunk_seen &= !map.fully_staged(heap, sz);
+        }
+        check(every_chunk_seen, "each boot chunk reads staged and then reads consumed");
+
+        /* A transfer whose staging never happened: the case the sndn2 warn
+         * is there to catch. */
+        map.reset();
+        check(!map.fully_staged(heap, 4096), "an unstaged range is not staged");
+        check_eq(map.staged_bytes(heap, 4096), 0, "an unstaged range stages no bytes");
+
+        /* A short write followed by a longer read: partial staging is
+         * reported as partial, not rounded up to the whole request. */
+        map.reset();
+        map.note_write(heap, 1024);
+        check(!map.fully_staged(heap, 4096), "a partly staged range is not fully staged");
+        check_eq(map.staged_bytes(heap, 4096), 1024, "only the written part counts");
+
+        /* Consuming one chunk must not clear a neighbour that a different
+         * SifSetDma staged: the heap holds one chunk at a time here, but the
+         * map is addressed by IOP address, not by chunk. */
+        map.reset();
+        map.note_write(heap, 0x1000);
+        map.note_write(heap + 0x1000, 0x1000);
+        map.consume(heap, 0x1000);
+        check(!map.fully_staged(heap, 0x1000), "the consumed chunk is gone");
+        check(map.fully_staged(heap + 0x1000, 0x1000), "its neighbour survives");
+
+        /* Granule rounding is outward, so a write of one byte marks the
+         * 16-byte block it lands in and nothing beyond it. */
+        map.reset();
+        map.note_write(heap + 5, 1);
+        check(map.fully_staged(heap, 16), "a one byte write marks its own granule");
+        check(!map.fully_staged(heap, 17), "and not the next one");
+
+        /* Out of range and empty arguments are answered, not trusted. */
+        map.reset();
+        map.note_write(RT_IOP_STAGE_SIZE, 64);
+        check_eq(map.staged_bytes(RT_IOP_STAGE_SIZE, 64), 0, "a write past IOP RAM stages nothing");
+        map.note_write(RT_IOP_STAGE_SIZE - 32, 4096); /* clipped at the top */
+        check(map.fully_staged(RT_IOP_STAGE_SIZE - 32, 32), "a write clipped at the top still lands");
+        check_eq(map.staged_bytes(heap, 0), 0, "a zero length stages nothing");
+    }
+
+    /* The unlock chime, at the host output rate and at one other, plus the
+     * degenerate arguments the caller is allowed to pass. */
+    test_chime_at(48000);
+    test_chime_at(44100);
+    rt_chime::render(nullptr, 16, 48000);
+    {
+        float one = 1.0f;
+        rt_chime::render(&one, 0, 48000);
+        rt_chime::render(&one, 1, 0);
+        check(one == 1.0f, "a zero frame count or rate writes nothing");
+    }
 
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;

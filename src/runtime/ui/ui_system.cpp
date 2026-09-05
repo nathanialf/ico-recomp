@@ -18,7 +18,7 @@
 
 #include "../runtime.h"
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 #include <SDL3/SDL.h>
 #endif
 
@@ -40,10 +40,27 @@ bool UiSystemInterface::LogMessage(Rml::Log::Type type, const Rml::String& messa
     case Rml::Log::LT_ALWAYS:
     default:                   level = "Always"; break;
     }
-    /* Every level goes to the log, unfiltered: an RCSS or RML mistake shows
-     * up as a warning from deep inside RmlUi and nowhere else. Returning
-     * true continues execution (false would break into the debugger). */
-    rt_log("ui", "RmlUi %s: %s", level, message.c_str());
+    /* RmlUi's own severity carries straight over to ours, so an RCSS or RML
+     * mistake keeps showing at the default level instead of needing the log
+     * turned up to find it. LT_ALWAYS is RmlUi's unconditional channel
+     * (version banners and the like) and is information, not a problem.
+     * Returning true continues execution (false would break into the
+     * debugger). */
+    switch (type) {
+    case Rml::Log::LT_ERROR:
+    case Rml::Log::LT_ASSERT:
+        rt_log_error("ui", "RmlUi %s: %s", level, message.c_str());
+        break;
+    case Rml::Log::LT_WARNING:
+        rt_log_warn("ui", "RmlUi %s: %s", level, message.c_str());
+        break;
+    case Rml::Log::LT_DEBUG:
+        rt_log_debug("ui", "RmlUi %s: %s", level, message.c_str());
+        break;
+    default:
+        rt_log_info("ui", "RmlUi %s: %s", level, message.c_str());
+        break;
+    }
     return true;
 }
 
@@ -65,11 +82,11 @@ void UiSystemInterface::SetMouseCursor(const Rml::String& /*cursor_name*/) {
      * asks for a resize or text caret cursor yet. */
 }
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 
 void UiSystemInterface::SetClipboardText(const Rml::String& text) {
     if (!SDL_SetClipboardText(text.c_str())) {
-        rt_log("ui", "SDL_SetClipboardText failed: %s", SDL_GetError());
+        rt_log_warn("ui", "SDL_SetClipboardText failed: %s", SDL_GetError());
     }
 }
 
@@ -83,14 +100,14 @@ void UiSystemInterface::GetClipboardText(Rml::String& text) {
     SDL_free(raw);
 }
 
-#else /* !ICORECOMP_PGS_SDL */
+#else /* !ICORECOMP_HAVE_SDL */
 
 /* No SDL means no window either, so rt_ui_init already refused to bring the
  * UI up; these exist only so the class is complete. */
 void UiSystemInterface::SetClipboardText(const Rml::String&) {}
 void UiSystemInterface::GetClipboardText(Rml::String& text) { text.clear(); }
 
-#endif /* ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_HAVE_SDL */
 
 } // namespace rtui
 

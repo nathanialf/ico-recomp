@@ -95,13 +95,15 @@ struct Prog {
      * average the two look identical. Cleared by rt_vu1_prof_report. */
     uint64_t win_calls = 0;
     uint64_t win_ns = 0;
+    /* This field only, for the hitch line (prof.h g_rt_prof_field_hook). */
+    uint64_t field_calls = 0;
+    uint64_t field_ns = 0;
 };
 std::vector<Prog> g_progs;
 Prog* g_bound = nullptr;
 uint32_t g_bound_hash = 0;
 uint32_t g_entry_pc = 0; /* pc of the MSCAL currently executing */
 
-uint64_t g_mscal_misses = 0;
 uint64_t g_xgkicks = 0;
 
 bool is_pow2(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
@@ -136,12 +138,12 @@ void capture_open() {
     }
     g_capture = rt_fopen_utf8(path, "wb");
     if (!g_capture) {
-        rt_log("vu1", "VU1 capture: could not open '%s'; capture disabled", path);
+        rt_log_warn("vu1", "VU1 capture: could not open '%s'; capture disabled", path);
         return;
     }
     CaptureHeader h{kCaptureMagic, 1, (uint32_t)sizeof(Vu1State), 0};
     std::fwrite(&h, sizeof h, 1, g_capture);
-    rt_log("vu1", "VU1 capture: writing up to %u states per (program, entry) to %s",
+    rt_log_info("vu1", "VU1 capture: writing up to %u states per (program, entry) to %s",
         g_capture_per_site, path);
 }
 
@@ -183,13 +185,16 @@ Vu1State* rt_vu1_state() {
 
 uint8_t* rt_vu1_micro() { return g_micro; }
 
+static void vu1_field_hook(bool hitch, char* buf, size_t cap);
+
 void rt_vu1_init() {
+    rt_prof_detail::g_rt_prof_field_hook = vu1_field_hook;
     capture_open();
 #ifdef ICORECOMP_HAVE_VU1_GENERATED
     rt_vu1_register_all();
-    rt_log("vu1", "generated VU1 code linked: rt_vu1_register_all() registered %zu programs", g_progs.size());
+    rt_log_info("vu1", "generated VU1 code linked: rt_vu1_register_all() registered %zu programs", g_progs.size());
 #else
-    rt_log("vu1", "no generated VU1 code linked (generated/vu1 missing at configure time); MSCAL will loud-skip");
+    rt_log_warn("vu1", "no generated VU1 code linked (generated/vu1 missing at configure time); MSCAL will loud-skip");
 #endif
 }
 
@@ -200,7 +205,7 @@ void rt_vu1_micro_written(uint32_t offset, uint32_t bytes) {
         g_upload_len = offset + bytes;
     } else {
         /* Out-of-order segment: keep the covering extent, loudly. */
-        rt_log("vu1", "MPG segment at 0x%x does not continue the upload (len was 0x%x); extending extent",
+        rt_log_warn("vu1", "MPG segment at 0x%x does not continue the upload (len was 0x%x); extending extent",
             offset, g_upload_len);
         if (offset + bytes > g_upload_len) g_upload_len = offset + bytes;
     }
@@ -215,7 +220,7 @@ extern "C" void rt_vu1_register(uint32_t hash, uint32_t size_bytes, void (*entry
     g_progs.push_back(p);
     g_bound = nullptr; /* vector may reallocate; rebind on next MSCAL */
     g_upload_dirty = true;
-    rt_log("vu1", "registered microprogram hash=0x%08x size=%u entry=%p (registry now %zu)",
+    rt_log_info("vu1", "registered microprogram hash=0x%08x size=%u entry=%p (registry now %zu)",
         hash, size_bytes, (void*)entry, g_progs.size());
 }
 
@@ -235,7 +240,7 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
             if (p.hash == g_bound_hash) {
                 g_bound = &p;
                 if (p.size != g_upload_len) {
-                    rt_log("vu1", "upload of %u bytes matched hash 0x%08x but registry says %u bytes",
+                    rt_log_warn("vu1", "upload of %u bytes matched hash 0x%08x but registry says %u bytes",
                         g_upload_len, p.hash, p.size);
                 }
                 /* The first bind of each program is the useful line: it
@@ -243,7 +248,7 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
                  * rebinds the same five programs every field, so sample. */
                 ++p.binds;
                 if (rt_trace() || is_pow2(p.binds)) {
-                    rt_log("vu1", "upload of %u bytes bound to program hash=0x%08x entry=%p [bind #%" PRIu64 "]",
+                    rt_log_debug("vu1", "upload of %u bytes bound to program hash=0x%08x entry=%p [bind #%" PRIu64 "]",
                         g_upload_len, p.hash, (void*)p.entry, p.binds);
                 }
                 break;
@@ -251,18 +256,39 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
         }
         g_upload_dirty = false;
         if (!g_bound) {
-            rt_log("vu1", "upload of %u bytes has hash 0x%08x: NO registered program (registry has %zu); MSCALs will skip",
+            rt_log_warn("vu1", "upload of %u bytes has hash 0x%08x: NO registered program "
+                "(registry has %zu). An upload that is never run is harmless; the first MSCAL "
+                "into it is fatal",
                 g_upload_len, g_bound_hash, g_progs.size());
         }
     }
 
     if (!g_bound) {
-        ++g_mscal_misses;
-        if (is_pow2(g_mscal_misses)) {
-            rt_log("vu1", "%s pc=0x%x xtop=0x%x itop=0x%x: unbound upload (hash 0x%08x, %u bytes); SKIPPING [miss #%" PRIu64 "]",
-                how, vu->pc, xtop, itop, g_bound_hash, g_upload_len, g_mscal_misses);
+        /* CLAUDE.md, "Runtime": an unknown VU1 upload hash is a fatal log
+         * with a state dump. It used to be a sampled warn and a skip, which
+         * means a frame silently missing whatever that microprogram drew.
+         * The fatal is raised here, at the MSCAL, rather than at the bind:
+         * an upload the game never runs changes nothing, and running one
+         * this runtime has no translation for is the divergence.
+         *
+         * The registry is printed with it, because "no program matched" is
+         * only actionable next to what was on offer. Map a hash to a
+         * microprogram with the translator's own report, recomp-cli vu1. */
+        char registry[512];
+        size_t off = 0;
+        for (const Prog& p : g_progs) {
+            if (off >= sizeof(registry) - 32) {
+                off += (size_t)std::snprintf(registry + off, sizeof(registry) - off, " ...");
+                break;
+            }
+            off += (size_t)std::snprintf(registry + off, sizeof(registry) - off,
+                "%s0x%08x(%u bytes)", off ? ", " : "", p.hash, p.size);
         }
-        return;
+        if (!off) std::snprintf(registry, sizeof(registry), "(empty)");
+        rt_fatal("vu1", rt_fault_ctx(),
+            "%s pc=0x%x xtop=0x%x itop=0x%x: the uploaded microprogram (hash 0x%08x, %u bytes) "
+            "matches no registered program, so this MSCAL has nothing to run. Registry of %zu: %s",
+            how, vu->pc, xtop, itop, g_bound_hash, g_upload_len, g_progs.size(), registry);
     }
 
     /* Seed capture for the VU1 differential harness. Writes the exact
@@ -277,7 +303,7 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
     ++g_bound->calls;
     ++g_bound->win_calls;
     if (rt_trace() || is_pow2(g_bound->calls)) {
-        rt_log("vu1", "%s pc=0x%x xtop=0x%x itop=0x%x -> program hash=0x%08x [call #%" PRIu64 "]",
+        rt_log_debug("vu1", "%s pc=0x%x xtop=0x%x itop=0x%x -> program hash=0x%08x [call #%" PRIu64 "]",
             how, vu->pc, xtop, itop, g_bound->hash, g_bound->calls);
     }
     /* The entry pc this call was dispatched at, for the geometry checker:
@@ -298,13 +324,39 @@ void rt_vu1_mscal(uint32_t pc_bytes, uint32_t xtop, uint32_t itop, const char* h
          * subtracted. Reusing it costs two loads rather than a second
          * clock reading on the hot path, and cannot disagree with the
          * bucket it decomposes. Both reads are 0 with profiling off. */
-        g_bound->win_ns += rt_prof_zone_ns(RT_PROF_VU1) - before;
+        const uint64_t own = rt_prof_zone_ns(RT_PROF_VU1) - before;
+        g_bound->win_ns += own;
+        g_bound->field_ns += own;
+        ++g_bound->field_calls;
     }
 }
 
+/* The hitch line's VU1 detail: how many microprogram runs the field made and
+ * which program took the most of its time, so a 15 ms VU1 field reads as
+ * "volume" or "one slow program". Reset every field. */
+static void vu1_field_hook(bool hitch, char* buf, size_t cap) {
+    if (hitch && buf && cap) {
+        uint64_t calls = 0;
+        const Prog* top = nullptr;
+        for (const Prog& p : g_progs) {
+            calls += p.field_calls;
+            if (!top || p.field_ns > top->field_ns) top = &p;
+        }
+        if (top && top->field_ns) {
+            std::snprintf(buf, cap, "vu1 %llu runs this field, top program 0x%08x %.1f ms in %llu runs",
+                (unsigned long long)calls, top->hash, (double)top->field_ns / 1e6,
+                (unsigned long long)top->field_calls);
+        } else {
+            std::snprintf(buf, cap, "vu1 %llu runs this field", (unsigned long long)calls);
+        }
+        return;
+    }
+    for (Prog& p : g_progs) { p.field_calls = 0; p.field_ns = 0; }
+}
+
 /* One line per microprogram that ran this window, largest first, under the
- * "vu1" bucket it decomposes. Hashes are not named here: the names live in
- * the decomp and naming them would copy its symbols into this repo. Map a
+ * "vu1" bucket it decomposes. Hashes are not named here: a microprogram
+ * name is a symbol, and this repo carries no symbol lists. Map a
  * hash to a name with the translator's own report, `recomp-cli vu1`. */
 extern "C" void rt_vu1_prof_report(double fields) {
     /* Clear the window counters on every path, including this one: prof.h
@@ -323,7 +375,7 @@ extern "C" void rt_vu1_prof_report(double fields) {
                   [](const Prog* a, const Prog* b) { return a->win_ns > b->win_ns; });
         for (const Prog* p : ran) {
             const double ms = (double)p->win_ns / 1e6;
-            rt_log("prof", "    vu1 0x%08x %8.1f ms %7.3f ms/field  n=%-9llu mean %8.2f us",
+            rt_log_info("prof", "    vu1 0x%08x %8.1f ms %7.3f ms/field  n=%-9llu mean %8.2f us",
                 p->hash, ms, ms / fields, (unsigned long long)p->win_calls,
                 (double)p->win_ns / 1e3 / (double)p->win_calls);
         }
@@ -343,8 +395,9 @@ uint32_t rt_vu1_entry_pc() { return g_entry_pc; }
 extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
     RT_PROF_ZONE(RT_PROF_GIF);
     ++g_xgkicks;
-    static const bool geom = rt_verbose("geom");
-    if (geom) rt_geom_note_clip(vu->clip, g_bound_hash);
+#ifdef ICORECOMP_GEOM_CHECK
+    rt_geom_note_clip(vu->clip, g_bound_hash);
+#endif
     uint32_t addr = qw_addr & (kVuDataQw - 1);
     const uint32_t start_addr = addr;
 
@@ -369,7 +422,7 @@ extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
             default: len = 1 + nloop; break;                       /* IMAGE */
         }
         if (len > kVuDataQw) {
-            rt_log("vu1", "xgkick: malformed GIF tag at qw 0x%x (len %u qw), truncating packet", addr, len);
+            rt_log_warn("vu1", "xgkick: malformed GIF tag at qw 0x%x (len %u qw), truncating packet", addr, len);
             break;
         }
         total_qw += len;
@@ -381,12 +434,12 @@ extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
          * time; only the log line is sampled, because a stream that
          * produces one malformed packet produces them by the thousand. */
         if (is_pow2(g_xgkicks)) {
-            rt_log("vu1", "xgkick #%" PRIu64 ": no EOP within VU1 data memory, packet dropped", g_xgkicks);
+            rt_log_warn("vu1", "xgkick #%" PRIu64 ": no EOP within VU1 data memory, packet dropped", g_xgkicks);
         }
         return;
     }
     if (is_pow2(g_xgkicks)) {
-        rt_log("vu1", "xgkick #%" PRIu64 ": qw_addr=0x%x -> PATH1 packet of %u qw",
+        rt_log_debug("vu1", "xgkick #%" PRIu64 ": qw_addr=0x%x -> PATH1 packet of %u qw",
             g_xgkicks, qw_addr, total_qw);
     }
     if (total_qw == 0) return;
@@ -396,7 +449,7 @@ extern "C" void rt_xgkick(Vu1State* vu, uint32_t qw_addr) {
          * address walk is not guaranteed to land back on start_addr before
          * this could in principle be exceeded. Guard the fixed packet
          * buffer below rather than overflow it silently. */
-        rt_log("vu1", "xgkick #%" PRIu64 ": packet of %u qw exceeds VU1 data memory, dropped",
+        rt_log_warn("vu1", "xgkick #%" PRIu64 ": packet of %u qw exceeds VU1 data memory, dropped",
             g_xgkicks, total_qw);
         return;
     }

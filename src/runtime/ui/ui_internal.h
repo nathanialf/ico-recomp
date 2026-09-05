@@ -31,7 +31,7 @@
 
 namespace Rml { class DataModelHandle; }
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Declared, not included, for the same reason ui.h declares it: this header
  * is included by files that see no SDL. SDL3/SDL.h's own typedef agrees with
  * it, so either include order works. */
@@ -42,12 +42,14 @@ namespace rtui {
 
 /* ---- overlay backend ----------------------------------------------------
  *
- * The four library entry points this module uses, wrapped so that the rest
- * of the module compiles unchanged when the build has no paraLLEl-GS library
- * to link against (ICORECOMP_PARALLEL_GS=OFF, the CI gate). The wrappers are
- * defined in ui.cpp, the real ones under ICORECOMP_HAVE_PARALLEL_GS and
- * do-nothing ones otherwise. All of them are between-frames-only; only
- * rt_ui_tick may call them.
+ * The backend and window entry points this module uses, wrapped in ui.cpp so
+ * the rest of the module names neither the GS backend interface nor the
+ * window service. The overlay ones go through GsBackend, so they reach
+ * whichever renderer is live and stay ordered on the GS command ring; the
+ * window, surface size, present mode and present rectangle come from the
+ * window service (host/window_service.h). A build with no live backend at
+ * all takes GsBackend's own no-op defaults and reports no window. The
+ * overlay calls are between-frames-only; only rt_ui_tick may make them.
  */
 bool backend_window_live();
 void backend_surface_size(uint32_t* width, uint32_t* height);
@@ -66,8 +68,8 @@ void backend_set_frame(const RtPgsOverlayFrame* frame);
 void* backend_window_handle();
 /* The window-backbuffer rectangle the last presented scanout was blitted
  * into, plus the backbuffer size it was measured against. All zero before
- * the first present and in a build with no library. The drawn cursor for
- * the game's own menus is placed on this rectangle. */
+ * the first present and in a run with no window. The drawn cursor for the
+ * game's own menus is placed on this rectangle. */
 void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
                           int32_t* bb_w, int32_t* bb_h);
 
@@ -251,6 +253,11 @@ struct UiState {
      * rt_ui_wants_input() true and takes the menu hotkey out of service
      * (ui_events.cpp), because the launcher owns the window while it is up. */
     bool launcher_visible = false;
+    /* Whether the achievement unlock toast is up, mirrored for the same
+     * reason as the two flags above: the tick has to know whether anything
+     * is on screen before it decides to render. achievements_model_tick()
+     * shows and hides the document. */
+    bool toast_visible = false;
     /* Set by rt_ui_set_visible(false), consumed by the next rt_ui_tick: the
      * menu closes from inside the event pump, and the settings file write
      * belongs at the field boundary. */
@@ -271,6 +278,9 @@ struct UiState {
     Rml::ElementDocument* launcher = nullptr;
     /* Loaded once at init and shown and hidden from ui_menu_cursor.cpp. */
     Rml::ElementDocument* cursor = nullptr;
+    /* Loaded once at init and shown and hidden from
+     * ui_achievements_model.cpp. */
+    Rml::ElementDocument* toast = nullptr;
     UiRenderInterface* render = nullptr;
     UiSystemInterface* system = nullptr;
 };
@@ -405,10 +415,10 @@ void settings_model_disarm_quit();
  *
  * Returns false, having logged, when the model or launcher.rml could not be
  * created. That disables the launcher (rt_launcher_run then returns true
- * straight away) without disabling the settings menu. */
+ * straight away) without disabling the menu. */
 bool launcher_init(Rml::Context* context, const std::string& ui_dir);
 
-/* Takes launcher.rml down while the settings menu is open on top of it, and
+/* Takes launcher.rml down while the menu is open on top of it, and
  * puts it back when the menu closes. The menu's backdrop is translucent
  * because the game's scanout belongs behind it; over the launcher there is
  * no scanout, only another document, and the two read as one jumbled
@@ -451,7 +461,35 @@ void ui_menu_cursor_build_from_logo(const uint8_t* rgba, uint32_t width, uint32_
  * which counts g_ui.cursor_visible. */
 void ui_menu_cursor_tick();
 
-#ifdef ICORECOMP_PGS_SDL
+/* ---- achievements (ui_achievements_model.cpp) ----------------------------
+ *
+ * One "achievements" data model read by two documents: the Achievements
+ * section inside ui/menu.rml (a nested data-model div, so this model has to
+ * exist before menu.rml is loaded, exactly like the settings model) and
+ * ui/achievement_toast.rml, which this file loads and owns.
+ *
+ * Everything shown comes from guest/achievements.h. Nothing here reads guest
+ * memory or decides what is unlocked.
+ */
+
+/* Creates the model and loads the toast document. Must run after the context
+ * exists and BEFORE menu.rml is loaded. Returns false, having logged, when
+ * the model could not be created, which costs the tab and the toast and
+ * nothing else. */
+bool achievements_model_init(Rml::Context* context, const std::string& ui_dir);
+
+/* Rebuilds the table and dirties everything. Called when the menu opens, so
+ * a tab opened after an unlock shows it without waiting for the tick's own
+ * change check. */
+void achievements_model_refresh();
+
+/* The field-boundary half: polls the unlock toast on the UI clock, shows and
+ * hides its document, and rebuilds the table when something changed while
+ * the menu is up. Called from rt_ui_tick before the "nothing is up"
+ * early-out, which counts g_ui.toast_visible. */
+void achievements_model_tick();
+
+#ifdef ICORECOMP_HAVE_SDL
 /* Resolves input.keyboard[RT_KB_MENU] / input.gamepad[RT_GP_MENU] into an
  * SDL scancode and gamepad button, once, at init. An unresolvable name logs
  * and keeps the compiled-in default for that binding (never "no binding").

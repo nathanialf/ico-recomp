@@ -117,7 +117,7 @@ void rt_reverb_set_params(uint32_t mode, float depth_l, float depth_r) {
     if (mode != g_mode) {
         g_mode = mode;
         set_lengths(p.scale);
-        rt_log("snd", "reverb mode=%u depth=(%.3f, %.3f)", mode, depth_l, depth_r);
+        rt_log_info("snd", "reverb mode=%u depth=(%.3f, %.3f)", mode, depth_l, depth_r);
     }
     g_feedback = p.feedback;
     g_damp = p.damp;

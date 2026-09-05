@@ -1,7 +1,7 @@
 /* host/portable.h: small OS portability helpers shared by the runtime .cpp
  * files. Everything here is header-only and behavior-identical across
- * Linux and Windows; keep per-OS ifdefs in this file so the callers stay
- * clean.
+ * Linux, Windows and macOS; keep per-OS ifdefs in this file so the callers
+ * stay clean.
  */
 #ifndef ICORECOMP_HOST_PORTABLE_H
 #define ICORECOMP_HOST_PORTABLE_H
@@ -32,6 +32,41 @@
 #include <timeapi.h>
 #else
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+
+/* Path of the running executable on macOS. There is no /proc, so the
+ * loader's own record is the only source: _NSGetExecutablePath fills a
+ * caller-sized buffer and reports the size it needs when the buffer is too
+ * small, which is why it is called twice. The path it hands back is
+ * whatever resolution produced the image, so it can still carry symlinks or
+ * "." segments; realpath is what turns it into the canonical location. That
+ * matters because rt_exe_dir's answer is the bundle's Contents/MacOS
+ * folder, which ui/, saves/ and screenshots/ are resolved against. Returns
+ * an empty string when the path cannot be determined; callers map that to
+ * their own fallback. */
+inline std::string rt_apple_exe_path() {
+    uint32_t size = 0;
+    /* Returns -1 with `size` set to the required length, terminator
+     * included. A zero size means the call told us nothing usable. */
+    _NSGetExecutablePath(nullptr, &size);
+    if (size == 0) return std::string();
+    std::string raw(size_t(size), '\0');
+    if (_NSGetExecutablePath(raw.data(), &size) != 0) return std::string();
+    raw.resize(std::strlen(raw.c_str()));
+    if (raw.empty()) return std::string();
+    /* realpath(p, nullptr) allocates the result, so no PATH_MAX buffer is
+     * needed. A failure leaves the unresolved path, which still names the
+     * right file in every case except one reached through a symlink. */
+    if (char* resolved = realpath(raw.c_str(), nullptr)) {
+        std::string out(resolved);
+        std::free(resolved);
+        return out;
+    }
+    return raw;
+}
 #endif
 
 /* Aligned, zero-initialized allocation for the long-lived guest memory
@@ -207,6 +242,11 @@ inline std::string rt_exe_dir() {
     WideCharToMultiByte(CP_UTF8, 0, wpath, int(n), path.data(), len, nullptr, nullptr);
     size_t cut = path.find_last_of("\\/");
     return cut == std::string::npos ? std::string(".") : path.substr(0, cut);
+#elif defined(__APPLE__)
+    const std::string path = rt_apple_exe_path();
+    if (path.empty()) return ".";
+    size_t cut = path.find_last_of('/');
+    return cut == std::string::npos ? std::string(".") : path.substr(0, cut);
 #else
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -224,6 +264,13 @@ inline std::string rt_user_state_dir() {
 #ifdef _WIN32
     if (const char* p = std::getenv("LOCALAPPDATA")) return std::string(p) + "/icorecomp";
     return std::string();
+#elif defined(__APPLE__)
+    /* macOS has no state/config split, the same way Windows does not: both
+     * directories are the one Application Support folder. */
+    if (const char* p = std::getenv("HOME")) {
+        return std::string(p) + "/Library/Application Support/icorecomp";
+    }
+    return std::string();
 #else
     if (const char* p = std::getenv("XDG_STATE_HOME")) return std::string(p) + "/icorecomp";
     if (const char* p = std::getenv("HOME")) return std::string(p) + "/.local/state/icorecomp";
@@ -233,10 +280,17 @@ inline std::string rt_user_state_dir() {
 
 /* Per-user configuration directory. On Linux this is XDG_CONFIG_HOME or
  * ~/.config; Windows has no config/state split, so both land in
- * %LOCALAPPDATA%/icorecomp. Empty when no base env var exists. */
+ * %LOCALAPPDATA%/icorecomp, and macOS the same way in
+ * ~/Library/Application Support/icorecomp. Empty when no base env var
+ * exists. */
 inline std::string rt_user_config_dir() {
 #ifdef _WIN32
     if (const char* p = std::getenv("LOCALAPPDATA")) return std::string(p) + "/icorecomp";
+    return std::string();
+#elif defined(__APPLE__)
+    if (const char* p = std::getenv("HOME")) {
+        return std::string(p) + "/Library/Application Support/icorecomp";
+    }
     return std::string();
 #else
     if (const char* p = std::getenv("XDG_CONFIG_HOME")) return std::string(p) + "/icorecomp";
@@ -283,6 +337,17 @@ inline std::string rt_exe_identity() {
     }
     std::snprintf(out, sizeof out, "%llu bytes, %04u-%02u-%02u %02u:%02u:%02u",
         sz, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return out;
+#elif defined(__APPLE__)
+    const std::string self = rt_apple_exe_path();
+    if (self.empty()) return "unknown";
+    struct stat sb;
+    if (stat(self.c_str(), &sb) != 0) return "unknown";
+    struct tm tmv;
+    localtime_r(&sb.st_mtime, &tmv);
+    std::snprintf(out, sizeof out, "%llu bytes, %04d-%02d-%02d %02d:%02d:%02d",
+        (unsigned long long)sb.st_size, tmv.tm_year + 1900, tmv.tm_mon + 1,
+        tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     return out;
 #else
     char buf[4096];

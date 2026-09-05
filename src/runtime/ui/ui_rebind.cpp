@@ -50,7 +50,7 @@
  */
 #include "ui.h"
 
-#if defined(ICORECOMP_UI) && defined(ICORECOMP_PGS_SDL)
+#if defined(ICORECOMP_UI) && defined(ICORECOMP_HAVE_SDL)
 
 #include "ui_internal.h"
 
@@ -112,6 +112,16 @@ bool is_menu_slot_capture() {
     return g_device == RT_BIND_GAMEPAD && g_slot == rt_settings_bind_menu_slot(RT_BIND_GAMEPAD);
 }
 
+/* The two devices whose captures read SDL gamepad events. Player 2's table
+ * captures from any pad the same way player 1's does: a binding is a button
+ * name, not a device, and the name resolves against whichever pad is on that
+ * port at the time. Requiring the press to come from the pad currently on
+ * port 1 would make the table unbindable whenever the second pad is
+ * unplugged, and would say nothing about a pad swapped in later. */
+bool is_gamepad_capture() {
+    return g_device == RT_BIND_GAMEPAD || g_device == RT_BIND_GAMEPAD2;
+}
+
 void chord_reset() {
     g_chord_seen.clear();
     g_chord_held = 0;
@@ -120,8 +130,9 @@ void chord_reset() {
 const std::string& stored_name(RtBindDevice device, int slot) {
     const RtSettings& s = rt_settings();
     switch (device) {
-    case RT_BIND_GAMEPAD: return s.input.gamepad[slot];
-    case RT_BIND_MOUSE:   return s.input.mouse[slot];
+    case RT_BIND_GAMEPAD:  return s.input.gamepad[slot];
+    case RT_BIND_GAMEPAD2: return s.input.gamepad2[slot];
+    case RT_BIND_MOUSE:    return s.input.mouse[slot];
     default:              return s.input.keyboard[slot];
     }
 }
@@ -152,7 +163,7 @@ void end_capture(const char* log_reason, const std::string& status) {
     chord_reset();
     settings_model_set_rebind(false, g_device, g_slot, status);
     if (log_reason) {
-        rt_log("ui", "rebind %s.%s: %s",
+        rt_log_info("ui", "rebind %s.%s: %s",
             bind_device_name(g_device), rt_settings_binding_key(g_device, g_slot), log_reason);
     }
     g_slot = -1;
@@ -164,17 +175,26 @@ void end_capture(const char* log_reason, const std::string& status) {
  * user hunt through the table.
  *
  * Only the captured device's own slots are looked at. The mouse has no menu
- * slot (rt_settings_bind_menu_slot returns -1 for it), so the first branch
- * is unreachable there, and a mouse name can never collide with a key or a
- * pad button because the two are never compared. */
+ * slot (rt_settings_bind_menu_slot returns -1 for it), so that branch is
+ * unreachable there, and player 2's pad has neither hotkey, so both are
+ * unreachable there. A mouse name can never collide with a key or a pad
+ * button because the two are never compared, and neither can a name on one
+ * pad collide with the same name on the other: they are two devices and one
+ * button on each is two buttons. */
 bool accept_allowed(const std::string& name) {
     const int menu = rt_settings_bind_menu_slot(g_device);
+    const int shot = rt_settings_bind_screenshot_slot(g_device);
     const int count = rt_settings_bind_slot_count(g_device);
     for (int i = 0; i < count; ++i) {
         if (i == g_slot) continue;           /* re-pressing the slot's own name is fine */
         if (!name_equal(name, stored_name(g_device, i))) continue;
         if (i == menu) {
             set_status("\"" + name + "\" is the menu key; the menu eats it before the pad sees it");
+        } else if (i == shot) {
+            /* The other host hotkey. Same reason as the menu key: the pump
+             * takes it and nothing downstream ever sees the press. */
+            set_status("\"" + name + "\" is the screenshot key; the host eats it before the pad"
+                " sees it");
         } else {
             set_status("\"" + name + "\" is already bound to " + bind_slot_label(g_device, i));
         }
@@ -239,7 +259,7 @@ bool capture_gamepad_button(const SDL_Event& e) {
 }
 
 /* The release half of the menu-slot chord capture above: every other slot's
- * gamepad release is simply swallowed (nothing to do, the button already
+ * gamepad release is swallowed (nothing to do, the button already
  * accepted on the press). Accepts once nothing captured is still held: one
  * distinct button becomes its own name, two become "first+second" in the
  * order they were pressed. */
@@ -341,7 +361,7 @@ void rebind_begin(RtBindDevice device, int slot) {
          * normally. */
         settings_model_set_rebind(false, g_device, g_slot,
             "applying the previous capture, press Rebind again");
-        rt_log("ui", "rebind %s.%s: refused, the previous capture is still being applied",
+        rt_log_warn("ui", "rebind %s.%s: refused, the previous capture is still being applied",
             bind_device_name(device), rt_settings_binding_key(device, slot));
         return;
     }
@@ -358,7 +378,7 @@ void rebind_begin(RtBindDevice device, int slot) {
     g_started = RebindClock::now();
     chord_reset();
     settings_model_set_rebind(true, device, slot, "");
-    rt_log("ui", "rebind %s.%s: waiting for input (Escape cancels, 5 s timeout)",
+    rt_log_info("ui", "rebind %s.%s: waiting for input (Escape cancels, 5 s timeout)",
         bind_device_name(device), rt_settings_binding_key(device, slot));
 }
 
@@ -414,11 +434,11 @@ bool rebind_handle_sdl_event(const SDL_Event& e) {
          * whatever field had the focus. */
         return true;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        return g_device == RT_BIND_GAMEPAD ? capture_gamepad_button(e) : true;
+        return is_gamepad_capture() ? capture_gamepad_button(e) : true;
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        return g_device == RT_BIND_GAMEPAD ? capture_gamepad_button_up(e) : true;
+        return is_gamepad_capture() ? capture_gamepad_button_up(e) : true;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        return g_device == RT_BIND_GAMEPAD ? capture_gamepad_axis(e) : true;
+        return is_gamepad_capture() ? capture_gamepad_axis(e) : true;
     case SDL_EVENT_GAMEPAD_REMOVED:
         /* The pad this capture was reading is gone. host/input.cpp (called
          * first by the pump) decides whether another pad takes over; either
@@ -428,7 +448,7 @@ bool rebind_handle_sdl_event(const SDL_Event& e) {
          * next. Only the capture's own device cares: a keyboard or mouse
          * capture ignores it and falls through, same as ui_events.cpp's
          * nav-hold clear does for that event. */
-        if (g_device != RT_BIND_GAMEPAD) return false;
+        if (!is_gamepad_capture()) return false;
         chord_reset();
         set_status("controller removed; press the button again");
         return true;
@@ -462,8 +482,9 @@ void rebind_tick() {
 
     RtSettings& m = rt_settings_mutable();
     switch (device) {
-    case RT_BIND_GAMEPAD: m.input.gamepad[slot] = name; break;
-    case RT_BIND_MOUSE:   m.input.mouse[slot] = name; break;
+    case RT_BIND_GAMEPAD:  m.input.gamepad[slot] = name; break;
+    case RT_BIND_GAMEPAD2: m.input.gamepad2[slot] = name; break;
+    case RT_BIND_MOUSE:    m.input.mouse[slot] = name; break;
     default:              m.input.keyboard[slot] = name; break;
     }
     rt_settings_commit(false);
@@ -480,7 +501,7 @@ void rebind_tick() {
         g_pending.clear();
         settings_model_set_rebind(false, device, slot, reject);
         g_slot = -1;
-        rt_log("ui", "rebind %s.%s: the commit rejected \"%s\"",
+        rt_log_warn("ui", "rebind %s.%s: the commit rejected \"%s\"",
             bind_device_name(device), rt_settings_binding_key(device, slot), name.c_str());
         return;
     }
@@ -490,10 +511,10 @@ void rebind_tick() {
     settings_model_set_rebind(false, device, slot,
         std::string(bind_slot_label(device, slot)) + " is now \"" + name + "\"");
     g_slot = -1;
-    rt_log("ui", "rebind %s.%s = \"%s\"",
+    rt_log_info("ui", "rebind %s.%s = \"%s\"",
         bind_device_name(device), rt_settings_binding_key(device, slot), name.c_str());
 }
 
 } // namespace rtui
 
-#endif /* ICORECOMP_UI && ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_UI && ICORECOMP_HAVE_SDL */

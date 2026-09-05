@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# tools/gen_gs_shaders_dxil.sh: compiles the committed HLSL into signed DXIL
+# and writes the index header the D3D12 backend includes. The Linux twin of
+# tools/gen_gs_shaders_dxil.ps1, which stays for a Windows checkout.
+#
+# Why this exists. Until now the only way to produce DXIL was on Windows,
+# because a driver rejects an unsigned container outside developer mode and
+# signing was dxil.dll's job. A DirectX Shader Compiler release for Linux
+# carries the same signing code (libLLVMDxilHash, and lib/libdxil.so beside
+# lib/libdxcompiler.so): the containers this script writes come out with a
+# non-zero container hash, which is checked below rather than assumed. With
+# the index header in the tree the shipped executable never loads
+# dxcompiler.dll at all, which is what the D3D12 backend wants: those DLLs
+# are 32 MB, they need the Visual C++ redistributable, and a machine without
+# it fails the load with an error that reads as "file not found".
+#
+# Inputs   src/runtime/gs/render/shaders/hlsl/*.hlsl  (tools/gen_gs_shaders.sh)
+#          src/runtime/gs/render/shaders/shaders.manifest, the shader list the
+#          same script writes, read here so this stage cannot compile a
+#          different set from the one the SPIR-V, HLSL and MSL indexes carry
+#          src/runtime/rhi/d3d12/rhi_d3d12_shaders.cpp for the blit shader,
+#          which has no GLSL because Vulkan blits with vkCmdBlitImage
+# Outputs  src/runtime/gs/render/shaders/dxil/<name>.<stage>.dxil.inc
+#          src/runtime/rhi/rhi_shaders_dxil.h
+#
+# dxc is taken from $ICORECOMP_DXC, then .cache/dxc-linux/bin/dxc, then PATH.
+# Nothing here is downloaded: docs/GS_RENDERER.md says where the release comes
+# from and the cache directory is outside the tree.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+HLSL_DIR=src/runtime/gs/render/shaders/hlsl
+DXIL_DIR=src/runtime/gs/render/shaders/dxil
+INDEX=src/runtime/rhi/rhi_shaders_dxil.h
+MANIFEST=src/runtime/gs/render/shaders/shaders.manifest
+BLIT_CPP=src/runtime/rhi/d3d12/rhi_d3d12_shaders.cpp
+
+DXC="${ICORECOMP_DXC:-}"
+if [[ -z "$DXC" && -x .cache/dxc-linux/bin/dxc ]]; then
+    DXC=".cache/dxc-linux/bin/dxc"
+fi
+if [[ -z "$DXC" ]] && command -v dxc >/dev/null 2>&1; then
+    DXC="$(command -v dxc)"
+fi
+if [[ -z "$DXC" || ! -x "$DXC" ]]; then
+    echo "gen_gs_shaders_dxil: no dxc found (ICORECOMP_DXC, .cache/dxc-linux/bin/dxc, PATH)." >&2
+    echo "gen_gs_shaders_dxil: see docs/GS_RENDERER.md for the release to unpack there." >&2
+    exit 1
+fi
+echo "gen_gs_shaders_dxil: using $DXC"
+
+if [[ ! -f "$MANIFEST" ]]; then
+    echo "gen_gs_shaders_dxil: $MANIFEST is missing; run tools/gen_gs_shaders.sh first" >&2
+    exit 1
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# The shader model follows from the stage, and the entry is always main:
+# that is what glslang emits and what SPIRV-Cross keeps for HLSL.
+target_for() {
+    case "$1" in
+        comp) echo cs_6_0 ;;
+        vert) echo vs_6_0 ;;
+        frag) echo ps_6_0 ;;
+        *) echo "gen_gs_shaders_dxil: stage '$1' has no shader model here" >&2; exit 1 ;;
+    esac
+}
+
+# A signed container is 'DXBC' followed by a sixteen byte digest that is not
+# all zero. Unsigned DXIL is what a driver refuses outside developer mode, so
+# it is checked rather than assumed; the digest is printed so the check is
+# visible in the log of whoever ran this.
+check_signed() {
+    local obj="$1" name="$2"
+    python3 - "$obj" "$name" <<'PY'
+import sys
+blob = open(sys.argv[1], 'rb').read()
+name = sys.argv[2]
+if len(blob) < 20 or blob[0:4] != b'DXBC':
+    sys.exit("gen_gs_shaders_dxil: %s is not a DXIL container" % name)
+digest = blob[4:20]
+if not any(digest):
+    sys.exit("gen_gs_shaders_dxil: %s came out unsigned (container hash all zero); "
+             "this dxc release cannot sign, so the DXIL stage would ship shaders every "
+             "driver rejects" % name)
+print("gen_gs_shaders_dxil: %s signed, container hash %s" % (name, digest.hex()))
+PY
+}
+
+# The SHA-1 of a file, bare hex. Used as the tie between a committed DXIL
+# container and the HLSL it was compiled from, so an HLSL edit without a
+# regeneration is caught by tools/check_shaders_fresh.py rather than shipping a
+# D3D12 backend that renders the previous shader.
+sha1_of() {
+    if command -v sha1sum >/dev/null 2>&1; then
+        sha1sum "$1" | cut -d' ' -f1
+    else
+        python3 -c 'import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+    fi
+}
+
+# `inline constexpr uint8_t <symbol>[] = { ... };` from a raw container.
+# inline and not static: the index header's table takes the address of each
+# array, and a static array in a header gives every translation unit its own,
+# which makes the inline table function differ between them.
+emit_inc() {
+    local path="$1" symbol="$2" source="$3" obj="$4" digest="$5"
+    {
+        echo "/* $path: DXIL for $source, generated by tools/gen_gs_shaders_dxil.sh."
+        echo " * Ours (MIT), our own shader source, not ROM-derived. Do not edit by hand;"
+        echo " * rerun the script after rerunning tools/gen_gs_shaders.sh."
+        echo " *"
+        echo " * source SHA-1: $digest"
+        echo " */"
+        echo "inline constexpr uint8_t ${symbol}[] = {"
+        od -An -v -tx1 "$obj" | tr -s ' ' '\n' | grep -v '^$' | \
+            awk 'BEGIN { n = 0 }
+                 { printf (n % 12 == 0 ? "    0x%s," : " 0x%s,"), $1;
+                   n++;
+                   if (n % 12 == 0) printf "\n" }
+                 END { if (n % 12 != 0) printf "\n" }'
+        echo "};"
+    } > "$path"
+}
+
+mkdir -p "$DXIL_DIR"
+NAMES=()
+SYMBOLS=()
+INCS=()
+DIGESTS=()
+
+while read -r name stage; do
+    [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
+    src="$HLSL_DIR/$name.$stage.hlsl"
+    if [[ ! -f "$src" ]]; then
+        echo "gen_gs_shaders_dxil: $src is missing; run tools/gen_gs_shaders.sh with " \
+             "spirv-cross available first" >&2
+        exit 1
+    fi
+    target="$(target_for "$stage")"
+    obj="$TMP/$name.$stage.dxil"
+    # -Zpc: column-major matrices, the convention overlay.vert declares and
+    # the same flag the run-time dxcompiler path passes.
+    "$DXC" -T "$target" -E main -Zpc -O3 -Fo "$obj" "$src"
+    check_signed "$obj" "$name.$stage"
+    sym="kDxil_${name}_${stage}"
+    inc="$DXIL_DIR/$name.$stage.dxil.inc"
+    digest="$(sha1_of "$src")"
+    emit_inc "$inc" "$sym" "$src" "$obj" "$digest"
+    echo "gen_gs_shaders_dxil: wrote $inc ($(stat -c%s "$obj") bytes, source $digest)"
+    NAMES+=("$name.$stage")
+    SYMBOLS+=("$sym")
+    INCS+=("$inc")
+    DIGESTS+=("$digest")
+done < "$MANIFEST"
+
+if [[ ${#NAMES[@]} -eq 0 ]]; then
+    echo "gen_gs_shaders_dxil: $MANIFEST lists no shaders" >&2
+    exit 1
+fi
+
+# The present blit. Its HLSL lives inside the D3D12 backend because there is
+# no GLSL twin for it, so it is lifted out of the string literal in
+# rhi_d3d12_shaders.cpp rather than kept in a second copy here. The .ps1 does
+# the same with the same pattern.
+BLIT="$TMP/blit.hlsl"
+python3 - "$BLIT_CPP" "$BLIT" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding='utf-8').read()
+m = re.search(r'const char kBlitHlsl\[\] =\s*((?:\s*"(?:[^"\\]|\\.)*"\s*)+);', text)
+if not m:
+    sys.exit("gen_gs_shaders_dxil: the kBlitHlsl literal was not found in %s; the blit "
+             "shader and this extractor have drifted apart" % sys.argv[1])
+# One pass over the escapes, not three passes of str.replace: replacing \n
+# first and \\ last would turn a literal backslash followed by an n into a
+# newline. No such sequence is in the blit shader today; this is so a later
+# one cannot be silently mistranslated.
+ESC = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0'}
+out = []
+for lit in re.finditer(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+    out.append(re.sub(r'\\(.)', lambda e: ESC.get(e.group(1), e.group(1)), lit.group(1)))
+open(sys.argv[2], 'w', encoding='utf-8').write(''.join(out))
+PY
+
+for spec in "blit.vert vs_6_0 main_vs kDxil_blit_vert" "blit.frag ps_6_0 main_ps kDxil_blit_frag"; do
+    set -- $spec
+    bname="$1"; btarget="$2"; bentry="$3"; bsym="$4"
+    obj="$TMP/$bname.dxil"
+    "$DXC" -T "$btarget" -E "$bentry" -Zpc -O3 -Fo "$obj" "$BLIT"
+    check_signed "$obj" "$bname"
+    inc="$DXIL_DIR/$bname.dxil.inc"
+    bdigest="$(sha1_of "$BLIT")"
+    emit_inc "$inc" "$bsym" "$BLIT_CPP kBlitHlsl" "$obj" "$bdigest"
+    echo "gen_gs_shaders_dxil: wrote $inc ($(stat -c%s "$obj") bytes, source $bdigest)"
+    NAMES+=("$bname")
+    SYMBOLS+=("$bsym")
+    INCS+=("$inc")
+    DIGESTS+=("$bdigest")
+done
+
+{
+    echo "/* rhi/rhi_shaders_dxil.h: the native GS renderer's shaders as signed DXIL."
+    echo " *"
+    echo " * Generated by tools/gen_gs_shaders_dxil.sh (Linux) or"
+    echo " * tools/gen_gs_shaders_dxil.ps1 (Windows). Ours (MIT). Do not edit by hand."
+    echo " * Rerun after tools/gen_gs_shaders.sh."
+    echo " *"
+    echo " * When this header is present the D3D12 backend uses it and never loads"
+    echo " * dxcompiler.dll. See src/runtime/rhi/d3d12/rhi_d3d12_shaders.h."
+    echo " *"
+    echo " * source_sha1 is the SHA-1 of the HLSL each container was compiled from"
+    echo " * (for blit.vert and blit.frag, of the kBlitHlsl literal lifted out of"
+    echo " * rhi_d3d12_shaders.cpp). tools/check_shaders_fresh.py recomputes them and"
+    echo " * the runtime build fails when one does not match, so HLSL edited without"
+    echo " * a regeneration cannot ship as a D3D12 backend rendering the old shader."
+    echo " */"
+    echo "#ifndef ICORECOMP_RHI_SHADERS_DXIL_H"
+    echo "#define ICORECOMP_RHI_SHADERS_DXIL_H"
+    echo
+    echo "#include <cstddef>"
+    echo "#include <cstdint>"
+    echo
+    for inc in "${INCS[@]}"; do
+        # Relative to src/runtime/rhi, which is where the index header lives.
+        echo "#include \"../${inc#src/runtime/}\""
+    done
+    echo
+    echo "namespace rhi {"
+    echo
+    echo "struct ShaderDxil {"
+    echo "    const char* name;"
+    echo "    const uint8_t* bytes;"
+    echo "    size_t size;"
+    echo "    const char* source_sha1;"
+    echo "};"
+    echo
+    echo "inline const ShaderDxil* shader_dxil_table(size_t* count) {"
+    echo "    static const ShaderDxil kTable[] = {"
+    for i in "${!NAMES[@]}"; do
+        echo "        { \"${NAMES[$i]}\", ${SYMBOLS[$i]}, sizeof(${SYMBOLS[$i]}), \"${DIGESTS[$i]}\" },"
+    done
+    echo "    };"
+    echo "    *count = sizeof(kTable) / sizeof(kTable[0]);"
+    echo "    return kTable;"
+    echo "}"
+    echo
+    echo "} // namespace rhi"
+    echo
+    echo "#endif /* ICORECOMP_RHI_SHADERS_DXIL_H */"
+} > "$INDEX"
+
+echo "gen_gs_shaders_dxil: wrote $INDEX"

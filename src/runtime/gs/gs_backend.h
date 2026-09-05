@@ -26,6 +26,7 @@
 #ifndef ICORECOMP_GS_BACKEND_H
 #define ICORECOMP_GS_BACKEND_H
 
+#include <cstddef>
 #include <cstdint>
 
 /* Overlay geometry for the settings menu and the launcher, defined by the
@@ -34,6 +35,42 @@
  * this header stays free of that ABI. gs_parallel.cpp, gs_threaded.cpp and
  * the UI include gs_parallel_api.h themselves for the layout. */
 struct RtPgsOverlayFrame;
+
+/* Which RHI backend the native renderer's device is created on
+ * (gs/render/gs_native.h). These are exactly the three explicit values
+ * ICORECOMP_GS_BACKEND takes beside `auto` and `parallel-gs`. It lives here
+ * rather than in gs_native.h so gs_select.cpp can resolve the setting in a
+ * build that has no native renderer and still name what it rejected;
+ * rhi::Backend is not used for it so nothing outside rhi/ includes rhi.h.
+ * `auto` is resolved before this enum is reached, so there is no Auto
+ * member. */
+enum class RtNativeRhi { Vulkan, D3D12, Metal };
+
+/* Present-path decomposition for the profile summary (prof.h), since the
+ * last read; all zero for a backend with no present path. Filled by
+ * present_timings() below.
+ *
+ *   flush_ns    flushing the renderer at the field boundary
+ *   scanout_ns  building the scanout image
+ *   present_ns  the presents themselves, repeats included
+ *   fields      the vsyncs the first two cover
+ *   presents    presents that happened. Not the same as fields: with
+ *               display.present_rate set, the newest field is presented
+ *               again between fields, so present_ns is per present and the
+ *               other two are per field.
+ *   repeats     of those presents, the ones that showed a picture already on
+ *               screen rather than a new field
+ *
+ * One averaged "present" bucket cannot say which of the three a slow field
+ * went to, which is why the split crosses this interface at all. */
+struct RtGsPresentTimings {
+    uint64_t flush_ns;
+    uint64_t scanout_ns;
+    uint64_t present_ns;
+    uint64_t fields;
+    uint64_t presents;
+    uint64_t repeats;
+};
 
 /* Consumer-side cost of a backend that has a worker thread, since the last
  * read; all zero for one that does not. Filled by consumer_timings() below
@@ -73,8 +110,48 @@ public:
     virtual uint64_t read_priv(uint32_t offset) = 0;
 
     /* End of field. Returns true when a frame's worth of traffic was
-     * presented (any GIF transfer landed since the previous vsync). */
+     * presented (any GIF transfer landed since the previous vsync).
+     *
+     * On the live backend this no longer puts anything on screen: the field
+     * is latched and present_pump() below shows it. The bool keeps its
+     * meaning on every backend (RT_PGS_VSYNC_LATCHED, gs_parallel_api.h);
+     * no caller acts on it, hw/gspriv.cpp ignores the result. */
     virtual bool vsync(unsigned field) = 0;
+
+    /* Presents the newest field the backend holds, and repeats it every
+     * 1/max_hz seconds while no newer one arrives. max_hz 0 means one
+     * present per field and no repeats, which is what every backend did
+     * before this existed. See rt_pgs_present_pump in gs_parallel_api.h for
+     * what a repeat is and is not.
+     *
+     * Consumer-thread only, like every other call that touches the
+     * swapchain. Which thread that is depends on the wiring:
+     *
+     *   with the GS command ring   ThreadedBackend's worker calls this on
+     *                              the inner backend, once after each vsync
+     *                              record and again from its park loop; the
+     *                              ring itself takes the default no-op, so
+     *                              the EE's call below does nothing.
+     *   with the ring bypassed     ICORECOMP_GS_THREAD=0 hands out the inner
+     *                              backend directly and the EE thread is the
+     *                              consumer, so hw/gspriv.cpp's call at the
+     *                              field boundary is the one that presents.
+     *
+     * hw/gspriv.cpp calls it unconditionally for that second case. The rate
+     * the ring's worker uses arrives separately through set_present_rate(),
+     * because it has to reach the worker in order with the fields it applies
+     * to.
+     *
+     * With the ring bypassed there are no repeats whatever the rate says:
+     * the only thread that could run one is the EE thread, and its time
+     * between fields belongs to the guest. That configuration is a developer
+     * bisect switch (gs_select.cpp), not a way to play. */
+    virtual void present_pump(double /*max_hz*/) {}
+
+    /* display.present_rate, pushed at the field boundary like
+     * display.present. Only the command ring implements it: it is the one
+     * backend whose consumer is a thread the setting cannot be read from. */
+    virtual void set_present_rate(double /*max_hz*/) {}
 
     /* End-of-run statistics dump (atexit; see gs_select.cpp), called with any
      * consumer thread already stopped (see quiesce). */
@@ -111,14 +188,10 @@ public:
      * thread leaves the caller's struct untouched, so callers zero it. */
     virtual void consumer_timings(RtGsConsumerTimings* /*out*/) {}
 
-    /* Present-path decomposition for the profile summary (prof.h): the
-     * nanoseconds spent flushing the renderer, scanning out and presenting
-     * since the previous call, and the number of fields they cover. One
-     * averaged "present" bucket cannot say which of the three a slow field
-     * went to. Reading clears the counters. A backend with no present path
-     * leaves the caller's values untouched, so callers zero them first. */
-    virtual void present_timings(uint64_t* /*flush_ns*/, uint64_t* /*scanout_ns*/,
-                                 uint64_t* /*present_ns*/, uint64_t* /*fields*/) {}
+    /* See RtGsPresentTimings. Reading clears the counters. A backend with no
+     * present path leaves the caller's struct untouched, so callers zero it
+     * first. */
+    virtual void present_timings(RtGsPresentTimings* /*out*/) {}
 
     /* ---- presentation and overlay ---------------------------------------
      *
@@ -146,6 +219,14 @@ public:
      * them in order with the fields they apply to. */
     virtual void set_raster(uint32_t /*raster*/) {}
     virtual void set_deinterlace(uint32_t /*deinterlace*/) {}
+    /* display.widescreen's presentation half: the aspect the finished
+     * scanout is presented at, or 0 for "whatever the scanout derived from
+     * the CRTC registers", which is the retail 4:3. Stored only, read at the
+     * next present. Routed through the backend for the same reason
+     * set_raster is: the paraLLEl-GS shim is a separate shared library and
+     * cannot call guest/widescreen.cpp, and a queued GS worker has to see
+     * the value in order with the fields it applies to. */
+    virtual void set_widescreen_aspect(double /*aspect*/) {}
 
     /* Returns the texture id, or 0 when there is no overlay renderer. */
     virtual uint32_t overlay_texture_create(const uint8_t* /*rgba8*/, uint32_t /*width*/,
@@ -156,7 +237,54 @@ public:
     /* One presented frame with no guest scanout (the launcher). Returns the
      * RT_PGS_VSYNC_* bitmask, 0 when there is nothing to present into. */
     virtual uint32_t present_ui() { return 0; }
+
+    /* Arms one user-facing screenshot of the presented picture
+     * (rt_pgs_request_screenshot; host/screenshot.cpp owns the hotkey, the
+     * folder and the PNG). `slots` is 1 for the picture on its own, or
+     * RT_PGS_SHOT_SLOTS for the pre/post pair the screenshot verbose channel
+     * asks for.
+     *
+     * This is the arm only, and it does ride the ring, because it changes
+     * what a present does and has to land on the field the user asked
+     * for. */
+    virtual void request_screenshot(uint32_t /*slots*/) {}
+
+    /* Reads one armed slot back. `slot` is RT_PGS_SHOT_PRE or
+     * RT_PGS_SHOT_POST (gs_parallel_api.h). Returns 0 when the slot holds
+     * nothing ready, otherwise the image size in bytes (width * height * 4).
+     * `dst` null is the size query: *w and *h are filled and nothing is
+     * copied. With `dst` non-null the slot is consumed, the rows are copied
+     * out tightly packed as RGBA8 from the top, and a `dst_bytes` smaller
+     * than the image copies nothing, keeps the slot and returns 0. Any of
+     * `w` and `h` may be null.
+     *
+     * Unlike the arm above, this does NOT ride the command ring, and
+     * gs_threaded.cpp passes it straight through: it is a read of state the
+     * present that copied the pixels already published, it needs no ordering
+     * against GIF traffic, and routing it through the ring would make the
+     * host wait for the worker to answer. It goes through this interface
+     * rather than through a backend-specific handle so that the native
+     * renderer's own capture reaches host/screenshot.cpp by the same
+     * route. */
+    virtual size_t take_screenshot(uint32_t /*slot*/, uint32_t* w, uint32_t* h,
+                                   uint8_t* /*dst*/, size_t /*dst_bytes*/) {
+        if (w) *w = 0;
+        if (h) *h = 0;
+        return 0;
+    }
 };
+
+/* The RT_PGS_PRESENT_* value (gs/gs_parallel_api.h) every live backend is
+ * created with: ICORECOMP_GS_PRESENT when it is set, otherwise
+ * display.present. Resolved once on the first call and remembered, with one
+ * warning if the two disagree, so the launcher (ui/ui_launcher.cpp), which
+ * forces FIFO while it is up and restores this at hand-off, reads the same
+ * value the backend was made with rather than deriving the mapping a second
+ * time. Defined in gs_select.cpp, which is built in every configuration.
+ *
+ * RT_PGS_PRESENT_MAILBOX before rt_settings_init() has run, which no caller
+ * does. */
+uint32_t rt_gs_present_mode();
 
 /* Singleton accessor (gs_select.cpp). First call creates the backend per
  * ICORECOMP_GS; the dump flavor writes a file only when ICORECOMP_GS_DUMP
@@ -170,7 +298,7 @@ GsBackend* rt_gs_backend();
  * happening at rt_hw_init() and nowhere earlier. host/settings_apply.cpp
  * uses it: a settings change that arrives before the backend exists has
  * nothing to push into, exactly as it had when the guard there was
- * rt_gs_parallel_handle() != nullptr. */
+ * a live-backend handle being non-null. */
 GsBackend* rt_gs_backend_if_created();
 
 /* Moves the command ring from inline draining to its worker thread. Called

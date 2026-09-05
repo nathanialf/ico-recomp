@@ -1,10 +1,11 @@
 <rml>
 <head>
-	<title>Settings</title>
+	<title>Menu</title>
 	<link type="text/rcss" href="style/base.rcss"/>
+	<link type="text/rcss" href="style/achievements.rcss"/>
 </head>
 <!--
-	The settings menu. Every control is bound to the "settings" data model
+	The in-game menu. Every control is bound to the "settings" data model
 	(src/runtime/ui/ui_settings_model.cpp): data-value / data-checked carry
 	the value both ways, and data-event-change (plus data-event-blur on the
 	text fields) calls apply(), which queues the commit for the next field
@@ -17,13 +18,17 @@
 	<div class="shell">
 		<div class="nav">
 			<div class="nav-stack">
+				<div id="nav-achievements" class="nav-button" data-class-active="active_tab == 'achievements'" data-event-click="active_tab = 'achievements'">
+					<span class="nav-name">Achievements</span>
+					<span class="nav-tagline">local, host-side only</span>
+				</div>
 				<div id="nav-display" class="nav-button" data-class-active="active_tab == 'display'" data-event-click="active_tab = 'display'">
 					<span class="nav-name">Display</span>
-					<span class="nav-tagline">window, scaling, rate</span>
+					<span class="nav-tagline">window, scaling, picture</span>
 				</div>
 				<div id="nav-audio" class="nav-button" data-class-active="active_tab == 'audio'" data-event-click="active_tab = 'audio'">
 					<span class="nav-name">Audio</span>
-					<span class="nav-tagline">output volume</span>
+					<span class="nav-tagline">output volumes</span>
 				</div>
 				<div id="nav-input" class="nav-button" data-class-active="active_tab == 'input'" data-event-click="active_tab = 'input'">
 					<span class="nav-name">Input</span>
@@ -42,7 +47,7 @@
 				<div class="bracket-cap"/>
 				<div class="bracket-line">
 					<div class="bracket-seg"/>
-					<div class="bracket-label">Settings</div>
+					<div class="bracket-label">Menu</div>
 					<div class="bracket-seg"/>
 				</div>
 				<div class="bracket-cap"/>
@@ -83,14 +88,17 @@
 				</div>
 
 				<div class="control">
-					<div class="control-label">Present</div>
-					<select data-value="present" data-event-change="apply()" data-attrif-disabled="overridden_present">
-						<option value="mailbox">Mailbox</option>
-						<option value="fifo">FIFO</option>
-						<option value="immediate">Immediate</option>
-					</select>
-					<div class="hint">mailbox: low latency, no tearing</div>
-					<div class="override" data-if="overridden_present">{{override_text_present}}</div>
+					<div class="check-row" data-event-click="remember_window_size = !remember_window_size; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="remember_window_size"/>
+							<div class="check-glyph" data-if="remember_window_size">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
+						<span class="check-label">Remember the window size</span>
+					</div>
+					<div class="hint">on, a resize drag writes the new size back into the size above; off, every run opens at the size above whatever the window was last dragged to</div>
 				</div>
 
 				<div class="control">
@@ -112,13 +120,13 @@
 				</div>
 
 				<div class="control">
-					<div class="control-label">Deinterlace</div>
-					<select data-value="deinterlace" data-event-change="apply()">
-						<option value="adaptive">Adaptive</option>
-						<option value="bob">Bob</option>
-						<option value="weave">Weave</option>
+					<div class="control-label">Widescreen</div>
+					<select data-value="widescreen" data-event-change="apply()">
+						<option value="off">Off (4:3)</option>
+						<option value="window">Match the window</option>
+						<option value="16_9">16:9</option>
 					</select>
-					<div class="hint">adaptive: weave still parts, bob moving parts; bob: each field on its own, as a CRT shows it; weave: pair the two fields, combs on interlaced video. bob and weave apply to the movie; gameplay fields are always composed adaptively</div>
+					<div class="hint">widens the game's own projection so the camera sees more to the left and right; the field of view, the menus, the movie and the fades keep their 4:3 proportions. Off is the retail picture</div>
 				</div>
 
 				<div class="control">
@@ -140,6 +148,25 @@
 					<div class="hint">super-sampling; 4x and up also draw the picture at higher resolution, using super-sampled textures so the game's display copy keeps the detail. The renderer can still decline, which the log reports as hires=no. Applies at the next field</div>
 				</div>
 
+
+				<!--
+					Read-only, describing the device the active backend
+					actually created. The backend publishes them once, just
+					after creating it (host/window_service.h); nothing here
+					makes a device to answer the question. These are the two
+					lines to send back from a machine where the picture does
+					not appear; see docs/MACOS.md.
+				-->
+				<div class="control">
+					<div class="control-label">Renderer</div>
+					<div class="hint">{{probe_renderer}}</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Feature support</div>
+					<div class="hint">{{probe_features}}</div>
+				</div>
+
 				<div class="control">
 					<div class="check-row" data-event-click="show_fps = !show_fps; apply()">
 						<div class="check-box">
@@ -151,6 +178,17 @@
 						</div>
 						<span class="check-label">Show the field rate</span>
 					</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Screenshot folder</div>
+					<input type="text" data-value="screenshot_dir" data-event-change="apply()" data-event-blur="apply()"/>
+					<div class="hint">empty means a screenshots folder beside saves; the screenshot key is F12 by default and is on the Input tab. The file is the picture without the menu, the pointer or this overlay; type with the keyboard</div>
+				</div>
+
+				<div class="control">
+					<div class="button" data-event-click="take_screenshot()">Take screenshot</div>
+					<div class="hint">the menu is not in the file; the capture happens on the next field</div>
 				</div>
 			</div>
 
@@ -167,6 +205,42 @@
 						<span class="range-value">{{master_volume_text}}</span>
 					</div>
 					<div class="hint">host output gain only; nothing the game mixes changes</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Music and ambience</div>
+					<div class="range-row">
+						<input type="range" min="0" max="100" step="1" data-value="music_volume" data-event-change="apply()"/>
+						<span class="range-value">{{music_volume_text}}</span>
+					</div>
+					<div class="hint">the voices the game streams from the disc, which carry its music and its ambience; the two arrive on the same voices and cannot be separated</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Sound effects</div>
+					<div class="range-row">
+						<input type="range" min="0" max="100" step="1" data-value="effects_volume" data-event-change="apply()"/>
+						<span class="range-value">{{effects_volume_text}}</span>
+					</div>
+					<div class="hint">every other voice: footsteps, the sword, the birds, the calls between Ico and Yorda</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Movie</div>
+					<div class="range-row">
+						<input type="range" min="0" max="100" step="1" data-value="movie_volume" data-event-change="apply()"/>
+						<span class="range-value">{{movie_volume_text}}</span>
+					</div>
+					<div class="hint">the attract movie's own soundtrack, which the game plays on a stream of its own</div>
+				</div>
+
+				<div class="control">
+					<div class="control-label">Unlock chime</div>
+					<div class="range-row">
+						<input type="range" min="0" max="100" step="1" data-value="chime_volume" data-event-change="apply()"/>
+						<span class="range-value">{{chime_volume_text}}</span>
+					</div>
+					<div class="hint">the port's own achievement chime, not the game's audio; heard only while the chime is turned on, on the Achievements tab</div>
 				</div>
 
 				<div class="control">
@@ -207,12 +281,12 @@
 				</div>
 
 				<!--
-					All three binding tables come from one array of rows each
-					(keyboard_binds / gamepad_binds / mouse_binds in the settings
-					data model), so the row count follows
-					RtKeyBind/RtPadBind/RtMouseBind rather than a hand-written row
-					per slot. it_index is the slot number the Rebind button hands
-					back to ui_rebind.cpp.
+					All four binding tables come from one array of rows each
+					(keyboard_binds / gamepad_binds / gamepad2_binds /
+					mouse_binds in the settings data model), so the row count
+					follows RtKeyBind/RtPadBind/RT_GP2_COUNT/RtMouseBind rather
+					than a hand-written row per slot. it_index is the slot
+					number the Rebind button hands back to ui_rebind.cpp.
 				-->
 				<div class="section-header">
 					<span class="section-number">03.1</span>
@@ -245,13 +319,38 @@
 				</div>
 
 				<!--
-					The mouse table is the sixteen DS2 buttons only: it has no
-					stick slots (mouse motion is mouse look, below) and no menu
-					slot. Most slots ship unbound, which the row shows as
-					"unbound" and Unbind puts back.
+					Player 2's pad, the second controller the PAL disc's
+					two-player mode reads for Yorda. The same sixteen DS2
+					buttons and no host hotkeys: the menu key and the
+					screenshot key are player 1's, so this table has sixteen
+					rows where the one above has eighteen.
 				-->
 				<div class="section-header">
 					<span class="section-number">03.3</span>
+					<span class="section-title">Gamepad (player 2)</span>
+				</div>
+				<div class="note">The second gamepad plugged in drives pad port 1, which the game reads as player 2. Until one is attached the game is told nothing is plugged into that port, exactly as it would be on a console. Unplugging player 1's pad moves player 2's onto port 0.</div>
+				<div class="bind-table">
+					<div class="bind-row" data-for="row : gamepad2_binds">
+						<span class="bind-slot">{{row.label}}</span>
+						<span class="bind-name" data-class-capturing="row.capturing">{{row.binding}}</span>
+						<div class="bind-button" data-event-click="rebind_gamepad2(it_index)">Rebind</div>
+					</div>
+				</div>
+				<div class="bind-actions">
+					<div class="button" data-event-click="reset_gamepad2_binds()">Reset player 2 bindings</div>
+				</div>
+
+				<!--
+					The mouse table is the sixteen DS2 buttons plus the
+					screenshot hotkey: it has no stick slots (mouse motion is
+					mouse look, below) and no menu slot, since the mouse is
+					what drives the pointer the menu draws. Most slots ship
+					unbound, which the row shows as "unbound" and Unbind puts
+					back.
+				-->
+				<div class="section-header">
+					<span class="section-number">03.4</span>
 					<span class="section-title">Mouse</span>
 				</div>
 				<div class="bind-table">
@@ -267,7 +366,7 @@
 				</div>
 
 				<div class="section-header">
-					<span class="section-number">03.4</span>
+					<span class="section-number">03.5</span>
 					<span class="section-title">Mouse look</span>
 				</div>
 
@@ -340,16 +439,36 @@
 				</div>
 
 				<div class="control">
-					<div class="control-label">Verbose channels</div>
-					<input type="text" data-value="verbose" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_verbose"/>
-					<div class="hint">channel list as for ICORECOMP_VERBOSE; empty means the defaults; type with the keyboard</div>
-					<div class="override" data-if="overridden_verbose">{{override_text_verbose}}</div>
+					<div class="control-label">Log level</div>
+					<select data-value="log_level" data-event-change="apply()" data-attrif-disabled="overridden_log_level">
+						<option value="error">Error</option>
+						<option value="warn">Warn</option>
+						<option value="info">Info</option>
+						<option value="debug">Debug</option>
+					</select>
+					<div class="hint">a line is logged when its own level is at or above this one. warn keeps the refusals, fallbacks and out-of-range values; info adds startup facts and the profiler; debug adds every per-field and per-packet line and turns on every verbose channel, which costs frame time</div>
+					<div class="override" data-if="overridden_log_level">{{override_text_log_level}}</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row" data-event-click="console = !console; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="console" data-attrif-disabled="gameplay_active"/>
+							<div class="check-glyph" data-if="console">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
+						<span class="check-label">Show a console window</span>
+					</div>
+					<div class="hint">Windows only: opens a console for a run started by double-clicking and echoes the log to it. A run started from a shell already writes to that shell</div>
+					<div class="note-restart">{{cold_note}}</div>
 				</div>
 
 				<div class="control">
 					<div class="check-row" data-event-click="log_file = !log_file; apply()">
 						<div class="check-box">
-							<input type="checkbox" data-checked="log_file" data-attrif-disabled="overridden_log_file"/>
+							<input type="checkbox" data-checked="log_file" data-attrif-disabled="log_file_locked"/>
 							<div class="check-glyph" data-if="log_file">
 								<div class="check-arm"/>
 								<div class="check-arm check-arm-b"/>
@@ -357,7 +476,8 @@
 						</div>
 						<span class="check-label">Write a log file</span>
 					</div>
-					<div class="hint">takes effect at the next start</div>
+					<div class="hint">the run's log file, written next to the executable or in the per-user state folder</div>
+					<div class="note-restart">{{cold_note}}</div>
 					<div class="override" data-if="overridden_log_file">{{override_text_log_file}}</div>
 				</div>
 
@@ -371,9 +491,109 @@
 				<div class="control">
 					<div class="control-label">Frame limit, Hz</div>
 					<input type="text" data-value="fps_limit_hz" data-event-change="apply()" data-event-blur="apply()" data-attrif-disabled="overridden_fps_limit_hz"/>
-					<div class="hint">0 disables pacing; type with the keyboard</div>
+					<div class="hint">"mode" follows the game's own video mode (59.94 Hz NTSC, 50 Hz PAL); 0 disables pacing; type with the keyboard</div>
 					<div class="override" data-if="overridden_fps_limit_hz">{{override_text_fps_limit_hz}}</div>
 				</div>
+			</div>
+
+			<!--
+				The Achievements tab. The outer .section belongs to the
+				"settings" model like every other pane, because its data-if
+				reads active_tab; the table inside carries its own
+				data-model="achievements" (src/runtime/ui/ui_achievements_
+				model.cpp), which RmlUi attaches to that subtree and stops
+				descending the settings model at. That model is created
+				before this document is loaded, in rt_ui_init.
+
+				Everything shown comes from src/runtime/guest/achievements.h.
+				Nothing here is a control: the tab reads state and writes
+				nothing.
+			-->
+			<div class="section" data-if="active_tab == 'achievements'">
+				<div class="section-header">
+					<span class="section-number">06</span>
+					<span class="section-title">Achievements</span>
+				</div>
+
+				<!--
+					The four achievements.* keys. They belong to the
+					"settings" model, so they sit outside the
+					data-model="achievements" subtree below: RmlUi stops
+					descending the settings model at that div.
+				-->
+				<div class="control">
+					<div class="check-row" data-event-click="ach_enabled = !ach_enabled; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="ach_enabled"/>
+							<div class="check-glyph" data-if="ach_enabled">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
+						<span class="check-label">Watch for unlocks</span>
+					</div>
+					<div class="hint">off, nothing is read out of the game's progress bits and no counter moves; what is already unlocked stays unlocked</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row" data-event-click="ach_toast = !ach_toast; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="ach_toast"/>
+							<div class="check-glyph" data-if="ach_toast">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
+						<span class="check-label">Show a notice on an unlock</span>
+					</div>
+					<div class="hint">off, an unlock is still recorded and logged; nothing is drawn over the picture</div>
+				</div>
+
+				<div class="control">
+					<div class="check-row" data-event-click="ach_sound = !ach_sound; apply()">
+						<div class="check-box">
+							<input type="checkbox" data-checked="ach_sound"/>
+							<div class="check-glyph" data-if="ach_sound">
+								<div class="check-arm"/>
+								<div class="check-arm check-arm-b"/>
+							</div>
+						</div>
+						<span class="check-label">Play a sound on an unlock</span>
+					</div>
+					<div class="hint">a short chime the port synthesises itself; no audio asset ships with it, and the game's own mix is not changed. Its volume is on the Audio tab, with the other output gains</div>
+				</div>
+
+				<div data-model="achievements">
+					<div class="ach-summary">
+						<span class="ach-count">{{summary}}</span>
+						<span class="ach-counters">{{counters}}</span>
+					</div>
+					<div class="ach-caveat" data-if="caveat != ''">{{caveat}}</div>
+					<div class="ach-table">
+						<!--
+							data-for is a structural view: RmlUi cancels
+							every other data view on the element that carries
+							it (ElementUtilities.cpp, "Structural data views
+							should cancel all other non-structural data
+							views"), so the unlocked class goes on the two
+							children that change with it and not on the row.
+						-->
+						<div class="ach-row" data-for="row : trophies">
+							<span class="ach-tier">{{row.tier}}</span>
+							<div class="ach-cell">
+								<div class="ach-name" data-class-unlocked="row.unlocked">{{row.name}}</div>
+								<div class="ach-desc">{{row.description}}</div>
+								<div class="ach-note" data-if="row.unresolved">condition not yet located in this port</div>
+							</div>
+							<div class="ach-status">
+								<div class="ach-state" data-class-unlocked="row.unlocked">{{row.state}}</div>
+								<div class="ach-when">{{row.when}}</div>
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<div class="note">Local and host-side only: read out of the game's own progress bits once per field, never written back, and kept in saves/achievements.json beside the memory card. See docs/ACHIEVEMENTS.md.</div>
 			</div>
 		</div>
 	</div>

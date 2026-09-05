@@ -70,7 +70,7 @@ bool rt_save_icon_load(RtPs2Icon& icon, RtPs2IconSys& icon_sys, char* err, size_
     std::vector<uint8_t> icon_bytes;
     if (!read_entry(data_df, view.c_str(), kMaxIconBytes, icon_bytes, err, err_len)) {
         if (view == kFallbackViewIcon) return false;
-        rt_log("ui", "save icon: icon.sys names '%s', which DATA.DF does not give (%s); trying '%s'",
+        rt_log_warn("ui", "save icon: icon.sys names '%s', which DATA.DF does not give (%s); trying '%s'",
             view.c_str(), err, kFallbackViewIcon);
         view = kFallbackViewIcon;
         if (!read_entry(data_df, view.c_str(), kMaxIconBytes, icon_bytes, err, err_len)) return false;
@@ -101,17 +101,17 @@ bool rt_save_icon_build(uint32_t size_px, RtPs2IconImage& out, char* err, size_t
     if (!rt_save_icon_load(icon, icon_sys, err, err_len)) return false;
     if (!rt_ps2_icon_render(icon, icon_sys, size_px, 0, out, err, err_len)) return false;
 
-    rt_log("ui", "save icon: built %ux%u in %.1f ms", out.width, out.height, ms_since(t0));
+    rt_log_info("ui", "save icon: built %ux%u in %.1f ms", out.width, out.height, ms_since(t0));
     return true;
 } catch (const std::exception& e) {
     out = RtPs2IconImage();
     set_err(err, err_len, "save icon build threw: %s", e.what());
-    rt_log("ui", "save icon: build threw (%s); the window keeps its default icon", e.what());
+    rt_log_warn("ui", "save icon: build threw (%s); the window keeps its default icon", e.what());
     return false;
 } catch (...) {
     out = RtPs2IconImage();
     set_err(err, err_len, "save icon build threw a non-standard exception");
-    rt_log("ui", "save icon: build threw a non-standard exception; the window keeps its default"
+    rt_log_warn("ui", "save icon: build threw a non-standard exception; the window keeps its default"
                 " icon");
     return false;
 }

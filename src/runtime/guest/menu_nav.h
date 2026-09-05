@@ -37,7 +37,12 @@
  *   fade    layout fade/transition state; 2 is the interactive state and 3
  *           and 5 are the two fading ones. Gameplay also sits at 2, so the
  *           predicate below needs more than fade.
- *   mcsel   the memory card check screen's selector index (0..14)
+ *   adjust_level   the screen adjustment screen's own level (0..14), which
+ *           is also the alpha the game draws its white overlay at
+ *
+ * The two PAL boot screens are not in those four: they are the kanban
+ * system's, not the layout system's, and the state below carries what was
+ * resolved for them beside the four. menu_nav.cpp traces the difference.
  *
  * The word the highlight is actually drawn from, the layout table entry's
  * current-item field, is not kept here: every decision reads it fresh out of
@@ -59,8 +64,20 @@ struct RtGuestMenuState {
     uint32_t layout = 0;
     uint32_t item = 0;
     uint32_t fade = 0;
-    uint32_t mcsel = 0;
+    uint32_t adjust_level = 0;
     bool valid = false;
+    /* The kanban system's screens, which the four words above say nothing
+     * about: the two PAL boot screens (the language choice and the 50/60 Hz
+     * choice) and the memory card message are drawn from a list of their
+     * own, and which of them is up is read out of the node the game is
+     * navigating rather than out of a state word. `kanban` is true while one
+     * of them is up and has items; `kanban_layout` is the layout table entry
+     * it is built from and `kanban_item` that entry's current item, which is
+     * the same selection word every other screen uses. menu_nav.cpp carries
+     * the trace. */
+    bool kanban = false;
+    uint32_t kanban_layout = 0;
+    uint32_t kanban_item = 0;
 };
 
 /* One selectable item of the current screen, as the game itself places it.
@@ -69,11 +86,11 @@ struct RtGuestMenuState {
  * written into. It is not always the current layout id: a screen is built
  * from a chain of layouts (the current one and its parents by +0x30), every
  * one of which lt_next_layout runs and draws, and the items of a page like
- * the load file select (0x10) belong to an ancestor (0xb, the ten-slot
+ * the load file select (0x13) belong to an ancestor (0x0E, the ten-slot
  * grid). menu_nav.cpp carries the trace.
  *
  * `item` is the value that layout's selection word takes for it: a scene
- * object index on every screen but the memory card check, and a selector
+ * object index on every screen but the screen adjustment one, and a bar
  * position 0..14 on that one.
  *
  * The rectangle is in normalized presented-scanout coordinates, so 0..1 is
@@ -117,8 +134,11 @@ const RtGuestMenuState& rt_guest_menu_state();
 const std::vector<RtGuestMenuItem>& rt_guest_menu_items();
 
 /* Whether a menu the host may point at is on screen: the state words read,
- * fade 2 (the interactive state), and at least one selectable item with a
- * usable rectangle on some layout in the current screen's chain. */
+ * and at least one selectable item with a usable rectangle. For a layout
+ * screen that also needs fade 2, the interactive state, on some layout in
+ * the current screen's chain; for one of the kanban system's screens the
+ * gate is that system's own, the node the game is navigating, and the layout
+ * fade state does not enter into it. */
 bool rt_guest_menu_active();
 
 /* DS2 button bits (host/input.h RT_PAD_* order) the host wants pressed on

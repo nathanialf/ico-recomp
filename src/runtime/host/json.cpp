@@ -474,12 +474,12 @@ bool rt_json_write_file(const std::string& path, const std::string& text) {
     std::string tmp = path + ".tmp";
     std::FILE* f = rt_fopen_utf8(tmp.c_str(), "wb");
     if (!f) {
-        rt_log("json", "json: could not open %s for writing: %s", tmp.c_str(), std::strerror(errno));
+        rt_log_warn("json", "json: could not open %s for writing: %s", tmp.c_str(), std::strerror(errno));
         return false;
     }
     size_t written = std::fwrite(text.data(), 1, text.size(), f);
     if (written != text.size()) {
-        rt_log("json", "json: short write to %s: %s", tmp.c_str(), std::strerror(errno));
+        rt_log_error("json", "json: short write to %s: %s", tmp.c_str(), std::strerror(errno));
         std::fclose(f);
         std::remove(tmp.c_str());
         return false;
@@ -494,7 +494,7 @@ bool rt_json_write_file(const std::string& path, const std::string& text) {
 
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
-        rt_log("json", "json: rename %s -> %s failed: %s", tmp.c_str(), path.c_str(), ec.message().c_str());
+        rt_log_warn("json", "json: rename %s -> %s failed: %s", tmp.c_str(), path.c_str(), ec.message().c_str());
         std::remove(tmp.c_str());
         return false;
     }

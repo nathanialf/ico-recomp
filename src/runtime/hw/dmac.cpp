@@ -107,13 +107,12 @@ KickRec g_kick[10];
  * DMAC in before a game's ELF runs, and this runtime HLEs the kernel, so
  * nothing else would ever set it. Inferred, not measured: the supporting
  * evidence is that the game's own libdma read-modify-writes D_CTRL while
- * preserving bit 0 (decomp asm/nonmatchings/src/cod/vendor_2418A0/
- * func_00244748.s, "lw $10, 0x0($2)" at 0x244758 with $2 = 0x1000E000,
+ * preserving bit 0 (the libdma helper at 0x00244748: "lw $10, 0x0($2)" at
+ * 0x244758 with $2 = 0x1000E000,
  * "and $10, $10, 0xFFFFFFFD" at 0x244878, "sw $10, 0x0($4)" at 0x2448AC),
  * which only leaves the DMAC enabled if something before the game had
  * already enabled it. The first guest write that sets it explicitly is
- * StageOrientInit ("ori $2, $2, 0x3" at 0x19D324, decomp
- * asm/nonmatchings/src/stage_orient/StageOrientInit.s), well after the boot
+ * StageOrientInit ("ori $2, $2, 0x3" at 0x19D324), well after the boot
  * DMA traffic starts. */
 uint32_t g_dctrl = 1;
 uint32_t g_dpcr = 0;
@@ -132,8 +131,8 @@ uint32_t g_enable = 0; /* D_ENABLEW shadow, read back via D_ENABLER */
  * with that bit. Measured across all eleven sites in this binary, the
  * window contains CHCR accesses and nothing else: one or more of them,
  * reads as well as writes, and never a MADR/TADR/QWC access. The common
- * shape is the shared helper at 0x00258690 (decomp src/cod/vendor_2575C0;
- * the MPEG library carries its own inlined copies), described in prose
+ * shape is the shared helper at 0x00258690 (the MPEG library carries its
+ * own inlined copies), described in prose
  * rather than transcribed: it disables interrupts, reads D_ENABLER
  * (0x1000F520), sets bit 16 and stores the result to D_ENABLEW
  * (0x1000F590), does one store to ch4 CHCR (0x1000B400), then reads
@@ -141,9 +140,9 @@ uint32_t g_enable = 0; /* D_ENABLEW shadow, read back via D_ENABLER */
  * D_ENABLEW and tail-calls the interrupt re-enable.
  *
  * Both directions go through it: a stop writes CHCR = 5 or 0 (STR clear),
- * a start writes CHCR with bit 8 set (decomp
- * asm/nonmatchings/src/GobjProc/func_00240218.s line 271 for ch4 and line
- * 206 for ch3, each an "ori ..., 0x100" fed into that store).
+ * a start writes CHCR with bit 8 set (in the function at 0x00240218, once
+ * for ch4 and once for ch3, each an "ori ..., 0x100" fed into that
+ * store).
  *
  * Two things this measurement settles, against the guess that the library
  * holds the DMAC still while it samples the channel:
@@ -157,10 +156,9 @@ uint32_t g_enable = 0; /* D_ENABLEW shadow, read back via D_ENABLER */
  *     (func_00240218.s lines 187-191 for ch3 and 248-252 for ch4).
  *
  * The teardown paths are the ones that put more than one access in the
- * window, and they read CHCR inside it: decomp
- * asm/nonmatchings/src/cod/vendor_2517D0/func_002517D0.s lines 19-34 sets
+ * window, and they read CHCR inside it: the teardown at 0x002517D0 sets
  * the suspend, then read-modify-writes ch3 CHCR and ch4 CHCR with the
- * 0xFFFFFEFF mask (STR clear) before releasing; func_00252488.s lines 23-35
+ * 0xFFFFFEFF mask (STR clear) before releasing; the one at 0x00252488
  * stores to ch3, ch4 and ch9 (toSPR) CHCR in one window. Both then write
  * QWC = 0 after the release. So the shadow has to answer a CHCR read while
  * held with STR still set, which is what an armed-but-not-started channel
@@ -195,11 +193,19 @@ uint8_t* dma_ptr(uint32_t addr, bool spr) {
     if (spr || (addr & 0x80000000u)) {
         uint32_t off = addr & 0x3FFF;
         uint8_t* page = g_pages[0x70000000u >> 16];
+        /* The RAM path below refuses an unmapped page; this one used to
+         * add the offset to whatever the page table held, which for a null
+         * page is a small absolute address. Same fatal, same reason. */
+        if (!page) {
+            rt_fatal("dmac", rt_fault_ctx(),
+                "DMA touches the scratchpad (address 0x%08x) but no scratchpad page is mapped",
+                addr);
+        }
         return page + off;
     }
     uint8_t* p = g_pages[addr >> 16];
     if (!p) {
-        rt_fatal("dmac", nullptr, "DMA touches unmapped guest address 0x%08x", addr);
+        rt_fatal("dmac", rt_fault_ctx(), "DMA touches unmapped guest address 0x%08x", addr);
     }
     return p + (addr & 0xFFFF);
 }
@@ -272,7 +278,7 @@ void run_source_chain(int ch, Channel& c) {
     for (;;) {
         if (++tags > kTagCap) {
             rt_dmac_dump_recent_tags(ch);
-            rt_fatal("dmac", nullptr, "ch%d (%s) source chain exceeded %u tags; runaway TADR=0x%08x STADR=0x%08x D_CTRL=0x%08x",
+            rt_fatal("dmac", rt_fault_ctx(), "ch%d (%s) source chain exceeded %u tags; runaway TADR=0x%08x STADR=0x%08x D_CTRL=0x%08x",
                 ch, kDesc[ch].name, kTagCap, c.tadr, g_stadr, g_dctrl);
         }
         bool tadr_spr = (c.tadr & 0x80000000u) != 0;
@@ -290,7 +296,7 @@ void run_source_chain(int ch, Channel& c) {
         ++g_tag_count[ch];
 
         if (rt_trace()) {
-            rt_log("dmac", "ch%d tag #%u @0x%08x: %s qwc=%u addr=0x%08x%s irq=%d",
+            rt_log_debug("dmac", "ch%d tag #%u @0x%08x: %s qwc=%u addr=0x%08x%s irq=%d",
                 ch, tags, c.tadr, tag_id_name(id), qwc, taddr, tspr ? " SPR" : "", irq ? 1 : 0);
         }
 
@@ -300,7 +306,7 @@ void run_source_chain(int ch, Channel& c) {
             std::memcpy(w, tagbuf + 8, 8);
             rt_vif1_feed(w, 2, c.tadr + 8);
         } else if (tte && ch != 9 && is_pow2(c.kicks)) {
-            rt_log("dmac", "ch%d (%s): TTE set on a non-VIF1 chain; tag words dropped", ch, kDesc[ch].name);
+            rt_log_warn("dmac", "ch%d (%s): TTE set on a non-VIF1 chain; tag words dropped", ch, kDesc[ch].name);
         }
         /* ch9 is left out of that log on purpose: toSPR has no peripheral
          * FIFO to receive tag words, so hardware ignores TTE there and
@@ -331,7 +337,7 @@ void run_source_chain(int ch, Channel& c) {
             case 4: /* REFS (stall control not modeled; loud below) */
                 if (id == 4 && (g_dctrl & 0xC0u)) {
                     static uint64_t n = 0;
-                    if (is_pow2(++n)) rt_log("dmac", "REFS with D_CTRL.STS armed (0x%x); stall not modeled [#%" PRIu64 "]", g_dctrl, n);
+                    if (is_pow2(++n)) rt_log_warn("dmac", "REFS with D_CTRL.STS armed (0x%x); stall not modeled [#%" PRIu64 "]", g_dctrl, n);
                 }
                 c.madr = taddr | (tspr ? 0x80000000u : 0);
                 sink_payload(ch, c, c.madr, qwc, tspr, gif_accum);
@@ -343,7 +349,7 @@ void run_source_chain(int ch, Channel& c) {
                 if (asp == 0) { c.asr0 = c.madr + qwc * 16; asp = 1; }
                 else if (asp == 1) { c.asr1 = c.madr + qwc * 16; asp = 2; }
                 else {
-                    rt_fatal("dmac", nullptr, "ch%d CALL with ASR stack full (asp=2)", ch);
+                    rt_fatal("dmac", rt_fault_ctx(), "ch%d CALL with ASR stack full (asp=2)", ch);
                 }
                 next_tadr = taddr | (tspr ? 0x80000000u : 0);
                 break;
@@ -378,7 +384,7 @@ void run_source_chain(int ch, Channel& c) {
         rt_gif_submit(2, gif_accum.data(), (uint32_t)(gif_accum.size() / 16));
     }
     if (rt_trace() || is_pow2(c.kicks)) {
-        rt_log("dmac", "ch%d (%s) chain done: %u tags, %u qw [kick #%" PRIu64 "]",
+        rt_log_debug("dmac", "ch%d (%s) chain done: %u tags, %u qw [kick #%" PRIu64 "]",
             ch, kDesc[ch].name, tags, total_qw, c.kicks);
     }
 }
@@ -436,7 +442,7 @@ void run_normal(int ch, Channel& c) {
     }
     if (ch == 2) c.madr += qwc * 16;
     if (rt_trace() || is_pow2(c.kicks)) {
-        rt_log("dmac", "ch%d (%s) normal done: %u qw [kick #%" PRIu64 "]", ch, kDesc[ch].name, qwc, c.kicks);
+        rt_log_debug("dmac", "ch%d (%s) normal done: %u qw [kick #%" PRIu64 "]", ch, kDesc[ch].name, qwc, c.kicks);
     }
 }
 
@@ -455,7 +461,14 @@ void kick(int ch, Channel& c) {
     switch (ch) {
         case 1: /* VIF1 */
             if (dir == 0) {
-                rt_log("dmac", "ch1 VIF1 kicked in FROM direction (GS readback); not modeled, dropped");
+                /* One line per kick if it ever became a per-field thing.
+                 * Fold on this condition's own counter, first few kept. */
+                static uint64_t from_kicks = 0;
+                ++from_kicks;
+                if (from_kicks <= 4 || (from_kicks & (from_kicks - 1)) == 0) {
+                    rt_log_warn("dmac", "ch1 VIF1 kicked in FROM direction (GS readback); not "
+                        "modeled, dropped [#%" PRIu64 "]", from_kicks);
+                }
                 break;
             }
             if (mode == 1) run_source_chain(ch, c);
@@ -466,16 +479,16 @@ void kick(int ch, Channel& c) {
                 rt_vif1_feed(reinterpret_cast<const uint32_t*>(buf.data()), (c.qwc & 0xFFFF) * 4, c.madr);
                 c.madr += (c.qwc & 0xFFFF) * 16;
                 if (rt_trace() || is_pow2(c.kicks)) {
-                    rt_log("dmac", "ch1 (VIF1) normal done: %u qw [kick #%" PRIu64 "]", c.qwc & 0xFFFF, c.kicks);
+                    rt_log_debug("dmac", "ch1 (VIF1) normal done: %u qw [kick #%" PRIu64 "]", c.qwc & 0xFFFF, c.kicks);
                 }
             } else {
-                rt_fatal("dmac", nullptr, "ch1 VIF1 kicked in interleave mode");
+                rt_fatal("dmac", rt_fault_ctx(), "ch1 VIF1 kicked in interleave mode");
             }
             break;
         case 2: /* GIF */
             if (mode == 1) run_source_chain(ch, c);
             else if (mode == 0) run_normal(ch, c);
-            else rt_fatal("dmac", nullptr, "ch2 GIF kicked in interleave mode");
+            else rt_fatal("dmac", rt_fault_ctx(), "ch2 GIF kicked in interleave mode");
             break;
         case 8: /* fromSPR */
             if (mode == 1) {
@@ -484,7 +497,7 @@ void kick(int ch, Channel& c) {
                  * (which the channel does not have). Nothing in this binary
                  * kicks it that way, so it stays a fatal rather than a guess.
                  * EE User's Manual, DMAC chapter; ps2tek "DMAC". */
-                rt_fatal("dmac", nullptr, "ch8 (fromSPR) kicked in chain mode; destination chain is not modeled");
+                rt_fatal("dmac", rt_fault_ctx(), "ch8 (fromSPR) kicked in chain mode; destination chain is not modeled");
             }
             run_normal(ch, c);
             break;
@@ -495,10 +508,10 @@ void kick(int ch, Channel& c) {
              * and every payload is written to the scratchpad at SADR.
              * Measured use in this binary: the MPEG library's macroblock
              * copy builds a list of REF tags with qwc=0x30, terminated by a
-             * REFE, and kicks CHCR=0x105 (decomp asm/nonmatchings/src/cod/
-             * vendor_2517D0/func_00252F90.s, the tag loop at .L002530D0
-             * writing "0x30000030" and "id << 28 | 0x30" pairs, then the
-             * SADR/TADR/QWC/CHCR stores at .L00253150). */
+             * REFE, and kicks CHCR=0x105 (the macroblock copy at
+             * 0x00252F90: its tag loop at 0x002530D0 writes "0x30000030"
+             * and "id << 28 | 0x30" pairs, then the SADR/TADR/QWC/CHCR
+             * stores at 0x00253150). */
             if (mode == 1) run_source_chain(ch, c);
             else run_normal(ch, c);
             break;
@@ -510,11 +523,11 @@ void kick(int ch, Channel& c) {
             rt_ipu_dma_kick(ch);
             return;
         case 0: /* VIF0: loud stub */
-            rt_log("dmac", "ch0 (VIF0) kicked (madr=0x%08x qwc=%u): STUB, transfer dropped [kick #%" PRIu64 "]",
+            rt_log_warn("dmac", "ch0 (VIF0) kicked (madr=0x%08x qwc=%u): STUB, transfer dropped [kick #%" PRIu64 "]",
                 c.madr, c.qwc, c.kicks);
             break;
         default: /* SIF channels: HLE'd at the SifSetDma layer */
-            rt_log("dmac", "ch%d (%s) kicked via CHCR (madr=0x%08x qwc=%u): STUB (SIF DMA is HLE'd), dropped [kick #%" PRIu64 "]",
+            rt_log_warn("dmac", "ch%d (%s) kicked via CHCR (madr=0x%08x qwc=%u): STUB (SIF DMA is HLE'd), dropped [kick #%" PRIu64 "]",
                 ch, kDesc[ch].name, c.madr, c.qwc, c.kicks);
             break;
     }
@@ -532,7 +545,7 @@ void record_pending(int ch) {
     g_pending[ch] = true;
     if (!g_pend_logged[ch]) {
         g_pend_logged[ch] = true;
-        rt_log("dmac", "ch%d (%s) started while the DMAC is held (D_ENABLE=0x%08x D_CTRL=0x%08x); "
+        rt_log_info("dmac", "ch%d (%s) started while the DMAC is held (D_ENABLE=0x%08x D_CTRL=0x%08x); "
                        "kick queued until release",
             ch, kDesc[ch].name, g_enable, g_dctrl);
     }
@@ -559,7 +572,7 @@ void release_pending(const char* why) {
      * case for the game's suspend bracket around a single CHCR store, so it
      * is not worth a line. */
     if (n > 0) {
-        rt_log("dmac", "%s: running %d queued kick%s (%s)", why, n, n == 1 ? "" : "s", names);
+        rt_log_info("dmac", "%s: running %d queued kick%s (%s)", why, n, n == 1 ? "" : "s", names);
     }
     bool ipu_kicked = false;
     for (int i = 0; i < n; ++i) {
@@ -586,27 +599,27 @@ bool rt_dmac_suspended() { return dma_held(); }
 
 void rt_dmac_dump_recent_tags(int ch) {
     if (ch < 0 || ch >= 10) {
-        rt_log("dmac", "recent tags requested for channel %d, which does not exist", ch);
+        rt_log_warn("dmac", "recent tags requested for channel %d, which does not exist", ch);
         return;
     }
     const KickRec& k = g_kick[ch];
     if (k.valid) {
-        rt_log("dmac", "ch%d kick #%" PRIu64 " started at TADR=0x%08x MADR=0x%08x CHCR=0x%08x, %u tags walked so far",
+        rt_log_info("dmac", "ch%d kick #%" PRIu64 " started at TADR=0x%08x MADR=0x%08x CHCR=0x%08x, %u tags walked so far",
             ch, k.kick, k.tadr, k.madr, k.chcr,
             (uint32_t)(g_tag_count[ch] - k.tags_at_start));
     } else {
-        rt_log("dmac", "ch%d has not been kicked", ch);
+        rt_log_info("dmac", "ch%d has not been kicked", ch);
     }
     const uint64_t n = g_tag_count[ch];
     if (n == 0) {
-        rt_log("dmac", "ch%d has walked no source-chain tags", ch);
+        rt_log_info("dmac", "ch%d has walked no source-chain tags", ch);
         return;
     }
     const uint32_t shown = (uint32_t)(n < 32 ? n : 32);
     for (uint32_t i = 0; i < shown; ++i) {
         const uint64_t idx = n - shown + i;
         const TagRec& t = g_tag_ring[ch][idx % 32];
-        rt_log("dmac", "ch%d recent tag[%u]: @0x%08x %s qwc=%u addr=0x%08x kick=#%" PRIu64 "%s",
+        rt_log_info("dmac", "ch%d recent tag[%u]: @0x%08x %s qwc=%u addr=0x%08x kick=#%" PRIu64 "%s",
             ch, i, t.tadr, tag_id_name(t.id), t.qwc, t.taddr, t.kick,
             idx + 1 == n ? " <- current" : "");
     }
@@ -693,7 +706,7 @@ bool rt_dmac_mmio_write(uint32_t addr, uint32_t v) {
                          * started, so the queued kick goes away. The MPEG
                          * library's stop/restart sequence does this. */
                         g_pending[ch] = false;
-                        rt_log("dmac", "ch%d (%s) stopped (CHCR without STR) while held; queued kick dropped",
+                        rt_log_warn("dmac", "ch%d (%s) stopped (CHCR without STR) while held; queued kick dropped",
                             ch, kDesc[ch].name);
                     }
                     /* A transfer already running on an IPU channel stops
@@ -718,7 +731,20 @@ bool rt_dmac_mmio_write(uint32_t addr, uint32_t v) {
             const bool was_held = dma_held();
             g_dctrl = v;
             if (v & ~1u) {
-                rt_log("dmac", "D_CTRL = 0x%08x arms unmodeled features (RELE/MFD/STS/STD); loud stub", v);
+                /* StageOrientInit writes 0x3, and anything that writes
+                 * D_CTRL once tends to write it every field. Keep the first
+                 * few and the distinct values, fold the rest: the value is
+                 * in the line, so a new bit pattern still shows up as a
+                 * fresh first line. */
+                static uint64_t ctrl_writes = 0;
+                static uint32_t last_value = 0;
+                ++ctrl_writes;
+                if (v != last_value || ctrl_writes <= 4
+                    || (ctrl_writes & (ctrl_writes - 1)) == 0) {
+                    last_value = v;
+                    rt_log_warn("dmac", "D_CTRL = 0x%08x arms unmodeled features "
+                        "(RELE/MFD/STS/STD); loud stub [#%" PRIu64 "]", v, ctrl_writes);
+                }
             }
             if (was_held && !dma_held()) release_pending("D_CTRL.DMAE set");
             return true;
@@ -727,15 +753,15 @@ bool rt_dmac_mmio_write(uint32_t addr, uint32_t v) {
         case 0x1000E030: g_dsqwc = v; return true;
         case 0x1000E040:
             g_rbsr = v;
-            if (v) rt_fatal("dmac", nullptr, "D_RBSR = 0x%08x arms MFIFO; not modeled (loud stub per plan)", v);
+            if (v) rt_fatal("dmac", rt_fault_ctx(), "D_RBSR = 0x%08x arms MFIFO; not modeled (loud stub per plan)", v);
             return true;
         case 0x1000E050:
             g_rbor = v;
-            if (v) rt_fatal("dmac", nullptr, "D_RBOR = 0x%08x arms MFIFO; not modeled (loud stub per plan)", v);
+            if (v) rt_fatal("dmac", rt_fault_ctx(), "D_RBOR = 0x%08x arms MFIFO; not modeled (loud stub per plan)", v);
             return true;
         case 0x1000E060:
             g_stadr = v;
-            if (v) rt_log("dmac", "D_STADR = 0x%08x written; stall control is not modeled (loud stub)", v);
+            if (v) rt_log_warn("dmac", "D_STADR = 0x%08x written; stall control is not modeled (loud stub)", v);
             return true;
         case 0x1000F590: { /* D_ENABLEW */
             const bool was_held = dma_held();

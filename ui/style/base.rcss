@@ -48,6 +48,7 @@
  *             #000000 hover and focus
  *   accent    #1a1a1a (a control that is on)
  *   warning   #3d2600 on #e9cf8e, border #1a1a1a
+ *   restart   #8f2418 (.note-restart, the cold keys and nothing else)
  */
 
 /* ---- elements ----------------------------------------------------------- */
@@ -260,35 +261,35 @@ body.menu {
 }
 
 /* Rotated about its own center, so the pre-rotation box is centered on the
- * line with a negative margin of half its width. 70dp holds "Settings" at
- * 8dp mono with 0.08em of letter-spacing (8 * 0.68 = 5.44dp each, 44dp in
- * all) with room to spare. flex-shrink: 0 because the label is a flex item
- * of the 1dp-wide line: at the default shrink factor RmlUi squeezes the
- * 70dp box down before the -35dp margin applies, and the rotated box lands
- * left of the line instead of on it. Nowrap because a wrap here would
- * rotate a second line into the nav column.
+ * line with a negative margin of half its width. 48dp holds "Menu" at
+ * 8dp mono with 0.08em of letter-spacing (8 * 0.68 = 5.44dp each, 22dp in
+ * all) with the same 13dp of clear line at either end that the wider box
+ * gave the old eight-letter label. flex-shrink: 0 because the label is a
+ * flex item of the 1dp-wide line: at the default shrink factor RmlUi
+ * squeezes the box down before the -24dp margin applies, and the rotated
+ * box lands left of the line instead of on it. Nowrap because a wrap here
+ * would rotate a second line into the nav column.
  *
- * The box is 70dp square so the two line segments above and below it stop
- * 13dp short of the 44dp text at either end, which is the gap the old mask
- * left: before rotation the segments meet the box's top and bottom edges,
- * and the rotation is about the box's centre, so after it the same 70dp
- * reach lies along the line. The -35dp margin puts the box's centre on the
- * line's left edge. */
+ * The box is 48dp square so the two line segments above and below it stop
+ * 13dp short of the 22dp text at either end: before rotation the segments
+ * meet the box's top and bottom edges, and the rotation is about the box's
+ * centre, so after it the same 48dp reach lies along the line. The -24dp
+ * margin puts the box's centre on the line's left edge. */
 .bracket-label {
 	display: block;
-	width: 70dp;
-	height: 70dp;
+	width: 48dp;
+	height: 48dp;
 	flex-shrink: 0;
-	margin-left: -35dp;
+	margin-left: -24dp;
 	padding: 0;
 	background-color: transparent;
 	text-align: center;
 	text-transform: uppercase;
 	letter-spacing: 0.08em;
 	font-size: 8dp;
-	/* One 8dp line centred in the 70dp box, so the rotation about the
+	/* One 8dp line centred in the 48dp box, so the rotation about the
 	 * box's centre lands the text on the line. */
-	line-height: 70dp;
+	line-height: 48dp;
 	color: #4a3f2c;
 	white-space: nowrap;
 	transform: rotate(-90deg);
@@ -412,6 +413,20 @@ scrollbarvertical sliderbar:hover {
 	display: block;
 	font-size: 9dp;
 	color: #4a3f2c;
+	line-height: 1.4;
+	margin-top: 3dp;
+}
+
+/* The note under a cold key (docs/SETTINGS.md section 2): changing it
+ * restarts the program, or, once the game is running, cannot be done here
+ * at all. A hint's colour would read as one more description of the
+ * control; this one is about what the change does to the run, so it is the
+ * one red in the menu. #8f2418 is that red against all three sand panels
+ * and is used nowhere else. */
+.note-restart {
+	display: block;
+	font-size: 9dp;
+	color: #8f2418;
 	line-height: 1.4;
 	margin-top: 3dp;
 }

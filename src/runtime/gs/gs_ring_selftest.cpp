@@ -28,6 +28,14 @@
  * The configurations below cover all four by shrinking the ring far below
  * the 32 MB the runtime uses.
  *
+ * The present pump has its own case at the end (run_present_pump_case). It
+ * is not a recorded call: the ring generates it, once after each vsync
+ * record and again from the consumer's park while a repeat interval
+ * expires, so it has no counterpart on the oracle and is counted rather than
+ * logged. What is checked is that display.present_rate 0 produces exactly
+ * one pump per vsync and never a repeat, that a rate produces repeats while
+ * the ring sits empty, and that the shortened park still wakes on a record.
+ *
  * The privileged-register shadow is checked at the same time: the inner
  * backend's read_priv returns a poison value, so any read the wrapper
  * forwards instead of answering itself is caught immediately.
@@ -41,12 +49,15 @@
 #include "gs_parallel_api.h"
 #include "runtime.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 /* ---- stubs for the runtime services gs_threaded.cpp uses ---------------- */
@@ -64,15 +75,29 @@ int g_dispatch_held = 0;
 uint64_t g_unheld_pumps = 0;
 } // namespace
 
-void rt_log(const char* component, const char* fmt, ...) {
+/* The runtime's four level entry points, all onto one line here: a
+ * selftest has one reader and no level to filter by. */
+void rt_log_line(const char* component, const char* fmt, va_list ap);
+
+void rt_log_error(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_warn(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_info(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+void rt_log_debug(const char* component, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); rt_log_line(component, fmt, ap); va_end(ap);
+}
+
+void rt_log_line(const char* component, const char* fmt, va_list ap) {
     ++g_log_lines;
     if (!g_log_verbose) return;
-    va_list ap;
-    va_start(ap, fmt);
     std::printf("[%s] ", component);
     std::vprintf(fmt, ap);
     std::printf("\n");
-    va_end(ap);
 }
 
 /* The ring holds event dispatch across every wait that pumps; there is no
@@ -94,6 +119,20 @@ void rt_window_pump() {
 /* Only reached by the ring's abandon path (a worker that will not stop),
  * which no configuration here provokes. */
 void rt_log_drain() {}
+
+/* The run-state notes the ring pushes for the end-of-run summary and the
+ * field watchdog (host/run_state.cpp). Stubbed rather than linked: this
+ * harness has no run to summarise, and linking run_state.cpp would drag in
+ * the log sink this file replaces. Counted so the ring's own checks can see
+ * the pushes happened at all. */
+uint64_t g_run_notes = 0;
+void rt_run_note_gs_record(const char*) { ++g_run_notes; }
+void rt_run_note_gs_worker(const char*) { ++g_run_notes; }
+void rt_run_note_gs_queued(uint64_t, uint64_t) { ++g_run_notes; }
+void rt_run_set_exit_reason(bool, const char*, ...) {}
+void rt_run_summary() {}
+void rt_thread_set_name(const char*) {}
+void rt_crash_reserve_stack() {}
 
 /* No fatal is in progress in this harness. */
 int rt_fatal_exit_code() { return -1; }
@@ -156,6 +195,8 @@ enum Tag : uint8_t {
     kTagOverlayTexCreate,
     kTagOverlayTexDestroy,
     kTagPresentUi,
+    kTagSetWideAspect,
+    kTagRequestShot,
 };
 
 /* The poison read_priv returns. ThreadedBackend must never forward a
@@ -223,6 +264,51 @@ public:
         append(e, deinterlace);
     }
 
+    /* The bits, not the double: the ring carries this value through a
+     * memcpy to a uint64_t record argument and back, and comparing the raw
+     * bytes is what makes a lost or reinterpreted bit visible. */
+    void set_widescreen_aspect(double aspect) override {
+        std::string& e = open(kTagSetWideAspect);
+        uint64_t bits = 0;
+        std::memcpy(&bits, &aspect, sizeof(bits));
+        append(e, bits);
+    }
+
+    void request_screenshot(uint32_t slots) override {
+        std::string& e = open(kTagRequestShot);
+        append(e, slots);
+        m_armed_slots = slots;
+    }
+
+    /* Straight through, never over the ring (gs_threaded.h): the wrapper
+     * calls this on the inner backend from the producer's own thread. A
+     * deterministic answer per slot lets the test check the pass-through
+     * without the two backends sharing state. */
+    size_t take_screenshot(uint32_t slot, uint32_t* w, uint32_t* h, uint8_t* dst,
+                           size_t dst_bytes) override {
+        if (slot >= RT_PGS_SHOT_SLOTS) return 0;
+        const uint32_t width = 4u + slot, height = 2u;
+        const size_t need = size_t(width) * height * 4u;
+        if (w) *w = width;
+        if (h) *h = height;
+        if (!dst) return need;
+        if (dst_bytes < need) return 0;
+        for (size_t i = 0; i < need; ++i) dst[i] = uint8_t(i + slot);
+        return need;
+    }
+
+    uint32_t armed_slots() const { return m_armed_slots; }
+
+    /* Counted, not logged. Every other method here records a call the test
+     * made; this one is made by the ring itself, so logging it would put an
+     * entry in the wrapped log that the oracle can never have. The counts
+     * are read after quiesce() has joined the worker, which is what makes
+     * reading these plain members from the test thread safe. */
+    void present_pump(double max_hz) override {
+        ++m_pumps;
+        m_last_rate = max_hz;
+    }
+
     uint32_t overlay_texture_create(const uint8_t* rgba8, uint32_t width,
                                     uint32_t height) override {
         std::string& e = open(kTagOverlayTexCreate);
@@ -262,6 +348,8 @@ public:
     void check_alignment() { m_check_alignment = true; }
 
     const std::vector<std::string>& log() const { return m_log; }
+    uint64_t pumps() const { return m_pumps; }
+    double last_rate() const { return m_last_rate; }
     uint64_t priv_reads() const { return m_priv_reads; }
     uint64_t alignment_faults() const { return m_alignment_faults; }
 
@@ -283,6 +371,9 @@ private:
     uint32_t m_present_ui = 0;
     uint64_t m_priv_reads = 0;
     uint64_t m_alignment_faults = 0;
+    uint64_t m_pumps = 0;
+    double m_last_rate = -1.0;
+    uint32_t m_armed_slots = 0;
 };
 
 /* ---- call generation ---------------------------------------------------- */
@@ -298,23 +389,37 @@ enum Op {
     kOpSetRenderScale,
     kOpSetRaster,
     kOpSetDeinterlace,
+    kOpSetWideAspect,
+    kOpSetPresentRate,
     kOpOverlaySetFrame,
     kOpOverlayClearFrame,
     kOpOverlayTexCreate,
     kOpOverlayTexDestroy,
     kOpPresentUi,
+    kOpRequestShot,
     kOpCount,
 };
 
-const char* const kOpNames[kOpCount] = {
+/* One op per ThreadedBackend method that writes a record, in the same order
+ * as gs_threaded.cpp's RecordKind. The count is asserted against the name
+ * table below; the two lists are kept beside each other so a new record kind
+ * that arrives with no op here is visible in one screen. Wrap has no
+ * producer method (the encoder writes it), and read_priv and take_screenshot
+ * are answered without a record but have their own cases in the sequence. */
+
+const char* const kOpNames[] = {
     "gif", "gif-large", "priv", "read-priv", "vsync", "set-presentation",
     "set-present-mode", "set-render-scale", "set-raster", "set-deinterlace",
-    "overlay-set-frame", "overlay-clear-frame", "overlay-tex-create",
-    "overlay-tex-destroy", "present-ui",
+    "set-wide-aspect", "set-present-rate", "overlay-set-frame",
+    "overlay-clear-frame", "overlay-tex-create", "overlay-tex-destroy",
+    "present-ui", "request-screenshot",
 };
+static_assert(std::size(kOpNames) == size_t(kOpCount),
+              "one name per Op, in Op order");
 
 /* Weights: GIF packets dominate a real run, so they dominate here too. */
-const uint32_t kOpWeights[kOpCount] = { 40, 3, 20, 10, 6, 2, 2, 2, 2, 2, 6, 2, 2, 3, 2 };
+const uint32_t kOpWeights[] = { 40, 3, 20, 10, 6, 2, 2, 2, 2, 2, 2, 2, 6, 2, 2, 3, 2, 2 };
+static_assert(std::size(kOpWeights) == size_t(kOpCount), "one weight per Op, in Op order");
 
 Op pick_op() {
     uint32_t total = 0;
@@ -370,6 +475,7 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
 
     uint64_t priv_reads_checked = 0;
     uint64_t vsync_returns_checked = 0;
+    uint64_t vsyncs_enqueued = 0;
 
     for (uint32_t i = 0; i < calls; ++i) {
         const Op op = pick_op();
@@ -412,6 +518,7 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
         }
         case kOpVsync: {
             const unsigned field = next_u32(2);
+            ++vsyncs_enqueued;
             const bool want = oracle.vsync(field);
             const bool got = ring.vsync(field);
             /* The runtime's field boundary: enqueue the vsync, then wait for
@@ -464,6 +571,46 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
             ring.set_deinterlace(deinterlace);
             break;
         }
+        case kOpSetWideAspect: {
+            /* Ordinary aspects and the two the derivation can produce at the
+             * ends, so the double survives the record's bit round trip for
+             * values that are not exactly representable in a few bits. */
+            static const double kAspects[] = { 4.0 / 3.0, 16.0 / 9.0, 1.0, 2.3518, 0.0 };
+            const double aspect = kAspects[next_u32(5)];
+            oracle.set_widescreen_aspect(aspect);
+            ring.set_widescreen_aspect(aspect);
+            break;
+        }
+        case kOpRequestShot: {
+            /* 1 or 2, the only two the host arms. The pixels never ride the
+             * ring: take_screenshot below is the straight-through read, and
+             * it must answer from this thread whatever the consumer is
+             * doing. */
+            const uint32_t slots = 1u + next_u32(2);
+            oracle.request_screenshot(slots);
+            ring.request_screenshot(slots);
+            uint32_t w = 0, h = 0;
+            const size_t need = ring.take_screenshot(RT_PGS_SHOT_PRE, &w, &h, nullptr, 0);
+            std::vector<uint8_t> px(need, 0);
+            const size_t got = ring.take_screenshot(RT_PGS_SHOT_PRE, &w, &h, px.data(), px.size());
+            if (need == 0 || got != need || w == 0 || h == 0) {
+                std::printf("take_screenshot passed through as %zu/%zu bytes, %ux%u\n",
+                            got, need, w, h);
+                return false;
+            }
+            break;
+        }
+        case kOpSetPresentRate:
+            /* The ring keeps this one to itself: it does not forward the
+             * rate to the inner backend, it hands it back as the argument of
+             * every present_pump. So there is nothing to record on the
+             * oracle, and what this op is here for is that a record kind
+             * with no inner call still leaves the order of everything around
+             * it exactly as it was. Always 0, so no repeat can fire and the
+             * pump count stays one per vsync; the rate that does repeat has
+             * its own case below. */
+            ring.set_present_rate(0.0);
+            break;
         case kOpOverlaySetFrame: {
             const uint32_t vcount = next_u32(64);
             const uint32_t icount = next_u32(96);
@@ -573,6 +720,14 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
                     ring.records_written(), ring.records_replayed());
         return false;
     }
+    /* Every vsync record pumps the present once, and with the rate at 0
+     * nothing else does: no repeat may fire from the consumer's park. */
+    if (wrapped->pumps() != vsyncs_enqueued) {
+        std::printf("%s: %" PRIu64 " present pumps for %" PRIu64 " vsyncs"
+                    " (display.present_rate 0 must never repeat)\n",
+                    cfg.name, wrapped->pumps(), vsyncs_enqueued);
+        return false;
+    }
 
     std::printf("  %-22s ring %7zu %-14s calls %6zu  records %6" PRIu64
                 "  bytes %10" PRIu64 "  wraps %5" PRIu64 "  stalls %5" PRIu64
@@ -580,6 +735,88 @@ bool run_config(const Config& cfg, uint32_t calls, uint64_t seed, uint64_t op_co
                 cfg.name, cfg.ring_bytes, mode_name(cfg), want.size(),
                 ring.records_replayed(), ring.bytes_written(), ring.wrap_markers(),
                 ring.back_pressure_stalls(), priv_reads_checked, vsync_returns_checked);
+    return true;
+}
+
+/* The present pump on its own. Two questions, both about the consumer's park
+ * loop, neither reachable from the randomised sequence above (which never
+ * leaves the ring empty for long enough).
+ *
+ *   1. display.present_rate 0 must produce exactly one pump per vsync, even
+ *      with the worker sitting on an empty ring for many repeat intervals.
+ *   2. A rate must produce repeats while the ring is empty, and the park
+ *      whose wait was shortened for those repeats must still wake on a
+ *      record.
+ *
+ * Every count is read after quiesce() has joined the worker; nothing here
+ * reads the inner backend's state while it is running. */
+bool run_present_pump_case() {
+    { /* 1: no rate, no repeats */
+        RecordingBackend* inner = new RecordingBackend(); /* owned by the ring */
+        ThreadedBackend ring(inner, 64u * 1024, true);
+        ring.start_worker();
+        ring.set_present_rate(0.0);
+        for (unsigned i = 0; i < 4; ++i) {
+            ring.vsync(i & 1u);
+            ring.field_sync();
+        }
+        /* Far longer than any repeat interval this build could pick. */
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        ring.quiesce();
+        if (inner->pumps() != 4) {
+            std::printf("present-pump: rate 0 pumped %" PRIu64 " times for 4 vsyncs\n",
+                        inner->pumps());
+            return false;
+        }
+        if (inner->last_rate() != 0.0) {
+            std::printf("present-pump: rate 0 reached the backend as %g\n", inner->last_rate());
+            return false;
+        }
+    }
+    { /* 2: a rate repeats, and the park still wakes on a record */
+        RecordingBackend* inner = new RecordingBackend();
+        ThreadedBackend ring(inner, 64u * 1024, true);
+        ring.start_worker();
+        /* 500 Hz, a 2 ms interval: short enough that 60 ms of an empty ring
+         * is unambiguous and long enough not to spin a core on a loaded
+         * build machine. */
+        ring.set_present_rate(500.0);
+        ring.vsync(0);
+        ring.field_sync();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+        /* The park's wait is now bounded by what is left of the repeat
+         * interval rather than by the ring's own 2 ms step. A record
+         * committed into that park has to be replayed anyway. */
+        const uint64_t replayed_before = ring.records_replayed();
+        ring.write_priv(0x40, 0x1234u);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (ring.records_replayed() <= replayed_before) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::printf("present-pump: the parked consumer did not replay a record"
+                            " committed during a repeat wait\n");
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ring.quiesce();
+        /* One pump for the vsync plus the repeats. 60 ms at 500 Hz is about
+         * 30; the bound is deliberately loose, since what is under test is
+         * that repeats happen at all and not the scheduler's accuracy. */
+        if (inner->pumps() < 6) {
+            std::printf("present-pump: 500 Hz over 60 ms of an empty ring pumped only %"
+                        PRIu64 " times\n", inner->pumps());
+            return false;
+        }
+        if (inner->last_rate() != 500.0) {
+            std::printf("present-pump: the rate reached the backend as %g, expected 500\n",
+                        inner->last_rate());
+            return false;
+        }
+        std::printf("  %-22s rate 0: 1 pump per vsync; rate 500 Hz: %" PRIu64
+                    " pumps over 60 ms of an empty ring, park woke on a record\n",
+                    "present-pump", inner->pumps());
+    }
     return true;
 }
 
@@ -622,6 +859,11 @@ int main(int argc, char** argv) {
             std::printf("FAILED in configuration %s\n", cfg.name);
             return 1;
         }
+    }
+
+    if (!run_present_pump_case()) {
+        std::printf("FAILED in the present-pump case\n");
+        return 1;
     }
 
     std::printf("calls by kind:");

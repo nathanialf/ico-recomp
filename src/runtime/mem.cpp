@@ -17,7 +17,7 @@
  *   The page table is 64 KB-granular but the EE scratchpad (SPR) is only
  *   16 KB; on real hardware the low 14 bits of the in-page offset are what's
  *   architecturally decoded, so the 16 KB region repeats 4x across the 64 KB
- *   page. We do not reproduce that repeat: we simply back the whole 64 KB
+ *   page. We do not reproduce that repeat: we back the whole 64 KB
  *   page with one zeroed block and let all 64 KB be addressable, independent
  *   storage. Every legitimate access uses vaddr 0x70000000-0x70003FFF (the
  *   16 KB compilers/games are told exists), so this is unobservable for
@@ -97,11 +97,11 @@ void rt_mem_init() {
      * NULL by the memset above; the rc_read.. / rc_write.. helpers in
      * recomp_ops.h fall through to rt_mmio_.. for a NULL page. */
 
-    rt_log("mem", "EE RAM: %zu bytes at host %p, guest 0x00000000 (+ aliases at 0x20000000/0x30000000/0x80000000/0xA0000000)",
+    rt_log_info("mem", "EE RAM: %zu bytes at host %p, guest 0x00000000 (+ aliases at 0x20000000/0x30000000/0x80000000/0xA0000000)",
         kRamSize, static_cast<void*>(g_ram));
-    rt_log("mem", "scratchpad: %zu-byte page at host %p, guest 0x70000000 (16 KB architectural, see mem.cpp comment)",
+    rt_log_info("mem", "scratchpad: %zu-byte page at host %p, guest 0x70000000 (16 KB architectural, see mem.cpp comment)",
         kScratchpadBlockSize, static_cast<void*>(g_scratchpad));
-    rt_log("mem", "VU mem window: page at host %p, guest 0x11000000 (micro0@+0x0 data0@+0x4000 micro1@+0x8000 data1@+0xC000 = Vu1State::mem)",
+    rt_log_info("mem", "VU mem window: page at host %p, guest 0x11000000 (micro0@+0x0 data0@+0x4000 micro1@+0x8000 data1@+0xC000 = Vu1State::mem)",
         static_cast<void*>(g_pages[0x11000000u >> 16]));
 }
 
@@ -109,7 +109,7 @@ void rt_mem_init() {
 
 void rt_override(uint32_t vram, recomp_fn_t fn) {
     if (vram < RECOMP_TEXT_BASE || vram >= RECOMP_TEXT_LIMIT) {
-        rt_log("functab", "rt_override: vram 0x%08x out of [0x%08x, 0x%08x)", vram, RECOMP_TEXT_BASE, RECOMP_TEXT_LIMIT);
+        rt_log_warn("functab", "rt_override: vram 0x%08x out of [0x%08x, 0x%08x)", vram, RECOMP_TEXT_BASE, RECOMP_TEXT_LIMIT);
         return;
     }
     uint32_t idx = RECOMP_FUNC_IDX(vram);
@@ -125,8 +125,15 @@ recomp_fn_t rt_original(uint32_t vram) {
 
 void rt_call_indirect(R5900Context* ctx, uint32_t target, uint32_t caller_vram) {
     if (target == RT_CLEAN_EXIT_VRAM) {
-        rt_log("functab", "clean exit: caller 0x%08x returned through the boot sentinel", caller_vram);
+        rt_log_info("functab", "clean exit: caller 0x%08x returned through the boot sentinel", caller_vram);
         rt_dump_registers(ctx);
+        /* Not a user quit: nothing the player did asked for this, and a
+         * game that returns out of its own entry function shortly after
+         * booting is one of the ways a run can end with nothing in the log
+         * saying why. warn, and the summary with it. */
+        rt_log_warn("functab", "the guest returned out of its entry function; the run is over");
+        rt_run_set_exit_reason(false, "the guest's entry function returned through the boot"
+            " sentinel (caller 0x%08x)", caller_vram);
         std::exit(0);
     }
     if (target < RECOMP_TEXT_BASE || target >= RECOMP_TEXT_LIMIT) {

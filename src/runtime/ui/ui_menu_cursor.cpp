@@ -131,7 +131,7 @@ bool cut_cursor(const uint8_t* rgba, uint32_t width, uint32_t height, float rati
     RtCursorImage img;
     char err[256];
     if (!rt_cursor_image_build(rgba, width, height, ratio, img, err, sizeof(err))) {
-        rt_log("ui", "menu cursor: nothing could be cut out of the %ux%u title image (%s)", width,
+        rt_log_warn("ui", "menu cursor: nothing could be cut out of the %ux%u title image (%s)", width,
             height, err);
         return false;
     }
@@ -154,10 +154,10 @@ bool cut_cursor(const uint8_t* rgba, uint32_t width, uint32_t height, float rati
     g_image_ratio = ratio;
     if (g_model_valid) g_model.DirtyAllVariables();
 
-    rt_log("ui", "menu cursor: the logo's I, %ux%u px, hotspot (%u,%u), tip at the %s", img.width,
+    rt_log_info("ui", "menu cursor: the logo's I, %ux%u px, hotspot (%u,%u), tip at the %s", img.width,
         img.height, img.hotspot_x, img.hotspot_y, img.tip_at_top ? "top" : "bottom");
     if (img.light_outline) {
-        rt_log("ui", "menu cursor: the glyph's opaque pixels are dark, so its outline is light");
+        rt_log_info("ui", "menu cursor: the glyph's opaque pixels are dark, so its outline is light");
     }
     return true;
 }
@@ -181,7 +181,7 @@ void sync_cursor_scale() {
         g_image_ratio = ratio;
         return;
     }
-    rt_log("ui", "menu cursor: window scale moved from %.2f to %.2f; re-cutting the glyph",
+    rt_log_info("ui", "menu cursor: window scale moved from %.2f to %.2f; re-cutting the glyph",
         double(g_image_ratio), double(ratio));
     if (cut_cursor(logo, logo_w, logo_h, ratio)) {
         failed_ratio = 0.0f;
@@ -198,7 +198,7 @@ void sync_cursor_scale() {
 void poll_cursor_upload() {
     if (!ui_render_take_image_upload_failure(kCursorScheme)) return;
     if (!g_c.image_cursor) return;
-    rt_log("ui", "menu cursor: the image could not be uploaded; back to the drawn arrow");
+    rt_log_warn("ui", "menu cursor: the image could not be uploaded; back to the drawn arrow");
     g_c.image_cursor = false;
     if (g_model_valid) g_model.DirtyAllVariables();
 }
@@ -212,7 +212,7 @@ void ui_menu_cursor_build_from_logo(const uint8_t* rgba, uint32_t width, uint32_
 bool ui_menu_cursor_init(Rml::Context* context, const std::string& ui_dir) {
     Rml::DataModelConstructor c = context->CreateDataModel("menucursor");
     if (!c) {
-        rt_log("ui", "Context::CreateDataModel(\"menucursor\") failed; the menu pointer has no"
+        rt_log_warn("ui", "Context::CreateDataModel(\"menucursor\") failed; the menu pointer has no"
                      " drawn cursor");
         return false;
     }
@@ -238,7 +238,7 @@ bool ui_menu_cursor_init(Rml::Context* context, const std::string& ui_dir) {
     const std::string path = ui_dir + "/cursor.rml";
     g_ui.cursor = context->LoadDocument(path);
     if (!g_ui.cursor) {
-        rt_log("ui", "document %s failed to load; the menu pointer has no drawn cursor",
+        rt_log_warn("ui", "document %s failed to load; the menu pointer has no drawn cursor",
                path.c_str());
         return false;
     }
@@ -251,7 +251,7 @@ void ui_menu_cursor_tick() {
     /* Shown while the pointer owns the mouse, the player is on a mouse, and
      * there is a position to point with. The capture term is what keeps this
      * from being a second cursor: relative mode is what hides the OS cursor,
-     * and with it off (mouse look off, or the settings menu over the game's
+     * and with it off (mouse look off, or the menu over the game's
      * menu) the system is drawing a cursor at that same point already.
      *
      * The device term (host/input.h) is the one that comes and goes during a
@@ -282,10 +282,10 @@ void ui_menu_cursor_tick() {
             static bool said = false;
             if (!said && !g_c.image_cursor) {
                 said = true;
-                rt_log("ui", "menu cursor: no logo image; drawn arrow");
+                rt_log_info("ui", "menu cursor: no logo image; drawn arrow");
             }
             /* No focus: this document is not interactive and must not take
-             * the keyboard away from a settings menu over it. */
+             * the keyboard away from a menu over it. */
             g_ui.cursor->Show(Rml::ModalFlag::None, Rml::FocusFlag::None);
         } else {
             g_ui.cursor->Hide();

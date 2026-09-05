@@ -16,10 +16,10 @@
  *     bridge is not involved. This is the decode reference.
  *
  *   dma: the stream lives in guest RAM behind a ch4 source chain of REF
- *     tags over 2048-byte slots, exactly the shape func_0023FDF0.s builds,
+ *     tags over 2048-byte slots, exactly the shape viBufAddDMA.s builds,
  *     and the model pulls it through rt_ipu_dma_kick. In this mode the test
  *     also replays the retail MPEG library's stop/restart bracket
- *     (func_00240090.s snapshot, func_00240218.s restart) at a chosen
+ *     (viBufStopDMA.s snapshot, viBufRestartDMA.s restart) at a chosen
  *     stream-byte cadence, using only guest-visible registers: CHCR without
  *     STR, read MADR/TADR/QWC/CHCR, wait for IPU_CTRL.OFC == 0, read
  *     IPU_BP, BCLR with the saved BP, then
@@ -50,6 +50,8 @@
  * scheduler/INTC/DMAC symbols ipu.cpp expects.
  */
 #include "hw.h"
+
+#include "../video_mode.h"
 
 #include "../iso/iso9660.h"
 #include "../prof.h"
@@ -113,8 +115,8 @@ void w32(uint32_t addr, uint32_t v) {
 /* ---- guest RAM and the toIPU source chain (dma feed mode) ----------------
  *
  * Slot size and tag shape come from the retail ring builder: decomp
- * asm/nonmatchings/src/GobjProc/func_0023FDF0.s at 0x23FF64-0x23FF80 and
- * 0x23FF90-0x23FFC8 stores "(ring_base + slot * 2048) << 32 | id << 28 |
+ * asm/nonmatchings/ito/mpeg/mv_vibuf/viBufAddDMA.s at 0x259ABC-0x23FF80 and
+ * 0x259AE8-0x259B20 stores "(ring_base + slot * 2048) << 32 | id << 28 |
  * 0x80" quadword tags, id 3 (REF) for every slot but the last, which gets
  * id 0 (REFE). */
 constexpr uint32_t kRamBase = 0x00400000;
@@ -168,7 +170,7 @@ void build_chain(const uint8_t* iq, const uint8_t* niq, const std::vector<uint8_
     g_tag_off = data_span;
     g_tag_first = kRamBase + (uint32_t)data_span;
     g_tag_last = g_tag_first + (uint32_t)((g_slots - 1) * 16);
-    rt_log("selftest", "dma chain: %zu slots of %u qwords over %zu stream bytes "
+    rt_log_info("selftest", "dma chain: %zu slots of %u qwords over %zu stream bytes "
         "(data 0x%08x, tags 0x%08x..0x%08x)", g_slots, kTagQwc, bytes, kRamBase, g_tag_first, g_tag_last);
 }
 
@@ -200,11 +202,11 @@ void ch4_start() {
 }
 
 /* Appends the next batch of slots the way the retail ring extender does:
- * decomp asm/nonmatchings/src/GobjProc/func_0023FDF0.s stops ch4 with
- * CHCR = 5 inside the D_ENABLE bracket (0x23FE54-0x23FE68), reads CHCR back
+ * decomp asm/nonmatchings/ito/mpeg/mv_vibuf/viBufAddDMA.s stops ch4 with
+ * CHCR = 5 inside the D_ENABLE bracket (0x2599AC-0x2599C0), reads CHCR back
  * (0x23FE98), rewrites the REFE that closed the ring into a REF and writes
- * the new tags (0x23FF48-0x23FFC8), then restarts with
- * CHCR = (readback & 0x0FFFFFFF) | 0x30000100 at 0x24000C-0x240054. */
+ * the new tags (0x23FF48-0x259B20), then restarts with
+ * CHCR = (readback & 0x0FFFFFFF) | 0x30000100 at 0x24000C-0x259BAC. */
 bool publish_more() {
     if (g_published >= g_slots) return false;
     *ch4r(0) = 5;
@@ -221,7 +223,7 @@ bool publish_more() {
     return true;
 }
 
-/* func_002407C0.s at 0x2407FC-0x240844: stream byte position =
+/* viBufGetTs.s at 0x25A354-0x240844: stream byte position =
  * D4_MADR - (IFC + FP) * 16 + (BP & 0x7F) >> 3. */
 uint32_t stream_pos() {
     uint32_t bp = (uint32_t)r64(IPU_BP);
@@ -251,11 +253,11 @@ void check_fifo_bound(const char* where) {
 }
 
 /* The retail stop/restart bracket, replayed with guest-visible registers
- * only. Snapshot: func_00240090.s (CHCR = 5, then MADR/TADR/QWC/CHCR, wait
- * IPU_CTRL.OFC == 0, then IPU_BP). Restart: func_00240218.s at
- * 0x240240-0x240278 (bp = BP & 0x7F, ifc = (BP >> 8) & 0xF,
+ * only. Snapshot: viBufStopDMA.s (CHCR = 5, then MADR/TADR/QWC/CHCR, wait
+ * IPU_CTRL.OFC == 0, then IPU_BP). Restart: viBufRestartDMA.s at
+ * 0x259D98-0x259DD0 (bp = BP & 0x7F, ifc = (BP >> 8) & 0xF,
  * fp = (BP >> 16) & 3, MADR' = MADR - (ifc + fp) * 16, QWC' = QWC + ifc + fp,
- * CHCR' = saved & 0x0FFFFFFF | id << 28 | 0x100), the BCLR at 0x240514, and
+ * CHCR' = saved & 0x0FFFFFFF | id << 28 | 0x100), the BCLR at 0x25A06C, and
  * the MADR/TADR/QWC stores at 0x240544-0x240554. */
 void library_stop_restart(const char* where) {
     g_in_restart = true;
@@ -280,8 +282,8 @@ void library_stop_restart(const char* where) {
 
     uint32_t madr2 = madr - (ifc + fp) * 16;
     uint32_t qwc2 = qwc + ifc + fp;
-    /* func_002587E0.s at 0x2588BC skips its own restart when the rewound
-     * MADR is zero. func_00240218 has no such test: it stores MADR, TADR
+    /* sceIpuRestartDMA.s at 0x2588BC skips its own restart when the rewound
+     * MADR is zero. viBufRestartDMA has no such test: it stores MADR, TADR
      * and QWC at 0x240544-0x240554 and restarts the channel at 0x24059C
      * whenever its ring counter says there is buffered data, QWC' = 0
      * included. That is the case the retail movie hits when the chain has
@@ -294,7 +296,7 @@ void library_stop_restart(const char* where) {
     *ch4r(1) = madr2;
     *ch4r(3) = tadr;
     *ch4r(2) = qwc2;
-    /* Verbatim func_00240218.s at 0x240278: the saved CHCR with STR, TAG
+    /* Verbatim viBufRestartDMA.s at 0x259DD0: the saved CHCR with STR, TAG
      * field included. The stop above wrote the bare constant 5, so the id
      * in it reads back as 0 (REFE); the library does not put one back on
      * this path and the channel has to carry on regardless. Writing an id
@@ -316,7 +318,7 @@ void maybe_restart(const char* where) {
 
 /* The movie player arms ch3 before every BDEC, so the output FIFO is
  * drained while the command is still running and IPU_CTRL.OFC is back to 0
- * by the time func_00240090 takes its snapshot. This stands in for that
+ * by the time viBufStopDMA takes its snapshot. This stands in for that
  * channel: everything the IPU has produced is taken out as it appears and
  * held here until the decoder asks for it. */
 std::vector<uint8_t> g_out_held;
@@ -446,7 +448,7 @@ void extract_video_es(std::vector<uint8_t>& es, size_t want, uint32_t skip_secto
         }
     }
     if (!pss_lsn) rt_fatal("selftest", nullptr, "no MPEG-2 program stream found inside DATA.DF");
-    rt_log("selftest", "program stream found at LBA %u (DATA.DF + %u sectors)", pss_lsn, pss_lsn - df.lsn);
+    rt_log_info("selftest", "program stream found at LBA %u (DATA.DF + %u sectors)", pss_lsn, pss_lsn - df.lsn);
 
     /* Stream the sectors through a small window buffer and walk the pack /
      * PES structure. skip_sectors starts the extraction a few seconds into
@@ -497,7 +499,7 @@ void extract_video_es(std::vector<uint8_t>& es, size_t want, uint32_t skip_secto
             ++pos;
         }
     }
-    rt_log("selftest", "demuxed %zu bytes of video elementary stream", es.size());
+    rt_log_info("selftest", "demuxed %zu bytes of video elementary stream", es.size());
 }
 
 /* ---- MPEG-2 sequence / picture state (parsed EE-side, like libmpeg) ------ */
@@ -559,20 +561,29 @@ void parse_sequence_header() {
     advance(32);
     g_seq.width = getbits(12);
     g_seq.height = getbits(12);
-    advance(4 + 4 + 18 + 1 + 10 + 1); /* aspect, frame rate, bitrate, marker, vbv, constrained */
+    /* Aspect ratio and frame rate codes are read rather than skipped: they
+     * are how this target's one measurement of the movie's geometry and
+     * rate is made, and the PAL/US comparison in docs/TARGET.md rests on
+     * them. Frame rate codes, MPEG-2 13818-2 table 6-4: 1 = 24000/1001,
+     * 2 = 24, 3 = 25, 4 = 30000/1001, 5 = 30, 6 = 50, 7 = 60000/1001,
+     * 8 = 60. */
+    const unsigned aspect_code = getbits(4);
+    const unsigned frame_rate_code = getbits(4);
+    advance(18 + 1 + 10 + 1); /* bitrate, marker, vbv, constrained */
     if (getbits(1)) { /* load_intra_quantiser_matrix: in-band SETIQ */
         ipu_cmd(0x50000000u);
         cmd_result();
-        rt_log("selftest", "sequence header loads a custom intra matrix");
+        rt_log_info("selftest", "sequence header loads a custom intra matrix");
     }
     if (getbits(1)) {
         ipu_cmd(0x58000000u);
         cmd_result();
-        rt_log("selftest", "sequence header loads a custom non-intra matrix");
+        rt_log_info("selftest", "sequence header loads a custom non-intra matrix");
     }
     g_seq.mb_w = (g_seq.width + 15) / 16;
     g_seq.mb_h = (g_seq.height + 15) / 16;
-    rt_log("selftest", "sequence: %ux%u (%ux%u macroblocks)", g_seq.width, g_seq.height, g_seq.mb_w, g_seq.mb_h);
+    rt_log_info("selftest", "sequence: %ux%u (%ux%u macroblocks), aspect code %u, frame rate code %u",
+        g_seq.width, g_seq.height, g_seq.mb_w, g_seq.mb_h, aspect_code, frame_rate_code);
 }
 
 void parse_picture_header() {
@@ -599,7 +610,7 @@ void parse_extension() {
         g_pic.as = getbits(1);
         advance(3); /* repeat_first_field, chroma_420_type, progressive_frame */
         if (getbits(1)) advance(20); /* composite display */
-        rt_log("selftest", "pic coding ext: fcode %u/%u %u/%u idp=%u struct=%u fpfd=%u conceal=%u qst=%u ivf=%u as=%u",
+        rt_log_info("selftest", "pic coding ext: fcode %u/%u %u/%u idp=%u struct=%u fpfd=%u conceal=%u qst=%u ivf=%u as=%u",
             g_pic.fcode[0][0], g_pic.fcode[0][1], g_pic.fcode[1][0], g_pic.fcode[1][1],
             g_pic.idp, g_pic.structure, g_pic.fpfd, g_pic.conceal, g_pic.qst, g_pic.ivf, g_pic.as);
         /* Program IPU_CTRL exactly the way libmpeg does before slices. */
@@ -838,7 +849,7 @@ PassResult decode_pass(const std::vector<uint8_t>& es, bool i_only) {
             advance(32 + 27); /* GOP header */
         } else if (sc == 0x100) {
             parse_picture_header();
-            rt_log("selftest", "picture type %u", g_pic.type);
+            rt_log_info("selftest", "picture type %u", g_pic.type);
             /* Decode the first I fully, plus residual passes over the first
              * B and first P (stream order in an open GOP is I B B P ...). */
             skip_pic = (g_pic.type == 1 && i_done) || (g_pic.type == 3 && (b_done || !i_done)) ||
@@ -894,11 +905,11 @@ PassResult decode_pass(const std::vector<uint8_t>& es, bool i_only) {
  *
  * The player reaches it in two steps. Its ch4 chain drains (the walk reads
  * the REFE that closed the ring, so STR clears, QWC is 0 and TADR sits on
- * the ring slot the guest has not written yet), and then func_00240218
- * issues its BCLR at 0x240514 with the command still pending, which throws
+ * the ring slot the guest has not written yet), and then viBufRestartDMA
+ * issues its BCLR at 0x25A06C with the command still pending, which throws
  * the input FIFO away. The next snapshot therefore reads QWC = 0 with
  * IFC = FP = 0, so the restart at 0x240544-0x24059C hands the channel back
- * MADR' = MADR and QWC' = 0 at that same TADR. func_0023FDF0 then appends
+ * MADR' = MADR and QWC' = 0 at that same TADR. viBufAddDMA then appends
  * behind the REFE it rewrote into a REF and restarts at the same TADR
  * again.
  *
@@ -944,7 +955,7 @@ void drained_chain_restart_check() {
             "published", g_pass, tadr, next_slot, g_published);
     }
 
-    /* func_00240218's BCLR, issued with the command still pending. */
+    /* viBufRestartDMA's BCLR, issued with the command still pending. */
     w32(IPU_CMD, (uint32_t)r64(IPU_BP) & 0x7F);
     const uint32_t bpreg = (uint32_t)r64(IPU_BP);
     const uint32_t ifc = (bpreg >> 8) & 0xF, fp = (bpreg >> 16) & 3;
@@ -988,7 +999,7 @@ void drained_chain_restart_check() {
             g_pass, tadr, *ch4r(3));
     }
 
-    /* func_0023FDF0: rewrite the closing REFE into a REF, append behind it
+    /* viBufAddDMA: rewrite the closing REFE into a REF, append behind it
      * and restart at the same TADR. The walk has to pick up the slot it
      * was sitting on. */
     if (!publish_more()) rt_fatal("selftest", nullptr, "%s: the chain had nothing left to publish", g_pass);
@@ -1002,7 +1013,7 @@ void drained_chain_restart_check() {
         rt_fatal("selftest", nullptr, "%s: the command is still pending after the ring extension "
             "delivered slot %u", g_pass, next_slot);
     }
-    rt_log("selftest", "%s: the drained chain, the BCLR under a pending command and the QWC' = 0 "
+    rt_log_info("selftest", "%s: the drained chain, the BCLR under a pending command and the QWC' = 0 "
         "restart all behaved as modelled; the unpublished slot at 0x%08x stopped the walk without "
         "consuming it, and the ring extension resumed at MADR 0x%08x in slot %u",
         g_pass, tadr, *ch4r(1), next_slot);
@@ -1011,11 +1022,11 @@ void drained_chain_restart_check() {
 /* ---- a restart continues the chain ---------------------------------------
  *
  * The retail library stops ch4 by storing the bare constant 5 into CHCR
- * (func_0023FDF0.s at 0x23FE54-0x23FE68, func_00240090.s at
- * 0x2400A4-0x2400E8), which leaves the TAG field reading back as an id of
+ * (viBufAddDMA.s at 0x2599AC-0x2599C0, viBufStopDMA.s at
+ * 0x259BFC-0x259C40), which leaves the TAG field reading back as an id of
  * 0, REFE. Both restart paths then hand that CHCR back with STR set:
- * func_00240218.s's same-block path stores the saved value unchanged
- * ("ori $19, $5, 0x100" at 0x240278), and func_0023FDF0 only forces an id
+ * viBufRestartDMA.s's same-block path stores the saved value unchanged
+ * ("ori $19, $5, 0x100" at 0x259DD0), and viBufAddDMA only forces an id
  * of 3 when it appended tags. A model that ends the chain on that id stops
  * the channel after the outstanding QWC on every one of those restarts and
  * starves the decoder with the ring still full, which is what the movie
@@ -1046,7 +1057,7 @@ void restart_continues_chain_check() {
     const uint32_t bp = bpreg & 0x7F, ifc = (bpreg >> 8) & 0xF, fp = (bpreg >> 16) & 3;
     w32(IPU_CMD, bp); /* BCLR */
 
-    /* func_00240218's same-block restart, verbatim: the saved CHCR with STR. */
+    /* viBufRestartDMA's same-block restart, verbatim: the saved CHCR with STR. */
     *ch4r(1) = madr - (ifc + fp) * 16;
     *ch4r(3) = tadr;
     *ch4r(2) = qwc + ifc + fp;
@@ -1065,7 +1076,7 @@ void restart_continues_chain_check() {
             "tag at TADR", g_pass, tadr, g_published, *ch4r(0), *ch4r(1), *ch4r(2),
             rt_ipu_test_resident_qw());
     }
-    rt_log("selftest", "%s: the restart walked past its %u outstanding quadwords into the tag at "
+    rt_log_info("selftest", "%s: the restart walked past its %u outstanding quadwords into the tag at "
         "0x%08x and carried on to TADR 0x%08x", g_pass, qwc + ifc + fp, tadr, *ch4r(3));
 }
 
@@ -1143,10 +1154,11 @@ void stuffing_tail_scan_check() {
     size_t end = run_at + run_len + (8u << 10);
     if (end > lead.size()) end = lead.size();
     std::vector<uint8_t> seg(lead.begin() + (ptrdiff_t)seq, lead.begin() + (ptrdiff_t)end);
-    rt_log("selftest", "stuffing pass: sequence header at stream byte %zu, %zu bytes of headers and "
+    rt_log_info("selftest", "stuffing pass: sequence header at stream byte %zu, %zu bytes of headers and "
         "picture data, then %zu bytes of zero stuffing for the last macroblock's BDEC to scan "
         "(%zu times the %zu-quadword input FIFO); segment %zu bytes",
-        seq, run_at - seq, run_len, run_len / ((kFifoQw + 1) * 16), kFifoQw + 1, seg.size());
+        seq, run_at - seq, run_len, run_len / ((kFifoQw + 1) * 16), (size_t)(kFifoQw + 1),
+        seg.size());
 
     const char* prev_pass = g_pass;
     const size_t prev_batch = g_slot_batch_want;
@@ -1175,7 +1187,7 @@ void stuffing_tail_scan_check() {
                 "(hash 0x%016" PRIx64 " vs 0x%016" PRIx64 ", %" PRIu64 " ring extensions)",
                 g_pass, r.i_hash, ref.i_hash, g_refills);
         }
-        rt_log("selftest", "%s: the scan crossed the stuffing and the picture matches "
+        rt_log_info("selftest", "%s: the scan crossed the stuffing and the picture matches "
             "(%u macroblocks, %" PRIu64 " ring extensions, peak %zu qwords / %zu bits resident)",
             g_pass, r.i_mbs, g_refills, g_max_resident_qw, g_max_avail_bits);
     }
@@ -1318,7 +1330,7 @@ void bdec_tail_resume_check() {
     const size_t mb_at = kSlot - 128 - kTailStall;
     std::vector<uint8_t> es(mb_at + sizeof kTailMb + 64, 0);
     std::memcpy(&es[mb_at], kTailMb, sizeof kTailMb);
-    rt_log("selftest", "tail resume: one crafted macroblock at stream byte %zu, ending 28 bits in "
+    rt_log_info("selftest", "tail resume: one crafted macroblock at stream byte %zu, ending 28 bits in "
         "with the byte after the alignment nonzero (0x%02x); the feed is cut %zu bytes later",
         mb_at, kTailMb[4], kTailStall);
 
@@ -1340,7 +1352,7 @@ void bdec_tail_resume_check() {
         rt_fatal("selftest", nullptr, "%s: the BDEC produced %zu output bytes, expected %zu",
             g_pass, ref.mb.size(), kMbBytes);
     }
-    rt_log("selftest", "%s: ECD set on the aligned byte, %zu-byte macroblock out", g_pass, ref.mb.size());
+    rt_log_info("selftest", "%s: ECD set on the aligned byte, %zu-byte macroblock out", g_pass, ref.mb.size());
 
     /* The same bits, with the feed cut at the byte the scan needs next. */
     g_pass = "bdec tail resume, starved direct";
@@ -1355,7 +1367,7 @@ void bdec_tail_resume_check() {
     }
     TailResult starved = tail_collect();
     tail_compare(ref, starved);
-    rt_log("selftest", "%s: the scan resumed inside the zero run and agrees with the direct decode "
+    rt_log_info("selftest", "%s: the scan resumed inside the zero run and agrees with the direct decode "
         "(ECD=%u SCD=%u)", g_pass, starved.ecd, starved.scd);
 
     /* And through the chain, one slot at a time. */
@@ -1378,7 +1390,7 @@ void bdec_tail_resume_check() {
     cmd_result();
     TailResult dma = tail_collect();
     tail_compare(ref, dma);
-    rt_log("selftest", "%s: the scan crossed the slot boundary and agrees with the direct decode "
+    rt_log_info("selftest", "%s: the scan crossed the slot boundary and agrees with the direct decode "
         "(ECD=%u SCD=%u, %" PRIu64 " ring extensions)", g_pass, dma.ecd, dma.scd, g_refills);
 
     g_dma = prev_dma;
@@ -1395,7 +1407,8 @@ void bdec_tail_resume_check() {
  * about 33000 register accesses per host field with the "ipu" and "mmio"
  * prof buckets together taking 9.8 ms of a 16.7 ms field. At the rate a
  * real-time movie needs, roughly two million accesses a second, the host
- * cost per access is what decides whether the port holds 59.94 fields/s.
+ * cost per access is what decides whether the port holds the field rate the
+ * game programmed, 59.94 on NTSC or 50 on PAL.
  *
  * This replays that scan against the real decoder state fed from the disc
  * and reports it. Only the IPU handler is measured, not the mmio.cpp
@@ -1439,13 +1452,18 @@ void register_access_benchmark(const std::vector<uint8_t>& es) {
             "dry and the number would be meaningless", n, kIters);
     }
     const double per = ns / (double)accesses;
-    /* Two million accesses a second is what a real-time movie asks for; a
-     * field is 1/59.94 s. */
-    const double ms_per_field = 2.0e6 * per / 1.0e9 / 59.94 * 1000.0;
-    rt_log("selftest", "register access benchmark: %" PRIu64 " accesses (%zu FDEC bytes scanned) in "
+    /* Two million accesses a second is what a real-time movie asks for. The
+     * field the budget is spent in is the video mode's, not a constant:
+     * 1/59.94 s on NTSC and 1/50 s on PAL, and the PAL disc plays a movie
+     * in either mode from its own display option, so both are reported. A
+     * PAL field is 20 ms against NTSC's 16.7, which is the more forgiving
+     * of the two, so the NTSC number stays the one to judge by. */
+    const double ms_per_field_ntsc = 2.0e6 * per / 1.0e9 / RT_FIELD_HZ_NTSC * 1000.0;
+    const double ms_per_field_pal = 2.0e6 * per / 1.0e9 / RT_FIELD_HZ_PAL * 1000.0;
+    rt_log_info("selftest", "register access benchmark: %" PRIu64 " accesses (%zu FDEC bytes scanned) in "
         "%.1f ms = %.1f ns per access; at two million accesses a second that is %.2f ms of host time "
-        "per field (sink 0x%016" PRIx64 ")",
-        accesses, n, ns / 1.0e6, per, ms_per_field, sink);
+        "per NTSC field and %.2f ms per PAL field (sink 0x%016" PRIx64 ")",
+        accesses, n, ns / 1.0e6, per, ms_per_field_ntsc, ms_per_field_pal, sink);
 
     /* What the profiler costs when it is on: two clock reads per zone. The
      * movie path used to open two nested zones per access (mmio.cpp's plus
@@ -1463,7 +1481,7 @@ void register_access_benchmark(const std::vector<uint8_t>& es) {
     }
     auto p2 = std::chrono::steady_clock::now();
     g_rt_prof_on = was_on;
-    rt_log("selftest", "profiler cost: %.1f ns per access for two nested zones (four clock reads), "
+    rt_log_info("selftest", "profiler cost: %.1f ns per access for two nested zones (four clock reads), "
         "%.1f ns for the one zone mmio.cpp now opens",
         (double)std::chrono::duration_cast<std::chrono::nanoseconds>(p1 - p0).count() / (double)kIters,
         (double)std::chrono::duration_cast<std::chrono::nanoseconds>(p2 - p1).count() / (double)kIters);
@@ -1492,7 +1510,7 @@ void register_access_benchmark(const std::vector<uint8_t>& es) {
             st->last = i;
         }
         auto h2 = std::chrono::steady_clock::now();
-        rt_log("selftest", "per-address access counter: %.1f ns per access through the hash map, "
+        rt_log_info("selftest", "per-address access counter: %.1f ns per access through the hash map, "
             "%.1f ns through the direct-mapped front",
             (double)std::chrono::duration_cast<std::chrono::nanoseconds>(h1 - h0).count() / (double)kIters,
             (double)std::chrono::duration_cast<std::chrono::nanoseconds>(h2 - h1).count() / (double)kIters);
@@ -1503,7 +1521,11 @@ void register_access_benchmark(const std::vector<uint8_t>& es) {
 } // namespace
 
 int main() {
-    rt_log("selftest", "IPU selftest starting");
+    /* Info, not the runtime's warn default: this tool's output is its
+     * progress lines, and they are all info. */
+    rt_log_set_initial_level(RT_LOG_INFO);
+
+    rt_log_info("selftest", "IPU selftest starting");
     rt_iso_mount();
 
     std::vector<uint8_t> es;
@@ -1520,7 +1542,7 @@ int main() {
     g_restart_bytes = 0;
     PassResult ref = decode_pass(es, false);
 
-    rt_log("selftest", "I picture: %u macroblocks; P pass: %u coded MBs / %u slices; B pass: %u coded MBs / %u slices;"
+    rt_log_info("selftest", "I picture: %u macroblocks; P pass: %u coded MBs / %u slices; B pass: %u coded MBs / %u slices;"
         " %" PRIu64 " BDECs total; I hash 0x%016" PRIx64,
         ref.i_mbs, ref.p_mbs, ref.p_slices, ref.b_mbs, ref.b_slices, g_bdec_count, ref.i_hash);
 
@@ -1529,7 +1551,7 @@ int main() {
     for (uint8_t v : ref.y) { sum += v; sum2 += (double)v * v; }
     double mean = sum / ref.y.size();
     double var = sum2 / ref.y.size() - mean * mean;
-    rt_log("selftest", "I frame luma: mean %.1f stddev %.1f", mean, var > 0 ? std::sqrt(var) : 0.0);
+    rt_log_info("selftest", "I frame luma: mean %.1f stddev %.1f", mean, var > 0 ? std::sqrt(var) : 0.0);
     if (mean < 10.0 || mean > 245.0 || var < 4.0) {
         rt_fatal("selftest", nullptr, "implausible luma statistics (mean %.1f var %.1f)", mean, var);
     }
@@ -1565,7 +1587,7 @@ int main() {
     const char* out = std::getenv("ICORECOMP_IPU_SELFTEST_OUT");
     std::string path = out ? out : "/tmp/ipu_selftest_frame0.bmp";
     write_bmp(path.c_str(), rgba.data(), g_seq.width, g_seq.height);
-    rt_log("selftest", "wrote decoded I frame to %s", path.c_str());
+    rt_log_info("selftest", "wrote decoded I frame to %s", path.c_str());
 
     /* ---- pass 2..n: the same I picture, fed through the ch4 chain, with
      * the library's stop/restart bracket replayed at several cadences.
@@ -1613,7 +1635,7 @@ int main() {
                         first < r.y.size() ? (first / g_seq.width / 16) * g_seq.mb_w + (first % g_seq.width) / 16 : 0,
                         g_restarts, g_restarts_busy, g_refills);
                 }
-                rt_log("selftest", "%s: I picture matches (%u macroblocks, %" PRIu64 " restarts, "
+                rt_log_info("selftest", "%s: I picture matches (%u macroblocks, %" PRIu64 " restarts, "
                     "%" PRIu64 " with a command pending, %" PRIu64 " of them with QWC' = 0, "
                     "%" PRIu64 " ring extensions, peak %zu qwords / %zu bits resident)",
                     g_pass, r.i_mbs, g_restarts, g_restarts_busy, g_restarts_dry, g_refills,
@@ -1633,6 +1655,6 @@ int main() {
     g_restart_mid_cmd = false;
     g_pass = "direct";
 
-    rt_log("selftest", "IPU selftest PASSED");
+    rt_log_info("selftest", "IPU selftest PASSED");
     return 0;
 }

@@ -16,6 +16,20 @@
  * (see title_logo.cpp's file comment) -- that inner layer stays private to
  * title_logo.cpp.
  *
+ * The outer table format is the same on the PAL and US discs: measured on
+ * both, a u32 count then that many 40-byte records, every entry's range
+ * inside the file. What differs is the entry set, and only in ways this
+ * reader does not care about. The PAL DATA.DF holds 193 entries against the
+ * US disc's 172, with 168 names in common. The PAL-only names are the ten
+ * per-language text blobs data_EG01/02, data_FR01/02, data_GR01/02,
+ * data_IT01/02 and data_SP01/02 where the US disc has a single data.jim,
+ * eleven extra .int scripts, and two extra attract movies
+ * (pal_advertise.pss and pal_advertise576.pss beside the advertise.pss both
+ * discs carry). So there are no per-language files on the disc itself; the
+ * language variation lives inside this container, selected by entry name.
+ * STGLOG.DF, icon.sys and boy_blk.ico, the three entries this header's
+ * callers read, are present on both.
+ *
  * Runtime-internal, NOT part of the ABI contract.
  */
 #ifndef ICORECOMP_UI_DATA_DF_H

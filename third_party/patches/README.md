@@ -100,14 +100,20 @@ nothing outside the new assignments is touched. Applies on top of 0001.
 binds the two most recent fields to both texture pairs
 (`vsync_last_fields[i & 1]` instead of `vsync_last_fields[i]`).
 
-Why: the ICO attract movie decodes a 720x480 picture and splits it on the GS
-into an even-row field buffer and an odd-row field buffer (decomp `../ico`,
-`ito/mpeg` mv_sub `func_0023E890`: a point sampled 2:1 vertical sprite with V
-starting at 0.5 or 1.5), displayed on alternate fields. A pure weave gives
+Why: the ICO attract movie decodes one picture and splits it on the GS into
+an even-row field buffer and an odd-row field buffer, displayed on alternate
+fields. Measured, in the retail ELF: `setDispEnv` (0x0025C0B8) puts the two
+buffers at pages 0 and 108, one 720x288 PSMCT32 buffer apart, and
+`vblankHandler` (0x0025C830) switches DISPFB2's FBP between them on
+CSR.FIELD. That the two upload sprites are point sampled 2:1 vertical sprites
+with V origins exactly one source row apart is inferred, not measured: their
+UV values are computed from `dispSetTags`'s arguments rather than being
+literals. See `src/runtime/gs/gs_parallel_scanout.cpp`. A pure weave gives
 that pair back as the picture the IPU decoded. Measured afterwards: the movie
 is interlaced video (a decoded I frame shows comb teeth on moving figures
-inside one picture), so the weave reproduces that comb; the runtime exposes
-it as `display.deinterlace = weave` for comparison and defaults to bob.
+inside one picture), so the weave reproduces that comb; the runtime's
+deinterlace mode is compiled in as bob (the `display.deinterlace` key was
+removed on 2026-09-04), and weave stays in the code for comparison builds.
 
 Scope: one texture binding index. With `uField2 == uField0` and
 `uField3 == uField1` every luma difference in `weave.frag` is zero,

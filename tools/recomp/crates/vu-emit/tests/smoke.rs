@@ -1,5 +1,7 @@
-//! Smoke gate for the VU1 static recompiler. Requires the sibling ../ico
-//! checkout (skips cleanly without it, like the other gated tests).
+//! Smoke gate for the VU1 static recompiler. Requires the boot ELF named by
+//! `[inputs]` in `config/recomp.toml`, which `setup.sh` extracts from the
+//! user's own disc; skips cleanly without it, since nothing in this
+//! repository can supply one.
 //!
 //! What it proves:
 //!  * the upload framing parser and emitter run over all five retail
@@ -31,9 +33,10 @@ fn config_path() -> PathBuf {
     repo_root().join("config/recomp.toml")
 }
 
-fn decomp_present() -> bool {
+/// The boot ELF the translator reads. Absent on CI, which has no disc.
+fn boot_elf_present() -> bool {
     RecompConfig::load(&config_path())
-        .map(|c| c.decomp_root.is_dir())
+        .map(|c| c.elf_path.is_file())
         .unwrap_or(false)
 }
 
@@ -123,8 +126,11 @@ int main(int argc, char** argv) {
 
 #[test]
 fn emit_compile_and_replay_all_programs() {
-    if !decomp_present() {
-        eprintln!("skipping: ../ico decomp repo not found next to ico-recomp");
+    if !boot_elf_present() {
+        eprintln!(
+            "skipping: the boot ELF named by [inputs] in config/recomp.toml is not \
+             present; run ./setup.sh <your disc image> to extract it"
+        );
         return;
     }
 

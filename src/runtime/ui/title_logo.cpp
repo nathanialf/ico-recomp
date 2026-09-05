@@ -636,12 +636,12 @@ const char* cache_path() {
         fs::create_directories(user, ec2);
         if (!ec2 && fs::is_directory(user, ec2)) {
             g_cache_path = user + "/title_logo.cache";
-            rt_log("ui", "title logo: '%s' is not writable; caching in '%s'", beside.c_str(),
+            rt_log_warn("ui", "title logo: '%s' is not writable; caching in '%s'", beside.c_str(),
                 g_cache_path.c_str());
             return g_cache_path.c_str();
         }
     }
-    rt_log("ui", "title logo: no writable cache location ('%s' and the per-user state directory both"
+    rt_log_warn("ui", "title logo: no writable cache location ('%s' and the per-user state directory both"
                  " failed); the geometry is rebuilt every run", beside.c_str());
     return "";
 }
@@ -692,7 +692,7 @@ bool cache_load(uint64_t key, TitleGeometry& geom, uint8_t colour[4]) {
     uint8_t head[kCacheHeaderBytes];
     bool ok = std::fread(head, 1, sizeof(head), f) == sizeof(head);
     if (ok && std::memcmp(head, kMagic, sizeof(kMagic)) != 0) {
-        rt_log("ui", "title logo: '%s' is not a logo cache; it will be overwritten", path);
+        rt_log_warn("ui", "title logo: '%s' is not a logo cache; it will be overwritten", path);
         ok = false;
     }
     uint32_t triangles = 0, bytes = 0, checksum = 0;
@@ -705,13 +705,13 @@ bool cache_load(uint64_t key, TitleGeometry& geom, uint8_t colour[4]) {
         bytes = rd_u32(head + 28);
         checksum = rd_u32(head + 32);
         if (version != kGeometryVersion || stored_key != key) {
-            rt_log("ui", "title logo: cache '%s' is for another disc or another build"
+            rt_log_warn("ui", "title logo: cache '%s' is for another disc or another build"
                          " (version %u, key %016llx); rebuilding",
                 path, version, (unsigned long long)stored_key);
             ok = false;
         } else if (triangles == 0 || triangles > kMaxTriangles ||
                    bytes != triangles * 24u + 4u || !(geom.aspect > 0.0f)) {
-            rt_log("ui", "title logo: cache '%s' declares %u triangles in %u bytes at aspect %g;"
+            rt_log_warn("ui", "title logo: cache '%s' declares %u triangles in %u bytes at aspect %g;"
                          " rebuilding",
                 path, triangles, bytes, double(geom.aspect));
             ok = false;
@@ -721,9 +721,9 @@ bool cache_load(uint64_t key, TitleGeometry& geom, uint8_t colour[4]) {
         std::vector<uint8_t> payload(bytes);
         ok = std::fread(payload.data(), 1, bytes, f) == bytes;
         if (!ok) {
-            rt_log("ui", "title logo: cache '%s' is truncated; rebuilding", path);
+            rt_log_warn("ui", "title logo: cache '%s' is truncated; rebuilding", path);
         } else if (payload_checksum(payload.data(), payload.size()) != checksum) {
-            rt_log("ui", "title logo: cache '%s' has checksum %08x over its %u payload bytes but"
+            rt_log_warn("ui", "title logo: cache '%s' has checksum %08x over its %u payload bytes but"
                          " its header says %08x; rebuilding",
                 path, payload_checksum(payload.data(), payload.size()), bytes, checksum);
             ok = false;
@@ -735,7 +735,7 @@ bool cache_load(uint64_t key, TitleGeometry& geom, uint8_t colour[4]) {
                  * one was ever written; the raster's float-to-int conversion
                  * has no defined answer for it. */
                 if (!std::isfinite(geom.xy[i])) {
-                    rt_log("ui", "title logo: cache '%s' holds a non-finite coordinate at %zu;"
+                    rt_log_warn("ui", "title logo: cache '%s' holds a non-finite coordinate at %zu;"
                                  " rebuilding",
                         path, i);
                     ok = false;
@@ -758,7 +758,7 @@ void cache_store(uint64_t key, const TitleGeometry& geom, const uint8_t colour[4
     const std::string tmp = std::string(path) + ".new";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) {
-        rt_log("ui", "title logo: cannot write the cache '%s': %s", tmp.c_str(), std::strerror(errno));
+        rt_log_warn("ui", "title logo: cannot write the cache '%s': %s", tmp.c_str(), std::strerror(errno));
         return;
     }
 
@@ -782,7 +782,7 @@ void cache_store(uint64_t key, const TitleGeometry& geom, const uint8_t colour[4
     ok = ok && std::fwrite(payload.data(), 1, payload.size(), f) == payload.size();
     ok = std::fclose(f) == 0 && ok;
     if (!ok) {
-        rt_log("ui", "title logo: writing the cache '%s' failed: %s", tmp.c_str(),
+        rt_log_warn("ui", "title logo: writing the cache '%s' failed: %s", tmp.c_str(),
             std::strerror(errno));
         std::remove(tmp.c_str());
         return;
@@ -791,11 +791,11 @@ void cache_store(uint64_t key, const TitleGeometry& geom, const uint8_t colour[4
     std::error_code ec;
     fs::rename(tmp, path, ec);
     if (ec) {
-        rt_log("ui", "title logo: cannot move '%s' into place: %s", tmp.c_str(), ec.message().c_str());
+        rt_log_warn("ui", "title logo: cannot move '%s' into place: %s", tmp.c_str(), ec.message().c_str());
         std::remove(tmp.c_str());
         return;
     }
-    rt_log("ui", "title logo: cached %u triangles at aspect %.4f (%zu bytes, payload checksum"
+    rt_log_info("ui", "title logo: cached %u triangles at aspect %.4f (%zu bytes, payload checksum"
                  " %08x) in '%s'",
         triangles, double(geom.aspect), sizeof(head) + payload.size(), checksum, path);
 }
@@ -861,7 +861,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
     auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> compressed;
     if (!rt_data_df_read(data_df, archive_offset, archive_size, compressed, err, err_len)) return false;
-    rt_log("ui", "title logo: read %u compressed bytes of %s in %.1f ms", archive_size, kArchiveName,
+    rt_log_info("ui", "title logo: read %u compressed bytes of %s in %.1f ms", archive_size, kArchiveName,
         ms_since(t0));
 
     /* Two inflates rather than one: the table has to be read before the byte
@@ -918,7 +918,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
         set_err(err, err_len, "%s: %s", kArchiveName, ierr);
         return false;
     }
-    rt_log("ui", "title logo: inflated %zu of %u bytes of %s in %.1f ms", image.size(), archive_size,
+    rt_log_info("ui", "title logo: inflated %zu of %u bytes of %s in %.1f ms", image.size(), archive_size,
         kArchiveName, ms_since(t0));
 
     for (int i = 0; i < kWantCount; ++i) {
@@ -933,7 +933,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
     TitleNode nodes[kLetterCount];
     const WantedFile& anim = wanted[kLetterCount];
     if (!parse_bga_nodes(image.data() + anim.offset, anim.size, nodes, err, err_len)) return false;
-    rt_log("ui", "title logo: placement from %s: I %g, C %g, O %g (y %g, scale %g)", kAnimName,
+    rt_log_info("ui", "title logo: placement from %s: I %g, C %g, O %g (y %g, scale %g)", kAnimName,
         double(nodes[0].x), double(nodes[1].x), double(nodes[2].x), double(nodes[0].y),
         double(nodes[0].sx));
 
@@ -945,7 +945,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
             return false;
         }
         per_letter[k] = unsigned(meshes[k].tri.size() / 3);
-        rt_log("ui", "title logo: '%s' at archive offset %zu, %zu bytes, %zu positions, %u triangles,"
+        rt_log_info("ui", "title logo: '%s' at archive offset %zu, %zu bytes, %zu positions, %u triangles,"
                      " texture '%s', colour %02x%02x%02x%02x, placed at x %g",
             mesh.name, mesh.offset, mesh.size, meshes[k].x.size(), per_letter[k],
             meshes[k].texture.c_str(), meshes[k].colour[0], meshes[k].colour[1], meshes[k].colour[2],
@@ -1004,7 +1004,7 @@ bool extract(const RtIsoFile& data_df, TitleGeometry& geom, uint8_t colour[4], c
         return false;
     }
 
-    rt_log("ui", "title logo: meshes I.p2o %u, C.p2o %u, O.p2o %u triangles (%zu in all); letters"
+    rt_log_info("ui", "title logo: meshes I.p2o %u, C.p2o %u, O.p2o %u triangles (%zu in all); letters"
                  " span %.4f by %.4f world units, box %.4f by %.4f with a %.4f border, aspect %.4f",
         per_letter[0], per_letter[1], per_letter[2], geom.triangles(), double(content_w),
         double(content_h), double(box_w), double(box_h), double(margin), double(geom.aspect));
@@ -1031,18 +1031,18 @@ bool ensure_geometry(char* err, size_t err_len) {
     const uint64_t key = disc_key(data_df);
     const auto t0 = std::chrono::steady_clock::now();
     if (cache_load(key, g_geometry, g_colour)) {
-        rt_log("ui", "title logo: cache hit, %zu triangles at aspect %.4f from '%s' in %.1f ms",
+        rt_log_info("ui", "title logo: cache hit, %zu triangles at aspect %.4f from '%s' in %.1f ms",
             g_geometry.triangles(), double(g_geometry.aspect), cache_path(), ms_since(t0));
         return true;
     }
 
-    rt_log("ui", "title logo: building from '%s' (DATA.DF at LSN %u, %u bytes, disc key %016llx)",
+    rt_log_info("ui", "title logo: building from '%s' (DATA.DF at LSN %u, %u bytes, disc key %016llx)",
         rt_iso_mounted_path(), data_df.lsn, data_df.size, (unsigned long long)key);
     if (!extract(data_df, g_geometry, g_colour, err, err_len)) {
         g_geometry = TitleGeometry();
         return false;
     }
-    rt_log("ui", "title logo: geometry built in %.1f ms", ms_since(t0));
+    rt_log_info("ui", "title logo: geometry built in %.1f ms", ms_since(t0));
     cache_store(key, g_geometry, g_colour);
     return true;
 }
@@ -1064,7 +1064,7 @@ bool rt_title_logo_build(uint32_t width_px, uint32_t height_px, RtTitleLogo& out
         out = RtTitleLogo();
         return false;
     }
-    rt_log("ui", "title logo: rasterised %zu triangles into %ux%u in %.2f ms (aspect %.4f against"
+    rt_log_info("ui", "title logo: rasterised %zu triangles into %ux%u in %.2f ms (aspect %.4f against"
                  " the box's %.4f)",
         g_geometry.triangles(), out.width, out.height, ms_since(t0), double(g_geometry.aspect),
         double(width_px) / double(height_px));
@@ -1073,13 +1073,13 @@ bool rt_title_logo_build(uint32_t width_px, uint32_t height_px, RtTitleLogo& out
     g_geometry = TitleGeometry();
     out = RtTitleLogo();
     set_err(err, err_len, "the build threw: %s", e.what());
-    rt_log("ui", "title logo: the build threw (%s); the launcher keeps its text title", e.what());
+    rt_log_warn("ui", "title logo: the build threw (%s); the launcher keeps its text title", e.what());
     return false;
 } catch (...) {
     g_geometry = TitleGeometry();
     out = RtTitleLogo();
     set_err(err, err_len, "the build threw a non-standard exception");
-    rt_log("ui", "title logo: the build threw a non-standard exception; the launcher keeps its"
+    rt_log_warn("ui", "title logo: the build threw a non-standard exception; the launcher keeps its"
                  " text title");
     return false;
 }

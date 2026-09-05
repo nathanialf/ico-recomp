@@ -15,9 +15,11 @@
  * Virtual clock: u64 EE bus cycles. Time advances only at runtime trap
  * points (syscalls, MMIO accesses) and in the scheduler idle loop, which
  * jumps straight to the next timeline event. The timeline is: vblank field
- * boundaries (59.94 Hz NTSC, alternating fields), timer compare/overflow
+ * boundaries (the programmed video mode's field rate, alternating fields),
+ * timer compare/overflow
  * interrupts (timers.cpp), kernel alarms (alarms.cpp) and deferred SIF
- * responses (sif/sif.cpp).
+ * responses (sif/rpc.cpp, which owns the delivery queue; sif/sif.cpp owns
+ * the register file).
  */
 #include "kernel.h"
 
@@ -30,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <thread>
 #include <vector>
 
 EEKernelState g_kern;
@@ -70,6 +73,12 @@ constexpr int kNumPrios = 128;
  * only holds the translated C frames, but interrupt-handler dispatch can
  * nest on top of a deep guest call chain, so be generous. */
 constexpr size_t kCoroStackSize = 2u * 1024 * 1024;
+/* Per-thread wake timestamps kept for the inventory's "wakes in the last
+ * second". A thread woken by the vblank handler wakes 50 times a second on
+ * PAL, so 128 covers that with room for a semaphore signalled harder, and
+ * the inventory says "128+" rather than a wrong number if it is ever
+ * exceeded. */
+constexpr size_t kWakeRing = 128;
 
 enum class TState : uint8_t { Free, Dormant, Ready, Run, Wait, Suspend, WaitSuspend };
 enum class WaitKind : uint8_t { None, Sleep, Sema };
@@ -79,6 +88,16 @@ constexpr uint32_t THS_RUN = 0x01, THS_READY = 0x02, THS_WAIT = 0x04,
                    THS_SUSPEND = 0x08, THS_DORMANT = 0x10;
 
 struct EEThread {
+    /* EE Status.EIE as this thread left it. The interrupt enable bit is
+     * part of a thread's saved context on the real kernel: a thread that
+     * runs di and then blocks keeps interrupts off for itself only, and
+     * every other thread keeps taking them. Modelled as one global flag,
+     * the PAL loader's read thread (func_00133250) did di and then slept in
+     * sceCdSync's sceCdDelayThread loop, and no alarm or SIF0 interrupt was
+     * ever delivered to anyone: the run idled forever after the first disc
+     * read. The scheduler itself runs with interrupts enabled, which is
+     * where pending interrupts are delivered between threads. */
+    bool eie = true;
     int id = 0;
     TState state = TState::Free;
     WaitKind wait = WaitKind::None;
@@ -93,6 +112,27 @@ struct EEThread {
     int release_ret = 0;            /* value a released/awoken blocking call returns */
     uint64_t blocked_since = 0;
     uint64_t run_count = 0;
+    /* Why this thread is interesting to an inventory, beyond its state.
+     *
+     * last_syscall_*: the syscall this thread made most recently, recorded
+     * by syscalls.cpp. The run-state summary already keeps the last syscall
+     * of the whole run; this is the per-thread version, which is what says
+     * that thread 7 last called SleepThread while thread 3 last called
+     * WaitSema.
+     *
+     * wake_at: the virtual-clock times of this thread's last kWakeRing
+     * wakes. A count is not enough on its own: the failure this exists for
+     * is a run where fields advanced at 50 Hz forever, and the question
+     * that separates a thread the vblank handler keeps waking from a thread
+     * nothing has touched in twenty seconds is "how many wakes in the last
+     * second", not "how many since boot". A ring rather than a windowed
+     * counter so the answer is exact rather than an artefact of when the
+     * window last rolled; kWakeRing caps how many it can report. */
+    int last_syscall_num = -1;
+    const char* last_syscall_name = nullptr;
+    uint64_t last_syscall_vclk = 0;
+    uint64_t wakes = 0;
+    uint64_t wake_at[kWakeRing] = {0};
     R5900Context ctx {};
     mco_coro* co = nullptr;
 };
@@ -105,8 +145,16 @@ struct EESema {
     int creator_tid = 0;
     uint32_t creator_ra = 0;        /* guest $ra at CreateSema, call-site hint */
     uint64_t signals = 0, waits = 0;
+    uint64_t refused = 0;           /* SignalSema calls refused at max_count */
+    bool refused_warned = false;    /* the overflow warn is one per semaphore */
     std::deque<int> waiters;        /* FIFO thread ids */
 };
+
+/* Set once by rt_sched_boot; read by rt_sched_on_ee_thread from any
+ * thread. Written before any other thread can observe it and never again,
+ * so a plain object is enough. */
+std::thread::id g_ee_thread;
+bool g_ee_thread_set = false;
 
 EEThread g_threads[kMaxThreads];    /* index == id; 0 unused */
 EESema g_semas[kMaxSemas];          /* index == id; 0 unused */
@@ -117,7 +165,11 @@ uint64_t g_resumes = 0;             /* total thread resumes, for hang detection 
 /* ---- virtual clock + vblank timeline ---- */
 
 uint64_t g_vclk = 0;
-uint64_t g_next_field_edge = RT_CYCLES_PER_FIELD; /* next vblank START */
+/* Next vblank START. Seeded from the boot mode's field length (a constant,
+ * because this is a static initializer) and moved on by the current field
+ * length from then on; a mode change re-derives it in video_mode_changed
+ * below. */
+uint64_t g_next_field_edge = RT_CYCLES_PER_FIELD_BOOT;
 uint64_t g_next_vblank_end = UINT64_MAX;
 unsigned g_field = 0;
 uint64_t g_vblank_count = 0;
@@ -202,8 +254,12 @@ int block_current(WaitKind k, int sema_id) {
     return t->release_ret;
 }
 
-/* Make a blocked/suspended thread runnable again. */
+/* Make a blocked/suspended thread runnable again. The one choke point every
+ * wake goes through (WakeupThread, SignalSema, ReleaseWaitThread, a deleted
+ * semaphore), so it is also where the inventory's wake history is kept. */
 void unblock(EEThread* t, int release_ret) {
+    t->wake_at[t->wakes % kWakeRing] = g_vclk;
+    ++t->wakes;
     t->release_ret = release_ret;
     if (t->state == TState::Wait) {
         t->wait = WaitKind::None;
@@ -229,7 +285,7 @@ void thread_trampoline(mco_coro* co) {
     }
     g_functab[RECOMP_FUNC_IDX(entry)](&t->ctx);
     /* Guest root function returned: implicit ExitThread. */
-    rt_log("sched", "thread %d root function returned; implicit ExitThread", t->id);
+    rt_log_info("sched", "thread %d root function returned; implicit ExitThread", t->id);
     t->state = TState::Dormant;
     /* Falling off the trampoline marks the coroutine dead; the scheduler
      * loop reaps it. */
@@ -267,7 +323,7 @@ static uint64_t clock_next_event() {
     return nxt;
 }
 
-/* Where virtual time comes from. A field is RT_CYCLES_PER_FIELD cycles;
+/* Where virtual time comes from. A field is rt_cycles_per_field() cycles;
  * whether those cycles are billed by a spinning guest (backedge/mmio) or
  * skipped over while every thread sleeps (idle) is the difference between
  * a wait that costs host time and one that costs none. */
@@ -292,8 +348,8 @@ void rt_clock_tick(uint64_t cycles) {
         if (g_vclk >= g_next_field_edge) {
             ++g_vblank_count;
             g_field ^= 1;
-            g_next_vblank_end = g_next_field_edge + RT_CYCLES_VBLANK;
-            g_next_field_edge += RT_CYCLES_PER_FIELD;
+            g_next_vblank_end = g_next_field_edge + rt_cycles_vblank();
+            g_next_field_edge += rt_cycles_per_field();
             rt_gs_vblank_start(g_field);
             rt_intc_raise(RT_INTC_VB_ON);
             if (g_kern.vsync_flag_ptr) { /* SetVSyncFlag one-shot */
@@ -304,9 +360,16 @@ void rt_clock_tick(uint64_t cycles) {
             static uint64_t logged = 0;
             ++logged;
             if ((logged & (logged - 1)) == 0) {
-                rt_log("vblank", "field #%" PRIu64 " start (vclk=%" PRIu64 ")", g_vblank_count, g_vclk);
+                rt_log_debug("vblank", "field #%" PRIu64 " start (vclk=%" PRIu64 ")", g_vblank_count, g_vclk);
             }
             if (g_max_vblanks && g_vblank_count >= g_max_vblanks) {
+                /* A bounded diagnostic run reaching its own bound is a
+                 * deliberate end: it is what the run was asked to do. Named
+                 * here rather than left to rt_sched_exit_game so the summary
+                 * comes out at info; the first caller wins, so this is the
+                 * reason that sticks. */
+                rt_run_set_exit_reason(true, "ICORECOMP_MAX_VBLANKS=%" PRIu64 " reached",
+                    g_max_vblanks);
                 rt_sched_exit_game(0, "ICORECOMP_MAX_VBLANKS reached");
             }
         }
@@ -413,6 +476,26 @@ extern "C" void rt_backedge(void) {
 
 /* ---- scheduler core ------------------------------------------------------ */
 
+namespace {
+
+/* rt_video_add_mode_hook, registered in rt_sched_init.
+ *
+ * The GS CRTC restarts its vertical counter when SMODE1 changes, so the
+ * field the game was in ends at the write and the next field edge is one
+ * whole field of the new mode away. A vblank-end deadline that is still
+ * pending belongs to the field that just ended and is left alone: it is
+ * always nearer than the new field edge, because a vblank is a fraction of
+ * a field. */
+void video_mode_changed(RtVideoMode, RtVideoMode) {
+    g_next_field_edge = g_vclk + rt_cycles_per_field();
+    rt_log_info("sched", "video mode change at vclk %llu: next field edge at %llu"
+        " (%llu cycles per field)",
+        (unsigned long long)g_vclk, (unsigned long long)g_next_field_edge,
+        (unsigned long long)rt_cycles_per_field());
+}
+
+} // namespace
+
 void rt_sched_init() {
     const char* e = std::getenv("ICORECOMP_MAX_VBLANKS");
     if (e) g_max_vblanks = std::strtoull(e, nullptr, 10);
@@ -420,7 +503,7 @@ void rt_sched_init() {
         uint64_t v = std::strtoull(c, nullptr, 10);
         if (v >= 1 && v <= 64) g_backedge_cycles = v;
     }
-    rt_log("sched", "EE loop billing: %llu bus cycles per backedge "
+    rt_log_info("sched", "EE loop billing: %llu bus cycles per backedge "
                     "(ICORECOMP_EE_LOOP_CYCLES; higher = slower emulated EE "
                     "relative to the field clock)",
         (unsigned long long)g_backedge_cycles);
@@ -429,15 +512,16 @@ void rt_sched_init() {
         if (v >= 1 && v <= 4096) {
             g_mmio_cycles = v;
         } else {
-            rt_log("sched", "ICORECOMP_MMIO_CYCLES=%s is outside 1..4096; keeping %llu",
+            rt_log_warn("sched", "ICORECOMP_MMIO_CYCLES=%s is outside 1..4096; keeping %llu",
                 m, (unsigned long long)g_mmio_cycles);
         }
     }
-    rt_log("sched", "MMIO billing: %llu bus cycles per hardware-register access, so a field of "
+    rt_log_info("sched", "MMIO billing: %llu bus cycles per hardware-register access, so a field of "
                     "%llu cycles holds %llu of them (ICORECOMP_MMIO_CYCLES; this is what paces "
                     "register-driven guest code such as the MPEG player)",
-        (unsigned long long)g_mmio_cycles, (unsigned long long)RT_CYCLES_PER_FIELD,
-        (unsigned long long)(RT_CYCLES_PER_FIELD / g_mmio_cycles));
+        (unsigned long long)g_mmio_cycles, (unsigned long long)rt_cycles_per_field(),
+        (unsigned long long)(rt_cycles_per_field() / g_mmio_cycles));
+    rt_video_add_mode_hook(video_mode_changed);
     rt_intc_init();
     rt_timers_init();
     rt_sif_init();
@@ -467,6 +551,13 @@ void rt_sched_maybe_preempt() {
     uint64_t idle_streak_start = 0;
     bool idling = false;
     for (;;) {
+        /* The field watchdog runs on its own thread and cannot walk these
+         * tables while this one is editing them, so it leaves a request
+         * instead and the dump happens here, between two thread resumes.
+         * See rt_run_request_inventory in runtime.h. */
+        if (const char* why = rt_run_take_inventory_request()) {
+            rt_sched_dump_inventory(why);
+        }
         int prio = best_ready_prio();
         if (prio >= 0) {
             idling = false;
@@ -478,6 +569,11 @@ void rt_sched_maybe_preempt() {
             ++t->run_count;
             ++g_resumes;
             mco_result r;
+            /* Restore this thread's interrupt enable state (see EEThread::eie).
+             * Enabling delivers whatever became pending while it was off the
+             * CPU, before its first instruction, which is what a real
+             * context switch into a thread with EIE set does. */
+            rt_intc_set_eie(t->eie);
             {
                 /* Everything the guest triggers (MMIO, syscalls, DMA,
                  * VIF1, VU1, GIF, GS) opens its own zone underneath
@@ -486,7 +582,11 @@ void rt_sched_maybe_preempt() {
                 RT_PROF_ZONE(RT_PROF_EE);
                 r = mco_resume(t->co);
             }
+            t->eie = rt_intc_get_eie();
             g_current = 0;
+            /* The scheduler context takes interrupts: a thread that blocked
+             * with di must not hold them off the whole machine. */
+            rt_intc_set_eie(true);
             if (r != MCO_SUCCESS) {
                 rt_fatal("sched", &t->ctx, "mco_resume(thread %d) failed: %s", id, mco_result_description(r));
             }
@@ -502,10 +602,10 @@ void rt_sched_maybe_preempt() {
             if (t->state == TState::Dormant) {
                 coro_destroy(t);
                 if (t->pending_delete) {
-                    rt_log("sched", "thread %d exited and deleted", id);
+                    rt_log_info("sched", "thread %d exited and deleted", id);
                     t->state = TState::Free;
                 } else {
-                    rt_log("sched", "thread %d is dormant", id);
+                    rt_log_info("sched", "thread %d is dormant", id);
                 }
             }
             continue;
@@ -532,6 +632,12 @@ void rt_sched_maybe_preempt() {
 }
 
 [[noreturn]] void rt_sched_boot(uint32_t entry_vram, uint32_t gp, uint32_t sp) {
+    /* The thread that owns g_threads, g_semas and the waiter deques from
+     * here on. Anything that wants to walk them from another thread (the
+     * end-of-run summary raised by a fatal on the GS worker, for instance)
+     * has to ask first: see rt_sched_on_ee_thread. */
+    g_ee_thread = std::this_thread::get_id();
+    g_ee_thread_set = true;
     EEThread* t = &g_threads[1];
     t->id = 1;
     t->state = TState::Dormant;
@@ -544,23 +650,91 @@ void rt_sched_maybe_preempt() {
     t->stack_size = 0x10000;
     coro_start(t, 0);
     ready_push_back(t);
-    rt_log("sched", "boot: thread 1 entry=0x%08x prio=0 sp=0x%08x gp=0x%08x", entry_vram, sp, gp);
+    rt_log_info("sched", "boot: thread 1 entry=0x%08x prio=0 sp=0x%08x gp=0x%08x", entry_vram, sp, gp);
     sched_loop();
 }
 
+/* How many of this thread's recorded wakes happened in the last second of
+ * virtual time, and whether the ring could hold them all. */
+size_t wakes_last_second(const EEThread* t, bool* capped) {
+    const uint64_t cutoff = g_vclk > RT_BUSCLK_HZ ? g_vclk - RT_BUSCLK_HZ : 0;
+    const size_t held = t->wakes < kWakeRing ? (size_t)t->wakes : kWakeRing;
+    size_t n = 0;
+    for (size_t i = 0; i < held; ++i) {
+        if (t->wake_at[i] >= cutoff) ++n;
+    }
+    *capped = n == kWakeRing;
+    return n;
+}
+
+bool rt_sched_on_ee_thread() {
+    return g_ee_thread_set && std::this_thread::get_id() == g_ee_thread;
+}
+
 void rt_sched_dump_inventory(const char* why) {
-    rt_log("sched", "---- thread/semaphore inventory (%s) ----", why);
-    rt_log("sched", "vclk=%" PRIu64 " cycles (%.3f s), vblank fields=%" PRIu64 ", thread resumes=%" PRIu64,
+    /* The tables below are the EE thread's, and nothing locks them. Walking
+     * a std::deque another thread is editing can fault, and faulting inside
+     * a crash report is worse than not printing one, so the inventory is
+     * skipped rather than raced when the caller is on another thread (a
+     * fatal raised on the GS worker reaches rt_run_summary the same way the
+     * EE thread does). Before the scheduler boots there is no owner and
+     * nothing to race with, which is why the unset case prints. */
+    if (g_ee_thread_set && !rt_sched_on_ee_thread()) {
+        rt_log_warn("sched", "thread/semaphore inventory (%s) SKIPPED: this is not the EE thread, "
+            "and its tables are edited without a lock. Whatever raised this is on another thread",
+            why);
+        return;
+    }
+    rt_log_info("sched", "---- thread/semaphore inventory (%s) ----", why);
+    rt_log_info("sched", "vclk=%" PRIu64 " cycles (%.3f s), vblank fields=%" PRIu64 ", thread resumes=%" PRIu64,
         g_vclk, (double)g_vclk / (double)RT_BUSCLK_HZ, g_vblank_count, g_resumes);
     for (int i = 1; i < kMaxThreads; ++i) {
         EEThread* t = &g_threads[i];
         if (t->state == TState::Free) continue;
-        char waitinfo[64] = "";
-        if (t->wait == WaitKind::Sleep) std::snprintf(waitinfo, sizeof(waitinfo), " wait=SleepThread");
-        if (t->wait == WaitKind::Sema) std::snprintf(waitinfo, sizeof(waitinfo), " wait=sema %d", t->wait_sema);
-        rt_log("sched", "  thread %-3d %-11s prio=%-3d entry=0x%08x stack=0x%08x+0x%x gp=0x%08x runs=%" PRIu64 "%s",
-            t->id, tstate_name(t->state), t->priority, t->entry, t->stack_base, t->stack_size,
-            t->gp, t->run_count, waitinfo);
+        /* What it is waiting on, with enough of the other side of the wait
+         * to say whether it can ever end: a semaphore's count and its
+         * waiter list, or how long a sleeping thread has been asleep. A
+         * bare "wait=sema 5" cannot distinguish a semaphore nobody signals
+         * from one signalled every field. */
+        char waitinfo[192] = "";
+        if (t->wait == WaitKind::Sleep) {
+            std::snprintf(waitinfo, sizeof(waitinfo),
+                " wait=SleepThread (wakeups pending=%d, asleep %.3f s)",
+                t->wakeup_count, (double)(g_vclk - t->blocked_since) / (double)RT_BUSCLK_HZ);
+        } else if (t->wait == WaitKind::Sema) {
+            EESema* s = sget(t->wait_sema);
+            char wbuf[64] = "";
+            size_t off = 0;
+            if (s) {
+                for (int w : s->waiters) {
+                    off += (size_t)std::snprintf(wbuf + off, sizeof(wbuf) - off, "%s%d", off ? "," : "", w);
+                    if (off >= sizeof(wbuf) - 8) break;
+                }
+            }
+            std::snprintf(waitinfo, sizeof(waitinfo),
+                " wait=sema %d (count=%d max=%d signals=%" PRIu64 " waiters=[%s], waiting %.3f s)",
+                t->wait_sema, s ? s->count : -1, s ? s->max_count : -1,
+                s ? s->signals : 0, wbuf,
+                (double)(g_vclk - t->blocked_since) / (double)RT_BUSCLK_HZ);
+        }
+        /* The entry address as a decomp name. Every ios thread in this game
+         * is created with the same entry (iosThreadMain), so the name alone
+         * does not separate them; it is still the difference between
+         * reading a thread list and reading twelve addresses. */
+        uint32_t fn_entry = 0;
+        const char* fn = rt_guest_func_name(t->entry, &fn_entry);
+        char entryname[96] = "";
+        if (fn) {
+            if (fn_entry == t->entry) std::snprintf(entryname, sizeof(entryname), " (%s)", fn);
+            else std::snprintf(entryname, sizeof(entryname), " (%s+0x%x)", fn, t->entry - fn_entry);
+        }
+        bool capped = false;
+        const size_t win = wakes_last_second(t, &capped);
+        rt_log_info("sched", "  thread %-3d %-11s prio=%-3d entry=0x%08x%s stack=0x%08x+0x%x gp=0x%08x "
+            "runs=%" PRIu64 " wakes=%" PRIu64 " (%zu%s in the last second) last syscall=%s%s",
+            t->id, tstate_name(t->state), t->priority, t->entry, entryname,
+            t->stack_base, t->stack_size, t->gp, t->run_count, t->wakes, win, capped ? "+" : "",
+            t->last_syscall_name ? t->last_syscall_name : "(none yet)", waitinfo);
     }
     for (int i = 1; i < kMaxSemas; ++i) {
         EESema* s = &g_semas[i];
@@ -571,18 +745,47 @@ void rt_sched_dump_inventory(const char* why) {
             off += std::snprintf(wbuf + off, sizeof(wbuf) - off, "%s%d", off ? "," : "", w);
             if (off >= sizeof(wbuf) - 8) break;
         }
-        rt_log("sched", "  sema %-3d count=%-3d max=%-3d init=%-3d signals=%" PRIu64 " waits=%" PRIu64
-            " creator=thread %d (ra 0x%08x) waiters=[%s]",
-            s->id, s->count, s->max_count, s->init_count, s->signals, s->waits,
+        rt_log_info("sched", "  sema %-3d count=%-3d max=%-3d init=%-3d signals=%" PRIu64 " waits=%" PRIu64
+            " refused=%" PRIu64 " creator=thread %d (ra 0x%08x) waiters=[%s]",
+            s->id, s->count, s->max_count, s->init_count, s->signals, s->waits, s->refused,
             s->creator_tid, s->creator_ra, wbuf);
     }
+    rt_alarms_dump();
     rt_sif_dump_inventory();
-    rt_log("sched", "---- end inventory ----");
+    rt_log_info("sched", "---- end inventory ----");
+}
+
+/* Recorded per thread by syscalls.cpp, next to the run-state summary's
+ * whole-run version. `name` is a dispatch-table entry with static
+ * lifetime. */
+void rt_sched_note_syscall(int num, const char* name) {
+    EEThread* t = tget(g_current);
+    if (!t) return;
+    t->last_syscall_num = num;
+    t->last_syscall_name = name;
+    t->last_syscall_vclk = g_vclk;
 }
 
 [[noreturn]] void rt_sched_exit_game(int code, const char* why) {
-    rt_log("sched", "exiting: %s", why);
+    /* warn unless something nearer the cause already said it was
+     * deliberate (a bounded diagnostic run reaching its bound). The guest
+     * calling Exit is not the player quitting: the player quits through the
+     * menu, the launcher or the window's close button, and every one of
+     * those comes through rt_request_exit instead. Translated code reaching
+     * Exit on its own is the game deciding to stop, which on this port is
+     * more often a boot that went wrong than a feature, and it is one of the
+     * ways a run can "just end" with nothing in the log to say why. */
+    const bool expected = rt_run_exit_reason_known();
+    if (expected) {
+        rt_log_info("sched", "exiting: %s (exit status %d)", why, code);
+    } else {
+        rt_log_warn("sched", "the guest ended the run itself (Exit): %s (exit status %d)",
+            why, code);
+    }
     rt_sched_dump_inventory("exit");
+    /* First caller wins, so this is only reached when nothing nearer the
+     * cause named itself: an Exit the run did not ask for. */
+    rt_run_set_exit_reason(false, "the guest called Exit: %s (exit status %d)", why, code);
     std::exit(code);
 }
 
@@ -590,7 +793,20 @@ void rt_sched_dump_inventory(const char* why) {
 
 int rt_thread_create(uint32_t entry, uint32_t stack, uint32_t stack_size,
                      uint32_t gp, int prio, uint32_t attr, uint32_t option) {
-    if (prio < 0 || prio >= kNumPrios) return -1;
+    /* Both failures below hand the guest a bare -1. Warn once per
+     * condition, naming the limit and what it means, because the per-call
+     * CreateThread line in syscalls.cpp stops after the first 32 and a
+     * failure after boot would otherwise leave nothing in the log. */
+    if (prio < 0 || prio >= kNumPrios) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            rt_log_warn("sched", "CreateThread(entry=0x%08x) asked for priority %d, outside the "
+                "kernel's 0..%d; returning -1 the way the kernel does. The guest gets no thread",
+                entry, prio, kNumPrios - 1);
+        }
+        return -1;
+    }
     for (int i = 2; i < kMaxThreads; ++i) {
         if (g_threads[i].state == TState::Free) {
             EEThread* t = &g_threads[i];
@@ -605,6 +821,16 @@ int rt_thread_create(uint32_t entry, uint32_t stack, uint32_t stack_size,
             t->attr = attr;
             t->option = option;
             return i;
+        }
+    }
+    {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            rt_log_warn("sched", "CreateThread(entry=0x%08x prio=%d) with all %d thread slots in "
+                "use; returning -1 the way the kernel does when its table is full. Whatever the "
+                "guest wanted this thread for will not run",
+                entry, prio, kMaxThreads - 2);
         }
     }
     return -1;
@@ -659,8 +885,13 @@ int rt_thread_change_priority(int id, int prio, bool from_int) {
     if (!t || prio < 0 || prio >= kNumPrios) return -1;
     int old = t->priority;
     if (t->id == g_current && !from_int) {
-        /* Kernel semantics: the running thread goes to the TAIL of the new
-         * priority's ready queue, i.e. this doubles as a yield. */
+        /* The running thread goes to the TAIL of the new priority's ready
+         * queue, i.e. this doubles as a yield. INFERRED, not measured: no
+         * disassembly of the retail kernel's ChangeThreadPriority has been
+         * read for this port, and tail is the reading that matches the
+         * kernel's other requeueing call, RotateThreadReadyQueue. If it is
+         * head, a same-priority sibling that was already queued would run
+         * one turn later than it does here. */
         t->priority = prio;
         ready_push_back(t);
         yield_current();
@@ -671,6 +902,14 @@ int rt_thread_change_priority(int id, int prio, bool from_int) {
     } else {
         t->priority = prio;
     }
+    /* Raising another thread's priority above the running thread's makes it
+     * the one that should be on the CPU, and the kernel switches to it at
+     * once. Every other call that can make a higher-priority thread ready
+     * (rt_thread_start, rt_thread_wakeup, rt_sema_signal, rt_thread_resume)
+     * ends this way; this one used to be the exception, which left the
+     * caller running until it blocked. Not from an interrupt handler: there
+     * the reschedule happens on the way out of rt_intc_deliver. */
+    if (t->id != g_current && !from_int) rt_sched_maybe_preempt();
     return old;
 }
 
@@ -811,8 +1050,21 @@ int rt_thread_release_wait(int id, bool from_int) {
 
 /* ---- semaphore syscall backends ----------------------------------------- */
 
-/* Kernel error code for PollSema on a zero-count semaphore (Sony KE_SEMA_ZERO). */
-constexpr int KE_SEMA_ZERO = -420;
+/* Kernel error codes for the two semaphore refusals.
+ *
+ * Source: ps2sdk iop/kernel/include/kerr.h, which lists
+ *   #define KE_SEMA_ZERO -419   (PollSema/WaitSema on a zero count)
+ *   #define KE_SEMA_OVF  -420   (SignalSema past max_count)
+ * next to each other. That header is the IOP kernel's; the EE kernel using
+ * the same numbering for the same two conditions is INFERRED, not measured
+ * (ps2sdk's ee/kernel headers declare the syscalls but define no error
+ * enum, and there is no ps2sdk tree on this machine to check an EE-side
+ * one against). Both are negative, which is what every caller in this
+ * binary tests, so the inference decides the exact value and nothing else.
+ * KE_SEMA_ZERO was -420 here until 2026-09-05, which is KE_SEMA_OVF's
+ * value in that header. */
+constexpr int KE_SEMA_ZERO = -419;
+constexpr int KE_SEMA_OVF = -420;
 
 int rt_sema_create(int init_count, int max_count, uint32_t attr, uint32_t option) {
     for (int i = 1; i < kMaxSemas; ++i) {
@@ -830,6 +1082,17 @@ int rt_sema_create(int init_count, int max_count, uint32_t attr, uint32_t option
             R5900Context* c = rt_sched_current_ctx();
             s->creator_ra = c ? (uint32_t)c->r[31].u64x[0] : 0;
             return i;
+        }
+    }
+    {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            rt_log_warn("sched", "CreateSema(init=%d max=%d) with all %d semaphore slots in use; "
+                "returning -1 the way the kernel does when its table is full. Whatever was going "
+                "to wait on this semaphore will not block, and whatever was going to signal it "
+                "will fail",
+                init_count, max_count, kMaxSemas - 1);
         }
     }
     return -1;
@@ -852,6 +1115,34 @@ int rt_sema_delete(int id) {
 int rt_sema_signal(int id, bool from_int) {
     EESema* s = sget(id);
     if (!s) return -1;
+    /* max_count is a ceiling, not a comment: the kernel refuses a signal
+     * that would push the count past it (KE_SEMA_OVF above) instead of
+     * accumulating. Only the no-waiter arm can overflow; a signal handed
+     * straight to a waiting thread never touches the count.
+     *
+     * What this changes, and what it does not. Measured on the PAL boot
+     * (dist/logs/handoff-2026-09-04/icorecomp-latest.log, the "sema"
+     * inventory): the main per-field semaphore the vblank handler signals
+     * is created with max=8, and the rest of the table is max 1, 2, 8, 16
+     * or 255. Nothing is created with max 0, so nothing is refused from
+     * its first signal. With max=8 an EE thread that overruns a field
+     * still banks the missed signals and still runs its catch-up fields
+     * exactly as before; what is new is that the count cannot climb past
+     * 8, which on hardware is where the kernel stops counting too. A
+     * ceiling of 1 elsewhere in the table now drops a repeat signal the
+     * way the kernel does. */
+    if (s->waiters.empty() && s->count >= s->max_count) {
+        ++s->refused;
+        if (!s->refused_warned) {
+            s->refused_warned = true;
+            rt_log_warn("sched", "SignalSema(%d) refused: count is already %d and the semaphore "
+                "was created with max_count %d, so the kernel answers KE_SEMA_OVF (%d) and the "
+                "signal is dropped rather than banked (creator thread %d, ra 0x%08x). Further "
+                "refusals on this semaphore are counted in the inventory, not logged",
+                id, s->count, s->max_count, KE_SEMA_OVF, s->creator_tid, s->creator_ra);
+        }
+        return KE_SEMA_OVF;
+    }
     ++s->signals;
     if (!s->waiters.empty()) {
         int tid = s->waiters.front();

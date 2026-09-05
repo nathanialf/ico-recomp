@@ -42,12 +42,12 @@ const char* rt_iso_forced_path();
  *      selftest does not, and skips this step.
  *   3. config/local.toml [disc] path (untracked, gitignored; relative to
  *      rt_base_dir())
- *   4. <decomp root>/baserom/Ico_USA.bin, then .iso; dev checkouts only,
+ *   4. <decomp root>/baserom/Ico_PAL.bin, then .iso; dev checkouts only,
  *      skipped when the config named no decomp root
- *   5. ico.iso / ico.bin / Ico_USA.iso / Ico_USA.bin next to the
+ *   5. ico.iso / ico.bin / Ico_PAL.iso / Ico_PAL.bin next to the
  *      executable (the packaged convention: disc beside the exe)
  * Fatal if nothing usable is found (loud failure per CLAUDE.md). Verifies
- * the mount by locating SCUS_971.13 and DFDATAS/DATA.DF. */
+ * the mount by locating SCES_507.60 and DFDATAS/DATA.DF. */
 void rt_iso_mount();
 bool rt_iso_mounted();
 
@@ -59,7 +59,7 @@ bool rt_iso_mounted();
 bool rt_iso_probe_mount(char* err, size_t err_len);
 
 /* Mounts exactly `path`: no probe list, no config or settings lookup. Runs
- * the same PVD read and SCUS_971.13 verification rt_iso_mount does, and
+ * the same PVD read and SCES_507.60 verification rt_iso_mount does, and
  * never calls rt_fatal. On failure `err` gets one human-readable line
  * naming the step that failed and the path, and nothing is left mounted
  * (the file handle is closed and the mount state reset, so a later

@@ -1,4 +1,4 @@
-/* ui/ui.h: the runtime's RmlUi overlay (settings menu, later the launcher).
+/* ui/ui.h: the runtime's RmlUi overlay (menu, later the launcher).
  *
  * Everything in this module runs on the main OS thread, at the field
  * boundary, with no locking: guest threads are minicoro coroutines on that
@@ -24,7 +24,7 @@
 #ifndef ICORECOMP_UI_UI_H
 #define ICORECOMP_UI_UI_H
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Declared, not included: ui.h stays free of SDL and RmlUi headers.
  * SDL3/SDL.h's own `typedef union SDL_Event {...} SDL_Event;` agrees with
  * this declaration, so either include order works. */
@@ -38,7 +38,7 @@ union SDL_Event;
  * Returns false, having logged the reason, when this build has no live
  * windowed backend, when rt_base_dir()/ui is missing, or when RmlUi itself
  * fails to initialize. A false return is not fatal: the game runs without a
- * settings menu. */
+ * menu. */
 bool rt_ui_init();
 
 /* One UI tick, from rt_gs_vsync_hook after rt_settings_apply_pending():
@@ -77,7 +77,7 @@ bool rt_launcher_run();
  * the menu does not also reach the game. */
 bool rt_ui_wants_input();
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Called from rt_window_pump for every event window.cpp does not fully own.
  * Inside, the order is binding capture (ui/ui_rebind.cpp), then the menu
  * hotkey, then RmlUi; the returned bool says whether the UI consumed the
@@ -96,7 +96,7 @@ inline void rt_ui_set_visible(bool) {}
  * reaches this, but the stub keeps the call site free of its own #ifdef. */
 inline bool rt_launcher_run() { return true; }
 inline bool rt_ui_wants_input() { return false; }
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 inline bool rt_ui_handle_sdl_event(const SDL_Event&) { return false; }
 #endif
 

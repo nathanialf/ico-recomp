@@ -8,19 +8,19 @@
  *
  * Guarded like host/input.cpp and host/window.cpp: SDL is only linked into
  * the executable when the live paraLLEl-GS backend was built with SDL3
- * window support (ICORECOMP_PGS_SDL). Without it every function here is a
+ * window support (ICORECOMP_HAVE_SDL). Without it every function here is a
  * no-op with no SDL calls compiled in.
  */
 #include "mouse.h"
 
 #include "../runtime.h"
 
-#ifdef ICORECOMP_PGS_SDL
-#include "../gs/gs_parallel_api.h"
+#ifdef ICORECOMP_HAVE_SDL
 #include "../ui/ui.h"
 #include "input.h"
 #include "settings.h"
 #include "window.h"
+#include "window_service.h"
 
 #include <cmath>
 
@@ -66,10 +66,17 @@ const char* g_release_reason = "";
 bool g_capture_error_logged = false;
 bool g_capture_error_wanted = false;
 
+/* The same shape for the two non-finite deltas. A driver that produces one
+ * NaN produces them at event rate, so each is said once and then stays
+ * quiet; a finite value on the same axis clears the latch, so a fault that
+ * comes back is reported again. */
+bool g_motion_nonfinite_logged = false;
+bool g_wheel_nonfinite_logged = false;
+
 SDL_Window* window() {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) return nullptr;          /* no live backend (dump mode, or not built) */
-    return (SDL_Window*)rt_pgs_window_handle(pgs);
+    /* The executable's own window (host/window_service.h); null when this
+     * run has none (dump mode, headless, or a build with no SDL). */
+    return (SDL_Window*)rt_window_handle();
 }
 
 /* Whether the pointer should be captured right now, and, when it should not,
@@ -111,7 +118,7 @@ void push_button(uint8_t button, bool down) {
          * consumer is about to act on, survives. Loud, once per run. */
         if (!g_button_log_overflowed) {
             g_button_log_overflowed = true;
-            rt_log("input", "mouse button log overflowed at %d entries; the oldest are being"
+            rt_log_warn("input", "mouse button log overflowed at %d entries; the oldest are being"
                 " dropped, which means nothing is draining it", kButtonLogSize);
         }
         for (int i = 1; i < kButtonLogSize; ++i) g_button_log[i - 1] = g_button_log[i];
@@ -154,10 +161,16 @@ void rt_mouse_on_event(const SDL_Event& e, bool ui_took_it) {
          * into a rate. Saying so beats carrying a NaN into the stick bytes,
          * where it would come out as a silently wrong pair. */
         if (!std::isfinite(e.motion.xrel) || !std::isfinite(e.motion.yrel)) {
-            rt_log("input", "mouse motion with a non-finite relative delta (%f, %f); ignored",
-                (double)e.motion.xrel, (double)e.motion.yrel);
+            if (!g_motion_nonfinite_logged) {
+                g_motion_nonfinite_logged = true;
+                rt_log_warn("input", "mouse motion with a non-finite relative delta (%f, %f);"
+                                     " ignored (this line is not repeated until a finite delta"
+                                     " arrives)",
+                    (double)e.motion.xrel, (double)e.motion.yrel);
+            }
             break;
         }
+        g_motion_nonfinite_logged = false;
         g_dx += e.motion.xrel;
         g_dy += e.motion.yrel;
         g_have_delta = true;
@@ -165,10 +178,15 @@ void rt_mouse_on_event(const SDL_Event& e, bool ui_took_it) {
     case SDL_EVENT_MOUSE_WHEEL:
         if (ui_took_it) break;
         if (!std::isfinite(e.wheel.y)) {
-            rt_log("input", "mouse wheel with a non-finite delta (%f); ignored",
-                (double)e.wheel.y);
+            if (!g_wheel_nonfinite_logged) {
+                g_wheel_nonfinite_logged = true;
+                rt_log_warn("input", "mouse wheel with a non-finite delta (%f); ignored (this"
+                                     " line is not repeated until a finite delta arrives)",
+                    (double)e.wheel.y);
+            }
             break;
         }
+        g_wheel_nonfinite_logged = false;
         /* The un-flip rule lives in mouse.h, because ui/ui_rebind.cpp has
          * to read the sign the same way when it captures a wheel binding. */
         g_wheel_accum += rt_mouse_wheel_signed(e.wheel.y,
@@ -229,7 +247,7 @@ void rt_mouse_tick() {
         if (!g_capture_error_logged || g_capture_error_wanted != wanted) {
             g_capture_error_logged = true;
             g_capture_error_wanted = wanted;
-            rt_log("input", "SDL_SetWindowRelativeMouseMode(%s) failed: %s; mouse look stays %s",
+            rt_log_warn("input", "SDL_SetWindowRelativeMouseMode(%s) failed: %s; mouse look stays %s",
                 wanted ? "true" : "false", SDL_GetError(), g_captured ? "captured" : "released");
         }
         return;
@@ -240,9 +258,9 @@ void rt_mouse_tick() {
     /* Whatever was accumulated across the edge belongs to the other mode. */
     drop_delta();
     if (wanted) {
-        rt_log("input", "mouse look: captured");
+        rt_log_info("input", "mouse look: captured");
     } else {
-        rt_log("input", "mouse look: released (%s)", g_release_reason);
+        rt_log_info("input", "mouse look: released (%s)", g_release_reason);
     }
 }
 
@@ -287,7 +305,7 @@ bool rt_mouse_button_held(int button) {
     return (g_button_held & (1u << (button - 1))) != 0;
 }
 
-#else /* !ICORECOMP_PGS_SDL */
+#else /* !ICORECOMP_HAVE_SDL */
 
 void rt_mouse_tick() {}
 bool rt_mouse_take_look_delta(float*, float*) { return false; }
@@ -302,4 +320,4 @@ int rt_mouse_take_wheel_ticks() { return 0; }
 int rt_mouse_take_button_events(RtMouseButtonEvent*, int) { return 0; }
 bool rt_mouse_button_held(int) { return false; }
 
-#endif /* ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_HAVE_SDL */

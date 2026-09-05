@@ -9,8 +9,13 @@
  *   11 OVFF (overflow flag, write 1 to clear). Tn_COMP: 16-bit compare.
  *   Timer n raises INTC cause 9+n.
  *
- * HBLNK is modeled as the NTSC line rate derived from the field timeline
- * (262.5 lines per 59.94 Hz field).
+ * HBLNK is modeled as the line rate derived from the programmed video
+ * mode's field timeline (262.5 lines per 59.94 Hz NTSC field, 312.5 per
+ * 50 Hz PAL field); ../video_mode.h carries the derivation. The length of
+ * an H-blank therefore changes when the game programs a different CMOD, so
+ * every H-blank timer is re-based at that moment (video_mode_changed
+ * below) rather than having its whole history rewritten by the new
+ * divisor.
  */
 #include "kernel.h"
 
@@ -47,8 +52,10 @@ struct Timer {
 
 Timer g_t[4];
 
-/* Bus cycles per tick, indexed by Tn_MODE.CLKS. */
-constexpr uint64_t kPrescale[4] = {1, 16, 256, RT_CYCLES_PER_HBLANK};
+/* Bus cycles per tick for the three fixed prescales, indexed by
+ * Tn_MODE.CLKS. CLKS 3 is HBLNK, whose length is the video mode's, so it is
+ * read from rt_cycles_per_hblank() instead of living here. */
+constexpr uint64_t kPrescale[3] = {1, 16, 256};
 
 /* The same three power-of-two divisors as shifts, for raw_ticks. The
  * static_asserts are the tie: change a prescale without its shift and the
@@ -58,7 +65,10 @@ static_assert(kPrescale[0] == 1ull << kPrescaleShift[0], "CLKS 0 prescale and sh
 static_assert(kPrescale[1] == 1ull << kPrescaleShift[1], "CLKS 1 prescale and shift disagree");
 static_assert(kPrescale[2] == 1ull << kPrescaleShift[2], "CLKS 2 prescale and shift disagree");
 
-uint64_t prescale(const Timer& t) { return kPrescale[t.mode & 3]; }
+uint64_t prescale(const Timer& t) {
+    const unsigned clks = t.mode & 3;
+    return clks == 3 ? rt_cycles_per_hblank() : kPrescale[clks];
+}
 
 bool counting(const Timer& t) { return (t.mode & 0x80) != 0; } /* CUE */
 
@@ -75,7 +85,7 @@ uint64_t raw_ticks(const Timer& t) {
     if (!counting(t)) return 0;
     const uint64_t elapsed = rt_clock_now() - t.base_vclk;
     const unsigned clks = t.mode & 3;
-    if (clks == 3) return elapsed / kPrescale[3];
+    if (clks == 3) return elapsed / rt_cycles_per_hblank();
     return elapsed >> kPrescaleShift[clks];
 }
 
@@ -92,24 +102,52 @@ int timer_index(uint32_t addr, uint32_t* reg) {
     return idx;
 }
 
-} // namespace
-
-void rt_timers_init() {}
-
-namespace {
-
 /* Next compare/overflow interrupt across enabled timers, absolute vclk.
  *
  * Memoized, because clock_next_event calls this on every MMIO access and
  * the answer only moves when the timer state does. Every "when" below is an
  * absolute cycle computed from base_vclk, base_count, comp and mode, none
  * of which change as time passes, so the answer is good until something
- * writes a timer register or rt_timers_run_due retires an event. Those are
- * the only two places in this file that touch g_t, and both drop the cache;
- * nothing outside this file can reach that array, so the invalidation is
- * complete by construction rather than by convention. */
+ * writes a timer register or rt_timers_run_due retires an event. Those,
+ * and the video mode hook below, are the only places in this file that
+ * touch g_t, and every one of them drops the cache; nothing outside this
+ * file can reach that array, so the invalidation is complete by
+ * construction rather than by convention. */
 uint64_t g_next_event_cache = 0;
 bool g_next_event_valid = false;
+
+/* rt_video_add_mode_hook, registered in rt_timers_init.
+ *
+ * COUNT is derived, not stored: it is base_count plus the cycles since
+ * base_vclk over the prescale. For an H-blank timer the prescale is about
+ * to change, and dividing the whole elapsed span by the new line length
+ * would rewrite the count the game has already read. So each H-blank timer
+ * is re-based here: its count at this instant becomes the new base_count
+ * and now becomes the new base_vclk, and it counts on at the new line rate
+ * from there, which is what the hardware counter does across a CRTC
+ * restart. Timers on the three BUSCLK prescales are untouched. */
+void video_mode_changed(RtVideoMode, RtVideoMode) {
+    const uint64_t now = rt_clock_now();
+    for (int i = 0; i < 4; ++i) {
+        Timer& t = g_t[i];
+        if ((t.mode & 3) != 3) continue;
+        t.base_count = count_now(t);
+        t.base_vclk = now;
+        t.last_check = now;
+        rt_log_info("timers", "T%d re-based across the video mode change: COUNT=%u,"
+            " H-blank now %llu cycles", i, t.base_count,
+            (unsigned long long)rt_cycles_per_hblank());
+    }
+    g_next_event_valid = false;
+}
+
+} // namespace
+
+void rt_timers_init() {
+    rt_video_add_mode_hook(video_mode_changed);
+}
+
+namespace {
 
 uint64_t timers_next_event_slow() {
     uint64_t best = UINT64_MAX;
@@ -143,39 +181,63 @@ uint64_t rt_timers_next_event() {
     return g_next_event_cache;
 }
 
+namespace {
+
+/* Carries one timer forward from its last evaluation to now: sets EQUF on a
+ * compare crossed, OVFF on a wrap, applies ZRET, and raises the timer's INTC
+ * line when the matching enable is set.
+ *
+ * The flags are set by the comparison and by the overflow themselves, not by
+ * the interrupt enables. CMPE and OVFE gate the interrupt only (ps2tek, EE
+ * timers; the register list at the top of this file says the same). A guest
+ * that polls Tn_MODE for EQUF without arming CMPE, which is the ordinary way
+ * to use a timer as a stopwatch, sees the flag on hardware and used to see
+ * nothing here.
+ *
+ * Which of the two ways of keeping the flags current this file takes, of the
+ * two the review named: NOT extra timeline events. timers_next_event_slow
+ * still schedules only timers with an enable set, so a counting timer nobody
+ * has armed an interrupt on costs no wakeups. Instead this runs lazily from
+ * the COUNT and MODE reads below, which is where an unarmed timer's flags
+ * and its ZRET reset can be observed at all. A timer with an enable set is
+ * still advanced by rt_timers_run_due at its scheduled event, so its
+ * interrupt timing is unchanged; the lazy call cannot raise the same event
+ * twice because last_check moves with it. */
+void advance_timer(Timer& t, int i) {
+    if (!counting(t)) { t.last_check = rt_clock_now(); return; }
+    uint64_t ps = prescale(t);
+    uint64_t prev_ticks = t.last_check > t.base_vclk ? (t.last_check - t.base_vclk) / ps : 0;
+    uint64_t cur_ticks = raw_ticks(t);
+    t.last_check = rt_clock_now();
+    if (cur_ticks == prev_ticks) return;
+    uint64_t span = cur_ticks - prev_ticks;
+    uint32_t prev_cnt = (uint32_t)((t.base_count + prev_ticks) & 0xFFFF);
+    /* Compare hit within (prev, cur]? */
+    uint64_t to_comp = ((t.comp - prev_cnt - 1) & 0xFFFF) + 1;
+    if (to_comp <= span) {
+        t.equf = true;
+        if (t.mode & 0x100) rt_intc_raise(RT_INTC_TIMER0 + i); /* CMPE */
+        if (t.mode & 0x40) { /* ZRET: count resets on compare */
+            t.base_vclk = t.last_check - (span - to_comp) * ps;
+            t.base_count = 0;
+            g_next_event_valid = false; /* base moved; see the cache */
+        }
+    }
+    uint64_t to_ovf = 0x10000 - prev_cnt;
+    if (to_ovf <= span) {
+        t.ovff = true;
+        if (t.mode & 0x200) rt_intc_raise(RT_INTC_TIMER0 + i); /* OVFE */
+    }
+}
+
+} // namespace
+
 void rt_timers_run_due() {
     /* Unconditional: a compare that fired without resetting the count still
      * has to move the cached answer on to the next period, or the tick loop
      * would keep finding the same event due. */
     g_next_event_valid = false;
-    for (int i = 0; i < 4; ++i) {
-        Timer& t = g_t[i];
-        if (!counting(t)) { t.last_check = rt_clock_now(); continue; }
-        uint64_t ps = prescale(t);
-        uint64_t prev_ticks = t.last_check > t.base_vclk ? (t.last_check - t.base_vclk) / ps : 0;
-        uint64_t cur_ticks = raw_ticks(t);
-        t.last_check = rt_clock_now();
-        if (cur_ticks == prev_ticks) continue;
-        uint64_t span = cur_ticks - prev_ticks;
-        uint32_t prev_cnt = (uint32_t)((t.base_count + prev_ticks) & 0xFFFF);
-        /* Compare hit within (prev, cur]? */
-        uint64_t to_comp = ((t.comp - prev_cnt - 1) & 0xFFFF) + 1;
-        if (to_comp <= span) {
-            if (t.mode & 0x100) { /* CMPE */
-                t.equf = true;
-                rt_intc_raise(RT_INTC_TIMER0 + i);
-            }
-            if (t.mode & 0x40) { /* ZRET: count resets on compare */
-                t.base_vclk = t.last_check - (span - to_comp) * ps;
-                t.base_count = 0;
-            }
-        }
-        uint64_t to_ovf = 0x10000 - prev_cnt;
-        if ((t.mode & 0x200) && to_ovf <= span) { /* OVFE */
-            t.ovff = true;
-            rt_intc_raise(RT_INTC_TIMER0 + i);
-        }
-    }
+    for (int i = 0; i < 4; ++i) advance_timer(g_t[i], i);
 }
 
 bool rt_timers_mmio_read(uint32_t addr, uint32_t* out) {
@@ -184,8 +246,12 @@ bool rt_timers_mmio_read(uint32_t addr, uint32_t* out) {
     if (i < 0) return false;
     Timer& t = g_t[i];
     switch (reg) {
-        case 0x00: *out = count_now(t); return true;
+        case 0x00:
+            advance_timer(t, i);        /* ZRET may have reset the count */
+            *out = count_now(t);
+            return true;
         case 0x10:
+            advance_timer(t, i);        /* EQUF/OVFF are read here */
             *out = (t.mode & 0x3FF) | (t.equf ? 0x400 : 0) | (t.ovff ? 0x800 : 0);
             return true;
         case 0x20: *out = t.comp; return true;
@@ -232,7 +298,7 @@ bool rt_timers_mmio_write(uint32_t addr, uint32_t v) {
                         std::snprintf(tail, sizeof(tail), " [identical rewrite #%u]",
                             t.identical_rewrites);
                     }
-                    rt_log("timer", "T%d_MODE = 0x%03x (clks=%u cue=%d cmpe=%d ovfe=%d zret=%d comp=0x%04x)%s",
+                    rt_log_debug("timer", "T%d_MODE = 0x%03x (clks=%u cue=%d cmpe=%d ovfe=%d zret=%d comp=0x%04x)%s",
                         i, t.mode, t.mode & 3, !!(t.mode & 0x80), !!(t.mode & 0x100), !!(t.mode & 0x200),
                         !!(t.mode & 0x40), t.comp, tail);
                     if (changed) {

@@ -19,7 +19,7 @@
  * ui/ui.h document:
  *   - rt_mouse_on_event() runs from rt_window_pump (host/window.cpp), which
  *     can execute from inside Granite's WSI::begin_frame. It may only record
- *     values and flip flags. It makes no SDL call and no rt_pgs_* call.
+ *     values and flip flags. It makes no SDL call and no window-service call.
  *   - rt_mouse_tick() runs from rt_gs_vsync_hook (hw/gspriv.cpp), at the
  *     field boundary. Every SDL call this module makes, which today means
  *     the relative-mouse-mode transitions, happens there.
@@ -28,7 +28,7 @@
  * reason host/settings.h states: guest threads are minicoro coroutines on
  * that thread.
  *
- * Without ICORECOMP_PGS_SDL (no SDL in this build) every function below is a
+ * Without ICORECOMP_HAVE_SDL (no SDL in this build) every function below is a
  * no-op that reports no motion, no focus and no capture, so call sites need
  * no #ifdef of their own.
  *
@@ -39,7 +39,7 @@
 
 #include <cstdint>
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Declared, not included, exactly as ui/ui.h does it: this header stays free
  * of SDL headers, and SDL3/SDL.h's own `typedef union SDL_Event {...}
  * SDL_Event;` agrees with this declaration, so either include order works. */

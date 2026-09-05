@@ -1,26 +1,60 @@
-# Inputs consumed from the sibling ICO decomp checkout (read-only).
-# No data from these paths may be copied into this repository.
-
-[decomp]
-root = "../ico"
-elf = "baserom/baseelf.elf"
-rom = "baserom/baseelf.rom"
-splat_yaml = "config/ico.us.yaml"
-symbol_addrs = "config/symbol_addrs.us.txt"
-asm_dir = "asm"
-vu1_sources = [
-    "src/cluster.S",
-    "src/mesh.S",
-    "src/normal_c.S",
-    "src/normal_l.S",
-    "src/particle.S",
-]
-
-[pins]
-# SHA-1 of the retail US boot ELF / flat ROM view; refuse to run on mismatch.
-elf_sha1 = "a4d8fc1948fb2da2395f3863a94a3b93de55de14"
+# The retail target: SCES_507.60, the European ICO disc (SCES-50760).
+#
+# No data from any path named here may be copied into this repository. The
+# files are read-only inputs: the user supplies them from their own disc,
+# and setup.sh extracts the two the translator reads into baserom/, which
+# .gitignore ignores wholesale.
+#
+# This config names ONE input table. [inputs] is the disc: the retail boot
+# ELF and the development-build objdump listing the disc carries. Function
+# boundaries and function names come from the ELF itself (the entry proofs
+# in tools/recomp/crates/ingest/src/scan.rs) with the listing's functions
+# correlated onto it by masked fingerprint (correlate.rs). The decomp is not
+# an input to this project (the user's ruling, 2026-09-05, restated in
+# CLAUDE.md): there is no [decomp] table, and adding one back is not a
+# supported configuration.
+#
+# ---------------------------------------------------------------------------
+# Measured facts about the three text files the disc carries, all established
+# by comparing them against SCES_507.60 itself:
+#
+#   MAIN.MAP     is the GNU ld map of a DIFFERENT link: its .text is
+#                0x16A29C where the retail ELF's is 0x189BC4. It is NOT an
+#                address authority for this ELF, and nothing reads it: the
+#                [inputs] table below does not name it, setup.sh does not
+#                extract it, and the ingest opens no disc file but
+#                SRCFILE.TXT.
+#   SRCFILE.TXT  is an objdump -dl listing of a late development link
+#                ("main.elf"): its .text ends at 0x28DB34 against the retail
+#                ELF's 0x289BC4, about 16 KB larger. Its code is the same
+#                code: 295 of 300 sampled functions are found in the retail
+#                .text by masked-field fingerprint. It is the donor of
+#                names, source files and boundaries described above.
+#   TRFILE.TXT   is the address-to-source-line table of the same link as
+#                SRCFILE.TXT (both end at __fixdfdi, 0x28DAD8). Nothing reads
+#                it either; it is recorded here because it is on the disc,
+#                not because the translator uses it.
 
 [target]
 entry = 0x00100008
 vram_base = 0x00100000
-gp = 0x006388F0
+# Read from the ELF's .reginfo ri_gp_value (the last word of the 24-byte
+# MIPS_REGINFO section at file offset 0x53D124). Cross-checked against the
+# pair of instructions crt0 forms it with, at 0x00100034 and 0x00100048, and
+# the register move at 0x0010005C; that reading is in the run log, not here,
+# and src/runtime/target.h names the same three addresses.
+gp = 0x00640AF0
+
+[pins]
+# SHA-1 of the retail boot ELF; refuse to run on mismatch.
+elf_sha1 = "da3644c54c26fe760f3b6a591a5fc2eab396ed2b"
+
+# The two files setup.sh extracts from the disc image it is handed. A
+# relative root is resolved against this repository's root, so the shipped
+# config works from a fresh clone with no local edit. ICORECOMP_PAL_ROOT
+# overrides it and says so on stderr when it does, for inputs kept
+# elsewhere.
+[inputs]
+root = "baserom/pal"
+elf = "SCES_507.60"
+objdump = "SRCFILE.TXT"

@@ -141,7 +141,7 @@ std::unordered_map<uint32_t, AccessStat> g_write_stats;
  * rotation and makes about 33000 accesses a field, and the probe measured
  * 7.1 ns each (hw/ipu_selftest.cpp's register access benchmark). Hardware
  * registers are 16-byte aligned, so the low bits of addr >> 4 spread them
- * without collisions in practice; a collision just costs the map lookup it
+ * without collisions in practice; a collision costs the map lookup it
  * would have cost anyway. std::unordered_map is node based, so a stat's
  * address is stable once inserted and safe to hold here. */
 constexpr size_t kStatCacheSize = 128; /* power of two */
@@ -173,10 +173,10 @@ void log_access(const char* dir, uint32_t addr, int size_bits, uint64_t value,
 
     const char* name = mmio_name(addr);
     if (name) {
-        rt_log("mmio", "%s%-3d 0x%08x (%-14s) = 0x%llx  [access #%llu]",
+        rt_log_debug("mmio", "%s%-3d 0x%08x (%-14s) = 0x%llx  [access #%llu]",
             dir, size_bits, addr, name, (unsigned long long)value, (unsigned long long)st.count);
     } else {
-        rt_log("mmio", "%s%-3d 0x%08x = 0x%llx  [access #%llu]",
+        rt_log_debug("mmio", "%s%-3d 0x%08x = 0x%llx  [access #%llu]",
             dir, size_bits, addr, (unsigned long long)value, (unsigned long long)st.count);
     }
 }
@@ -286,7 +286,7 @@ const char* mmio_region_name(uint32_t addr, uint32_t norm) {
     const char* suffix = misaligned(addr, bits)
         ? (dir[0] == 'r' ? ", unaligned (AdEL on the EE)" : ", unaligned (AdES on the EE)")
         : "";
-    rt_log("mmio", "FATAL: unmapped guest %s%d at 0x%08x (physical 0x%08x, %s)%s value=0x%llx thread=%d ra=0x%08x",
+    rt_log_error("mmio", "FATAL: unmapped guest %s%d at 0x%08x (physical 0x%08x, %s)%s value=0x%llx thread=%d ra=0x%08x",
         dir, bits, addr, norm, mmio_region_name(addr, norm), suffix, (unsigned long long)value,
         rt_thread_current_id(), ra);
     rt_dump_registers(ctx);
@@ -303,12 +303,58 @@ const char* mmio_region_name(uint32_t addr, uint32_t norm) {
     rt_log_drain();
     R5900Context* ctx = rt_fault_ctx();
     uint32_t ra = ctx ? (uint32_t)ctx->r[31].u64x[0] : 0;
-    rt_log("mmio", "FATAL: unaligned guest %s%d of hardware register 0x%08x (physical 0x%08x) value=0x%llx "
+    rt_log_error("mmio", "FATAL: unaligned guest %s%d of hardware register 0x%08x (physical 0x%08x) value=0x%llx "
         "thread=%d ra=0x%08x", dir, bits, addr, norm, (unsigned long long)value, rt_thread_current_id(), ra);
     rt_dump_registers(ctx);
     rt_sched_dump_inventory("unaligned guest access");
     rt_fatal("mmio", nullptr, "unaligned guest %s%d of hardware register 0x%08x: the EE raises AdEL/AdES here",
         dir, bits, addr);
+}
+
+/* A register inside one of the two hardware windows that no module in
+ * hw/ or ee/ claims. The fallback here is the P1 behaviour: a read gives 0
+ * and a write is dropped. That is a value the runtime substituted for one
+ * the hardware would have produced, so it says so once per address rather
+ * than only appearing as an ordinary access line with a zero in it.
+ *
+ * Measured on the two retail ELFs: SCES_507.60 and SCUS_971.13 reach
+ * exactly two such registers, and both are the same two in both binaries,
+ * inside libkernel's kputchar (0x001010C8 on PAL, the same routine at the
+ * same two instruction offsets on US): 0x1000F130, the EE debug console's
+ * TX-ready word, read at kputchar+0x8, and 0x1000F180, the character port,
+ * written at kputchar+0x34. Reading 0 for the first makes kputchar's
+ * `andi 0x8000` fail and its wait loop fall straight through, so nothing
+ * spins; the second discards the character. No third address exists in
+ * either binary, so a line naming a different one is new behaviour worth
+ * looking at.
+ *
+ * Fixed table, no allocation on this path; a full table degrades to
+ * logging every unclaimed access rather than to silence. */
+constexpr size_t kUnclaimedSlots = 32;
+uint32_t g_unclaimed[kUnclaimedSlots];
+size_t g_unclaimed_count = 0;
+
+bool unclaimed_first_time(uint32_t norm) {
+    for (size_t i = 0; i < g_unclaimed_count; ++i) {
+        if (g_unclaimed[i] == norm) return false;
+    }
+    if (g_unclaimed_count < kUnclaimedSlots) g_unclaimed[g_unclaimed_count++] = norm;
+    return true;
+}
+
+void note_unclaimed(const char* dir, uint32_t addr, uint32_t norm, int bits, uint64_t v, bool wrote) {
+    if (!unclaimed_first_time(norm)) return;
+    if (wrote) {
+        rt_log_warn("mmio",
+            "%s%d of hardware register 0x%08x (physical 0x%08x): NOT MODELED, no module owns this "
+            "register; guest wrote 0x%llx and it was dropped",
+            dir, bits, addr, norm, (unsigned long long)v);
+    } else {
+        rt_log_warn("mmio",
+            "%s%d of hardware register 0x%08x (physical 0x%08x): NOT MODELED, no module owns this "
+            "register; guest asked for its value and was given 0",
+            dir, bits, addr, norm);
+    }
 }
 
 uint64_t mmio_read_common(uint32_t addr, int bits) {
@@ -326,7 +372,9 @@ uint64_t mmio_read_common(uint32_t addr, int bits) {
      * before the sample starves it forever. */
     rt_kernel_mmio_bill();
     uint64_t v = 0;
-    hw_read(norm, ipu, &v); /* v stays 0 for unmodeled registers */
+    if (!hw_read(norm, ipu, &v)) { /* v stays 0 for unmodeled registers */
+        note_unclaimed("read", addr, norm, bits, 0, false);
+    }
     log_access("read", addr, bits, v, g_read_stats, g_read_cache);
     rt_intc_deliver();
     return v;
@@ -338,7 +386,9 @@ void mmio_write_common(uint32_t addr, int bits, uint64_t v) {
     if (misaligned(addr, bits)) unaligned_fatal("write", addr, norm, bits, v);
     const bool ipu = is_ipu_addr(norm);
     RT_PROF_ZONE(ipu ? RT_PROF_IPU : RT_PROF_MMIO);
-    hw_write(norm, ipu, v);
+    if (!hw_write(norm, ipu, v)) {
+        note_unclaimed("write", addr, norm, bits, v, true);
+    }
     log_access("write", addr, bits, v, g_write_stats, g_write_cache);
     /* CHCR-triggered DMA completions raised their D_STAT bits inside
      * hw_write; delivery happens here, after the store completed, via the

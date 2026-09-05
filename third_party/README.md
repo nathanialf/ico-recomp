@@ -9,6 +9,82 @@ not MIT-compatible must stay isolated and clearly labeled.
 Single-header stackful coroutine library (public domain / MIT-0). Used by the
 EE scheduler (src/runtime/ee/sched.cpp).
 
+## SDL
+
+SDL3, the window, input and audio library. The executable owns the one window
+of the run (`src/runtime/host/window_service.cpp`) and hands it to whichever
+GS backend presents into it.
+
+- Upstream: https://github.com/libsdl-org/SDL
+- Pinned commit: 8586f63d2a900303701676a253a3e18593a6a6ae
+  (release-3.4.0-1161-g8586f63d2) as a git submodule. That is the same commit
+  Granite vendors as `parallel-gs/Granite/third_party/sdl3`, deliberately: a
+  tree with both submodules compiles one SDL rather than two revisions of it.
+  Granite's copy is the fallback when `third_party/SDL` is not checked out.
+- License: Zlib (see SDL/LICENSE.txt), which is MIT-compatible.
+
+How it is built:
+
+- As a shared library (`SDL_SHARED`, `SDL_STATIC` off), because the window is
+  created in the MIT executable and `libicorecomp-parallel-gs` presents into a
+  surface made from it: the two must be the same SDL instance. The .so or DLL
+  ships beside the executable.
+- Subsystems this port does not use are turned off at configure time
+  (CMakeLists.txt); audio, dialog, filesystem and misc stay on, for
+  `host/audio.cpp` and the launcher's disc picker.
+- Compiled unmodified. No patches are carried.
+
+## volk
+
+The Vulkan meta-loader: it resolves every Vulkan entry point at run time
+instead of linking an import library. The clean-room renderer's Vulkan RHI
+(`src/runtime/rhi`) is built on it, and on macOS it is what finds the
+loader that MoltenVK sits behind.
+
+- Upstream: https://github.com/zeux/volk
+- Pinned commit: 776893306c5d3b22b6185b5d4a258b81d94572bf
+  (tag `vulkan-sdk-1.4.357.0`, 2026-07-18) as a git submodule, matched to
+  the Vulkan-Headers pin below: volk generates its loader from that
+  version's registry, so the two move together.
+- License: MIT (see volk/LICENSE.md), Copyright (c) 2018-2026 Arseny
+  Kapoulkine.
+
+How it is built:
+
+- Compiled unmodified as a static library, `icorecomp-volk`, into the `ico`
+  executable and into `icorecomp-gs-replay` (CMakeLists.txt). Built with
+  hidden visibility, because `libicorecomp-parallel-gs` carries Granite's
+  own copy of volk and two copies with default visibility would resolve to
+  one set of function pointers across the shared-library boundary.
+- No patches are carried.
+
+## Vulkan-Headers
+
+The Khronos Vulkan headers volk and the RHI compile against, so the build
+does not depend on a Vulkan SDK being installed on the machine.
+
+- Upstream: https://github.com/KhronosGroup/Vulkan-Headers
+- Pinned commit: e3b1eec08173d6b825cd3ac88c885a63b621504a (tag `v1.4.357`,
+  "Update for Vulkan-Docs 1.4.357", 2026-07-17) as a git submodule.
+- License: Apache-2.0 OR MIT, at the user's choice, as the files' own
+  SPDX identifiers state (see Vulkan-Headers/LICENSE.md and
+  Vulkan-Headers/LICENSES/). This repo elects MIT, which is the
+  MIT-compatible half; the Apache-2.0 half is stated here because it is
+  the only non-MIT, non-Zlib license in the new set and so the one most
+  worth recording.
+- Headers only: nothing is compiled from this submodule and nothing from it
+  ships in the package. It contributes an include directory to
+  `icorecomp-volk` and to the RHI.
+- No patches are carried.
+
+## glslang and SPIRV-Cross (not submodules)
+
+Neither is vendored. `tools/gen_gs_shaders.sh` uses them to compile the
+renderer's GLSL compute shaders to SPIR-V and, for the D3D12 backend, to
+cross-compile that SPIR-V to HLSL. The results are committed, so a normal
+build needs neither tool; they are prerequisites for regenerating shaders
+only. See docs/GS_RENDERER.md.
+
 ## parallel-gs
 
 paraLLEl-GS, a PlayStation 2 Graphics Synthesizer implementation on Vulkan
@@ -97,6 +173,72 @@ notices ship beside them and are installed with the package:
 - Playfair Display (`PlayfairDisplay[wght].ttf`, notice in
   `PlayfairDisplay-OFL.txt`), Copyright 2017 The Playfair Display Project
   Authors, with Reserved Font Name "Playfair Display".
+
+## DirectX Shader Compiler (not vendored, not committed)
+
+The D3D12 backend's shaders are HLSL cross-compiled from this project's own
+GLSL. They reach the GPU as DXIL, which a driver rejects unless the container
+carries a signature.
+
+Nothing from the DirectX Shader Compiler is committed here. Two copies of one
+release are cached outside the tree, and `.cache/` is in `.gitignore`:
+
+- `.cache/dxc/bin/x64/dxcompiler.dll` and `dxil.dll`, from the Windows zip of
+  release **v1.9.2607** (`dxc_2026_07_29.zip`,
+  <https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.9.2607>).
+  CMake's `ICORECOMP_DXC_DIR` installs the pair beside `ico.exe` as the
+  run-time fallback for a build with no compiled-in DXIL.
+- `.cache/dxc-linux/`, from `linux_dxc_2026_07_29.x86_x64.tar.gz` of the same
+  release, holding `bin/dxc`, `lib/libdxcompiler.so` and `lib/libdxil.so`.
+  `tools/gen_gs_shaders_dxil.sh` uses it to produce
+  `src/runtime/rhi/rhi_shaders_dxil.h` on Linux; the containers it writes are
+  signed (the script checks the container hash and fails if it is zero).
+
+Licences, both carried in the release archives as `LICENSE-LLVM.txt` and
+`LICENSE-MS.txt`:
+
+- `dxcompiler.dll` / `libdxcompiler.so` is the University of Illinois/NCSA
+  Open Source Licence with the LLVM exceptions. Permissive, redistributable,
+  attribution in the binary distribution.
+- `dxil.dll` / `libdxil.so` is Microsoft's, redistributable under the terms in
+  `LICENSE-MS.txt` (the DirectX Shader Compiler binary licence, which permits
+  distributing it with an application).
+
+Both Windows DLLs import `MSVCP140.dll`, `VCRUNTIME140.dll` and
+`VCRUNTIME140_1.dll` (measured with `objdump -p`), so a machine without the
+Visual C++ 2015-2022 redistributable fails to load them with
+`ERROR_MOD_NOT_FOUND`. That is the reason the compiled-in DXIL is the shipping
+path and the DLLs are only a fallback.
+
+## MoltenVK (not vendored, not committed, redistributed in the macOS package)
+
+Khronos' implementation of Vulkan on Metal. Nothing from it is in this tree
+and nothing links against it: it is loaded at run time by `dlopen`, so the
+macOS build needs no Vulkan SDK. It is redistributed all the same, because a
+self-contained `ICO Recomp.app` has to carry a driver.
+
+Three files from one MoltenVK release are copied into the bundle, by the
+configure variables `ICORECOMP_MOLTENVK_DYLIB`, `ICORECOMP_MOLTENVK_ICD` and
+`ICORECOMP_MOLTENVK_LICENSE`:
+
+- `Contents/MacOS/libMoltenVK.dylib`, the driver.
+- `Contents/Resources/vulkan/icd.d/MoltenVK_icd.json`, the release's own ICD
+  manifest with only its `library_path` rewritten to point back into the
+  bundle. Its `api_version` is left as the release wrote it.
+- `Contents/Resources/MoltenVK-LICENSE.txt`.
+
+- Upstream: <https://github.com/KhronosGroup/MoltenVK>
+- Not pinned in this repository. CI takes Homebrew's `molten-vk` and records
+  its version in the job log, so the artifact of any run is traceable to the
+  MoltenVK that went into it. Pinning means downloading the
+  `MoltenVK-macos.tar` asset of a tagged release and pointing the same three
+  variables at what it unpacks.
+- License: Apache-2.0, which is MIT-compatible and requires the license text
+  to travel with a redistributed binary. That is what the third file is for,
+  and CMake warns loudly when the dylib is bundled without it.
+
+docs/MACOS.md, "MoltenVK in the bundle", is why a launcher script is needed
+before the copy in the bundle is the one that gets loaded.
 
 ## patches
 

@@ -35,24 +35,45 @@ uint8_t* rt_spu_ram(); /* allocated on first use, zero-filled */
  * the EE reuses the staging buffer for the next chunk. */
 void rt_spu_upload(const uint8_t* src, uint32_t spu_addr, uint32_t len);
 
+/* The staging witness (snd/iop_stage.h). rt_snd_pcm_note_iop_write forwards
+ * every EE to IOP DMA entry here, so a cmd 0x20 can be checked against what
+ * the EE actually wrote into its heap block before queueing the transfer:
+ * sound/s_init.c soundBDDataSet (PAL 0x00143D68) does the raw SifSetDma and
+ * the SgDmaWrite back to back for every chunk. rt_spu_staged_bytes returns
+ * how much of [iop_addr, iop_addr + size) lies in a granule some transfer
+ * touched, and rt_spu_consume_staging drops those marks once the bytes have
+ * been taken, because the EE reuses the same heap address for the next
+ * chunk. */
+void rt_spu_note_iop_write(uint32_t iop_addr, uint32_t size);
+uint32_t rt_spu_staged_bytes(uint32_t iop_addr, uint32_t size);
+void rt_spu_consume_staging(uint32_t iop_addr, uint32_t size);
+
+/* The number of the most recent bank transfer whose destination range
+ * contains [spu_addr, spu_addr + len), or 0 when no transfer ever covered
+ * it. This is the question a key-on has to ask: whether a bank was uploaded
+ * there. The bytes at the address cannot answer it, since a run of zeros
+ * inside an uploaded bank is ordinary content. */
+uint32_t rt_spu_covered_by(uint32_t spu_addr, uint32_t len);
+
 /* ---- engine.cpp ---------------------------------------------------------- */
 
 /* fno 0x65 remote init. voice_budget is init word 0 (0x1E observed). */
 void rt_snd_engine_init(uint32_t voice_budget);
 
 /* One untagged command record: w1..w3 are the raw 32-bit words the EE's
- * enqueue (retail func_002591F0) stored. Tagged records (DMA, cmd
+ * enqueue (_SgSetPkAdd, PAL 0x002737E0) stored. Tagged records (DMA, cmd
  * 0x20/0x21) never reach this function; sndn2.cpp handles them. */
 void rt_snd_command(uint32_t cmd, uint32_t w1, uint32_t w2, uint32_t w3);
 
-/* Called once per fno 0x64 flush: renders one vblank field of audio
- * (48000 / 59.94 frames, fractional remainder carried) into host/audio. */
+/* Called once per fno 0x64 flush: renders one vblank field of audio at the
+ * programmed video mode's field rate (48000 / 59.94 frames on NTSC, 960 on
+ * PAL, fractional remainder carried) into host/audio. */
 void rt_snd_flush_tick();
 
 /* Fills the IOP-written fields of the 0x200-byte EE status block that the
  * library reads besides the ack word: per-voice stream read cursors at
- * +0xC0 + (v % 24) * 4 + (v / 24) * 0x60 (retail func_0025DFB0,
- * SgStAdpcmIopReadAddr). The cursor is a byte offset within the ring, not
+ * +0xC0 + (v % 24) * 4 + (v / 24) * 0x60 (SgStAdpcmIopReadAddr, PAL
+ * 0x002785A0). The cursor is a byte offset within the ring, not
  * an address; see the derivation on rt_snd_fill_status in engine.cpp. */
 void rt_snd_fill_status(uint8_t* recv, uint32_t recv_size);
 

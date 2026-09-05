@@ -16,6 +16,8 @@
  */
 #include "kernel.h"
 
+#include "osd_config.h"
+#include "../host/settings.h"
 #include "../hw/hw.h"
 #include "../prof.h"
 
@@ -32,7 +34,6 @@ struct Args {
 };
 
 uint64_t g_syscall_count = 0;
-uint32_t g_set_syscall_vec[256];
 bool g_dchain_logged = false;
 
 /* Per-call-site log cap: the first `cap` calls land on the default
@@ -70,7 +71,7 @@ void set_v0(R5900Context* ctx, int64_t v) {
 /* ---- handlers ----------------------------------------------------------- */
 
 int64_t h_ResetEE(const Args& a) {
-    rt_log("syscall", "ResetEE(0x%x): no-op (no devices to reset)", a.a0);
+    rt_log_info("syscall", "ResetEE(0x%x): no-op (no devices to reset)", a.a0);
     return 0;
 }
 
@@ -79,7 +80,7 @@ int64_t h_SetGsCrt(const Args& a) {
     g_kern.gscrt_mode = a.a1;
     g_kern.gscrt_ffmd = a.a2;
     g_kern.gscrt_set = true;
-    rt_log("syscall", "SetGsCrt(interlace=%u, mode=0x%x, ffmd=%u) recorded", a.a0, a.a1, a.a2);
+    rt_log_info("syscall", "SetGsCrt(interlace=%u, mode=0x%x, ffmd=%u) recorded", a.a0, a.a1, a.a2);
     /* The real kernel programs SMODE1/SMODE2 here; games never write SMODE1
      * themselves, and the GS needs it to know the video mode. */
     rt_gs_program_crt(a.a0, a.a1, a.a2);
@@ -123,7 +124,7 @@ int64_t h_CreateThread(const Args& a) {
     uint32_t option = rt_gread32(a.a0 + 0x20);
     int id = rt_thread_create(func, stack, stack_size, gp, prio, attr, option);
     if (log_capped("sched", &g_thread_create_logged, kSchedLogCap)) {
-        rt_log("sched", "CreateThread: id=%d entry=0x%08x stack=0x%08x+0x%x gp=0x%08x prio=%d",
+        rt_log_info("sched", "CreateThread: id=%d entry=0x%08x stack=0x%08x+0x%x gp=0x%08x prio=%d",
             id, func, stack, stack_size, gp, prio);
     }
     return id;
@@ -131,7 +132,7 @@ int64_t h_CreateThread(const Args& a) {
 int64_t h_DeleteThread(const Args& a) { return rt_thread_delete((int)a.a0); }
 int64_t h_StartThread(const Args& a) {
     if (log_capped("sched", &g_thread_start_logged, kSchedLogCap)) {
-        rt_log("sched", "StartThread: id=%d arg=0x%08x", (int)a.a0, a.a1);
+        rt_log_info("sched", "StartThread: id=%d arg=0x%08x", (int)a.a0, a.a1);
     }
     return rt_thread_start((int)a.a0, a.a1);
 }
@@ -170,7 +171,7 @@ int64_t h_SetupThread(const Args& a) {
     /* Write an empty argument block (argc=0) so a root that parses args
      * reads zeros, not stale RAM. */
     if (rt_gptr(a.a3)) rt_gwrite32(a.a3, 0);
-    rt_log("syscall", "RFU060/SetupThread: gp=0x%08x stack=0x%08x+0x%x args=0x%08x root=0x%08x -> sp=0x%08x",
+    rt_log_info("syscall", "RFU060/SetupThread: gp=0x%08x stack=0x%08x+0x%x args=0x%08x root=0x%08x -> sp=0x%08x",
         a.a0, g_kern.stack_base, g_kern.stack_size, a.a3, a.t0, top);
     return top;
 }
@@ -184,7 +185,7 @@ int64_t h_SetupHeap(const Args& a) {
     } else {
         g_kern.heap_end = a.a0 + a.a1;
     }
-    rt_log("syscall", "RFU061/SetupHeap: base=0x%08x size=0x%x -> heap end 0x%08x",
+    rt_log_info("syscall", "RFU061/SetupHeap: base=0x%08x size=0x%x -> heap end 0x%08x",
         a.a0, a.a1, g_kern.heap_end);
     return g_kern.heap_end;
 }
@@ -199,7 +200,7 @@ int64_t h_CreateSema(const Args& a) {
     uint32_t option = rt_gread32(a.a0 + 0x14);
     int id = rt_sema_create(init_count, max_count, attr, option);
     if (log_capped("sched", &g_sema_create_logged, kSchedLogCap)) {
-        rt_log("sched", "CreateSema: id=%d init=%d max=%d (thread %d, ra=0x%08x)",
+        rt_log_info("sched", "CreateSema: id=%d init=%d max=%d (thread %d, ra=0x%08x)",
             id, init_count, max_count, rt_thread_current_id(), (uint32_t)a.ctx->r[31].u64x[0]);
     }
     return id;
@@ -213,7 +214,7 @@ int64_t h_ReferSemaStatus(const Args& a) { return rt_sema_refer((int)a.a0, a.a1)
 int64_t h_Copy(const Args& a) {
     /* Copy(dest, src, size_bytes): kernel memcpy. Sony libkernel uses it to
      * install patch code into kernel RAM (0x80070000 region) before pointing
-     * SetSyscall vectors at it; all of that RAM is mapped, so just copy. */
+     * SetSyscall vectors at it; all of that RAM is mapped, so copy it. */
     uint32_t dest = a.a0, src = a.a1, n = a.a2;
     for (uint32_t i = 0; i < n; ) {
         uint8_t* d = rt_gptr(dest + i);
@@ -226,7 +227,7 @@ int64_t h_Copy(const Args& a) {
         std::memcpy(d, s, chunk);
         i += chunk;
     }
-    rt_log("syscall", "Copy(dest=0x%08x, src=0x%08x, size=%u) done", dest, src, n);
+    rt_log_info("syscall", "Copy(dest=0x%08x, src=0x%08x, size=%u) done", dest, src, n);
     return dest;
 }
 
@@ -235,19 +236,138 @@ int64_t h_GetEntryAddress(const Args& a) {
      * by libkernel patch shims. There is no real kernel here; hand back an
      * address in the kernel-reserved area that is plain zeroed RAM so a
      * shim that only stores it stays harmless. Fatal if ever jumped to
-     * (outside the function table). */
-    static bool warned = false;
-    if (!warned) {
-        rt_log("syscall", "WARNING: GetEntryAddress(%u): HLE kernel has no real entry points; "
-            "returning dummy 0x00080000", a.a0);
-        warned = true;
+     * (outside the function table).
+     *
+     * The one caller on this disc is InitAlarm at 0x00100C90 (the name is
+     * the disc's own link map, MAIN.MAP; the address is that map's and the
+     * retail ELF's alike, libkernl being linked first). It
+     * walks a static table of syscall numbers at 0x0028F470 and, for the six
+     * entries past the first two, does SetSyscall(n, GetEntryAddress(n)).
+     * The table is byte-identical to the US build's (US 0x00274E70), so the
+     * six indices are the same on both: 0xFC, 0xFE, 0xFD, 0xFF, 0x12C, 0x08.
+     * The first two entries of that table are installed without asking the
+     * kernel: SetSyscall(0x5A, 0x00100C48) and SetSyscall(0x5B, 0x80076000).
+     *
+     * Logged once per distinct index rather than once overall, so the log
+     * carries the whole set the guest asked for and what each one was
+     * answered with. Six lines, at boot, and then nothing. */
+    static uint32_t seen[8];
+    static unsigned n_seen = 0;
+    bool fresh = true;
+    for (unsigned i = 0; i < n_seen; ++i) {
+        if (seen[i] == a.a0) { fresh = false; break; }
+    }
+    if (fresh) {
+        if (n_seen < sizeof(seen) / sizeof(seen[0])) seen[n_seen++] = a.a0;
+        rt_log_warn("syscall",
+            "GetEntryAddress(0x%x): NOT MODELED, the HLE kernel has no entry point for that index; "
+            "guest asked for kernel entry 0x%x and was given 0x00080000 (zeroed kernel-reserved RAM). "
+            "InitAlarm then does SetSyscall(0x%x, 0x00080000); the runtime dispatches syscall 0x%x "
+            "from its own table, so the vector it records is never jumped to "
+            "(InitAlarm, 0x00100C90)",
+            a.a0, a.a0, a.a0, a.a0 & 0xFF);
     }
     return 0x00080000;
 }
 
+/* The OSD configuration word a console's kernel holds. Every field but the
+ * two below is zero here, which is what this runtime has always reported;
+ * nothing in this game reads any of them.
+ *
+ * The two that are not zero are the ones sceScfGetLanguage looks at, and the
+ * bit positions are measured on the vendor library this build links rather
+ * than carried from an SDK header. Verified in the retail ELF
+ * (SCES_507.60): sceScfGetLanguage is at 0x00272958, which is the target of
+ * the jal at 0x001B9614 named below; it calls this
+ * syscall, takes `(word >> 13) & 7` as a version (`srl $v0,$v1,13` at
+ * 0x0027298C), and returns
+ * `(word >> 16) & 0x1F` as the language when that version is nonzero
+ * (`andi $v0,$v0,0x1f` at 0x002729A8). A
+ * version of zero sends it down the other branch, `(word >> 4) & 1`, which
+ * is a one-bit Japanese/English field and cannot express the four other
+ * languages this disc carries; that branch is what the zeroed word used to
+ * take, and it is why every run reported the same language whatever the
+ * player wanted.
+ *
+ * So the word carries version 1 and the language from settings.json
+ * (host/settings.h RtLanguage, whose values are the OSD numbers this field
+ * holds). Any nonzero version does: the threshold in the library is "not
+ * zero", not "two or more". Three other functions in the same vendor object
+ * (sceScfGetDateNotation, sceScfGetTimeNotation and sceScfGetSummerTime)
+ * branch on a nonzero version straight to GetOsdConfigParam2 (syscall 0x6F),
+ * so version 1 does not avoid them, and 0x6F is implemented below rather
+ * than left as an unknown-syscall stop.
+ *
+ * Measured on the PAL ELF, not inferred: of those three, only
+ * sceScfGetSummerTime has a caller at all, sceScfGetLocalTimefromRTC at
+ * 0x002731C0 (jal at 0x002731D8), and that function has no caller itself, so
+ * no reachable path in this build enters GetOsdConfigParam2. The one path
+ * that does run is kanbanBootMcCheck -> sceScfGetLanguage (jal at
+ * 0x001B9614) -> GetOsdConfigParam, twice, and the second result is the one
+ * it keeps.
+ *
+ * This is a PAL-only surface. The same scan over the US ELF
+ * (SCUS_971.13) finds zero callers of the GetOsdConfigParam stub at
+ * 0x001005D0 and zero of GetOsdConfigParam2 at 0x00100830: the US build
+ * never asks the kernel for its OSD configuration, and this game's language
+ * therefore only follows the console setting on the PAL disc.
+ *
+ * Nothing the game supplied is changed by this. The game asks the machine it
+ * is running on what its configured language is; this is that answer, and on
+ * a console it comes from the OSD the player set. */
 int64_t h_GetOsdConfigParam(const Args& a) {
-    rt_log("syscall", "GetOsdConfigParam(0x%08x): returning zeroed defaults", a.a0);
-    rt_gwrite32(a.a0, 0);
+    const int language = (int)rt_settings().system.language;
+    const uint32_t word = rt_osd_config_word(language);
+    /* PAL-only surface: named once, with where the fact was measured, then
+     * the per-call line. The US build never reaches this syscall. */
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        rt_log_info("syscall",
+            "PAL: the game asks the kernel for its OSD configuration. "
+            "kanbanBootMcCheck calls sceScfGetLanguage (jal at 0x001B9614, target 0x00272958), "
+            "which reads version at bits 13..15 (0x0027298C) and language at bits 16..20 "
+            "(0x002729A8) of this word. "
+            "The US build (SCUS_971.13) never calls this syscall");
+    }
+    rt_log_info("syscall", "GetOsdConfigParam(0x%08x): version 1, language %d -> 0x%08x",
+        a.a0, language, word);
+    rt_gwrite32(a.a0, word);
+    return 0;
+}
+
+/* GetOsdConfigParam2(out, num, offset): copies `num` words of the console's
+ * OSD configuration starting at word index `offset`. Word 1 is the one the
+ * vendor library reads, and it reads it as a byte: sceScfGetSummerTime
+ * calls it with
+ * (sp+4, 1, 1) at 0x00272B88 (verified in the retail ELF: that word is
+ * `jal 0x00100830`, the GetOsdConfigParam2 stub) and then takes
+ * `(byte >> 4) & 1` as daylight
+ * saving; sceScfGetTimeNotation (0x00272C08) takes `(byte >> 5) & 1`;
+ * sceScfGetDateNotation (0x00272B08) takes `byte >> 6`.
+ *
+ * This kernel has no OSD, so there is no measured value for that word and
+ * none is invented: every word asked for is written as zero and the call
+ * says so. Zero reads back as daylight saving off, 24-hour time and date
+ * notation 0. Nothing in this build reaches any of the three readers (see
+ * the note above h_GetOsdConfigParam), so this exists to keep a dead vendor
+ * path from becoming an unknown-syscall stop, and to be loud if it ever
+ * stops being dead. */
+int64_t h_GetOsdConfigParam2(const Args& a) {
+    const uint32_t out = a.a0, num = a.a1, offset = a.a2;
+    for (uint32_t i = 0; i < num; ++i) {
+        if (!rt_gptr(out + i * 4)) {
+            rt_fatal("syscall", a.ctx,
+                "GetOsdConfigParam2(0x%08x, %u, %u): unmapped at word %u", out, num, offset, i);
+        }
+        rt_gwrite32(out + i * 4, 0);
+    }
+    rt_log_warn("syscall",
+        "GetOsdConfigParam2(0x%08x, num=%u, offset=%u): NOT MODELED, this kernel has no OSD "
+        "configuration word %u; guest asked for %u word(s) and was given %u zero word(s) "
+        "(daylight saving 0, time notation 0, date notation 0). PAL-only path, statically dead in "
+        "this build (its one caller is sceScfGetSummerTime, at 0x00272B88)",
+        out, num, offset, offset, num, num);
     return 0;
 }
 
@@ -255,7 +375,7 @@ int64_t h_GetCop0(const Args& a) { return (int64_t)(int32_t)rt_cop0_read(a.ctx, 
 int64_t h_FlushCache(const Args&) { return 0; }
 
 int64_t h_SifStopDma(const Args&) {
-    rt_log("syscall", "SifStopDma: no-op");
+    rt_log_info("syscall", "SifStopDma: no-op");
     return 0;
 }
 
@@ -266,6 +386,21 @@ int64_t h_GsPutIMR(const Args& a) {
 }
 
 int64_t h_SetVSyncFlag(const Args& a) {
+    /* One-shot: the next vblank writes the flag word and disarms it. Arming
+     * a second one while the first is still waiting drops the first, and
+     * whatever was waiting on that word never sees it set, so say so. Once
+     * per run: if it happens at all it is a shape worth one line, and if it
+     * is normal for this binary the line says that too. */
+    if (g_kern.vsync_flag_ptr && g_kern.vsync_flag_ptr != a.a0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            rt_log_warn("syscall", "SetVSyncFlag(0x%08x, 0x%08x) replaces an armed flag at "
+                "0x%08x that no vblank has written yet; the earlier one is dropped and nothing "
+                "will ever set it",
+                a.a0, a.a1, g_kern.vsync_flag_ptr);
+        }
+    }
     g_kern.vsync_flag_ptr = a.a0;
     g_kern.vsync_csr_ptr = a.a1;
     if (a.a0 && rt_gptr(a.a0)) rt_gwrite32(a.a0, 0);
@@ -274,12 +409,16 @@ int64_t h_SetVSyncFlag(const Args& a) {
 
 uint32_t g_set_syscall_logged = 0;
 int64_t h_SetSyscall(const Args& a) {
-    g_set_syscall_vec[a.a0 & 0xFF] = a.a1;
-    /* Same channel and cap as the generic trace line for this syscall
-     * (kSyscallTraceCap): the first few by default, all of them under
-     * debug.verbose=syscall. */
+    /* The vector is not stored. This runtime dispatches every syscall from
+     * its own table below, so a recorded vector could only ever be printed,
+     * and the line right here prints it. (There used to be a 256-entry
+     * shadow array that nothing read.)
+     *
+     * Same channel and cap as the generic trace line for this syscall
+     * (kSyscallTraceCap): the first few by default, all of them when the
+     * "syscall" verbose channel is on. */
     if (log_capped("syscall", &g_set_syscall_logged, kSyscallTraceCap)) {
-        rt_log("syscall", "SetSyscall(num=0x%x, vector=0x%08x) recorded", a.a0, a.a1);
+        rt_log_info("syscall", "SetSyscall(num=0x%x, vector=0x%08x) recorded", a.a0, a.a1);
     }
     return 0;
 }
@@ -290,25 +429,32 @@ int64_t h_SifSetDma(const Args& a) {
     /* Let the virtual SIF latency elapse so the deferred IOP response (if
      * one was scheduled) is deliverable at this syscall boundary. Without
      * this, an interrupt-less guest poll loop on plain RAM would never see
-     * it. */
+     * it.
+     *
+     * 8192 cycles (about 27 us of virtual time) is CHOSEN, not measured: it
+     * only has to be at least kSifLatency (sif/rpc.cpp) so that one call
+     * carries a queued response past its due time. No cost of a real
+     * sceSifSetDma has been measured for this port. It is not billed to a
+     * g_cyc_* bucket, so the profile summary's "vclk source" split covers
+     * backedges, MMIO and idle and not these syscall ticks. */
     rt_clock_tick(8192);
     return id;
 }
 int64_t h_SifSetDChain(const Args&) {
     if (!g_dchain_logged) {
-        rt_log("syscall", "SifSetDChain: accepted (receive chain is implicit in the SIF HLE)");
+        rt_log_info("syscall", "SifSetDChain: accepted (receive chain is implicit in the SIF HLE)");
         g_dchain_logged = true;
     }
     return 0;
 }
 int64_t h_SifSetReg(const Args& a) {
-    if (rt_trace()) rt_log("sif", "SifSetReg(0x%08x, 0x%08x)", a.a0, a.a1);
+    if (rt_trace()) rt_log_info("sif", "SifSetReg(0x%08x, 0x%08x)", a.a0, a.a1);
     rt_sif_set_reg(a.a0, a.a1);
     return 0;
 }
 int64_t h_SifGetReg(const Args& a) {
     uint32_t v = rt_sif_get_reg(a.a0);
-    if (rt_trace()) rt_log("sif", "SifGetReg(0x%08x) -> 0x%08x", a.a0, v);
+    if (rt_trace()) rt_log_debug("sif", "SifGetReg(0x%08x) -> 0x%08x", a.a0, v);
     return (int64_t)(int32_t)v;
 }
 
@@ -364,7 +510,7 @@ void deci2_log_text(const uint8_t* data, uint32_t len) {
         if (c == '\r') continue;
         if (c == '\n' || fill >= sizeof(line) - 1) {
             line[fill] = 0;
-            if (fill) rt_log("tty", "%s", line);
+            if (fill) rt_log_info("tty", "%s", line);
             fill = 0;
             if (c != '\n' && fill < sizeof(line) - 1) line[fill++] = c;
             continue;
@@ -384,7 +530,7 @@ int64_t h_Deci2Call(const Args& a) {
                 if (!g_deci2[i].open) {
                     g_deci2[i] = Deci2Sock{true, proto, opt, handler,
                                            (uint32_t)a.ctx->r[28].u64x[0], false};
-                    rt_log("syscall", "Deci2Open: sock=%u proto=0x%x opt=0x%08x handler=0x%08x",
+                    rt_log_info("syscall", "Deci2Open: sock=%u proto=0x%x opt=0x%08x handler=0x%08x",
                         i, proto, opt, handler);
                     return (int64_t)i;
                 }
@@ -436,7 +582,7 @@ int64_t h_Deci2Call(const Args& a) {
         default: {
             static bool warned = false;
             if (!warned) {
-                rt_log("syscall", "WARNING: Deci2Call(cmd=0x%x) NOT MODELED, returning 0", cmd);
+                rt_log_warn("syscall", "WARNING: Deci2Call(cmd=0x%x) NOT MODELED, returning 0", cmd);
                 warned = true;
             }
             return 0;
@@ -444,6 +590,10 @@ int64_t h_Deci2Call(const Args& a) {
     }
 }
 
+/* MachineType: 0 is what this kernel has always answered. It is a
+ * PLACEHOLDER, not measured: no retail console's answer has been read for
+ * this port, and nothing in SCES_507.60 is known to call the syscall (it is
+ * in the table so that a call is not an unknown-syscall stop). */
 int64_t h_MachineType(const Args&) { return 0; }
 int64_t h_GetMemorySize(const Args&) { return (int64_t)RT_RAM_SIZE; }
 
@@ -527,6 +677,9 @@ struct Table {
         set(0x67, "iGetCop0", h_GetCop0);
         set(0x68, "iFlushCache", h_FlushCache);
         set(0x6B, "SifStopDma", h_SifStopDma);
+        /* PAL-only: the US build never calls the GetOsdConfigParam2 stub at
+         * 0x00100830, the PAL build links three vendor readers that do. */
+        set(0x6F, "GetOsdConfigParam2", h_GetOsdConfigParam2);
         set(0x70, "GsGetIMR", h_GsGetIMR);
         set(0x71, "GsPutIMR", h_GsPutIMR);
         set(0x73, "SetVSyncFlag", h_SetVSyncFlag);
@@ -624,7 +777,7 @@ bool should_log(int32_t num, uint32_t a0) {
     uint8_t fkey = (uint8_t)(uint32_t)(num < 0 ? -num : num);
     if (!g_sig_fallback_warned[fkey]) {
         g_sig_fallback_warned[fkey] = true;
-        rt_log("syscall", "signature table crowded (%zu entries, %zu probes), syscall %d falls back "
+        rt_log_warn("syscall", "signature table crowded (%zu entries, %zu probes), syscall %d falls back "
                           "to a per-num counter",
             kSigTableSize, kSigProbeLimit, num);
     }
@@ -656,11 +809,28 @@ void rt_syscall(R5900Context* ctx) {
             num, (uint32_t)num, key, a.a0, a.a1, a.a2, a.a3, (uint32_t)ctx->r[31].u64x[0]);
     }
     if (should_log(num, a.a0)) {
-        rt_log("syscall", "%s%s(a0=0x%x, a1=0x%x, a2=0x%x, a3=0x%x) thread=%d ra=0x%08x%s",
+        rt_log_debug("syscall", "%s%s(a0=0x%x, a1=0x%x, a2=0x%x, a3=0x%x) thread=%d ra=0x%08x%s",
             a.ivariant && e.name[0] != 'i' && e.name[0] != '_' ? "i:" : "", e.name,
             a.a0, a.a1, a.a2, a.a3, rt_thread_current_id(), (uint32_t)ctx->r[31].u64x[0],
             rt_in_interrupt() ? " [in-interrupt]" : "");
     }
+    /* The last syscall the end-of-run summary and the field watchdog
+     * report (host/run_state.cpp). Recorded before the handler runs, not
+     * after, so a syscall that never returns (a fatal inside it, a fault) is
+     * the one named. e.name is a table entry with static lifetime, which is
+     * what makes storing the pointer rather than a copy safe. */
+    rt_run_note_syscall(num, e.name);
+    /* The same fact per guest thread, for the inventory: the run-state
+     * version is the last syscall of the whole run, which on a run with a
+     * dozen threads says nothing about which of them is stuck. */
+    rt_sched_note_syscall(num, e.name);
+    /* Every syscall advances the virtual clock a little, so a guest loop
+     * that only ever calls the kernel still reaches the next timeline
+     * event. 256 cycles (about 0.9 us) is CHOSEN, not measured: no retail
+     * syscall entry cost has been timed for this port, and the number only
+     * has to be small against a field and nonzero. Like the SifSetDma tick
+     * above it is not billed to a g_cyc_* bucket, so the profile summary's
+     * "vclk source" percentages describe backedges, MMIO and idle only. */
     rt_clock_tick(256);
     int64_t v0 = e.fn(a);
     set_v0(ctx, v0);

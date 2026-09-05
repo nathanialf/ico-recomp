@@ -22,7 +22,7 @@
  * core presenting frames nothing is producing (there is no pace_field here,
  * the guest clock is not running), and FIFO is what paces this loop. The
  * user's mode goes back at hand-off, taken from
- * rt_gs_parallel_present_mode() rather than re-derived, so
+ * rt_gs_present_mode() rather than re-derived, so
  * ICORECOMP_GS_PRESENT still wins exactly as it did at startup.
  */
 #include "ui.h"
@@ -37,6 +37,7 @@
 #include "../host/window.h"
 #include "../iso/iso9660.h"
 #include "../runtime.h"
+#include "../target.h"
 #include "ps2_icon.h"
 #include "ps2_icon_render.h"
 #include "save_icon.h"
@@ -56,7 +57,7 @@
 #include <string>
 #include <thread>
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 #include <SDL3/SDL.h>
 #endif
 
@@ -111,7 +112,7 @@ LauncherModel g_m;
 Rml::DataModelHandle g_model;
 bool g_model_valid = false;
 
-/* True while the settings menu is up over the launcher and this document
+/* True while the menu is up over the launcher and this document
  * has been hidden for it (launcher_set_covered). */
 bool g_covered = false;
 
@@ -160,7 +161,7 @@ void set_status(const std::string& text) {
 
 /* ---- precheck ----------------------------------------------------------- */
 
-/* Runs the boot precheck (config, disc mount, SCUS_971.13, SHA-1 pins, entry
+/* Runs the boot precheck (config, disc mount, SCES_507.60, the SHA-1 pin, entry
  * lookup) and fills the whole disc half of the model from the result. Reads
  * and hashes about a megabyte off the disc, so it runs on entry and after a
  * disc change, never per frame. Called only from launcher_tick(), which is
@@ -184,7 +185,11 @@ void refresh_precheck() {
                           " next to the executable";
     }
     g_model_dirty = true;
-    rt_log("launcher", "boot precheck: %s (disc '%s', %s)", ok ? "ready" : err,
+    /* The boot ELF is in the line because "this disc is not the one this
+     * build was built for" is the one failure a user cannot diagnose from
+     * the path alone. */
+    rt_log_info("launcher", "boot precheck: %s (boot ELF %s; disc '%s', %s)",
+        ok ? "ready" : err, RT_TARGET_BOOT_ELF,
         g_m.disc_path.c_str(), g_m.disc_source.c_str());
 
     /* The title image can only be built once a disc is mounted, which is
@@ -233,7 +238,7 @@ bool raster_title_logo(uint32_t w, uint32_t h, bool first) try {
     RtTitleLogo logo;
     char err[512];
     if (!rt_title_logo_build(w, h, logo, err, sizeof(err))) {
-        rt_log("ui", "no title logo from this disc: %s; the launcher keeps its text title", err);
+        rt_log_warn("ui", "no title logo from this disc: %s; the launcher keeps its text title", err);
         return false;
     }
     if (!ui_render_set_logo(logo.rgba.data(), logo.width, logo.height)) return false;
@@ -249,18 +254,18 @@ bool raster_title_logo(uint32_t w, uint32_t h, bool first) try {
     g_logo_px_w = logo.width;
     g_logo_px_h = logo.height;
     ++g_logo_generation;
-    rt_log("ui", "title logo: %s at %ux%u pixels (%ux%u dp at ratio %.2f)",
+    rt_log_info("ui", "title logo: %s at %ux%u pixels (%ux%u dp at ratio %.2f)",
         first ? "rasterised for the first paint" : "re-rasterised for the new window scale",
         logo.width, logo.height, kRtTitleLogoDpWidth, kRtTitleLogoDpHeight,
         double(ui_density_ratio()));
     return true;
 } catch (const std::exception& e) {
-    rt_log("ui", "title logo: building the %ux%u image threw (%s); the launcher keeps its text"
+    rt_log_warn("ui", "title logo: building the %ux%u image threw (%s); the launcher keeps its text"
                  " title",
         w, h, e.what());
     return false;
 } catch (...) {
-    rt_log("ui", "title logo: building the %ux%u image threw a non-standard exception; the launcher"
+    rt_log_warn("ui", "title logo: building the %ux%u image threw a non-standard exception; the launcher"
                  " keeps its text title",
         w, h);
     return false;
@@ -283,7 +288,7 @@ void build_title_logo() {
  * disc once it has (successfully or not) settled on an image; a disc that
  * only resolves after Browse still gets a try, since this runs from the
  * same two call sites build_title_logo() does. Between frames only, per
- * rt_window_set_icon's contract. Never fatal: any failure just logs and
+ * rt_window_set_icon's contract. Never fatal: any failure logs and
  * leaves the window's default icon in place. */
 void set_window_icon() {
     /* Latches on success only, like build_title_logo(): a disc that fails
@@ -297,18 +302,18 @@ void set_window_icon() {
     RtPs2Icon icon;
     RtPs2IconSys icon_sys;
     if (!rt_save_icon_load(icon, icon_sys, err, sizeof(err))) {
-        rt_log("ui", "window icon: %s; the window keeps its default icon", err);
+        rt_log_warn("ui", "window icon: %s; the window keeps its default icon", err);
         return;
     }
     RtPs2IconImage icon64;
     if (!rt_ps2_icon_render(icon, icon_sys, 64, 0, icon64, err, sizeof(err))) {
-        rt_log("ui", "window icon: %s; the window keeps its default icon", err);
+        rt_log_warn("ui", "window icon: %s; the window keeps its default icon", err);
         return;
     }
     RtPs2IconImage icon128;
     const bool have128 = rt_ps2_icon_render(icon, icon_sys, 128, 0, icon128, err, sizeof(err));
     if (!have128) {
-        rt_log("ui", "window icon: 128 px alternate image failed (%s); using the 64 px icon alone",
+        rt_log_warn("ui", "window icon: 128 px alternate image failed (%s); using the 64 px icon alone",
             err);
     }
     rt_window_set_icon(icon64.rgba.data(), icon64.width, icon64.height,
@@ -333,7 +338,7 @@ void refresh_logo_source() {
     if (!g_ui.launcher) return;
     Rml::Element* img = g_ui.launcher->GetElementById("title-logo");
     if (!img) {
-        rt_log("ui", "launcher: no element 'title-logo' in %s; the image cannot be shown",
+        rt_log_warn("ui", "launcher: no element 'title-logo' in %s; the image cannot be shown",
             g_ui.launcher->GetSourceURL().c_str());
         return;
     }
@@ -359,7 +364,7 @@ void sync_logo_scale() {
      * that size. One box size, one attempt, one line. */
     static uint32_t failed_w = 0, failed_h = 0;
     if (w == failed_w && h == failed_h) return;
-    rt_log("ui", "title logo: window scale moved, %ux%u is no longer the drawn size", g_logo_px_w,
+    rt_log_info("ui", "title logo: window scale moved, %ux%u is no longer the drawn size", g_logo_px_w,
         g_logo_px_h);
     if (raster_title_logo(w, h, false)) {
         failed_w = failed_h = 0;
@@ -380,7 +385,7 @@ void sync_logo_scale() {
 void poll_logo_upload() {
     if (!ui_render_take_logo_upload_failure()) return;
     if (!g_m.logo_available) return;
-    rt_log("ui", "title logo: the %ux%u image could not be uploaded; the launcher goes back to its"
+    rt_log_warn("ui", "title logo: the %ux%u image could not be uploaded; the launcher goes back to its"
                  " text title",
         g_logo_px_w, g_logo_px_h);
     g_m.logo_available = false;
@@ -402,7 +407,7 @@ void verify_logo_box() {
     checked_generation = g_logo_generation;
     if (std::fabs(size.x - float(g_logo_px_w)) > 0.5f ||
         std::fabs(size.y - float(g_logo_px_h)) > 0.5f) {
-        rt_log("ui", "title logo: the layout gave the image %.1fx%.1f pixels but it was rasterised"
+        rt_log_warn("ui", "title logo: the layout gave the image %.1fx%.1f pixels but it was rasterised"
                      " for %ux%u; ui/style/base.rcss and kRtTitleLogoDpWidth/Height disagree, so the"
                      " overlay is resampling it",
             double(size.x), double(size.y), g_logo_px_w, g_logo_px_h);
@@ -416,11 +421,11 @@ void verify_logo_box() {
 void mount_chosen_path(const std::string& path) {
     char err[1024];
     if (!rt_iso_try_mount(path.c_str(), err, sizeof(err))) {
-        rt_log("launcher", "disc '%s' rejected: %s", path.c_str(), err);
+        rt_log_warn("launcher", "disc '%s' rejected: %s", path.c_str(), err);
         set_status(err);
         char probe_err[1024];
         if (!rt_iso_probe_mount(probe_err, sizeof(probe_err))) {
-            rt_log("launcher", "the previous disc did not come back either: %s", probe_err);
+            rt_log_warn("launcher", "the previous disc did not come back either: %s", probe_err);
         }
         refresh_precheck();
         return;
@@ -438,14 +443,14 @@ void mount_chosen_path(const std::string& path) {
     rt_settings_mutable().launcher.disc_path = stored;
     rt_settings_commit(false);
     rt_settings_request_save();
-    rt_log("launcher", "disc set to '%s'; saved as settings.json launcher.disc_path", stored.c_str());
+    rt_log_info("launcher", "disc set to '%s'; saved as settings.json launcher.disc_path", stored.c_str());
     set_status("disc image accepted and saved");
     refresh_precheck();
 }
 
 /* ---- file dialog -------------------------------------------------------- */
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 
 /* SDL calls this from inside SDL_PumpEvents (SDL_dialog.c posts the result
  * back to the thread that runs the event loop), which for this process means
@@ -460,7 +465,7 @@ void mount_chosen_path(const std::string& path) {
 void SDLCALL dialog_callback(void* /*userdata*/, const char* const* filelist, int /*filter*/) {
     if (!filelist) {
         const char* e = SDL_GetError();
-        rt_log("launcher", "the file dialog could not be shown: %s", e && e[0] ? e : "unknown reason");
+        rt_log_warn("launcher", "the file dialog could not be shown: %s", e && e[0] ? e : "unknown reason");
         g_m.browse_available = false;
         set_status(e && e[0] ? std::string("no file dialog on this system: ") + e
                              : std::string("no file dialog on this system"));
@@ -483,32 +488,32 @@ void show_open_dialog() {
         std::filesystem::path parent = std::filesystem::path(g_m.disc_path).parent_path();
         if (!parent.empty() && std::filesystem::is_directory(parent, ec)) location = parent.string();
     }
-    rt_log("launcher", "opening the file dialog at '%s'", location.c_str());
+    rt_log_info("launcher", "opening the file dialog at '%s'", location.c_str());
     SDL_ShowOpenFileDialog(dialog_callback, nullptr, win, kFilters, 1, location.c_str(), false);
 }
 
 void open_url(const std::string& url) {
     if (!SDL_OpenURL(url.c_str())) {
-        rt_log("launcher", "could not open '%s': %s", url.c_str(), SDL_GetError());
+        rt_log_warn("launcher", "could not open '%s': %s", url.c_str(), SDL_GetError());
         set_status("could not open " + url + " in a browser");
     }
 }
 
-#else /* !ICORECOMP_PGS_SDL */
+#else /* !ICORECOMP_HAVE_SDL */
 
 /* No SDL in this build: no dialog to show and no browser to hand a URL to.
  * Both say so rather than doing nothing. */
 void show_open_dialog() {
-    rt_log("launcher", "this build has no SDL, so there is no file dialog; use the path field");
+    rt_log_warn("launcher", "this build has no SDL, so there is no file dialog; use the path field");
     set_status("this build has no file dialog; type a path instead");
 }
 
 void open_url(const std::string& url) {
-    rt_log("launcher", "this build has no SDL, so '%s' cannot be opened", url.c_str());
+    rt_log_warn("launcher", "this build has no SDL, so '%s' cannot be opened", url.c_str());
     set_status("this build cannot open " + url);
 }
 
-#endif /* ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_HAVE_SDL */
 
 /* ---- data model callbacks -----------------------------------------------
  *
@@ -516,6 +521,13 @@ void open_url(const std::string& url) {
  * exception, and it is the same call the menu hotkey makes from the same
  * context (ui_events.cpp): showing a document touches nothing the
  * reentrancy rule protects.
+ *
+ * The event is still named open_settings although the overlay it opens is
+ * labelled "Menu" in launcher.rml and menu.rml. The name is the binding
+ * between this file and the document, it is not shown to anyone, and
+ * renaming it would have to land in both files at once for the button to
+ * keep working; menu.rml's data model, ui_settings_model.cpp and
+ * settings.json all still say "settings" for the same reason.
  */
 
 void on_start(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { g_start_pending = true; }
@@ -553,7 +565,7 @@ void on_startup_change(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList
 
 void on_open_url(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
     if (arguments.size() != 1) {
-        rt_log("launcher", "open_url() wants exactly one argument; the document passed %zu",
+        rt_log_warn("launcher", "open_url() wants exactly one argument; the document passed %zu",
             arguments.size());
         return;
     }
@@ -581,7 +593,7 @@ void attach_click(Rml::ElementDocument* doc, const char* id, Rml::EventListener*
     if (!doc) return;
     Rml::Element* el = doc->GetElementById(id);
     if (!el) {
-        rt_log("ui", "launcher: no element '%s' in %s; that click does nothing",
+        rt_log_warn("ui", "launcher: no element '%s' in %s; that click does nothing",
             id, doc->GetSourceURL().c_str());
         return;
     }
@@ -595,7 +607,7 @@ void attach_click(Rml::ElementDocument* doc, const char* id, Rml::EventListener*
 bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     Rml::DataModelConstructor c = context->CreateDataModel("launcher");
     if (!c) {
-        rt_log("ui", "Context::CreateDataModel(\"launcher\") failed; the launcher is disabled");
+        rt_log_warn("ui", "Context::CreateDataModel(\"launcher\") failed; the launcher is disabled");
         return false;
     }
 
@@ -638,7 +650,7 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
 
     g_disc_forced = rt_iso_forced_path()[0] != 0;
     g_m.disc_locked = g_disc_forced;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     /* Whether a dialog can actually be shown is only known when one is
      * asked for: SDL reports "no portal, no zenity" through the callback,
      * not up front. Until then the button is offered. */
@@ -658,13 +670,13 @@ bool launcher_init(Rml::Context* context, const std::string& ui_dir) {
     const std::string launcher_path = ui_dir + "/launcher.rml";
     g_ui.launcher = context->LoadDocument(launcher_path);
     if (!g_ui.launcher) {
-        rt_log("ui", "document %s failed to load; the launcher is disabled", launcher_path.c_str());
+        rt_log_warn("ui", "document %s failed to load; the launcher is disabled", launcher_path.c_str());
         return false;
     }
 
     attach_click(g_ui.launcher, "credit-link", &g_open_site);
 
-    rt_log("ui", "launcher document loaded: %s", launcher_path.c_str());
+    rt_log_info("ui", "launcher document loaded: %s", launcher_path.c_str());
     return true;
 }
 
@@ -680,7 +692,7 @@ void launcher_set_covered(bool covered) {
     } else {
         g_ui.launcher->Show();
     }
-    rt_log("ui", "launcher document %s for the settings menu", covered ? "hidden" : "shown again");
+    rt_log_info("ui", "launcher document %s for the menu", covered ? "hidden" : "shown again");
 }
 
 namespace {
@@ -696,7 +708,7 @@ void launcher_tick() {
         rt_settings_mutable().launcher.show_at_startup = g_m.show_at_startup;
         rt_settings_commit(false);
         rt_settings_request_save();
-        rt_log("launcher", "launcher.show_at_startup = %s", g_m.show_at_startup ? "true" : "false");
+        rt_log_info("launcher", "launcher.show_at_startup = %s", g_m.show_at_startup ? "true" : "false");
         /* commit_validate may have reverted it; show what was kept. */
         g_m.show_at_startup = rt_settings().launcher.show_at_startup;
         g_model_dirty = true;
@@ -707,7 +719,7 @@ void launcher_tick() {
         rt_settings_mutable().launcher.disc_path.clear();
         rt_settings_commit(false);
         rt_settings_request_save();
-        rt_log("launcher", "launcher.disc_path cleared");
+        rt_log_info("launcher", "launcher.disc_path cleared");
         set_status("saved disc path forgotten");
         /* The mount stays as it is: clearing the setting is about what the
          * next run looks for. The precheck re-runs so the screen shows the
@@ -740,7 +752,7 @@ void launcher_tick() {
     if (g_start_pending) {
         g_start_pending = false;
         if (g_m.can_start) {
-            rt_log("launcher", "Start: booting '%s'", g_m.disc_path.c_str());
+            rt_log_info("launcher", "Start: booting '%s'", g_m.disc_path.c_str());
             g_done = true;
             g_done_started = true;
         } else {
@@ -754,7 +766,7 @@ void launcher_tick() {
 
     if (g_quit_pending) {
         g_quit_pending = false;
-        /* Same shutdown path a closed window takes: rt_pgs_notify_quit sets
+        /* Same shutdown path a closed window takes: rt_window_notify_quit sets
          * the flag backend_present_ui() below reports as RT_PGS_VSYNC_
          * WINDOW_CLOSED, and the loop's own WINDOW_CLOSED branch ends it,
          * exactly as it would for the X button. Nothing here sets g_done:
@@ -792,7 +804,7 @@ void launcher_prepare_first_frame() {
     refresh_precheck();
 
     if (!g_logo_pending) {
-        rt_log("ui", "title logo: no disc resolved before the first frame; the launcher opens with"
+        rt_log_info("ui", "title logo: no disc resolved before the first frame; the launcher opens with"
                      " its text title and picks the image up when a disc is chosen");
         return;
     }
@@ -802,7 +814,7 @@ void launcher_prepare_first_frame() {
 
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
-    rt_log("ui", "title logo: held the first launcher frame for %.1f ms; it %s", ms,
+    rt_log_warn("ui", "title logo: held the first launcher frame for %.1f ms; it %s", ms,
         g_m.logo_available ? "carries the image" : "falls back to the text title");
 }
 
@@ -814,27 +826,26 @@ bool rt_launcher_run() {
     using namespace rtui;
 
     if (!g_ui.initialized || !g_ui.launcher) {
-        rt_log("launcher", "no launcher document in this run; booting straight into the game");
+        rt_log_info("launcher", "no launcher document in this run; booting straight into the game");
         return true;
     }
     if (!backend_window_live()) {
         /* main's gate checks this too. Repeated here because a loop with no
          * window would spin at whatever rate present_ui returns 0 at, which
          * is as fast as the CPU allows. */
-        rt_log("launcher", "no live window to draw the launcher into; booting straight into the game");
+        rt_log_warn("launcher", "no live window to draw the launcher into; booting straight into the game");
         return true;
     }
 
     const uint32_t user_present_mode = backend_present_mode();
-    const RtPresentMode present_at_entry = rt_settings().display.present;
     backend_set_present_mode(RT_PGS_PRESENT_FIFO);
-    rt_log("launcher", "present mode forced to FIFO while the launcher is up (mode %u restored at hand-off)",
+    rt_log_info("launcher", "present mode forced to FIFO while the launcher is up (mode %u restored at hand-off)",
         user_present_mode);
 
     g_covered = false;
     g_ui.launcher_visible = true;
     g_ui.launcher->Show();
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     /* The path field needs SDL_EVENT_TEXT_INPUT, which SDL3 only delivers
      * between StartTextInput and StopTextInput. */
     menu_set_text_input(true);
@@ -844,9 +855,10 @@ bool rt_launcher_run() {
     g_done_started = false;
     /* Before the loop, so nothing has been presented yet when it runs. */
     launcher_prepare_first_frame();
+    rt_run_phase(RT_PHASE_LAUNCHER_SHOWN);
 
     bool window_closed = false;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     bool menu_was_visible = false;
 #endif
     while (!g_done) {
@@ -854,7 +866,7 @@ bool rt_launcher_run() {
         rt_settings_apply_pending();
         launcher_tick();
         if (g_done) break;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         /* rt_ui_set_visible(false) turns text input off when the menu that
          * was opened from here closes. The launcher still has a text field,
          * so it goes back on. */
@@ -864,12 +876,21 @@ bool rt_launcher_run() {
         rt_ui_tick();
         const uint32_t flags = backend_present_ui();
         if (flags & RT_PGS_VSYNC_WINDOW_CLOSED) {
-            rt_log("launcher", "window closed or exit requested; exiting");
+            rt_log_info("launcher", "window closed or exit requested; exiting");
+            /* Only if nothing named a reason already: rt_request_exit says
+             * which of Quit, the close button and a restart this is, and
+             * that is more useful than the generalisation here. */
+            rt_run_set_exit_reason(true, "the launcher window was closed");
             window_closed = true;
             break;
         }
         if (!(flags & RT_PGS_VSYNC_PRESENTED)) {
-            /* Nothing was presented, so FIFO did not pace this iteration:
+            /* From rt_pgs_present_ui, PRESENTED still means what it always
+             * did here: a frame reached the swapchain. That call latches and
+             * presents in one step, so the decoupled present pump the game
+             * path uses does not reach this loop and this test is unchanged.
+             *
+             * Nothing was presented, so FIFO did not pace this iteration:
              * a minimized window is not presentable and the library polls
              * and returns instead of parking the thread. Without this the
              * loop would spin a core for as long as the window stays
@@ -884,20 +905,17 @@ bool rt_launcher_run() {
     g_ui.launcher->Hide();
     g_ui.launcher_visible = false;
     g_covered = false;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     if (!rt_ui_visible()) menu_set_text_input(false);
 #endif
 
-    /* The user's present mode goes back, unless they changed display.present
-     * in the settings menu while the launcher was up: rt_settings_apply_
-     * pending already applied that choice in the loop above, and putting the
-     * startup value back would undo it. */
-    if (rt_settings().display.present == present_at_entry) {
-        backend_set_present_mode(user_present_mode);
-        rt_log("launcher", "present mode restored to %u", user_present_mode);
-    } else {
-        rt_log("launcher", "present mode left as the settings menu set it; not restoring the startup value");
-    }
+    /* The user's present mode goes back. It used to be conditional on
+     * display.present not having moved while the launcher was up; that key
+     * is retired (host/settings.cpp `load_retired`), the menu has no control
+     * for it and nothing loads it, so the comparison could only ever be
+     * true and the other arm was unreachable. */
+    backend_set_present_mode(user_present_mode);
+    rt_log_info("launcher", "present mode restored to %u", user_present_mode);
 
     /* One write before either leaving or handing off: show_at_startup and a
      * new disc path are the two things a user expects to survive a launcher
@@ -905,7 +923,7 @@ bool rt_launcher_run() {
      * legal here. */
     rt_settings_flush_save();
 
-    rt_log("launcher", "%s", start ? "starting the game" : "exiting without starting");
+    rt_log_info("launcher", "%s", start ? "starting the game" : "exiting without starting");
     return start;
 }
 

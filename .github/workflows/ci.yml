@@ -32,6 +32,51 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
           cmake --build build -j4
+      - name: run the disc-free selftests
+        # The build above already produced every target in the stub
+        # configuration, so this only has to run them. The list is every
+        # selftest in CMakeLists.txt that needs no disc image and has no
+        # blocking job of its own: settings, log, menu-nav and achievements
+        # have theirs below, and the four renderer ones need the
+        # ICORECOMP_NATIVE_GS configure in the next step.
+        #
+        # The only selftest target with no blocking Linux job at all is
+        # icorecomp-title-logo-selftest, which mounts the user's disc image
+        # to read a texture out of it and so cannot run anywhere in CI.
+        run: |
+          set -e
+          ./build/icorecomp-mc-selftest
+          ./build/icorecomp-sif-selftest
+          ./build/icorecomp-video-mode-selftest
+          ./build/icorecomp-osd-config-selftest
+          ./build/icorecomp-snd-pcm-selftest
+          ./build/icorecomp-stick-shape-selftest
+          ./build/icorecomp-mouse-look-selftest
+          ./build/icorecomp-png-selftest
+          ./build/icorecomp-ipu-selftest
+          ./build/icorecomp-vif1-selftest
+          ./build/icorecomp-gif-widescreen-selftest
+          ./build/icorecomp-gsring-selftest
+      - name: build and run the native GS renderer selftests
+        # The clean-room renderer's four selftests are pure CPU: no GPU, no
+        # Vulkan device, no disc image, no ROM-derived data. They sit behind
+        # ICORECOMP_NATIVE_GS, which needs the two header-only submodules the
+        # RHI compiles against, so they get a configure of their own rather
+        # than the stub one above. The committed SPIR-V is used as it stands;
+        # tools/gen_gs_shaders.sh is not run here, because building glslang
+        # would cost more than everything else in this job.
+        run: |
+          set -e
+          git submodule update --init third_party/volk third_party/Vulkan-Headers
+          cmake -B build-gs -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build-gs -j4 --target icorecomp-gs-swizzle-selftest \
+                                              icorecomp-gif-decode-selftest \
+                                              icorecomp-gs-raster-selftest \
+                                              icorecomp-gs-texture-selftest
+          ./build-gs/icorecomp-gs-swizzle-selftest
+          ./build-gs/icorecomp-gif-decode-selftest
+          ./build-gs/icorecomp-gs-raster-selftest
+          ./build-gs/icorecomp-gs-texture-selftest
 
   settings-selftest:
     runs-on: ubuntu-latest
@@ -43,6 +88,35 @@ jobs:
           cmake --build build --target icorecomp-settings-selftest -j4
       - name: run
         run: ICORECOMP_SETTINGS_SELFTEST_DIR=$(mktemp -d) ./build/icorecomp-settings-selftest
+
+  guest-selftests:
+    # The two guest-facing selftests. Both compile the guest address block in
+    # src/runtime/guest/ico_syms.h, which carries the trophy bit table, the
+    # progress array length and the scene-object layout, so a change to a
+    # constant there is exercised here rather than only described.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure and build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build -j4 --target icorecomp-menu-nav-selftest \
+                                           icorecomp-achievements-selftest
+      - name: run
+        run: |
+          ./build/icorecomp-menu-nav-selftest
+          ./build/icorecomp-achievements-selftest "$(mktemp -d)"
+
+  log-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure and build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build --target icorecomp-log-selftest -j4
+      - name: run
+        run: ICORECOMP_LOG_SELFTEST_DIR=$(mktemp -d) ./build/icorecomp-log-selftest
 
   runtime-ui-linux:
     # The RmlUi UI built without the live GS backend: the cheap gate that
@@ -79,6 +153,15 @@ jobs:
   runtime-stub-windows:
     # Informational until the Windows port lands: failures here are
     # portability debt to burn down, not merge blockers.
+    #
+    # This and runtime-pgs-windows are the only two jobs that link with
+    # MSVC, so they are the only two that exercise /ENTRY:mainCRTStartup
+    # (CMakeLists.txt, the Windows GUI subsystem block: /SUBSYSTEM:WINDOWS
+    # looks for WinMain, and this points it back at the console startup that
+    # calls main). While both are continue-on-error a link failure from that
+    # option is a green build, which is why CMakeLists.txt says a change
+    # there has to be checked against an MSVC link by hand. The flag comes
+    # off after the first green run, and that hand check goes with it.
     continue-on-error: true
     runs-on: windows-latest
     steps:
@@ -96,7 +179,11 @@ jobs:
 
   runtime-pgs-windows:
     # Optional/informational: the paraLLEl-GS live backend on MSVC. Needs
-    # the submodule tree and the Vulkan SDK; failures here never block.
+    # the submodule tree and the Vulkan SDK.
+    #
+    # continue-on-error until the first green run, and the second of the two
+    # jobs that link the MSVC /ENTRY:mainCRTStartup option; see
+    # runtime-stub-windows above.
     continue-on-error: true
     runs-on: windows-latest
     steps:
@@ -114,6 +201,626 @@ jobs:
         run: |
           cmake -B build-pgs -DICORECOMP_PARALLEL_GS=ON
           cmake --build build-pgs --config Release
-# verify-decode and the ground-truth tests need the sibling ico decomp
-# checkout and the user's ELF; they run locally, not in CI. Tests that
-# depend on ../ico skip with a notice when it is absent.
+
+  gs-shaders-lavapipe:
+    # The one job that actually runs the renderer's shaders.
+    #
+    # Every other GS job builds the C++ half and runs the four CPU selftests.
+    # Everything on the GPU side of the line, which is the binding layout,
+    # every barrier, the whole pixel pipeline and the CRTC, had no automated
+    # coverage at all, which is how a missing entry in a shader name table
+    # (shadow.comp, absent from the D3D12 and Metal tables) sat in the tree as
+    # a startup fatal on two of three backends.
+    #
+    # mesa's lavapipe is a Vulkan 1.3 CPU implementation, so the whole
+    # renderer runs on a GitHub runner with no GPU. ICORECOMP_RHI_SOFTWARE=1
+    # makes the backend pick it deliberately rather than take whatever the
+    # loader ranks first, and fatal if no CPU device enumerates: a run that
+    # silently used something else would be measuring the wrong thing.
+    #
+    # continue-on-error until the first green run: nothing here has ever been
+    # executed, so the first failures are as likely to be this job's own
+    # arrangement as the renderer's. Remove the flag once it has passed once,
+    # and it becomes a merge blocker like the two UI jobs.
+    #
+    # Until then this job is informational and nothing else blocks on it. Say
+    # it plainly, because it is easy to misread: while this flag is set, a
+    # green CI covers no shader, no binding layout, no barrier and no CRTC.
+    # The only blocking GS coverage is the four CPU selftests in
+    # runtime-stub-linux (swizzle, gif-decode, raster, texture). The date of
+    # the first green run and the commit that removes the flag belong in
+    # docs/GS_RENDERER.md, "Status, 2026-09-05".
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install lavapipe and the Vulkan loader
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+      - name: fetch the RHI submodules
+        run: git submodule update --init third_party/volk third_party/Vulkan-Headers
+      - name: configure and build
+        # The committed SPIR-V is used as it stands; tools/gen_gs_shaders.sh is
+        # not run here, for the reason runtime-stub-linux gives.
+        run: |
+          cmake -B build-gs -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build-gs -j4 --target icorecomp-gs-gen-dump icorecomp-gs-replay
+      - name: write the synthetic dumps
+        run: |
+          mkdir -p dumps
+          ./build-gs/icorecomp-gs-gen-dump dumps
+          ls -l dumps
+      - name: replay every dump on Vulkan
+        # A fatal is a nonzero exit and the log line that goes with it, so the
+        # loop stops at the first one and the step fails. --screenshot reads
+        # the scanout image back and writes a PPM, which is what makes this a
+        # test of the whole pipeline and not just of device creation.
+        env:
+          ICORECOMP_RHI_SOFTWARE: "1"
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          set -e
+          mkdir -p shots-vulkan
+          for f in dumps/*.gs; do
+            name="$(basename "$f" .gs)"
+            echo "=== $name"
+            ./build-gs/icorecomp-gs-replay "$f" --backend=native \
+                --screenshot "shots-vulkan/$name.ppm"
+          done
+          ls -l shots-vulkan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gs-shots-vulkan
+          path: shots-vulkan/
+          if-no-files-found: error
+
+  gs-shaders-warp:
+    # The same corpus through the D3D12 backend on WARP, Microsoft's software
+    # rasteriser, and then compared byte for byte against the Vulkan job's
+    # PPMs. That comparison is the cross-backend gate: it settles whether the
+    # rewritten HLSL registers, the root signature and the D3D12 barriers
+    # produce the same picture as the SPIR-V and the Vulkan bindings, which is
+    # the one thing about that backend nothing else here can measure.
+    #
+    # What it is not: a check against the hardware. Both backends run the same
+    # GLSL, so a bug in the shared source passes this gate. Golden PPMs come
+    # later, from a capture on the user's own machine, and are what turns this
+    # into an accuracy test rather than an agreement test.
+    #
+    # continue-on-error until the first green run, for the reason the lavapipe
+    # job gives, and informational in exactly the same way in the meantime.
+    continue-on-error: true
+    needs: gs-shaders-lavapipe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch the RHI submodules
+        run: git submodule update --init third_party/volk third_party/Vulkan-Headers
+      - name: configure and build
+        run: |
+          cmake -B build-gs -DICORECOMP_PARALLEL_GS=OFF
+          cmake --build build-gs --config Release --target icorecomp-gs-gen-dump icorecomp-gs-replay
+      - name: write the synthetic dumps
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dumps | Out-Null
+          & build-gs/Release/icorecomp-gs-gen-dump.exe dumps
+          Get-ChildItem dumps
+      - name: replay every dump on D3D12 (WARP)
+        # ICORECOMP_GS_BACKEND picks the RHI backend the replay tool creates,
+        # in display.backend's own spelling, and ICORECOMP_RHI_SOFTWARE=1
+        # makes that device WARP. Neither is a fallback: a build with no D3D12
+        # backend, or a machine with no WARP adapter, is a fatal naming it.
+        shell: pwsh
+        env:
+          ICORECOMP_GS_BACKEND: d3d12
+          ICORECOMP_RHI_SOFTWARE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path shots-d3d12 | Out-Null
+          foreach ($f in Get-ChildItem dumps/*.gs) {
+            Write-Host "=== $($f.BaseName)"
+            & build-gs/Release/icorecomp-gs-replay.exe $f.FullName --backend=native `
+                --screenshot "shots-d3d12/$($f.BaseName).ppm"
+            if ($LASTEXITCODE -ne 0) { throw "replay failed on $($f.Name)" }
+          }
+          Get-ChildItem shots-d3d12
+      - uses: actions/download-artifact@v4
+        with:
+          name: gs-shots-vulkan
+          path: shots-vulkan
+      - name: compare the two backends byte for byte
+        # No epsilon. Both backends run the same GLSL through the same
+        # integer pixel pipeline, so any difference is a binding, a barrier or
+        # a cross-compile that does not say what the source said, and rounding
+        # is not an excuse for it. A file present on one side and missing on
+        # the other is a failure too: it means one backend fatalled on a case
+        # the other completed.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vk = Get-ChildItem shots-vulkan/*.ppm | Sort-Object Name
+          $dx = Get-ChildItem shots-d3d12/*.ppm | Sort-Object Name
+          $vkNames = $vk | ForEach-Object { $_.Name }
+          $dxNames = $dx | ForEach-Object { $_.Name }
+          $missing = Compare-Object $vkNames $dxNames
+          if ($missing) {
+            $missing | Format-Table | Out-String | Write-Host
+            throw "the two backends did not produce the same set of screenshots"
+          }
+          $bad = 0
+          foreach ($name in $vkNames) {
+            $a = [System.IO.File]::ReadAllBytes("shots-vulkan/$name")
+            $b = [System.IO.File]::ReadAllBytes("shots-d3d12/$name")
+            if ($a.Length -ne $b.Length) {
+              Write-Host "DIFFER $name (sizes $($a.Length) and $($b.Length))"
+              $bad++
+              continue
+            }
+            $same = $true
+            for ($i = 0; $i -lt $a.Length; $i++) {
+              if ($a[$i] -ne $b[$i]) {
+                Write-Host "DIFFER $name at byte $i ($($a[$i]) versus $($b[$i]))"
+                $same = $false
+                break
+              }
+            }
+            if (-not $same) { $bad++ } else { Write-Host "same   $name" }
+          }
+          if ($bad -ne 0) { throw "$bad of $($vkNames.Count) screenshots differ between Vulkan and D3D12" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gs-shots-d3d12
+          path: shots-d3d12/
+          if-no-files-found: error
+
+  shader-blobs:
+    # The committed shader outputs against the sources they came from.
+    #
+    # Four index headers and four directories of blobs are checked in:
+    # SPIR-V, cross-compiled HLSL, cross-compiled MSL and, since the DXIL
+    # generator was ported to Linux, signed DXIL containers. Nothing else in
+    # CI runs a shader generator, so a shader edited without rerunning them
+    # would ship a binary that no longer matches its own GLSL, on three
+    # backends, and nothing would say so. This job regenerates the lot and
+    # fails on a single byte of difference.
+    #
+    # Every tool is pinned, because the output is bytes and a different
+    # compiler emits different bytes from the same source:
+    #
+    #   glslang      the copy vendored under the paraLLEl-GS submodule,
+    #                which tools/gen_gs_shaders.sh builds itself when no
+    #                glslangValidator is on PATH. Nothing apt-installs one
+    #                here on purpose: the distribution's version would drift
+    #                from the one that wrote the committed SPIR-V.
+    #   SPIRV-Cross  the copy vendored under the same submodule, built into
+    #                build/spirv-cross-tools, which is the second place the
+    #                script looks for it.
+    #   dxc          the release tagged below, from its Linux asset. That is
+    #                the release that produced the seven containers in the
+    #                tree (docs/GS_RENDERER.md, "Shader path").
+    #
+    # continue-on-error until the first green run. That the pins above
+    # reproduce the committed blobs byte for byte is exactly what has not
+    # been measured yet, and the first green run is the measurement. The
+    # flag comes off then, which is the whole point of the job.
+    #
+    # While the flag is set this is the only thing standing between an edited
+    # shader source and a stale committed blob, and it cannot fail the build,
+    # so a shader change has to be regenerated by hand. Informational, not a
+    # gate.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      DXC_RELEASE: v1.9.2607
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch the shader toolchain submodules
+        # glslang and SPIRV-Cross both sit under the paraLLEl-GS submodule's
+        # own third_party, so this one has to be recursive.
+        run: git submodule update --init --recursive third_party/parallel-gs
+      - name: record the pins
+        id: pins
+        run: |
+          set -e
+          gl=$(git -C third_party/parallel-gs/Granite/third_party/glslang rev-parse HEAD)
+          sc=$(git -C third_party/parallel-gs/Granite/third_party/spirv-cross rev-parse HEAD)
+          echo "glslang $gl"
+          echo "spirv-cross $sc"
+          echo "dxc $DXC_RELEASE"
+          echo "glslang=$gl" >> "$GITHUB_OUTPUT"
+          echo "spirvcross=$sc" >> "$GITHUB_OUTPUT"
+      - name: cache the built shader tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/glslang-tools
+            build/spirv-cross-tools
+          key: shader-tools-${{ runner.os }}-${{ steps.pins.outputs.glslang }}-${{ steps.pins.outputs.spirvcross }}
+      - name: cache the pinned DXC release
+        uses: actions/cache@v4
+        with:
+          path: .cache/dxc-linux
+          key: dxc-linux-${{ env.DXC_RELEASE }}
+      - name: fetch the pinned DXC release
+        # The tag is the pin. The asset's own file name carries a build date
+        # rather than the version, so it is looked up through the release
+        # API instead of being spelled out and guessed wrong.
+        run: |
+          set -e
+          if [ -x .cache/dxc-linux/bin/dxc ]; then
+            echo "cached"
+          else
+            url=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+                  "https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/tags/$DXC_RELEASE" \
+                  | jq -r '.assets[] | select(.name | test("^linux_dxc.*\\.tar\\.gz$")) | .browser_download_url')
+            test -n "$url" || { echo "no Linux dxc asset in $DXC_RELEASE"; exit 1; }
+            echo "$url"
+            mkdir -p .cache/dxc-linux
+            curl -fsSL "$url" -o /tmp/dxc-linux.tar.gz
+            tar -xzf /tmp/dxc-linux.tar.gz -C .cache/dxc-linux
+            chmod +x .cache/dxc-linux/bin/dxc
+          fi
+          .cache/dxc-linux/bin/dxc --version
+      - name: build the pinned SPIRV-Cross
+        # Into build/spirv-cross-tools, which is where gen_gs_shaders.sh
+        # looks after PATH. The vendored source means the version is pinned
+        # by the submodule and nothing has to be downloaded.
+        run: |
+          set -e
+          if [ ! -x build/spirv-cross-tools/spirv-cross ]; then
+            cmake -S third_party/parallel-gs/Granite/third_party/spirv-cross \
+                  -B build/spirv-cross-tools -DCMAKE_BUILD_TYPE=Release \
+                  -DSPIRV_CROSS_CLI=ON -DSPIRV_CROSS_ENABLE_TESTS=OFF
+            cmake --build build/spirv-cross-tools -j4 --target spirv-cross
+          fi
+          test -x build/spirv-cross-tools/spirv-cross
+      - name: regenerate every shader output
+        # One invocation: gen_gs_shaders.sh writes the SPIR-V, then the
+        # HLSL and MSL through spirv-cross, then calls
+        # gen_gs_shaders_dxil.sh itself because .cache/dxc-linux/bin/dxc is
+        # now there.
+        run: |
+          set -eo pipefail
+          tools/gen_gs_shaders.sh 2>&1 | tee gen.log
+      - name: check no stage was skipped
+        # Both optional stages skip with a STATUS line and a zero exit, so
+        # without this a job that found neither tool would regenerate the
+        # SPIR-V alone and pass while checking nothing about the other three
+        # backends.
+        run: |
+          set -e
+          if grep -q "skipping the HLSL and MSL stages" gen.log; then
+            echo "spirv-cross was not found, so HLSL and MSL were not checked"; exit 1
+          fi
+          if grep -q "skipping the DXIL stage" gen.log; then
+            echo "dxc was not found, so the DXIL was not checked"; exit 1
+          fi
+      - name: fail on any difference
+        run: |
+          set -e
+          paths="src/runtime/gs/render/shaders \
+                 src/runtime/rhi/rhi_shaders.h \
+                 src/runtime/rhi/rhi_shaders_hlsl.h \
+                 src/runtime/rhi/rhi_shaders_msl.h \
+                 src/runtime/rhi/rhi_shaders_dxil.h"
+          if [ -n "$(git status --porcelain -- $paths)" ]; then
+            git status --porcelain -- $paths
+            git diff --stat -- $paths
+            echo
+            echo "the committed shader outputs are not what the sources compile to."
+            echo "run tools/gen_gs_shaders.sh and commit what it writes."
+            exit 1
+          fi
+          echo "every committed shader output matches its source"
+
+  package-windows-cross:
+    # The mingw cross build carried all the way to an installed folder,
+    # which is how the Windows package is actually produced
+    # (docs/WINDOWS.md). The install step is the point: runtime-ui-mingw
+    # links the executable and stops, so nothing in CI had ever run
+    # install().
+    #
+    # dxcapi.h has to be on the include path for the D3D12 backend to be
+    # enabled at all, so the Windows DXC release is still unpacked here for
+    # its inc/. Its DLLs are not: since 2026-09-05 CMakeLists.txt installs
+    # neither dxcompiler.dll nor dxil.dll (the native D3D12 renderer was
+    # withdrawn from the player's build), so the package holds neither and
+    # asserting them made this job fail on every run.
+    #
+    # continue-on-error until the first green run. runtime-ui-mingw stays
+    # the cheap blocking gate on this toolchain and is deliberately left
+    # alone, so a failure here cannot take a merge blocker down with it.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      DXC_RELEASE: v1.9.2607
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: fetch the submodules the package needs
+        run: |
+          git submodule update --init third_party/rmlui third_party/freetype \
+                                      third_party/volk third_party/Vulkan-Headers
+      - name: cache the pinned DXC release
+        uses: actions/cache@v4
+        with:
+          path: .cache/dxc-win
+          key: dxc-win-${{ env.DXC_RELEASE }}
+      - name: fetch the pinned DXC release for Windows
+        # For its inc/dxcapi.h and nothing else. The DLLs in the same
+        # archive are not used by this job any more (see the job comment).
+        run: |
+          set -e
+          if [ -f .cache/dxc-win/inc/dxcapi.h ]; then
+            echo "cached"
+          else
+            url=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+                  "https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/tags/$DXC_RELEASE" \
+                  | jq -r '.assets[] | select(.name | test("^dxc_.*\\.zip$")) | .browser_download_url')
+            test -n "$url" || { echo "no Windows dxc asset in $DXC_RELEASE"; exit 1; }
+            echo "$url"
+            mkdir -p .cache/dxc-win
+            curl -fsSL "$url" -o /tmp/dxc-win.zip
+            unzip -q /tmp/dxc-win.zip -d .cache/dxc-win
+          fi
+          ls .cache/dxc-win
+          test -f .cache/dxc-win/inc/dxcapi.h
+      - name: configure, build and install
+        run: |
+          set -eo pipefail
+          cmake -B build-pkg -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
+                -DCMAKE_BUILD_TYPE=Release -DICORECOMP_PARALLEL_GS=OFF \
+                -DICORECOMP_UI=ON \
+                -DCMAKE_CXX_FLAGS="-I$PWD/.cache/dxc-win/inc" 2>&1 | tee configure.log
+          grep -q "icorecomp: D3D12 backend enabled" configure.log
+          cmake --build build-pkg -j4 --target icorecomp-runtime
+          cmake --install build-pkg --prefix dist/windows-ci
+      - name: check what landed in the package
+        # The folder a user unzips, with nothing else needed beside it.
+        # packaging/README.txt.in describes exactly this list, so the two
+        # have to be changed together.
+        run: |
+          set -e
+          find dist/windows-ci -maxdepth 2 -print
+          for f in ico.exe README.txt ui; do
+            test -e "dist/windows-ci/$f" || { echo "missing $f"; exit 1; }
+          done
+          # The other half of the same statement: since 2026-09-05 the
+          # install ships no DXC DLLs, and the README says the folder holds
+          # nothing else. If that is reversed, this fails so the two
+          # documents are updated with it rather than after it.
+          for f in dxcompiler.dll dxil.dll; do
+            if [ -e "dist/windows-ci/$f" ]; then
+              echo "$f is installed again; update packaging/README.txt.in and docs/WINDOWS.md"
+              exit 1
+            fi
+          done
+
+  runtime-macos-arm64:
+    # The macOS port ships untested (nobody on this project has a Mac), so
+    # this job exists to prove the arm64 build compiles, links and passes the
+    # disc-free selftests. macos-14 is the Apple Silicon runner, which is the
+    # only configuration this port targets.
+    #
+    # continue-on-error until the first green run, the same rule the two
+    # shader jobs above follow: nothing here has ever been executed, so the
+    # first failures are as likely to be Apple clang disagreeing with a
+    # preset as the port being wrong. Remove the flag once this job has
+    # passed once and it becomes a merge blocker.
+    continue-on-error: true
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch UI submodules
+        run: git submodule update --init third_party/rmlui third_party/freetype
+      - name: configure and build (UI, no live GS backend)
+        run: |
+          cmake --preset macos-arm64-stub
+          cmake --build --preset macos-arm64-stub -j4
+      - name: build and run the disc-free selftests
+        # Every selftest target in CMakeLists.txt that needs no disc image.
+        # Excluded: icorecomp-title-logo-selftest, which mounts the user's
+        # disc image and so cannot run anywhere in CI.
+        run: |
+          set -e
+          BUILD=build/macos-arm64-stub
+          for t in icorecomp-settings-selftest icorecomp-log-selftest \
+                   icorecomp-mc-selftest icorecomp-sif-selftest \
+                   icorecomp-menu-nav-selftest icorecomp-snd-pcm-selftest \
+                   icorecomp-stick-shape-selftest icorecomp-mouse-look-selftest \
+                   icorecomp-ipu-selftest icorecomp-vif1-selftest \
+                   icorecomp-gsring-selftest icorecomp-gif-widescreen-selftest \
+                   icorecomp-video-mode-selftest \
+                   icorecomp-osd-config-selftest \
+                   icorecomp-achievements-selftest; do
+            cmake --build "$BUILD" --target "$t" -j4
+          done
+          ICORECOMP_SETTINGS_SELFTEST_DIR=$(mktemp -d) "$BUILD/icorecomp-settings-selftest"
+          ICORECOMP_LOG_SELFTEST_DIR=$(mktemp -d) "$BUILD/icorecomp-log-selftest"
+          "$BUILD/icorecomp-mc-selftest"
+          "$BUILD/icorecomp-sif-selftest"
+          "$BUILD/icorecomp-menu-nav-selftest"
+          "$BUILD/icorecomp-snd-pcm-selftest"
+          "$BUILD/icorecomp-stick-shape-selftest"
+          "$BUILD/icorecomp-mouse-look-selftest"
+          "$BUILD/icorecomp-ipu-selftest"
+          "$BUILD/icorecomp-vif1-selftest"
+          "$BUILD/icorecomp-gsring-selftest"
+          "$BUILD/icorecomp-gif-widescreen-selftest"
+          "$BUILD/icorecomp-video-mode-selftest"
+          "$BUILD/icorecomp-osd-config-selftest"
+          "$BUILD/icorecomp-achievements-selftest" "$(mktemp -d)"
+
+  runtime-macos-arm64-pgs:
+    # The live renderer over MoltenVK, and the one measurement this project
+    # can make about macOS without owning a Mac: icorecomp-gs-replay --probe
+    # reports whether a Vulkan device enumerates on the runner and which of
+    # paraLLEl-GS's requirements it meets. Whether the runner exposes a
+    # Metal device to a process with no window server session is exactly the
+    # fact the probe measures; the answer is recorded in the job log either
+    # way and never fails the job.
+    #
+    # It is also the job that produces the deliverable: the last steps
+    # install the bundle, check its layout, and upload the signed .app so a
+    # Mac user can download it and report what happens. Nothing here can say
+    # whether it launches.
+    #
+    # continue-on-error until the first green run, for the reason the job
+    # above gives. Remove the flag once it has passed once.
+    continue-on-error: true
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: install MoltenVK and the Vulkan loader
+        # molten-vk is the driver the bundle ships. vulkan-loader is not
+        # shipped and is installed only so the probe step below exercises
+        # the loader path as well as the direct one, which is what a user
+        # with the LunarG SDK will have.
+        #
+        # Homebrew's version floats. It is recorded in the log rather than
+        # pinned, so the artifact from any run can be traced back to the
+        # MoltenVK that went into it. Pinning instead means downloading the
+        # MoltenVK-macos.tar asset of a tagged KhronosGroup/MoltenVK release
+        # and pointing the same three cache variables at what it unpacks.
+        run: |
+          set -e
+          brew install molten-vk vulkan-loader
+          brew list --versions molten-vk vulkan-loader
+      - name: locate the MoltenVK files to bundle
+        # The dylib, the ICD manifest from the same release, and the license
+        # Apache-2.0 requires to travel with a redistributed binary. Found
+        # rather than hardcoded: Homebrew's layout under its prefix is not a
+        # promise, and a wrong path here would silently produce a bundle
+        # with no driver in it. The check below is what makes that loud.
+        run: |
+          set -e
+          prefix="$(brew --prefix molten-vk)"
+          find "$prefix" -name 'libMoltenVK.dylib' -o -name 'MoltenVK_icd.json' \
+               -o -name 'LICENSE*' | sort
+          dylib="$(find "$prefix" -name 'libMoltenVK.dylib' | head -1)"
+          icd="$(find "$prefix" -name 'MoltenVK_icd.json' | head -1)"
+          lic="$(find "$prefix" -maxdepth 3 \( -name 'LICENSE*' -o -name 'COPYING*' \) | head -1)"
+          test -n "$dylib" || { echo "no libMoltenVK.dylib under $prefix"; exit 1; }
+          test -n "$icd"   || { echo "no MoltenVK_icd.json under $prefix"; exit 1; }
+          # Apache-2.0, so this is not optional: the text has to travel with
+          # the binary. If a Homebrew keg ever stops carrying it, take the
+          # LICENSE out of a MoltenVK release archive instead and pass its
+          # path as ICORECOMP_MOLTENVK_LICENSE.
+          test -n "$lic"   || { echo "no LICENSE under $prefix"; exit 1; }
+          echo "MVK_DYLIB=$dylib"   >> "$GITHUB_ENV"
+          echo "MVK_ICD=$icd"       >> "$GITHUB_ENV"
+          echo "MVK_LICENSE=$lic"   >> "$GITHUB_ENV"
+      - name: configure and build (paraLLEl-GS live backend, native renderer, Metal)
+        # The preset leaves ICORECOMP_NATIVE_GS at its default, so this build
+        # also compiles the clean-room renderer and, on macOS, its Metal
+        # backend. The three MoltenVK variables are what make the installed
+        # bundle self-contained; CMakeLists.txt's macOS section says what
+        # each one puts where. The configure output is kept for the check
+        # below.
+        run: |
+          set -eo pipefail
+          cmake --preset macos-arm64-release \
+                -DICORECOMP_MOLTENVK_DYLIB="$MVK_DYLIB" \
+                -DICORECOMP_MOLTENVK_ICD="$MVK_ICD" \
+                -DICORECOMP_MOLTENVK_LICENSE="$MVK_LICENSE" 2>&1 | tee configure.log
+          cmake --build --preset macos-arm64-release -j4
+      - name: check the Metal backend compiled in
+        # The one thing this job settles about the Metal backend without a
+        # GPU: that CMake found the four frameworks, that ICORECOMP_RHI_METAL
+        # is defined, and therefore that the three Objective-C++ translation
+        # units in src/runtime/rhi/metal built into both icorecomp-runtime and
+        # icorecomp-gs-replay. It says nothing about whether a frame renders;
+        # docs/GS_RENDERER.md lists what stays unverified.
+        run: |
+          grep -q "icorecomp: Metal backend enabled" configure.log
+          grep -q "icorecomp: native GS renderer enabled" configure.log
+      - name: build and run the GS selftests
+        # The renderer's disc-free selftests, which are built only when the
+        # native renderer is on. They exercise the shared C++ half (the
+        # swizzle against the manual's tables, GIF decode, the rasteriser
+        # rules, the texturing rules) on arm64; none of them opens a device,
+        # so none of them touches Metal.
+        run: |
+          set -e
+          BUILD=build/macos-arm64-release
+          for t in icorecomp-gs-swizzle-selftest icorecomp-gif-decode-selftest \
+                   icorecomp-gs-raster-selftest icorecomp-gs-texture-selftest; do
+            cmake --build "$BUILD" --target "$t" -j4
+          done
+          "$BUILD/icorecomp-gs-swizzle-selftest"
+          "$BUILD/icorecomp-gif-decode-selftest"
+          "$BUILD/icorecomp-gs-raster-selftest"
+          "$BUILD/icorecomp-gs-texture-selftest"
+      - name: probe the Vulkan device
+        # Diagnostic only, and continue-on-error for that reason: the runner
+        # may have no usable GPU, which is a fact about the runner and not a
+        # failure of the build this job gates.
+        continue-on-error: true
+        run: |
+          export DYLD_LIBRARY_PATH="$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib:$DYLD_LIBRARY_PATH"
+          export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/share/vulkan/icd.d/MoltenVK_icd.json"
+          build/macos-arm64-release/icorecomp-gs-replay --probe || true
+      - name: install the app bundle
+        run: |
+          set -eo pipefail
+          cmake --install build/macos-arm64-release --prefix dist/macos 2>&1 | tee install.log
+          find "dist/macos" -print
+      - name: check the bundle is self-contained
+        # Everything a Mac user needs has to be inside the .app, so this
+        # step is the mechanical half of that claim: the files are there,
+        # Finder is pointed at the launcher, and the ICD manifest names a
+        # driver inside the bundle rather than the Homebrew prefix it was
+        # copied from. What it cannot say is whether the thing launches.
+        run: |
+          set -e
+          app="dist/macos/ICO Recomp.app"
+          for f in Contents/Info.plist \
+                   Contents/MacOS/ico \
+                   Contents/MacOS/ico-launch \
+                   Contents/MacOS/libMoltenVK.dylib \
+                   Contents/MacOS/libicorecomp-parallel-gs.dylib \
+                   Contents/Resources/vulkan/icd.d/MoltenVK_icd.json \
+                   Contents/Resources/MoltenVK-LICENSE.txt; do
+            test -e "$app/$f" || { echo "missing $f"; exit 1; }
+          done
+          test -x "$app/Contents/MacOS/ico-launch"
+          test -x "$app/Contents/MacOS/ico"
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          test "$exe" = "ico-launch" || { echo "CFBundleExecutable is $exe"; exit 1; }
+          cat "$app/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
+          # Resolved the way the Vulkan loader resolves a relative
+          # library_path: against the manifest's own directory.
+          test -f "$app/Contents/Resources/vulkan/icd.d/../../../MacOS/libMoltenVK.dylib"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          otool -L "$app/Contents/MacOS/ico"
+      - name: archive the signed bundle
+        # ditto, not zip, and a zip of our own rather than upload-artifact's:
+        # ditto keeps the mode bits, the extended attributes and the code
+        # signature, and the artifact upload keeps none of them. A downloaded
+        # copy that lost the execute bit on Contents/MacOS/ico would fail to
+        # launch and would read as a bug in the port.
+        run: |
+          set -e
+          ditto -c -k --sequesterRsrc --keepParent "dist/macos/ICO Recomp.app" \
+                ICO-Recomp-macos-arm64.zip
+          # The package README is installed beside the bundle, not inside
+          # it, so it travels with the artifact separately.
+          cp dist/macos/README.txt README-macos.txt
+          ls -l ICO-Recomp-macos-arm64.zip README-macos.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ico-recomp-macos-arm64
+          path: |
+            ICO-Recomp-macos-arm64.zip
+            README-macos.txt
+          if-no-files-found: error
+# verify-decode and the ground-truth tests need the user's own extracted
+# disc, that is the boot ELF and the objdump listing SRCFILE.TXT named by
+# [inputs] in config/recomp.toml; they run locally, not in CI. There is no
+# decomp input any more (CLAUDE.md, 2026-09-05). Tests that depend on the
+# disc skip with a notice when it is absent.

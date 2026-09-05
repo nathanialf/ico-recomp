@@ -11,14 +11,14 @@
  *
  *   stream byte position = D4_MADR - (IFC + FP) * 16 + (IPU_BP.BP >> 3)
  *
- * That expression is the retail code's own, at 0x2407FC-0x240848 in the
- * decomp (asm/nonmatchings/src/GobjProc/func_002407C0.s): it loads D4_MADR
+ * That expression is the retail code's own, at 0x25A354-0x25A3A0 in the
+ * decomp (asm/nonmatchings/ito/mpeg/mv_vibuf/viBufGetTs.s): it loads D4_MADR
  * and IPU_BP, takes IFC = (BP >> 8) & 0xF and FP = (BP >> 16) & 3, forms
  * (IFC + FP) << 4, subtracts that from MADR and adds (BP & 0x7F) >> 3. The
  * library's stop/restart bracket does the same arithmetic on the DMA
- * registers themselves (asm/nonmatchings/src/cod/vendor_2575C0/
- * func_002587E0.s at 0x258804-0x258830 and 0x2588DC-0x258910): after the
- * snapshot taken by func_002586F8 it restarts ch4 with
+ * registers themselves (asm/nonmatchings/src/cod/vendor_272338/
+ * sceIpuRestartDMA.s at 0x272444-0x272470 and 0x27251C-0x272550): after the
+ * snapshot taken by sceIpuStopDMA it restarts ch4 with
  *   MADR' = MADR - (IFC + FP) * 16      QWC' = QWC + IFC + FP
  * and issues BCLR with the saved BP first, i.e. it hands back to the DMA
  * exactly the quadwords that were still resident in the IPU and expects
@@ -72,7 +72,7 @@
  *     The drain is not gated on command completion: an armed ch3 takes
  *     each macroblock as the decoder produces it, because the library's
  *     snapshot spins on IPU_CTRL.OFC reading zero before it goes on
- *     (func_00240090.s at 0x240140-0x240158 masks the readback with 0xF0
+ *     (viBufStopDMA.s at 0x259C98-0x259CB0 masks the readback with 0xF0
  *     and loops while it is nonzero), and a BDEC that has emitted its
  *     macroblock and is still scanning would otherwise hold that wait open
  *     for the whole scan.
@@ -84,7 +84,7 @@
  * the comment on kTraceEvents for what it covers and how it is metered.
  *
  * The stop/restart round trip is verified rather than argued: the dma
- * passes in hw/ipu_selftest.cpp replay func_00240090/func_00240218 over the
+ * passes in hw/ipu_selftest.cpp replay viBufStopDMA/viBufRestartDMA over the
  * real FMV bitstream at nine byte cadences, four ring sizes and with and
  * without a command pending, and require the decoded I picture to match the
  * uninterrupted decode exactly.
@@ -179,7 +179,7 @@ uint64_t g_trace_polled[TS_COUNT] = {0}; /* polled-state lines emitted, per slot
 bool g_trace_spent = false;    /* budget notice already printed */
 
 void trace_out(const char* text) {
-    rt_log("ipu", "[trace %" PRIu64 "] %s", ++g_trace_n, text);
+    rt_log_debug("ipu", "[trace %" PRIu64 "] %s", ++g_trace_n, text);
 }
 
 /* False once the whole budget is gone; says so once. */
@@ -188,7 +188,7 @@ bool trace_room() {
     if (g_trace_n < kTraceEvents) return true;
     if (!g_trace_spent) {
         g_trace_spent = true;
-        rt_log("ipu", "[trace %" PRIu64 "] the %" PRIu64 "-line toIPU trace is full; from here the "
+        rt_log_debug("ipu", "[trace %" PRIu64 "] the %" PRIu64 "-line toIPU trace is full; from here the "
             "power-of-two sampled lines are all there is", g_trace_n, kTraceEvents);
     }
     return false;
@@ -350,7 +350,7 @@ size_t qw_from(size_t at) {
  * command that runs out of input rewinds to its start and will replay from
  * there, so its start is the position the library has to be handed back for
  * the replay to read the same bits. Reporting the high-water mark instead
- * makes MADR' = MADR - (IFC + FP) * 16 (func_002587E0.s at 0x258828) stop
+ * makes MADR' = MADR - (IFC + FP) * 16 (sceIpuRestartDMA.s at 0x272468) stop
  * short of bits the replay still needs, and the decode loses bitstream sync
  * at the restart. That is measured: hw/ipu_selftest.cpp's dma passes replay
  * the library bracket and only agree with the direct feed this way. */
@@ -365,7 +365,7 @@ uint32_t bp_bp() { return (uint32_t)(g_in_pos % 128); }
 size_t walk_qw() { return qw_from(g_in_hw); }
 
 /* The quadword the decoder is inside counts as FP, the rest as IFC; the
- * split does not matter to the library (func_002587E0 and func_002407C0
+ * split does not matter to the library (sceIpuRestartDMA and viBufGetTs
  * only ever use IFC + FP), the sum does. */
 uint32_t bp_fp() { return held_qw() ? 1u : 0u; }
 /* Declared here so the IPU_BP overrun below can name the command that
@@ -384,7 +384,7 @@ uint32_t bp_ifc() {
     if (h > kFifoQw + 1) {
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
-            rt_log("ipu", "%zu quadwords sit between the decode cursor and the end of the input, more "
+            rt_log_debug("ipu", "%zu quadwords sit between the decode cursor and the end of the input, more "
                 "than the %zu the input FIFO holds; IPU_BP.IFC saturates and the library's "
                 "MADR - (IFC + FP) * 16 rewind would stop short. The command that rewound this "
                 "far is 0x%08x%s [#%" PRIu64 "]",
@@ -406,7 +406,7 @@ void complete_ch4() {
         g_to.tags, g_to.tags == 1 ? "" : "s", g_to.delivered, g_to.delivered == 1 ? "" : "s",
         (uint64_t)held_qw(), held_qw() == 1 ? "" : "s", g_to.kicks);
     if (rt_trace() || is_pow2(g_to.kicks)) {
-        rt_log("ipu", "toIPU ch4 transfer complete (madr=0x%08x qwc=%u tadr=0x%08x) with %zu qword%s "
+        rt_log_debug("ipu", "toIPU ch4 transfer complete (madr=0x%08x qwc=%u tadr=0x%08x) with %zu qword%s "
             "still resident [kick #%" PRIu64 "]",
             *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3], held_qw(), held_qw() == 1 ? "" : "s",
             g_to.kicks);
@@ -447,7 +447,7 @@ void advance_walk() {
             *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3]);
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
-            rt_log("ipu", "toIPU walk held off: the DMAC is suspended [#%" PRIu64 "]", n);
+            rt_log_debug("ipu", "toIPU walk held off: the DMAC is suspended [#%" PRIu64 "]", n);
         }
         return;
     }
@@ -473,7 +473,7 @@ void advance_walk() {
                     *g_ch4_reg[2], *g_ch4_reg[1], *g_ch4_reg[3]);
                 static uint64_t n = 0;
                 if (rt_trace() || is_pow2(++n)) {
-                    rt_log("ipu", "toIPU walk stalls: input FIFO full with qwc=%u left at madr=0x%08x "
+                    rt_log_debug("ipu", "toIPU walk stalls: input FIFO full with qwc=%u left at madr=0x%08x "
                         "(tadr=0x%08x) [#%" PRIu64 "]", *g_ch4_reg[2], *g_ch4_reg[1], *g_ch4_reg[3], n);
                 }
                 return;
@@ -511,7 +511,7 @@ void advance_walk() {
         if (lo == 0) {
             /* An all-zero quadword is not a tag the retail ring builder can
              * have written: every tag it stores carries a payload address
-             * and QWC 0x80 (func_0023FDF0.s at 0x23FF64-0x23FFC8). So the
+             * and QWC 0x80 (viBufAddDMA.s at 0x259ABC-0x259B20). So the
              * walk has caught up with the producer and is looking at a ring
              * slot the guest has not filled yet. That is the ordinary
              * steady state whenever the decoder drains the ring faster than
@@ -522,8 +522,8 @@ void advance_walk() {
              * would end the transfer and advance TADR one slot; that is
              * what a DMAC reading those bits would do. It is not what this
              * guest can have meant, because what it does next is write this
-             * very slot and restart at this same TADR (func_0023FDF0.s at
-             * 0x23FF90-0x23FFC8, then the CHCR store at 0x240054), so
+             * very slot and restart at this same TADR (viBufAddDMA.s at
+             * 0x259AE8-0x259B20, then the CHCR store at 0x259BAC), so
              * consuming the slot would lose 2048 bytes of bitstream and put
              * every later append behind the walk. Which of the two hardware
              * does is not measured, so the choice is the one that keeps the
@@ -531,7 +531,7 @@ void advance_walk() {
              * logged rather than left silent. */
             static uint64_t n = 0;
             if (rt_trace() || is_pow2(++n)) {
-                rt_log("ipu", "toIPU chain has caught up with the ring: the tag at TADR=0x%08x has "
+                rt_log_debug("ipu", "toIPU chain has caught up with the ring: the tag at TADR=0x%08x has "
                     "not been written yet (madr=0x%08x qwc=%u chcr=0x%08x, %zu qword%s resident). The "
                     "walk stops with TADR left on that slot, so the guest's next ring extension is "
                     "still read [#%" PRIu64 "]",
@@ -554,7 +554,7 @@ void advance_walk() {
         *g_ch4_reg[0] = (*g_ch4_reg[0] & 0xFFFFu) | ((uint32_t)(lo >> 16) & 0xFFFF0000u);
         if ((*g_ch4_reg[0] >> 6) & 1) {
             static uint64_t n = 0;
-            if (is_pow2(++n)) rt_log("ipu", "toIPU chain tag with TTE set; tag words 2-3 dropped [#%" PRIu64 "]", n);
+            if (is_pow2(++n)) rt_log_warn("ipu", "toIPU chain tag with TTE set; tag words 2-3 dropped [#%" PRIu64 "]", n);
         }
         switch (id) {
             case 0: /* REFE */
@@ -713,7 +713,7 @@ void complete_ch3() {
     *g_ch3_reg[0] &= ~0x100u;
     rt_dmac_raise(3);
     if (rt_trace() || is_pow2(g_from.kicks)) {
-        rt_log("ipu", "fromIPU ch3 transfer complete (madr=0x%08x) [kick #%" PRIu64 "]",
+        rt_log_debug("ipu", "fromIPU ch3 transfer complete (madr=0x%08x) [kick #%" PRIu64 "]",
             *g_ch3_reg[1], g_from.kicks);
     }
 }
@@ -1274,7 +1274,7 @@ bool bdec_tail_scan() {
 void bdec_error(const char* what) {
     static uint64_t n = 0;
     if (rt_trace() || is_pow2(++n)) {
-        rt_log("ipu", "BDEC: no %s code matches the bitstream at bit %zu; IPU_CTRL.ECD set and the "
+        rt_log_warn("ipu", "BDEC: no %s code matches the bitstream at bit %zu; IPU_CTRL.ECD set and the "
             "command stops with no macroblock output (the decoder has lost sync) [#%" PRIu64 "]",
             what, g_in_pos, n);
     }
@@ -1369,7 +1369,7 @@ bool exec_bdec(uint32_t val) {
     g_bdec_tail = true;
     take_snapshot();
     /* An armed ch3 takes it now rather than at the end of the command. The
-     * scan below can run for thousands of bytes, and func_00240090.s waits
+     * scan below can run for thousands of bytes, and viBufStopDMA.s waits
      * for IPU_CTRL.OFC to read 0 before it takes its snapshot, so leaving a
      * decoded macroblock in the output queue for the length of the scan
      * would park the library in that wait. Hardware does not: the fromIPU
@@ -1428,7 +1428,7 @@ bool exec_vdec(uint32_t val) {
                 }
             } else {
                 static uint64_t n = 0;
-                if (is_pow2(++n)) rt_log("ipu", "VDEC MBT with PCT=%d (D picture?); returning error [#%" PRIu64 "]", pct, n);
+                if (is_pow2(++n)) rt_log_warn("ipu", "VDEC MBT with PCT=%d (D picture?); returning error [#%" PRIu64 "]", pct, n);
             }
             break;
         }
@@ -1506,11 +1506,20 @@ void csc_one_mb(const MacroBlock8* mb, uint8_t* rgb_out /* 1024 bytes */) {
 
 /* Macroblocks of the current CSC that are already converted and pushed.
  * CSC is the one command whose input dwarfs the FIFO: the retail player
- * hands it a whole 720x480 frame, 1350 macroblocks of RAW8, as a single
- * 32400-quadword normal-mode ch4 transfer, in runs of up to 0x147
- * macroblocks per command. Committing each macroblock keeps a retry from
- * replaying the whole run, which is what let the input queue grow far past
- * anything IPU_BP could describe. */
+ * hands it a whole frame of RAW8 as a single normal-mode ch4 transfer and
+ * then converts it in runs. On the PAL disc that frame is one of two
+ * sizes, because the disc carries both and the player asks for whichever
+ * the display option selected: 720x480 is 1350 macroblocks and 32400
+ * quadwords, 720x576 is 1620 and 38880 (measured on SCES_507.60:
+ * `li s1,480` at 0x00101E54, `li v0,576` at 0x00101E74 and the `movn` at
+ * 0x00101E84 over the display word at 0x0028F4C0; the macroblock count
+ * reaches sceMpegGetPicture as `li a2,0x654` at 0x001A6F20, against the US
+ * build's unconditional `li a2,0x546` at 0x0019E0F0). The library splits
+ * the conversion into runs of at most 1023 macroblocks (`div a1, 1023` in
+ * _doCSC2, 0x00271B68), so a 576-line frame is 1023 + 597 and a 480-line
+ * one 1023 + 327. Committing each macroblock keeps a retry from replaying
+ * the whole run, which is what let the input queue grow far past anything
+ * IPU_BP could describe. */
 uint32_t g_csc_done = 0;
 
 bool exec_csc(uint32_t val) {
@@ -1518,6 +1527,28 @@ bool exec_csc(uint32_t val) {
     bool ofm = (val >> 27) & 1;
     if (ofm) {
         rt_fatal("ipu", nullptr, "CSC with OFM=1 (RGB16 output); not in this binary's census");
+    }
+    /* The one place this runtime observes the movie's geometry: the guest
+     * asks for a macroblock count and the decoder never learns a picture
+     * size of its own. Named once so a log says which of the PAL disc's
+     * movie sets was playing.
+     *
+     * Measured on the retail PAL disc image by scanning it for MPEG-2
+     * sequence headers: it carries three video sets, 720x480 at frame rate
+     * code 4 (29.97 Hz, 4.5 Mbit/s, 280 headers), 720x576 at code 3 (25 Hz,
+     * 6 Mbit/s, 234) and 720x480 at code 3 (233). The US disc carries only
+     * the first. Which one plays follows the same display word at
+     * 0x0028F4C0 that selects the video mode, so a PAL run reaches 1350 or
+     * 1620 macroblocks per frame and a US run only ever 1350. A run whose
+     * counts sum to neither is playing something this comparison has not
+     * measured. */
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        rt_log_info("ipu",
+            "first CSC: guest asked for %u macroblocks in one command. This disc's movies are "
+            "720x480 (1350 macroblocks per frame) and 720x576 (1620); the run's display option "
+            "picks which, and the library splits a frame into runs of at most 1023", mbc);
     }
     MacroBlock8 mb;
     uint8_t rgb[1024];
@@ -1549,7 +1580,7 @@ bool exec_setiq(uint32_t val) {
     if (!ensure_bits(64 * 8)) return false;
     uint8_t* dst = niq ? g_niq : g_iq;
     for (int i = 0; i < 64; ++i) dst[i] = (uint8_t)get_bits(8);
-    if (rt_trace()) rt_log("ipu", "SETIQ %s matrix loaded", niq ? "non-intra" : "intra");
+    if (rt_trace()) rt_log_info("ipu", "SETIQ %s matrix loaded", niq ? "non-intra" : "intra");
     return true;
 }
 
@@ -1561,14 +1592,14 @@ bool exec_setvq() {
 
 /* BCLR discards the input FIFO and sets the bit position. The library
  * restarts the toIPU DMA at the quadword the decoder was inside
- * (func_002587E0.s at 0x2588DC: MADR - (IFC + FP) * 16) and issues this
+ * (sceIpuRestartDMA.s at 0x27251C: MADR - (IFC + FP) * 16) and issues this
  * command with the saved BP, so everything resident here has to go: the
  * same bytes are about to be transferred again. The cursor is left partway
  * into a quadword that has not arrived yet, which is why avail_bits()
  * saturates at zero.
  *
  * A command waiting for input survives this. The library issues the BCLR
- * from inside its restart (func_00240218.s at 0x240514) and only waits for
+ * from inside its restart (viBufRestartDMA.s at 0x25A06C) and only waits for
  * BUSY to clear when it has frames in hand, so a starved command routinely
  * sees one; hardware resets the FIFO and the bit pointer under it and the
  * command carries on from the new BP when the DMA refills. The saved BP is
@@ -1584,7 +1615,7 @@ void exec_bclr(uint32_t val) {
         g_busy ? ", its retry snapshot rebased onto bp" : "");
     static uint64_t n = 0;
     if (rt_trace() || is_pow2(++n)) {
-        rt_log("ipu", "BCLR bp=%u: dropping %zu resident qword%s (ifc=%u fp=%u), pending command "
+        rt_log_debug("ipu", "BCLR bp=%u: dropping %zu resident qword%s (ifc=%u fp=%u), pending command "
             "0x%08x [#%" PRIu64 "]", bp, held_qw(), held_qw() == 1 ? "" : "s", bp_ifc(), bp_fp(),
             g_busy ? g_cur_cmd : 0u, n);
     }
@@ -1626,7 +1657,7 @@ void soft_reset() {
         g_dcpred[0] = g_dcpred[1] = g_dcpred[2] = 128;
     }
     rt_intc_raise(RT_INTC_IPU);
-    rt_log("ipu", "soft reset (IPU_CTRL.RST)");
+    rt_log_info("ipu", "soft reset (IPU_CTRL.RST)");
 }
 
 /* ---- command dispatch / retry -------------------------------------------- */
@@ -1705,7 +1736,7 @@ void run_pending() {
             g_to.active ? "running" : "idle", *g_ch4_reg[0], *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3]);
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
-            rt_log("ipu", "command 0x%08x stalls on input (have %zu bits); pending [#%" PRIu64 "]",
+            rt_log_debug("ipu", "command 0x%08x stalls on input (have %zu bits); pending [#%" PRIu64 "]",
                 val, avail_bits(), n);
         }
         return;
@@ -1721,7 +1752,7 @@ void run_pending() {
 /* Hardware runs the toIPU DMA and the decoder alongside the guest. This
  * model advances both at every point the guest could observe them, so a
  * command stalled for input still makes progress while the guest sits in
- * its BUSY poll (func_002587E0.s at 0x258870 and 0x2588A0 are two such
+ * its BUSY poll (sceIpuRestartDMA.s at 0x2724B0 and 0x2724E0 are two such
  * polls, and the movie player has more). */
 void service_input() {
     advance_walk();
@@ -1740,7 +1771,7 @@ void cmd_write(uint32_t val) {
                                     "PACK", "SETTH", "?", "?", "?", "?", "?", "?"};
     ++g_cmd_census[code];
     if (is_pow2(g_cmd_census[code]) || rt_trace()) {
-        rt_log("ipu", "%s 0x%08x [#%" PRIu64 "]", names[code], val, g_cmd_census[code]);
+        rt_log_debug("ipu", "%s 0x%08x [#%" PRIu64 "]", names[code], val, g_cmd_census[code]);
     }
     trace_cmd("IPU_CMD 0x%08x (%s #%" PRIu64 "): %" PRIu64 " bits available at cursor %" PRIu64 " (hardware "
         "position %" PRIu64 ", %" PRIu64 " qword%s resident, bp=%u ifc=%u fp=%u); ch4 %s madr=0x%08x qwc=%u "
@@ -1756,7 +1787,7 @@ void cmd_write(uint32_t val) {
          * the bits the next command will actually read. BCLR is the
          * exception and is handled in exec_bclr: the library issues it under
          * a pending command on purpose. */
-        rt_log("ipu", "command 0x%08x written while 0x%08x is still pending; previous dropped", val, g_cur_cmd);
+        rt_log_warn("ipu", "command 0x%08x written while 0x%08x is still pending; previous dropped", val, g_cur_cmd);
         g_busy = false;
         g_in_hw = g_in_pos; /* the stall already rewound g_in_pos */
     }
@@ -1805,7 +1836,7 @@ void rt_ipu_dma_kick(int ch) {
     if (ch == 4) {
         ++g_to.kicks;
         if (g_to.active) {
-            rt_log("ipu", "toIPU ch4 kicked while a transfer is active; continuing with new registers");
+            rt_log_warn("ipu", "toIPU ch4 kicked while a transfer is active; continuing with new registers");
         }
         uint32_t chcr = *g_ch4_reg[0];
         uint32_t mode = (chcr >> 2) & 3;
@@ -1822,12 +1853,12 @@ void rt_ipu_dma_kick(int ch) {
          * current tag across a stop. The retail library rules that reading
          * out, because both of its restart paths hand the channel back a
          * CHCR whose TAG field is whatever its own stop left behind, and
-         * that stop writes the bare constant 5 (func_0023FDF0.s at
-         * 0x23FE54-0x23FE68 and func_00240090.s at 0x2400A4-0x2400E8), so
-         * the id reads back as 0. func_0023FDF0 puts an id of 3 back only
-         * when it appended tags (the "beqz $18, .L0024001C" at 0x240004),
-         * and func_00240218.s's same-block path never puts one back at all
-         * ("ori $19, $5, 0x100" at 0x240278 restarts with the saved CHCR).
+         * that stop writes the bare constant 5 (viBufAddDMA.s at
+         * 0x2599AC-0x2599C0 and viBufStopDMA.s at 0x259BFC-0x259C40), so
+         * the id reads back as 0. viBufAddDMA puts an id of 3 back only
+         * when it appended tags (the "beqz $18, .L0024001C" at 0x259B5C),
+         * and viBufRestartDMA.s's same-block path never puts one back at all
+         * ("ori $19, $5, 0x100" at 0x259DD0 restarts with the saved CHCR).
          * Ending the chain on that id therefore stops the channel after
          * the outstanding QWC on every one of those restarts and leaves
          * the decoder starved with the ring still full.
@@ -1858,12 +1889,14 @@ void rt_ipu_dma_kick(int ch) {
             return;
         }
         /* A very large normal-mode kick is not a runaway: the movie player
-         * feeds CSC a whole reconstructed frame this way, 720x480 in 4:2:0
-         * RAW8 macroblock order, 1350 * 384 bytes = 32400 quadwords, and
-         * then issues CSC in runs of a few hundred macroblocks. The
-         * bitstream chain is the source-chain kick; this is the other one. */
+         * feeds CSC a whole reconstructed frame this way, in 4:2:0 RAW8
+         * macroblock order, and then issues CSC in runs of at most 1023
+         * macroblocks. 720x480 is 1350 * 384 bytes = 32400 quadwords and
+         * 720x576 is 1620 * 384 = 38880; the PAL disc plays either (see the
+         * note above g_csc_done). The bitstream chain is the source-chain
+         * kick; this is the other one. */
         if (rt_trace() || is_pow2(g_to.kicks)) {
-            rt_log("ipu", "toIPU ch4 kick: %s madr=0x%08x qwc=%u tadr=0x%08x [#%" PRIu64 "]",
+            rt_log_debug("ipu", "toIPU ch4 kick: %s madr=0x%08x qwc=%u tadr=0x%08x [#%" PRIu64 "]",
                 g_to.chain ? "chain" : "normal", *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3], g_to.kicks);
         }
         advance_walk();
@@ -1872,19 +1905,19 @@ void rt_ipu_dma_kick(int ch) {
     } else {
         ++g_from.kicks;
         if (g_from.active) {
-            rt_log("ipu", "fromIPU ch3 kicked while a transfer is pending; continuing with new registers");
+            rt_log_debug("ipu", "fromIPU ch3 kicked while a transfer is pending; continuing with new registers");
         }
         g_from.active = true;
         g_from.drain_all = (*g_ch3_reg[2] == 0);
         if (g_from.drain_all) {
             static uint64_t n = 0;
             if (is_pow2(++n)) {
-                rt_log("ipu", "fromIPU ch3 kicked with QWC=0; draining the whole output queue (%zu qw) [#%" PRIu64 "]",
+                rt_log_debug("ipu", "fromIPU ch3 kicked with QWC=0; draining the whole output queue (%zu qw) [#%" PRIu64 "]",
                     out_avail() / 16, n);
             }
         }
         if (rt_trace() || is_pow2(g_from.kicks)) {
-            rt_log("ipu", "fromIPU ch3 kick: madr=0x%08x qwc=%u (out has %zu qw) [#%" PRIu64 "]",
+            rt_log_debug("ipu", "fromIPU ch3 kick: madr=0x%08x qwc=%u (out has %zu qw) [#%" PRIu64 "]",
                 *g_ch3_reg[1], *g_ch3_reg[2], out_avail() / 16, g_from.kicks);
         }
         drain_ch3();
@@ -1902,7 +1935,7 @@ void rt_ipu_dma_kick(int ch) {
 
 /* CHCR written with STR=0: the transfer stops where it is. The registers
  * are left alone (they are what the library reads back straight after:
- * func_002586F8.s at 0x258710-0x258754 loads MADR, TADR, QWC and CHCR the
+ * sceIpuStopDMA.s at 0x272350-0x272394 loads MADR, TADR, QWC and CHCR the
  * instant the stop returns), the input FIFO keeps what it already holds,
  * and no completion interrupt is raised because nothing completed. */
 void rt_ipu_dma_stop(int ch) {
@@ -1930,7 +1963,7 @@ void rt_ipu_dma_stop(int ch) {
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
             bind_regs();
-            rt_log("ipu", "toIPU ch4 stopped (CHCR without STR) at madr=0x%08x qwc=%u tadr=0x%08x "
+            rt_log_debug("ipu", "toIPU ch4 stopped (CHCR without STR) at madr=0x%08x qwc=%u tadr=0x%08x "
                 "with %zu qword%s resident (ifc=%u fp=%u bp=%u) [#%" PRIu64 "]",
                 *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3], held_qw(), held_qw() == 1 ? "" : "s",
                 bp_ifc(), bp_fp(), bp_bp(), n);
@@ -1944,7 +1977,7 @@ void rt_ipu_dma_stop(int ch) {
         static uint64_t n = 0;
         if (rt_trace() || is_pow2(++n)) {
             bind_regs();
-            rt_log("ipu", "fromIPU ch3 stopped (CHCR without STR) at madr=0x%08x qwc=%u [#%" PRIu64 "]",
+            rt_log_debug("ipu", "fromIPU ch3 stopped (CHCR without STR) at madr=0x%08x qwc=%u [#%" PRIu64 "]",
                 *g_ch3_reg[1], *g_ch3_reg[2], n);
         }
     }
@@ -1965,7 +1998,7 @@ void rt_ipu_dma_resume() {
      * ch4 already complete sent one diagnosis down the wrong path. */
     static uint64_t n = 0;
     if (rt_trace() || is_pow2(++n)) {
-        rt_log("ipu", "DMAC hold lifted: ch4 %s (madr=0x%08x qwc=%u tadr=0x%08x), ch3 %s "
+        rt_log_debug("ipu", "DMAC hold lifted: ch4 %s (madr=0x%08x qwc=%u tadr=0x%08x), ch3 %s "
             "(madr=0x%08x qwc=%u), %zu qword%s resident [#%" PRIu64 "]",
             g_to.active ? "running" : "idle", *g_ch4_reg[1], *g_ch4_reg[2], *g_ch4_reg[3],
             g_from.active ? "running" : "idle", *g_ch3_reg[1], *g_ch3_reg[2],
@@ -1998,7 +2031,7 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
             }
             *out = (uint64_t)data | (g_busy ? (1ull << 63) : 0);
             if (g_busy && is_pow2(++g_busy_polls)) {
-                rt_log("ipu", "IPU_CMD busy poll while 0x%08x waits for input [#%" PRIu64 "]",
+                rt_log_debug("ipu", "IPU_CMD busy poll while 0x%08x waits for input [#%" PRIu64 "]",
                     g_cur_cmd, g_busy_polls);
             }
             return true;
@@ -2016,9 +2049,9 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
         }
         case 0x10002020: { /* IPU_BP */
             /* BP bits 0-6, IFC bits 8-11, FP bits 16-17. Field positions
-             * measured from the retail library itself: func_002587E0.s at
-             * 0x258804-0x258818 masks the readback with 0x7F, (>>8)&0xF and
-             * (>>16)&3, and func_002407C0.s at 0x240808-0x240818 does the
+             * measured from the retail library itself: sceIpuRestartDMA.s at
+             * 0x272444-0x272458 masks the readback with 0x7F, (>>8)&0xF and
+             * (>>16)&3, and viBufGetTs.s at 0x25A360-0x25A370 does the
              * same. */
             bind_regs(); /* the trace below reads the ch4 registers */
             service_input();
@@ -2027,8 +2060,8 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
             /* The library reads this to work out where in the stream the
              * decoder is, so the trace carries its arithmetic as well as
              * the raw value: stream byte = MADR - (IFC + FP) * 16 + BP / 8
-             * (func_002407C0.s at 0x2407FC-0x240848), and the restart it
-             * feeds (func_00240218.s at 0x240240-0x240278). */
+             * (viBufGetTs.s at 0x25A354-0x25A3A0), and the restart it
+             * feeds (viBufRestartDMA.s at 0x259D98-0x259DD0). */
             trace_state(TS_BP, "IPU_BP read = 0x%05x: bp=%u ifc=%u fp=%u; cursor %" PRIu64 " bits, hardware "
                 "position %" PRIu64 " bits, %" PRIu64 " qword%s resident; ch4 %s madr=0x%08x qwc=%u "
                 "tadr=0x%08x -> the library would rewind to madr=0x%08x qwc=%u and call the stream "
@@ -2047,7 +2080,7 @@ bool rt_ipu_mmio_read(uint32_t addr, uint64_t* out) {
         }
         case 0x10007000: case 0x10007010: {
             static uint64_t n = 0;
-            if (is_pow2(++n)) rt_log("ipu", "IPU FIFO window read at 0x%08x; returns 0 [#%" PRIu64 "]", addr, n);
+            if (is_pow2(++n)) rt_log_debug("ipu", "IPU FIFO window read at 0x%08x; returns 0 [#%" PRIu64 "]", addr, n);
             *out = 0;
             return true;
         }
@@ -2067,14 +2100,14 @@ bool rt_ipu_mmio_write(uint32_t addr, uint64_t v) {
             uint32_t nv = (uint32_t)v;
             g_ctrl_bits = nv & 0x07F30000u;
             if (((g_ctrl_bits >> 16) & 3) == 3) {
-                rt_log("ipu", "IPU_CTRL.IDP=3 is reserved; treating as 9-bit precision");
+                rt_log_warn("ipu", "IPU_CTRL.IDP=3 is reserved; treating as 9-bit precision");
                 g_ctrl_bits = (g_ctrl_bits & ~0x30000u) | 0x10000u;
             }
             if (nv & 0x40000000u) soft_reset();
             return true;
         }
         case 0x10002020: case 0x10002030:
-            rt_log("ipu", "write to read-only IPU register 0x%08x = 0x%llx ignored", addr, (unsigned long long)v);
+            rt_log_warn("ipu", "write to read-only IPU register 0x%08x = 0x%llx ignored", addr, (unsigned long long)v);
             return true;
         case 0x10007010:
             /* Only 128-bit stores are in this binary's census; those are
@@ -2101,7 +2134,7 @@ void rt_ipu_fifo_feed(const uint8_t* qw16) {
     if (walk_qw() > kFifoQw) {
         static uint64_t full = 0;
         if (is_pow2(++full)) {
-            rt_log("ipu", "toIPU FIFO qword store with the input FIFO already full (%zu qwords); "
+            rt_log_warn("ipu", "toIPU FIFO qword store with the input FIFO already full (%zu qwords); "
                 "hardware would stall the store [#%" PRIu64 "]", walk_qw(), full);
         }
     }
@@ -2109,7 +2142,7 @@ void rt_ipu_fifo_feed(const uint8_t* qw16) {
     g_in.resize(base + 16);
     std::memcpy(g_in.data() + base, qw16, 16);
     if (rt_trace() || is_pow2(++n)) {
-        rt_log("ipu", "toIPU FIFO qword store (input now %zu bits) [#%" PRIu64 "]", avail_bits(), n);
+        rt_log_debug("ipu", "toIPU FIFO qword store (input now %zu bits) [#%" PRIu64 "]", avail_bits(), n);
     }
     run_pending();
 }

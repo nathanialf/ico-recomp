@@ -119,7 +119,7 @@ uint64_t g_missing_field_data = 0;
 
 void note_missing_field(uint32_t cmd, uint32_t f) {
     if (is_pow2(++g_missing_field_data)) {
-        rt_log("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
+        rt_log_warn("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
             cmd, f, g_missing_field_data);
     }
 }
@@ -137,7 +137,7 @@ void note_missing_field_run(uint32_t cmd, uint32_t lanes, uint32_t count) {
     uint64_t p = 1;
     while (p != 0 && p <= start) p <<= 1;
     for (; p != 0 && p <= end; p <<= 1) {
-        rt_log("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
+        rt_log_warn("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
             cmd, lanes + (uint32_t)((p - start - 1) % per), p);
     }
 }
@@ -307,13 +307,13 @@ void exec_unpack(Vif1& v, const uint32_t* pay, uint32_t paywords) {
     if (cl == 0 && wl > cl) {
         /* CL=0 with filling would consume no input at all; loud and clamp. */
         static uint64_t n = 0;
-        if (is_pow2(++n)) rt_log("vif1", "UNPACK with CL=0 (STCYCL=0x%02x%02x); clamping CL to 1", v.wl, v.cl);
+        if (is_pow2(++n)) rt_log_warn("vif1", "UNPACK with CL=0 (STCYCL=0x%02x%02x); clamping CL to 1", v.wl, v.cl);
         cl = 1;
     }
     const bool filling = wl > cl;
     static uint64_t fill_uses = 0;
     if (filling && is_pow2(++fill_uses)) {
-        rt_log("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
+        rt_log_debug("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
     }
 
     /* Source bytes. A payload shorter than the format needs read as zeroes
@@ -415,7 +415,7 @@ void exec_unpack(Vif1& v, const uint32_t* pay, uint32_t paywords) {
                             v.row[f] = out;
                         } else if (mode == 3) {
                             static uint64_t n = 0;
-                            if (is_pow2(++n)) rt_log("vif1", "UNPACK with undefined STMOD=3; treating as 0 [#%" PRIu64 "]", n);
+                            if (is_pow2(++n)) rt_log_warn("vif1", "UNPACK with undefined STMOD=3; treating as 0 [#%" PRIu64 "]", n);
                         }
                         break;
                     }
@@ -436,7 +436,7 @@ void exec_unpack(Vif1& v, const uint32_t* pay, uint32_t paywords) {
 
     ++v.unpacks;
     if (rt_trace() || is_pow2(v.unpacks)) {
-        rt_log("vif1", "UNPACK #%" PRIu64 " cmd=0x%02x addr=0x%x num=%u flg=%d usn=%d cl=%u wl=%u mode=%u masked=%d",
+        rt_log_debug("vif1", "UNPACK #%" PRIu64 " cmd=0x%02x addr=0x%x num=%u flg=%d usn=%d cl=%u wl=%u mode=%u masked=%d",
             v.unpacks, cmd, addr, num, flg ? 1 : 0, usn ? 1 : 0, cl, wl, v.mode, masked ? 1 : 0);
     }
 }
@@ -466,13 +466,13 @@ void exec_unpack_reference(Vif1& v, const uint32_t* pay, uint32_t paywords) {
     if (cl == 0 && wl > cl) {
         /* CL=0 with filling would consume no input at all; loud and clamp. */
         static uint64_t n = 0;
-        if (is_pow2(++n)) rt_log("vif1", "UNPACK with CL=0 (STCYCL=0x%02x%02x); clamping CL to 1", v.wl, v.cl);
+        if (is_pow2(++n)) rt_log_warn("vif1", "UNPACK with CL=0 (STCYCL=0x%02x%02x); clamping CL to 1", v.wl, v.cl);
         cl = 1;
     }
     const bool filling = wl > cl;
     static uint64_t fill_uses = 0;
     if (filling && is_pow2(++fill_uses)) {
-        rt_log("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
+        rt_log_debug("vif1", "UNPACK filling mode in use (CL=%u WL=%u) [#%" PRIu64 "]", cl, wl, fill_uses);
     }
 
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pay);
@@ -555,7 +555,7 @@ void exec_unpack_reference(Vif1& v, const uint32_t* pay, uint32_t paywords) {
                          * hardware writes indeterminate data. Write 0, loud
                          * once in a while. */
                         if (is_pow2(++missing_field_data)) {
-                            rt_log("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
+                            rt_log_warn("vif1", "UNPACK cmd=0x%02x writes field %u with no source data (mask says data) [#%" PRIu64 "]",
                                 cmd, f, missing_field_data);
                         }
                         out = 0;
@@ -569,7 +569,7 @@ void exec_unpack_reference(Vif1& v, const uint32_t* pay, uint32_t paywords) {
                         v.row[f] = out;
                     } else if (v.mode == 3) {
                         static uint64_t n = 0;
-                        if (is_pow2(++n)) rt_log("vif1", "UNPACK with undefined STMOD=3; treating as 0 [#%" PRIu64 "]", n);
+                        if (is_pow2(++n)) rt_log_warn("vif1", "UNPACK with undefined STMOD=3; treating as 0 [#%" PRIu64 "]", n);
                     }
                     break;
                 }
@@ -583,7 +583,7 @@ void exec_unpack_reference(Vif1& v, const uint32_t* pay, uint32_t paywords) {
 
     ++v.unpacks;
     if (rt_trace() || is_pow2(v.unpacks)) {
-        rt_log("vif1", "UNPACK #%" PRIu64 " cmd=0x%02x addr=0x%x num=%u flg=%d usn=%d cl=%u wl=%u mode=%u masked=%d",
+        rt_log_debug("vif1", "UNPACK #%" PRIu64 " cmd=0x%02x addr=0x%x num=%u flg=%d usn=%d cl=%u wl=%u mode=%u masked=%d",
             v.unpacks, cmd, addr, num, flg ? 1 : 0, usn ? 1 : 0, cl, wl, v.mode, masked ? 1 : 0);
     }
 }
@@ -655,20 +655,20 @@ const uint8_t* dump_qword_ptr(uint32_t addr) {
  * or REFE, those 64 bytes name the allocation the packet was built in. */
 void dump_alloc_header(uint32_t payload_addr) {
     const uint32_t hdr = payload_addr - 0x40;
-    rt_log("vif1", "allocation header before REF payload 0x%08x", payload_addr);
+    rt_log_info("vif1", "allocation header before REF payload 0x%08x", payload_addr);
     char ascii[33];
     uint32_t n = 0;
     for (int line = 0; line < 4; ++line) {
         const uint32_t a = hdr + (uint32_t)line * 16;
         const uint8_t* p = dump_qword_ptr(a);
         if (!p) {
-            rt_log("vif1", "0x%08x: unmapped", a);
+            rt_log_warn("vif1", "0x%08x: unmapped", a);
             if (line < 2) for (int i = 0; i < 16; ++i) ascii[n++] = '.';
             continue;
         }
         uint32_t w[4];
         std::memcpy(w, p, sizeof(w));
-        rt_log("vif1", "0x%08x: %08x %08x %08x %08x", a, w[0], w[1], w[2], w[3]);
+        rt_log_info("vif1", "0x%08x: %08x %08x %08x %08x", a, w[0], w[1], w[2], w[3]);
         /* First 32 bytes are the two ASCII fields. */
         if (line < 2) {
             for (int i = 0; i < 16; ++i) {
@@ -678,7 +678,7 @@ void dump_alloc_header(uint32_t payload_addr) {
         }
     }
     ascii[n] = '\0';
-    rt_log("vif1", "header ascii: %s", ascii);
+    rt_log_info("vif1", "header ascii: %s", ascii);
 }
 
 /* ---- command execution -------------------------------------------------- */
@@ -787,7 +787,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
 
     if ((code & 0x80000000u) != 0) {
         /* i-bit: VIF1 interrupt, delivered deferred like everything else. */
-        rt_log("vif1", "i-bit set on cmd 0x%02x: raising INTC VIF1", cmd);
+        rt_log_info("vif1", "i-bit set on cmd 0x%02x: raising INTC VIF1", cmd);
         rt_intc_raise(5 /* VIF1 */);
     }
 
@@ -809,7 +809,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
         case 0x05: v.mode = imm & 3; break;      /* STMOD */
         case 0x06: /* MSKPATH3 */
             v.mskpath3 = (imm >> 15) & 1;
-            rt_log("vif1", "MSKPATH3 %s (arbitration is synchronous; informational only)",
+            rt_log_info("vif1", "MSKPATH3 %s (arbitration is synchronous; informational only)",
                 v.mskpath3 ? "masked" : "unmasked");
             break;
         case 0x07: v.mark = imm; break;          /* MARK */
@@ -826,7 +826,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
             uint32_t dst = ((uint32_t)imm * 8) & 0x3FFF;
             uint32_t bytes = num * 8;
             if (dst + bytes > 16384) {
-                rt_log("vif1", "MPG target [0x%x, 0x%x) exceeds micro memory; clamping", dst, dst + bytes);
+                rt_log_warn("vif1", "MPG target [0x%x, 0x%x) exceeds micro memory; clamping", dst, dst + bytes);
                 bytes = 16384 - dst;
             }
             /* ICO cycles the same small set of microprograms and
@@ -851,7 +851,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
              * VIFcodes in a field and a line per upload says nothing the
              * sampled line does not. */
             if (rt_trace() || is_pow2(v.mpgs)) {
-                rt_log("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x (%" PRIu64 " uploads so far were already resident)",
+                rt_log_debug("vif1", "MPG #%" PRIu64 ": %u instructions to micro 0x%x (%" PRIu64 " uploads so far were already resident)",
                     v.mpgs, num, dst, g_mpg_deferred);
             }
             break;
@@ -860,7 +860,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
             ++v.directs;
             uint32_t qw = paywords / 4;
             if (rt_trace() || is_pow2(v.directs)) {
-                rt_log("vif1", "DIRECT%s #%" PRIu64 ": %u qw to GIF PATH2", cmd == 0x51 ? "HL" : "", v.directs, qw);
+                rt_log_debug("vif1", "DIRECT%s #%" PRIu64 ": %u qw to GIF PATH2", cmd == 0x51 ? "HL" : "", v.directs, qw);
             }
             /* The old code always handed on a std::vector<uint32_t>
              * buffer, so PATH2 consumers have only ever seen a payload at
@@ -875,7 +875,7 @@ void exec_command(Vif1& v, const uint32_t* pay, uint32_t paywords) {
                 static std::vector<uint32_t> aligned;
                 static uint64_t n = 0;
                 if (is_pow2(++n)) {
-                    rt_log("vif1", "DIRECT payload is not quadword aligned in the feed buffer; copying [#%" PRIu64 "]", n);
+                    rt_log_debug("vif1", "DIRECT payload is not quadword aligned in the feed buffer; copying [#%" PRIu64 "]", n);
                 }
                 aligned.assign(pay, pay + paywords);
                 data = aligned.data();
@@ -930,7 +930,7 @@ uint32_t words_needed(const Vif1& v, uint32_t code) {
  * caller's buffer and leaves that counter at 0. */
 void rt_vif1_dump_state() {
     const Vif1& v = g_vif;
-    rt_log("vif1",
+    rt_log_info("vif1",
         "state: cl=%u wl=%u mask=0x%08x mode=%u itops=0x%03x itop=0x%03x base=0x%03x ofst=0x%03x "
         "tops=0x%03x top=0x%03x mark=0x%04x dbf=%d pending=%d need_words=%u payload=%u "
         "cmds=%" PRIu64 " unpacks=%" PRIu64 " directs=%" PRIu64 " mpgs=%" PRIu64 " mscals=%" PRIu64,
@@ -939,13 +939,13 @@ void rt_vif1_dump_state() {
         v.cmds, v.unpacks, v.directs, v.mpgs, v.mscals);
 
     if (v.cmds == 0) {
-        rt_log("vif1", "no VIFcodes have been taken yet");
+        rt_log_info("vif1", "no VIFcodes have been taken yet");
     } else {
         const uint32_t shown = (uint32_t)(v.cmds < 32 ? v.cmds : 32);
         for (uint32_t i = 0; i < shown; ++i) {
             const CodeRec& r = v.recent[(v.cmds - shown + i) % 32];
             const uint32_t cmd = (r.code >> 24) & 0x7F;
-            rt_log("vif1", "recent[%u]: 0x%08x cmd=0x%02x %s%s addr=0x%08x #%" PRIu64 " payload=%u",
+            rt_log_info("vif1", "recent[%u]: 0x%08x cmd=0x%02x %s%s addr=0x%08x #%" PRIu64 " payload=%u",
                 i, r.code, cmd, cmd_name(cmd), (r.code & 0x80000000u) ? " i" : "",
                 r.addr, r.index, r.need_words);
         }
@@ -955,12 +955,12 @@ void rt_vif1_dump_state() {
      * the packet that desynchronized the stream, so the window leans
      * backwards. */
     if (v.cur_addr == RT_VIF1_ADDR_NONE) {
-        rt_log("vif1", "current code word has no guest address (fed by a FIFO store); no hexdump");
+        rt_log_info("vif1", "current code word has no guest address (fed by a FIFO store); no hexdump");
         return;
     }
     const uint32_t base = v.cur_addr & ~15u;
     if (!dump_qword_ptr(base)) {
-        rt_log("vif1", "guest address 0x%08x of the current code word is unmapped; no hexdump", v.cur_addr);
+        rt_log_warn("vif1", "guest address 0x%08x of the current code word is unmapped; no hexdump", v.cur_addr);
         return;
     }
     for (int line = -8; line <= 4; ++line) {
@@ -969,7 +969,7 @@ void rt_vif1_dump_state() {
         if (!p) continue;
         uint32_t w[4];
         std::memcpy(w, p, sizeof(w));
-        rt_log("vif1", "0x%08x: %08x %08x %08x %08x%s", a, w[0], w[1], w[2], w[3],
+        rt_log_info("vif1", "0x%08x: %08x %08x %08x %08x%s", a, w[0], w[1], w[2], w[3],
             line == 0 ? " <- code" : "");
     }
 }
@@ -1038,7 +1038,7 @@ bool rt_hw_fifo_write128(uint32_t addr, const rc_u128* val) {
         case 0x10004000: { /* VIF0 FIFO: counted and discarded, see header */
             g_vif0_words += 4;
             if (is_pow2(g_vif0_words / 4)) {
-                rt_log("vif1", "VIF0 FIFO write discarded (words=0x%08x 0x%08x 0x%08x 0x%08x) [qw #%" PRIu64 "]",
+                rt_log_warn("vif1", "VIF0 FIFO write discarded (words=0x%08x 0x%08x 0x%08x 0x%08x) [qw #%" PRIu64 "]",
                     val->u32x[0], val->u32x[1], val->u32x[2], val->u32x[3], g_vif0_words / 4);
             }
             return true;
@@ -1094,7 +1094,7 @@ bool rt_vif_mmio_write(uint32_t addr, uint32_t v) {
                 std::memcpy(fresh.recent, g_vif.recent, sizeof(fresh.recent));
                 fresh.cur_addr = g_vif.cur_addr;
                 g_vif = fresh;
-                rt_log("vif1", "VIF1_FBRST reset");
+                rt_log_info("vif1", "VIF1_FBRST reset");
             }
             return true;
         case 0x10003C20: g_vif.err = v; return true;  /* VIF1_ERR */

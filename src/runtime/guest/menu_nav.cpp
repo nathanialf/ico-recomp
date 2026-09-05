@@ -4,46 +4,73 @@
  *
  * ---- how a menu highlight moves -------------------------------------------
  *
- * Traced in the decomp (../ico, read-only input): src/layout_texture.c,
- * src/layout_action.c, src/sceneManager.c and the asm under
- * asm/nonmatchings/src/layout_texture. The layout table is D_0053C020, one
- * 0x38-byte entry per menu screen id (guest/ico_syms.h); the scene objects a
- * screen is built from are D_002E81F0, stride 0x6C.
+ * The behaviour was traced against the decomp as a behavioural reference,
+ * the way PCSX2 is read, and then checked word for word against
+ * SCES_507.60. The decomp is not an input to this repo. Every address,
+ * offset and flag bit in this comment is SCES_507.60's, from
+ * guest/ico_syms.h, which says how each one was measured; several of them
+ * differ from the decomp's own structures and that header says which. This
+ * module names none of them: it reads the constants.
+ *
+ * The function names below are roles kept from that trace. The disc's own
+ * listing names the same functions lt_switch_layout = default_item_select
+ * (0x001BF220), lt_link_layout = display_texture (0x001BF960, in
+ * layout_texture.c), lt_prev_layout = display_primary_texture_layout
+ * (0x001C03E0), lt_next_layout = exec_layout_texture (0x001C06C8),
+ * GetRealModelId = lt_default_mask_property (0x001C0F58) and
+ * _la_set_preview_info = la_mc_file_select (0x001BAC08). guest/ico_syms.h
+ * carries the match of each one against the retail bytes.
+ *
+ * The layout table is at 0x00533FE8, one 0x38-byte entry per menu screen id,
+ * 0x50 entries; the scene objects a screen is built from are at 0x0030CFF8,
+ * stride 0x70.
+ *
+ * The 2D space below was checked rather than assumed: lt_link_layout applies
+ * the -320 and -113 biases (0x001BFA30 and 0x001BFA5C) and the sprite
+ * emitter at 0x0010FFA0 divides by 640 and 224 while multiplying by the
+ * frame buffer width and height words (0x0063A064 and 0x0063A068), so the
+ * mapping onto the picture was read off this build's own draw path.
  *
  *   lt_next_layout runs once per frame. It walks the current layout's
  *   parent chain by each entry's +0x30 link, and for every layout in the
  *   chain it copies that entry's current-item field (+0x2C) into the item
- *   mirror D_00633150, calls the entry's action function (+0x20) and then
+ *   mirror at 0x0063B610, calls the entry's action function (+0x20) and then
  *   lt_switch_layout for that layout. The current layout is handled last:
- *   D_00633150 is loaded from its +0x2C, lt_prev_layout draws it, and then
+ *   0x0063B610 is loaded from its +0x2C, lt_prev_layout draws it, and then
  *   lt_switch_layout runs on it.
  *
  *   lt_prev_layout calls the layout's action function and then
  *   lt_link_layout once per scene object in the layout's own range (entry
  *   +0x00 up to +0x04). lt_link_layout draws the highlight sprite for the
  *   one object whose index equals the entry's +0x2C, and only while the
- *   fade state D_00633158 is 2. The highlight is re-derived from +0x2C on
+ *   fade state at 0x0063B618 is 2. The highlight is re-derived from +0x2C on
  *   every frame; no press handler latches it anywhere else.
  *
  *   lt_switch_layout is where a D-pad press lands. It reads the game's
- *   pressed-this-frame word D_00275250[0]+0x04 and follows the current
- *   object's neighbour links (+0x2C right, +0x30 left, +0x34 down, +0x38
- *   up), storing the neighbour into the entry's +0x2C when it is not
- *   negative and playing the cursor sound when the value changed. Cross
- *   (0x40) and triangle (0x10) take the object's +0x28 and +0x24 target
- *   layout ids into func_001B5C38 and leave the fade state at 3 or 5. A
- *   screen that installed a custom handler in D_00633164 (the load grid's
- *   exec_layout_texture) has its +0x2C replaced by handler(+0x2C) instead
- *   of the neighbour walk; with no direction bit pressed the load grid's
+ *   pressed-this-frame pad word (not in guest/ico_syms.h: this module never
+ *   reads it) and follows the current object's neighbour links (+0x30
+ *   right, +0x34 left, +0x38 down, +0x3C up), storing the neighbour into
+ *   the entry's +0x2C when it is not negative and playing the cursor sound
+ *   when the value changed. Cross (0x40) and triangle (0x10) take the
+ *   object's +0x2C and +0x28 target layout ids into the layout switch
+ *   helper and leave the fade state at 3 or 5. A screen that installed a
+ *   custom handler in the game's handler word (also not in ico_syms.h, for
+ *   the same reason) has its +0x2C replaced by handler(+0x2C) instead of
+ *   the neighbour walk; with no direction bit pressed the load grid's
  *   handler returns the item it was given, except that it moves on from an
- *   empty save slot to the next occupied one.
+ *   empty save slot to the next occupied one. That last behaviour is traced
+ *   from the decomp as a reference and is not re-derived here: the handler
+ *   is installed through a setter with 92 call sites in this build, so
+ *   which function a given screen installs is not something this file can
+ *   assert. Nothing here depends on it beyond the one-write rule below,
+ *   which is what keeps the pointer from fighting it.
  *
  * One word therefore decides the highlight, and the screen keeps deriving
  * from it: the layout table entry's +0x2C. Writing it is the whole move,
  * and the game continues from it exactly as it would from its own. Three
  * consequences this file depends on:
  *
- *   - The mirror lags. D_00633150 is refreshed from +0x2C at the top of
+ *   - The mirror lags. 0x0063B610 is refreshed from +0x2C at the top of
  *     each frame, so between a write and the next frame it still holds the
  *     value from before the move. The selection is read back from +0x2C,
  *     never from the mirror, so a hover writes once instead of once per
@@ -62,10 +89,11 @@
  *     and the load grid moves the selection off an empty slot in exactly
  *     that frame.
  *
- *   - One frame in the game's own hands. D_00633160 (guest/ico_syms.h) is a
- *     one-frame flag that swallows navigation: while it is non-zero
- *     lt_switch_layout returns at once, lt_next_layout skips lt_switch_layout
- *     for every layout in the chain, and lt_link_layout draws no highlight.
+ *   - One frame in the game's own hands. 0x0063B620 (RT_ICO_NAV_SWALLOW,
+ *     guest/ico_syms.h) is a one-frame flag that swallows navigation: while
+ *     it is non-zero lt_switch_layout returns at once, lt_next_layout skips
+ *     lt_switch_layout for every layout in the chain, and lt_link_layout
+ *     draws no highlight.
  *     lt_next_layout clears it on the way out. Three writers were traced:
  *     lt_current_property_item sets it on the frame a fade completes and the
  *     new screen becomes interactive, _la_set_preview_info sets it on a load
@@ -76,12 +104,80 @@
  *     retries on the next field, and the one-write rule keys on the write
  *     actually happening rather than on the hover being seen.
  *
- * The memory card check screen is the one screen that does not work that
- * way. Its action function _la_memory_card_check (src/layout_action.c)
- * carries its own selector at D_00274EC0+0x2C, steps it with LEFT and RIGHT
- * clamped to 0 and 14, and calls GetRealModelId for all fifteen positions
- * every frame to light the selected one. There the selector is the word the
- * pointer writes and the layout entry is left alone.
+ * The screen adjustment screen is the one screen that does not work that
+ * way. Its action function is the listing's la_adjust_screen (0x001BE058,
+ * layout_action.c), and it carries its own level word at 0x0028F4C0+0x2C
+ * (RT_ICO_BRIGHTNESS): it steps that word with LEFT and RIGHT clamped to 0
+ * and 14, stores 7 into it on triangle, and calls GetRealModelId for all
+ * fifteen bar positions every frame to light the one the word names. The
+ * same word is what gsb_controlBrightness reads every frame as the alpha of
+ * a white full-frame sprite, so writing it is both the selection and the
+ * brightness. There the level word is what the pointer writes and the
+ * layout entry is left alone. guest/ico_syms.h carries both derivations.
+ *
+ * ---- the two boot screens the kanban system draws -------------------------
+ *
+ * The refresh rate choice (50 Hz or 60 Hz) and the language choice come up
+ * before any of the screens above and are not layout-table screens: no
+ * layout id word names them, lt_next_layout does not run them, and the fade
+ * state at 0x0063B618 is not what gates them. A log from a run of this port
+ * says exactly that. While both were on screen the pointer reported "layout
+ * 0x0 chain 0x0: 0 items" and never took the mouse, while the player's
+ * 50/60 choice arrived as SetGsCrt PAL/NTSC flips, so the game was reading
+ * the pad and moving a selection the pointer could not see.
+ *
+ * They are drawn by the game's kanban system (the disc listing's kanban.c
+ * and kanbanBoot.c), which keeps a list of its own, one node per screen, and
+ * hands each node a layout table entry to take everything else from. Traced
+ * in the decomp and then checked against the retail ELF word for word;
+ * guest/ico_syms.h states that check and its result, and carries every
+ * address:
+ *
+ *   kanbanReqAdd(id, priority) takes a free node out of the thirty slots at
+ *   0x0071CB10, stores the layout table entry for `id` at the node's +0x00,
+ *   copies that entry's default item (+0x28) into its current item (+0x2C)
+ *   and, when that default is not -1, makes the node the one the game
+ *   navigates: 0x0063C39C.
+ *
+ *   display_layout runs once a frame per node. For the node whose entry
+ *   pointer matches 0x0063C39C's, and only while that node's +0x0C bit 0
+ *   (the fading-out flag kanbanReqDelFade sets) is clear, it reads the same
+ *   pressed-this-frame pad word the layout path reads and follows the
+ *   current object's neighbour links, +0x30 right, +0x34 left, +0x38 down,
+ *   +0x3C up, storing the neighbour into the entry's +0x2C when it is
+ *   greater than zero. Cross (0x40) stores 1 into the node's +0x08 and
+ *   triangle (0x10) stores 2; the boot state machine acts on the 1 and
+ *   ignores the 2. Then it calls func_001B8B10 once per object in the
+ *   entry's own range (+0x00 up to +0x04), which is lt_link_layout's twin:
+ *   it draws the object and scatters the highlight over the one whose index
+ *   equals the entry's +0x2C.
+ *
+ * So the word that decides the highlight on these two screens is the layout
+ * table entry's +0x2C, the same word the pointer writes everywhere else, and
+ * a click is still a cross on the virtual pad. Three things differ from the
+ * layout path, each of them the game's own behaviour and not a
+ * simplification:
+ *
+ *   - Which screen is up comes from 0x0063C39C, not from the layout id word
+ *     and not from the fade state. The layout id word read 0 through both
+ *     boot screens in that log, which is the language screen's own entry id
+ *     by coincidence and not by the game putting it there.
+ *
+ *   - The item mirror 0x0063B610 is not written. lt_next_layout is what
+ *     refreshes that word from a layout's +0x2C, and it does not run these
+ *     screens, so writing it here would be a write the game does not make.
+ *
+ *   - The swallow flag 0x0063B620 is not read. display_layout and
+ *     func_001B8B10 never look at it, so a hover on these screens writes on
+ *     the field it happens on rather than deferring to the next one.
+ *
+ * The two entries are layout 0, the language choice, five items in a column,
+ * and layout 1, the 50/60 Hz choice, two items in a row. Those ids are used
+ * for the log line and nothing else: the screen is found through the node,
+ * so the one other kanban screen that has selectable items, the memory card
+ * message on layout 5 (the listing's la_boot_confirm_memory_card, two
+ * objects and a default item), is pointed at by the same code without being
+ * named.
  *
  * ---- where an item is on screen -------------------------------------------
  *
@@ -90,16 +186,17 @@
  * it. Its whole placement comes out of seven fields of the object, all of
  * them whole numbers:
  *
- *     w = +0x48, or +0x58 (the texture's width) when +0x48 is zero
- *     h = +0x44, or +0x54 (the texture's height) when +0x44 is zero
- *     x = -w/2 when +0x40 is non-zero, otherwise +0x50 - 320
- *     y = +0x4C - 113
+ *     w = +0x4C, or +0x64 (the texture's width) when +0x4C is zero
+ *     h = +0x48, or +0x60 (the texture's height) when +0x48 is zero
+ *     x = -w/2 when +0x44 is non-zero, otherwise +0x54 - 320
+ *     y = +0x50 - 113
  *
  * There are two boxes built from those numbers, half a unit apart. The box
- * (x, y) to (x + w, y + h/2) is the one gif_SpriteOffset and func_0010FF28
- * scatter the highlight over. The quad the object itself is drawn as adds 8
- * to the Y and subtracts 8 from the H, both in GS 12.4 fixed point, just
- * before gif_StartPacketPath1, so it runs from (x, y + 0.5) to (x + w,
+ * (x, y) to (x + w, y + h/2) is the one gif_SpriteOffset and the sprite
+ * emitter at 0x0010FFA0 scatter the highlight over. The quad the object
+ * itself is drawn as adds 8 to the Y and subtracts 8 from the H, both in GS
+ * 12.4 fixed point, just before gif_StartPacketPath1, so it runs from
+ * (x, y + 0.5) to (x + w,
  * y + h/2). This module reports the second, the drawn one; the half unit
  * between them is 0.002 of the picture's height, which is below the
  * resolution of the hit test and of the boxes the mapping was calibrated
@@ -109,12 +206,24 @@
  * The centring case is written as (640*16 - w*16)/2 - 320*16, which is
  * algebraically -w*16/2, so the 640 in it says nothing about any screen.
  *
+ * func_001B8B10, the kanban system's twin of lt_link_layout, reads the same
+ * seven fields with the same shifts and the same -320 on x, and differs in
+ * one number: its y bias is -112 (`addiu $2, $2, -0x70` at 0x001B8BE8) where
+ * lt_link_layout's is -113 (`addiu $3, $3, -0x71` at 0x001BFA5C). That is
+ * one line of 224, 0.004 of the picture's height. Each path is given the
+ * bias its own emitter applies rather than one averaged number: the boot
+ * screens are placed by the first and every other screen by the second.
+ *
  * The space those numbers live in is 640 by 224, with the origin at the
- * centre. func_0010FF28 (../ico src/FileManager.c, the sprite emitter this
- * path calls) scales every 2D coordinate by D_00631C5C/640 horizontally and
- * D_00631C60/224 vertically, where those two are the frame buffer's width
- * and height, and adds the base D_00631C54, D_00631C58. Both bases are
- * 2048.0 (light_killLinkLight), and the frame's XYOFFSET is
+ * centre. The sprite emitter this path calls (0x0010FFA0, the disc
+ * listing's gif_PointOffset) scales every 2D coordinate by 0x0063A064/640
+ * horizontally and 0x0063A068/224 vertically, where those two are the frame
+ * buffer's width and height (RT_ICO_SCREEN_W and RT_ICO_SCREEN_H), and adds
+ * the two 2D base words that sit just below them, 0x0063A05C and
+ * 0x0063A060. Both bases are 2048.0: the whole of this build's .text has
+ * three stores to them and all three are inside gsb_SetVSMatrix
+ * (0x00114C04, 0x00114C0C and 0x00114C74), the first two from the constant
+ * `lui $at, 0x4500`, which is 2048.0f. The frame's XYOFFSET is
  * (2048 - width/2, 2048 - height/2) (gsb_fade), which the GS subtracts from
  * the vertex. So a coordinate (x, y) lands on the frame buffer at
  *
@@ -125,24 +234,49 @@
  *     nx = 0.5 + x / 640      ny = 0.5 + y / 224
  *
  * which is why nothing here reads the frame buffer size or the scanout
- * geometry. The one writer of a base other than 2048.0 is the staff roll
- * (src/staffroll.c), which is not a layout the pointer is ever up on.
+ * geometry. The third store is the one that can leave a base other than
+ * 2048.0: it subtracts a per-frame delta while a flag word is set, and the
+ * only writers of that flag and that delta are 0x001C1F58 and the function
+ * at 0x001C2340, the first of which is the listing's staffRollStart. The
+ * staff roll is not a layout the pointer is ever up on.
  *
- * Calibrated against the retail game. On the title screen's continue or new
- * game choice (layout 0x9, items 0xe and 0xf) the user measured the two
- * items on the presented picture as
+ * Calibrated against the retail game. The screen is the title's continue or
+ * new game choice, which is layout 0x0C (the listing's
+ * la_title_continue_or_new, 0x001BA870) with scene objects 49 and 50; its
+ * default item is 49 and object 49's `down` link is 50, so the two are a
+ * column of two. The user measured them on the presented picture as
  *
- *     item 0xe   x 0.399..0.607   y 0.595..0.685
- *     item 0xf   x 0.400..0.598   y 0.725..0.821
+ *     upper item   x 0.399..0.607   y 0.595..0.685
+ *     lower item   x 0.400..0.598   y 0.725..0.821
  *
- * and the mapping above, run over that screen's scene objects as the retail
- * ELF ships them, gives 0.400..0.600 / 0.598..0.688 and 0.400..0.600 /
- * 0.732..0.821. The largest disagreement on either axis of either item is
- * 0.007 of the picture, which is inside the width of the line the boxes
- * were drawn with. guest/menu_nav_selftest.cpp carries the same check as a
- * synthetic case, and every screen logs its derived rectangles the first
- * time it is active so a log from a real run can be held against what is on
- * screen.
+ * The mapping above, run over those two objects as the retail ELF ships
+ * them, gives
+ *
+ *     object 49    x 0.4000..0.6000  y 0.5982..0.6875
+ *     object 50    x 0.3656..0.6344  y 0.7321..0.8214
+ *
+ * Object 49 agrees on both axes, worst case 0.007 of the picture, which is
+ * inside the width of the line the boxes were drawn with. Object 50 agrees
+ * on y and does NOT agree on x: it is 0.034 wider on each side than the
+ * user measured. The reason is in the object as shipped: its width field
+ * (+0x4C) is 0, so the mapping falls back to its texture width (+0x64),
+ * which is 0xAC = 172 rather than the 128 the upper item has. That
+ * fall-back is the game's own rule and was checked instruction for
+ * instruction in lt_link_layout (`lw $a1, 76($s0)` at 0x001BF9A8,
+ * `sll $a1, $a1, 4` at 0x001BF9C0, `bne $a1, $zero` at 0x001BF9DC with
+ * `sw $a1, 24($sp)` in the delay slot and `sw $a3, 24($sp)` on the
+ * fall-through, where $a3 is `lw $v0, 100($s0)` from 0x001BF990 shifted).
+ *
+ * Which of the two is wrong is not resolved. Either the game writes object
+ * 50's +0x4C or +0x64 before that screen is drawn, in which case the static
+ * object is not what the pointer sees and the earlier claim "as the retail
+ * ELF ships them" was the wrong claim to make, or the lower item's x
+ * measurement is off. It is left stated rather than papered over, and one
+ * measurement settles it: this module already logs every screen's derived
+ * rectangles the first time that screen is active, so a run that reaches
+ * the title screen prints object 50's rectangle and either 0.3656..0.6344
+ * or 0.400..0.598 comes out. guest/menu_nav_selftest.cpp carries the upper
+ * item's arithmetic as a synthetic case.
  *
  * ---- a screen is a chain of layouts, not one ------------------------------
  *
@@ -151,15 +285,16 @@
  *
  *   1. Walk the current layout's parent chain by each entry's +0x30 and
  *      push the ancestors onto a stack. On the way, for every object of
- *      every layout in the chain, copy +0x68 bit 0 into bit 1. Bit 1 is the
- *      per-frame "do not draw" flag lt_link_layout returns on and
- *      func_001B7218 rewrites mid-frame; bit 0 is the persistent one it is
- *      seeded from each frame. Bit 0 is general, not any one screen's:
- *      GetRealModelId (asm/matchings/src/sceneManager) sets it to its second
- *      argument's low bit on any object and touches nothing else, and the
- *      retail title screen ships items 0xe and 0xf with it set. The memory
- *      card check screen is one caller of it, below, and not its meaning.
- *   2. For each ancestor, farthest first: load the mirror D_00633150 from
+ *      every layout in the chain, copy +0x6C bit 5 into bit 4. Bit 4 is the
+ *      per-frame "do not draw" flag lt_link_layout returns on and the scene
+ *      manager rewrites mid-frame; bit 5 is the persistent one it is
+ *      seeded from each frame. Bit 5 is general, not any one screen's:
+ *      GetRealModelId (0x001C0F58) sets it to its second argument's low bit
+ *      on any object and touches nothing else, and the retail title screen
+ *      ships its own two items, scene objects 49 and 50, with it set (their
+ *      +0x6C is 0x28). The screen adjustment screen is one caller of it,
+ *      below, and not its meaning.
+ *   2. For each ancestor, farthest first: load the mirror 0x0063B610 from
  *      its +0x2C, call its action function (+0x20) while the fade state is
  *      1 or 2, then lt_switch_layout for it, skipped when its +0x2C is
  *      negative.
@@ -171,20 +306,25 @@
  *      current layout.
  *
  * A page's items therefore need not belong to the layout id the state word
- * reports. The load file select page is the case that forced this: the
- * current layout is 0x10, whose own nine objects have no default and no
- * current item, and its chain is 0x10 <- 0xb <- 0xd <- 0xc. The ten save
- * slots (objects 0x1b..0x24) belong to 0xb (_la_set_preview_info), which is
- * where their selection word lives and where D_00633164's custom handler
- * (exec_layout_texture, installed by 0x10's own action function
- * func_001B21F0) moves it. The save file select page 0x1d has the same
- * chain. Nine more screens in the load and save flow are the same shape:
- * 0x19, 0x2d and 0x2f take their two items from 0x17, 0x1f and 0x20 from
- * 0x18, 0x25 from 0x26, 0x15 from 0x17. All of them looked itemless before
- * the chain was walked.
+ * reports. The load file select page is the case that forced this. Read off
+ * the retail layout table: the page is layout 0x13 (the listing's
+ * la_mc_load_file_select), whose own range is objects 188..196 with no
+ * default item, and its parent chain is 0x13 <- 0x0E <- 0x10 <- 0x0F. The
+ * ten save slots belong to 0x0E (the listing's la_mc_file_select), whose
+ * range is 52..73 with default item 62: walking the four neighbour links
+ * from 62 inside that range reaches exactly ten objects, 62 through 71,
+ * which is the grid. That is where their selection word lives and where the
+ * screen's own item handler moves it.
+ *
+ * The save file select page, layout 0x21 (la_mc_save_file_select), has the
+ * same chain through 0x0E. Every other page in the memory card flow reaches
+ * its items the same way. Thirty-two of the table's layouts chain up to
+ * 0x0F: 0x0E, 0x10, every id from 0x13 to 0x2A, then 0x2C, 0x2D, 0x2E,
+ * 0x31, 0x33 and 0x34. Several of them have an empty range of their own.
+ * All of them looked itemless before the chain was walked.
  *
  * Each layout in the chain keeps its own +0x2C, and the pointer writes the
- * one belonging to the item it is over. The mirror D_00633150 is written
+ * one belonging to the item it is over. The mirror 0x0063B610 is written
  * only for the current layout, because phase 3 is last and leaves that
  * layout's field in it.
  *
@@ -204,31 +344,35 @@
  * into it would hand it a highlight and a navigable selection the game did
  * not have. The chain log line names any layout skipped this way.
  *
- * An object whose +0x68 has bit 1 set is skipped: lt_link_layout returns
+ * An object whose +0x6C has bit 4 set is skipped: lt_link_layout returns
  * without drawing it, so there is nothing on screen to point at. It is
  * still walked through, because a hidden object can sit between two visible
  * ones in the link graph.
  *
- * The memory card check screen is keyed differently, for the same reason
- * its selection word is different: its fifteen card positions are scene
- * objects 0x158..0x166, reached by _la_memory_card_check's own loop rather
- * than by any link, and the item value for one of them is its selector
- * position 0..14. The screen is recognised by its object range covering all
- * fifteen of them, which in the retail layout table only layout 0x38 does
- * (reached by cross on object 0x118 of layout 0x36, _la_mcard_error_check).
- * Bit 1 is not tested on those fifteen: _la_memory_card_check calls
- * GetRealModelId to set bit 0 on all of them and clear it on the one its
- * selector names, so phase 1 leaves all but the selected reading as hidden.
- * On this screen the general bit 0 is being used as a lit marker, which says
- * nothing about where the fifteen places are.
+ * The screen adjustment screen is keyed differently, for the same reason
+ * its selection word is different: its fifteen bar positions are scene
+ * objects 0x18B..0x199, reached by la_adjust_screen's own loop rather than
+ * by any link, and the item value for one of them is its level 0..14. The
+ * screen is recognised by its object range covering all fifteen of them,
+ * which in the retail layout table only layout 0x3C does: 0x3C's range is
+ * objects 392..420, and no other entry's range contains 395..409. Bit 4 is
+ * not tested on those fifteen: la_adjust_screen calls GetRealModelId to set
+ * bit 5 on all of them and clear it on the one the level names, so phase 1
+ * leaves all but the selected reading as hidden. On this screen the general
+ * bit 5 is being used as a lit marker, which says nothing about where the
+ * fifteen places are.
  *
  * The "is a menu up" predicate is then: reads valid, fade 2, and at least
  * one selectable item with a rectangle that lands on the picture, anywhere
- * in the chain. Gameplay (layout 0x32) and the pre-title cinematic (0x33)
- * both hold fade 2, and both are excluded structurally rather than by name:
- * the retail layout table gives each of them an empty object range (+0x00
- * equal to +0x04), a current and default item of -1 and no parent, so there
- * is no object to reach and no rectangle to derive.
+ * in the chain. Gameplay and the cinematics hold fade 2 as well, and they
+ * are excluded structurally rather than by name, which is what keeps this
+ * working without a gameplay layout id (guest/ico_syms.h says why that id
+ * is still a sentinel): the retail layout table gives every entry whose
+ * action function the disc listing names for one of those states an empty
+ * object range (+0x00 equal to +0x04), a default item of -1 and no parent,
+ * so there is no object to reach and no rectangle to derive. That covers
+ * la_title_demo (0x0A), la_game_loading (0x35), la_game_loop (0x36),
+ * la_game_demo (0x37) and la_switching_stage (0x3F).
  *
  * ---- the rules this file is built on --------------------------------------
  *
@@ -253,10 +397,14 @@
  *     with a log line, and a click that needed it presses nothing rather
  *     than confirming the item the game still has selected.
  *
- *   - Nothing is hovered means nothing happens. A click over no item
- *     presses nothing at all: there is no item to confirm, and pressing
- *     cross anyway would confirm whatever the game happens to have
- *     selected somewhere else on the screen.
+ *   - Nothing is hovered means no cross. A left click over no item presses
+ *     nothing at all: there is no item to confirm, and pressing cross
+ *     anyway would confirm whatever the game happens to have selected
+ *     somewhere else on the screen. The right button is not held to that
+ *     rule and presses triangle wherever the cursor is, because triangle is
+ *     back and back does not name an item. The wheel is the same: it moves
+ *     the selection with the game's own direction presses, which need no
+ *     item under the cursor either.
  *
  *   - The pointer acts for the SDL provider alone, and only with the
  *     settings overlay closed. rt_input_sdl_active() is the first: a run
@@ -289,6 +437,7 @@
  */
 #include "menu_nav.h"
 
+#include "gmem.h"
 #include "ico_syms.h"
 
 #include "../ee/kernel.h"
@@ -303,14 +452,15 @@
 #include <string>
 #include <vector>
 
-/* The live cursor needs both a window (SDL) and a presented scanout
- * rectangle (the paraLLEl-GS shared library). Either one missing and there
- * is no pointer: the honest answer is "no cursor", not a guessed one. */
-#if defined(ICORECOMP_PGS_SDL) && defined(ICORECOMP_HAVE_PARALLEL_GS)
+/* The live cursor needs a window and the rectangle the last present blitted
+ * the scanout into, and the window service owns both (host/window_service.h),
+ * whichever renderer is live. Without SDL there is no window and so no
+ * pointer: the honest answer is "no cursor", not a guessed one. */
+#if defined(ICORECOMP_HAVE_SDL)
 #define RT_MENU_NAV_HAVE_CURSOR 1
-#include "../gs/gs_parallel_api.h"
 #include "../host/mouse.h"
 #include "../host/window.h"
+#include "../host/window_service.h"
 #include <SDL3/SDL.h>
 #endif
 
@@ -334,34 +484,45 @@ constexpr uint32_t kMaxLines = 2000;
 uint32_t g_lines = 0;
 bool g_capped = false;
 
-/* Reads one guest word. False when the page is unmapped, which is the state
- * before the ELF is loaded. */
-bool read_word(uint32_t addr, uint32_t* out) {
-    const uint8_t* p = rt_gptr(addr);
-    if (!p) return false;
-    uint32_t v = 0;
-    std::memcpy(&v, p, sizeof(v));
-    *out = v;
-    return true;
-}
+/* Bound on the per-action lines, the one a hover that moves the selection
+ * writes and the one a click writes. Both are at info, which is a level the
+ * user runs at, and a cursor swept across a menu crosses an item every few
+ * fields, so without a bound they are a per-item trace. One closing line
+ * says the log stopped rather than letting it read as a pointer that
+ * stopped. */
+constexpr uint32_t kMaxActionLines = 200;
+uint32_t g_action_lines = 0;
+bool g_action_log_capped = false;
 
-/* The same word read as the signed value the game stores there. Every index
- * and link field in these two tables is signed, with -1 for "none". */
-bool read_i32(uint32_t addr, int32_t* out) {
-    uint32_t v = 0;
-    if (!read_word(addr, &v)) return false;
-    *out = (int32_t)v;
-    return true;
-}
+/* One log line each, never repeated: a write this module refuses is retried
+ * on every field the cursor stays on the item (see the hover block in
+ * rt_guest_menu_tick), so an unlatched line here would be one per field. */
+bool g_logged_adjust_range = false;
+bool g_logged_adjust_unmapped = false;
+bool g_logged_entry_unmapped = false;
+bool g_logged_item_range = false;
 
-/* Writes one guest word. False when the page is unmapped. Deliberately not
- * rt_gwrite32(): that is a fatal on an unmapped address, and nothing this
- * module does is ever fatal. */
-bool write_word(uint32_t addr, uint32_t v) {
-    uint8_t* p = rt_gptr(addr);
-    if (!p) return false;
-    std::memcpy(p, &v, sizeof(v));
-    return true;
+/* The three accessors this module needs, with the "never fatal, false when
+ * the page is unmapped" contract guest/gmem.h states once for the three
+ * observer modules that share it. */
+using rt_gmem::read_word;
+using rt_gmem::read_i32;
+using rt_gmem::write_word;
+
+/* True while the per-action log still has room, counting the line it
+ * allows. The first call past the bound writes one closing line and every
+ * call after that is silent. */
+bool take_action_line() {
+    if (g_action_log_capped) return false;
+    if (g_action_lines < kMaxActionLines) {
+        ++g_action_lines;
+        return true;
+    }
+    g_action_log_capped = true;
+    rt_log_info("guest", "guest menu: %u pointer actions logged; the rest of this run's selects"
+                    " and clicks are not logged",
+           (unsigned)kMaxActionLines);
+    return false;
 }
 
 /* The address of `layout`'s layout table entry. False when the id is past
@@ -395,6 +556,11 @@ constexpr float kSpaceW = 640.0f;
 constexpr float kSpaceH = 224.0f;
 constexpr int32_t kOriginX = 320;
 constexpr int32_t kOriginY = 113;
+/* The same space, as the kanban system's own emitter biases it: 112 rather
+ * than 113. The two functions were read separately and each screen is given
+ * the number its own emitter applies; the module header quotes both
+ * instructions. */
+constexpr int32_t kKanbanOriginY = 112;
 
 /* Bound on how many objects one layout's range may hold before this module
  * refuses to walk it. The longest range in the retail layout table is 101
@@ -405,21 +571,41 @@ constexpr int32_t kMaxRangeLen = 512;
 
 std::vector<RtGuestMenuItem> g_items;
 /* The chain lt_next_layout processed for the current screen, current layout
- * first, then its parents. g_mc_layouts holds the ones in it that are the
- * memory card check screen, whose selection word is the selector rather
- * than the layout entry's current item. */
+ * first, then its parents. g_adjust_layouts holds the ones in it that are
+ * the screen adjustment screen, whose selection word is that screen's own
+ * level rather than the layout entry's current item. */
 std::vector<uint32_t> g_chain;
-std::vector<uint32_t> g_mc_layouts;
+std::vector<uint32_t> g_adjust_layouts;
 /* A chain layout that has reachable objects but whose +0x2C is negative, so
  * the game itself will not navigate it this frame. Named in the chain log
  * because "the page looks right but the pointer does nothing" is otherwise
  * indistinguishable from a bad mapping. */
 std::vector<uint32_t> g_chain_no_selection;
 
+/* Set while the screen the items came from is one of the kanban system's
+ * (the two PAL boot screens and the memory card message; see the module
+ * header). It changes four things and nothing else: the screen is found
+ * through 0x0063C39C rather than the layout id word, "is a menu up" does not
+ * ask for fade 2, the item mirror is not written, and the swallow flag is
+ * not read. The selection word written is the same layout entry field. */
+bool g_kanban_active = false;
+uint32_t g_kanban_layout = 0;
+
+/* Logged once each: a repeat says nothing the first line did not. */
+bool g_logged_kanban_node = false;
+bool g_logged_kanban_entry = false;
+bool g_logged_kanban_no_items = false;
+bool g_logged_kanban_no_selection = false;
+
 /* Layouts whose chain and rectangles have already been logged, and the
  * bound on that list: a run that walks a lot of screens still costs a
  * bounded number of lines. */
 std::vector<uint32_t> g_logged_layouts;
+/* The kanban screens are kept apart from those, because the two name their
+ * screens out of the same numbering: the layout id word read 0 through both
+ * boot screens, which is also the language screen's own entry id, and one
+ * list would have let the first of them spend the other's line. */
+std::vector<uint32_t> g_logged_kanban_layouts;
 constexpr size_t kMaxLoggedLayouts = 64;
 bool g_layout_log_capped = false;
 bool g_logged_long_range = false;
@@ -431,8 +617,8 @@ bool g_logged_negative_size = false;
  * did not come from the game, or a cycle the visited set did not catch. */
 constexpr size_t kMaxChain = 16;
 
-bool layout_is_mc(uint32_t layout) {
-    for (uint32_t l : g_mc_layouts) {
+bool layout_is_adjust(uint32_t layout) {
+    for (uint32_t l : g_adjust_layouts) {
         if (l == layout) return true;
     }
     return false;
@@ -446,12 +632,13 @@ bool layout_is_mc(uint32_t layout) {
  *
  * `lit_flag` says the hidden bit on this object is the game's own lit
  * marker rather than a decision about whether the item is on screen, which
- * is the memory card check screen's fifteen positions and nothing else:
- * lt_next_layout copies bit 0 into bit 1 for every object in the chain at
- * the top of each frame, and _la_memory_card_check sets bit 0 on all
+ * is the screen adjustment screen's fifteen bar positions and nothing
+ * else: lt_next_layout copies bit 5 into bit 4 for every object in the
+ * chain at the top of each frame, and la_adjust_screen sets bit 5 on all
  * fifteen and clears it on the selected one, so all but the selected read
  * as hidden. Their places on the picture do not move with it. */
-bool object_rect(uint32_t layout, int32_t index, bool lit_flag, RtGuestMenuItem* out) {
+bool object_rect(uint32_t layout, int32_t index, bool lit_flag, int32_t origin_y,
+                 RtGuestMenuItem* out) {
     uint32_t base = 0;
     if (!object_addr(index, &base)) return false;
 
@@ -477,7 +664,7 @@ bool object_rect(uint32_t layout, int32_t index, bool lit_flag, RtGuestMenuItem*
          * quietly lost an item can be told apart from a bad mapping. */
         if (!g_logged_negative_size) {
             g_logged_negative_size = true;
-            rt_log("guest", "guest menu: layout 0x%x object 0x%x has a negative drawn size"
+            rt_log_warn("guest", "guest menu: layout 0x%x object 0x%x has a negative drawn size"
                             " (w %d, h %d); it is not an item (this line is not repeated)",
                    (unsigned)layout, (unsigned)index, (int)w, (int)h);
         }
@@ -490,7 +677,7 @@ bool object_rect(uint32_t layout, int32_t index, bool lit_flag, RtGuestMenuItem*
     const float sw = (float)w;
     const float sh = (float)h * 0.5f;
     const float sx = centred != 0 ? -0.5f * sw : (float)(x - kOriginX);
-    const float sy = (float)(y - kOriginY);
+    const float sy = (float)(y - origin_y);
 
     out->x0 = 0.5f + sx / kSpaceW;
     out->x1 = 0.5f + (sx + sw) / kSpaceW;
@@ -538,7 +725,7 @@ void build_chain() {
     }
     if (!g_logged_long_chain) {
         g_logged_long_chain = true;
-        rt_log("guest", "guest menu: layout 0x%x's parent chain is longer than %zu; the rest is"
+        rt_log_warn("guest", "guest menu: layout 0x%x's parent chain is longer than %zu; the rest is"
                         " not walked (this line is not repeated)",
                (unsigned)g_state.layout, kMaxChain);
     }
@@ -556,16 +743,18 @@ void add_layout_items(uint32_t layout) {
     }
     if (end <= first) return; /* gameplay and the cinematics land here */
 
-    /* The memory card check screen: its fifteen positions are objects
-     * 0x158..0x166 and the item value is the selector position. */
-    if (first <= (int32_t)RT_ICO_MC_FIRST_OBJ &&
-        end >= (int32_t)(RT_ICO_MC_FIRST_OBJ + RT_ICO_MC_COUNT)) {
-        g_mc_layouts.push_back(layout);
-        for (uint32_t i = 0; i < RT_ICO_MC_COUNT; ++i) {
+    /* The screen adjustment screen: its fifteen bar positions are the
+     * objects from RT_ICO_ADJUST_FIRST_OBJ (0x18B) on, and the item value
+     * is the position 0..14 rather than a scene object index. */
+    if (first <= (int32_t)RT_ICO_ADJUST_FIRST_OBJ &&
+        end >= (int32_t)(RT_ICO_ADJUST_FIRST_OBJ + RT_ICO_ADJUST_COUNT)) {
+        g_adjust_layouts.push_back(layout);
+        for (uint32_t i = 0; i < RT_ICO_ADJUST_COUNT; ++i) {
             RtGuestMenuItem it;
             it.layout = layout;
             it.item = i;
-            if (object_rect(layout, (int32_t)(RT_ICO_MC_FIRST_OBJ + i), true, &it)) {
+            if (object_rect(layout, (int32_t)(RT_ICO_ADJUST_FIRST_OBJ + i), true, kOriginY,
+                            &it)) {
                 g_items.push_back(it);
             }
         }
@@ -575,7 +764,7 @@ void add_layout_items(uint32_t layout) {
     if (end - first > kMaxRangeLen) {
         if (!g_logged_long_range) {
             g_logged_long_range = true;
-            rt_log("guest", "guest menu: layout 0x%x claims %d scene objects, past the %d this"
+            rt_log_warn("guest", "guest menu: layout 0x%x claims %d scene objects, past the %d this"
                             " module walks; no items (this line is not repeated)",
                    (unsigned)layout, (int)(end - first), (int)kMaxRangeLen);
         }
@@ -623,7 +812,145 @@ void add_layout_items(uint32_t layout) {
         RtGuestMenuItem it;
         it.layout = layout;
         it.item = (uint32_t)index;
-        if (object_rect(layout, index, false, &it)) g_items.push_back(it);
+        if (object_rect(layout, index, false, kOriginY, &it)) g_items.push_back(it);
+    }
+}
+
+/* ---- the kanban system's screens ------------------------------------------ */
+
+/* The name of one of them, for the log. Both ids are measured
+ * (guest/ico_syms.h) and neither decides anything: the screen is found
+ * through the node, and an id this does not know is still pointed at. */
+const char* kanban_screen_name(uint32_t layout) {
+    if (layout == RT_ICO_KANBAN_LAYOUT_LANGUAGE) return "the language screen";
+    if (layout == RT_ICO_KANBAN_LAYOUT_VIDEO_MODE) return "the 50/60 Hz screen";
+    return "a boot screen";
+}
+
+/* The layout entry of the kanban screen the game is navigating, as a layout
+ * id, or false when there is none. This is the whole of "which screen is up"
+ * on the boot screens, and it is the game's own answer: 0x0063C39C is the
+ * node kanbanReqAdd made navigable, its +0x00 is the layout table entry the
+ * screen is built from, and its +0x0C bit 0 is the flag display_layout gives
+ * a node no input at all through.
+ *
+ * Every value that is not one of the thirty node slots, and every entry
+ * pointer that is not a row of the layout table, is refused with a line
+ * naming the value: those are the two ways this could be reading something
+ * that is not a kanban node, and acting on either would write a word chosen
+ * by an unrelated number. */
+bool kanban_screen(uint32_t* out_layout) {
+    uint32_t node = 0;
+    if (!read_word(RT_ICO_KANBAN_ACTIVE, &node) || node == 0) return false;
+
+    const uint32_t nodes_end =
+        RT_ICO_KANBAN_NODES + RT_ICO_KANBAN_NODE_COUNT * RT_ICO_KANBAN_NODE_STRIDE;
+    if (node < RT_ICO_KANBAN_NODES || node >= nodes_end ||
+        ((node - RT_ICO_KANBAN_NODES) % RT_ICO_KANBAN_NODE_STRIDE) != 0) {
+        if (!g_logged_kanban_node) {
+            g_logged_kanban_node = true;
+            rt_log_warn("guest", "guest menu: the kanban screen word at 0x%08x holds 0x%08x, which"
+                            " is not one of the thirty node slots at 0x%08x; the pointer leaves"
+                            " these screens alone (this line is not repeated)",
+                   (unsigned)RT_ICO_KANBAN_ACTIVE, (unsigned)node,
+                   (unsigned)RT_ICO_KANBAN_NODES);
+        }
+        return false;
+    }
+
+    uint32_t entry = 0;
+    if (!read_word(node + RT_ICO_KANBAN_NODE_LAYOUT, &entry)) return false;
+    const uint32_t table_end = RT_ICO_LAYOUT_TABLE + RT_ICO_LAYOUT_COUNT * RT_ICO_LAYOUT_STRIDE;
+    if (entry < RT_ICO_LAYOUT_TABLE || entry >= table_end ||
+        ((entry - RT_ICO_LAYOUT_TABLE) % RT_ICO_LAYOUT_STRIDE) != 0) {
+        if (!g_logged_kanban_entry) {
+            g_logged_kanban_entry = true;
+            rt_log_warn("guest", "guest menu: kanban node 0x%08x names layout entry 0x%08x, which is"
+                            " not a row of the layout table at 0x%08x; the pointer leaves this"
+                            " screen alone (this line is not repeated)",
+                   (unsigned)node, (unsigned)entry, (unsigned)RT_ICO_LAYOUT_TABLE);
+        }
+        return false;
+    }
+
+    uint32_t flags = 0;
+    if (!read_word(node + RT_ICO_KANBAN_NODE_FLAGS, &flags)) return false;
+    /* Fading out. display_layout gives such a node no input, so neither does
+     * the pointer; it is still drawn, which is why this is not an error. */
+    if (flags & RT_ICO_KANBAN_FLAG_FADING) return false;
+
+    *out_layout = (entry - RT_ICO_LAYOUT_TABLE) / RT_ICO_LAYOUT_STRIDE;
+    return true;
+}
+
+/* The selectable items of one kanban screen, appended to g_items. The same
+ * walk as the layout path, from the entry's default and current item along
+ * the four neighbour links inside the entry's own object range, with the two
+ * differences display_layout has: a link is followed only when it is greater
+ * than zero (`bgtzl`/`blezl`, not the layout path's "not negative"), and the
+ * rectangle is placed with the kanban emitter's own y bias. */
+void add_kanban_items(uint32_t layout) {
+    uint32_t entry = 0;
+    if (!entry_addr(layout, &entry)) return;
+
+    int32_t first = 0, end = 0;
+    if (!read_i32(entry + RT_ICO_LAYOUT_FIRST_OBJ, &first) ||
+        !read_i32(entry + RT_ICO_LAYOUT_END_OBJ, &end)) {
+        return;
+    }
+    if (end <= first) return;
+    if (end - first > kMaxRangeLen) {
+        if (!g_logged_long_range) {
+            g_logged_long_range = true;
+            rt_log_warn("guest", "guest menu: layout 0x%x claims %d scene objects, past the %d this"
+                            " module walks; no items (this line is not repeated)",
+                   (unsigned)layout, (int)(end - first), (int)kMaxRangeLen);
+        }
+        return;
+    }
+
+    int32_t cur = -1;
+    if (!read_i32(entry + RT_ICO_LAYOUT_CUR_ITEM, &cur) || cur < first || cur >= end) {
+        /* kanbanReqAdd copies the entry's default item into this field when
+         * it makes the node navigable, and the default is what said the node
+         * was navigable at all, so this is a state the game does not
+         * normally reach. Without it there is no highlight to move and
+         * nothing says which item the game would confirm. */
+        if (!g_logged_kanban_no_selection) {
+            g_logged_kanban_no_selection = true;
+            rt_log_warn("guest", "guest menu: the kanban screen on layout 0x%x has a current item of"
+                            " %d, outside its objects 0x%x..0x%x; the pointer does nothing on it"
+                            " (this line is not repeated)",
+                   (unsigned)layout, (int)cur, (unsigned)first, (unsigned)(end - 1));
+        }
+        return;
+    }
+
+    std::vector<int32_t> order;
+    int32_t seed = 0;
+    if (read_i32(entry + RT_ICO_LAYOUT_DEFAULT_ITEM, &seed) && seed >= first && seed < end) {
+        order.push_back(seed);
+    }
+    if (!contains(order, cur)) order.push_back(cur);
+
+    static const uint32_t kLinks[4] = {RT_ICO_OBJ_RIGHT, RT_ICO_OBJ_LEFT,
+                                       RT_ICO_OBJ_DOWN, RT_ICO_OBJ_UP};
+    for (size_t i = 0; i < order.size(); ++i) {
+        uint32_t base = 0;
+        if (!object_addr(order[i], &base)) continue;
+        for (uint32_t off : kLinks) {
+            int32_t n = 0;
+            if (!read_i32(base + off, &n)) continue;
+            if (n <= 0 || n < first || n >= end || contains(order, n)) continue;
+            order.push_back(n);
+        }
+    }
+
+    for (int32_t index : order) {
+        RtGuestMenuItem it;
+        it.layout = layout;
+        it.item = (uint32_t)index;
+        if (object_rect(layout, index, false, kKanbanOriginY, &it)) g_items.push_back(it);
     }
 }
 
@@ -635,10 +962,37 @@ void add_layout_items(uint32_t layout) {
  * with the picture. Called once per tick, before anything reads them. */
 void rebuild_items() {
     g_items.clear();
-    g_mc_layouts.clear();
+    g_adjust_layouts.clear();
     g_chain_no_selection.clear();
     g_chain.clear();
+    g_kanban_active = false;
+    g_kanban_layout = 0;
     if (!g_state.valid) return;
+
+    /* A kanban screen first, because it is the game's own answer to "which
+     * screen is up" whenever there is one: 0x0063C39C is set only while such
+     * a screen is navigable. It is not a chain; each node carries one layout
+     * entry and display_layout draws that entry's own object range. */
+    uint32_t kanban_layout = 0;
+    if (kanban_screen(&kanban_layout)) {
+        add_kanban_items(kanban_layout);
+        if (!g_items.empty()) {
+            g_kanban_active = true;
+            g_kanban_layout = kanban_layout;
+            g_chain.push_back(kanban_layout);
+            return;
+        }
+        /* A screen the game is navigating whose items this module cannot
+         * place. Nothing is offered and the layout path is tried, which is
+         * what the module did before these screens were handled at all. */
+        if (!g_logged_kanban_no_items) {
+            g_logged_kanban_no_items = true;
+            rt_log_warn("guest", "guest menu: the kanban screen on layout 0x%x offers no item with a"
+                            " rectangle on the picture; the pointer does nothing on it"
+                            " (this line is not repeated)",
+                   (unsigned)kanban_layout);
+        }
+    }
 
     build_chain();
     for (uint32_t layout : g_chain) add_layout_items(layout);
@@ -650,30 +1004,42 @@ void rebuild_items() {
  * actually came from. */
 void log_layout_rects() {
     if (g_layout_log_capped || g_chain.empty()) return;
-    if (contains(g_logged_layouts, g_state.layout)) return;
-    if (g_logged_layouts.size() >= kMaxLoggedLayouts) {
+    std::vector<uint32_t>& seen = g_kanban_active ? g_logged_kanban_layouts : g_logged_layouts;
+    const uint32_t key = g_kanban_active ? g_kanban_layout : g_state.layout;
+    if (contains(seen, key)) return;
+    if (g_logged_layouts.size() + g_logged_kanban_layouts.size() >= kMaxLoggedLayouts) {
         g_layout_log_capped = true;
-        rt_log("guest", "guest menu: further layout rectangles not logged");
+        rt_log_debug("guest", "guest menu: further layout rectangles not logged");
         return;
     }
-    g_logged_layouts.push_back(g_state.layout);
+    seen.push_back(key);
 
-    std::string chain;
-    for (size_t i = 0; i < g_chain.size(); ++i) {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "0x%x", (unsigned)g_chain[i]);
-        if (i) chain += " <- ";
-        chain += buf;
+    if (g_kanban_active) {
+        /* The layout state word is on this line because it is what the
+         * pointer used to go by, and a log that carries both settles at a
+         * glance whether the layout system was up at the same time. */
+        rt_log_info("guest", "guest menu: kanban layout 0x%x (%s): %zu items; the layout state word"
+                        " says layout 0x%x fade %u",
+               (unsigned)g_kanban_layout, kanban_screen_name(g_kanban_layout), g_items.size(),
+               (unsigned)g_state.layout, (unsigned)g_state.fade);
+    } else {
+        std::string chain;
+        for (size_t i = 0; i < g_chain.size(); ++i) {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "0x%x", (unsigned)g_chain[i]);
+            if (i) chain += " <- ";
+            chain += buf;
+        }
+        rt_log_info("guest", "guest menu: layout 0x%x chain %s: %zu items",
+               (unsigned)g_state.layout, chain.c_str(), g_items.size());
     }
-    rt_log("guest", "guest menu: layout 0x%x chain %s: %zu items",
-           (unsigned)g_state.layout, chain.c_str(), g_items.size());
     for (uint32_t layout : g_chain_no_selection) {
-        rt_log("guest", "guest menu: layout 0x%x is in the chain and has reachable objects, but"
+        rt_log_info("guest", "guest menu: layout 0x%x is in the chain and has reachable objects, but"
                         " its current item is negative; it contributes none",
                (unsigned)layout);
     }
     for (const RtGuestMenuItem& it : g_items) {
-        rt_log("guest", "guest menu: layout 0x%x item 0x%x rect %.4f,%.4f,%.4f,%.4f",
+        rt_log_debug("guest", "guest menu: layout 0x%x item 0x%x rect %.4f,%.4f,%.4f,%.4f",
                (unsigned)it.layout, (unsigned)it.item,
                (double)it.x0, (double)it.y0, (double)it.x1, (double)it.y1);
     }
@@ -725,9 +1091,13 @@ bool g_vc_valid = false;                       /* has it ever taken the mouse */
 float g_vc_x = 0.5f, g_vc_y = 0.5f;
 
 /* Whether the pointer owned the mouse on the previous tick, for the two
- * transition log lines. */
+ * transition log lines, and which screen it owned it for: the hand-back line
+ * names the screen it is leaving, which is gone from the state words by the
+ * time it is printed. */
 bool g_had_mouse = false;
 bool g_had_mouse_known = false;
+bool g_had_kanban = false;
+uint32_t g_had_kanban_layout = 0;
 
 /* Bound on those two lines, on the same principle as the tuple log above: a
  * menu state that oscillates must not turn this into a per-field trace. */
@@ -746,10 +1116,10 @@ constexpr uint8_t kSdlButtonRight = 3;
 /* ---- helpers ------------------------------------------------------------- */
 
 /* One chain layout's selection, read fresh from the word the game derives
- * its highlight from: the memory card check screen's own selector, or that
+ * its highlight from: the screen adjustment screen's own level, or that
  * layout table entry's current item. False when that word is not mapped. */
 bool read_selection(uint32_t layout, uint32_t* out) {
-    if (layout_is_mc(layout)) return read_word(RT_ICO_MC_SELECT, out);
+    if (layout_is_adjust(layout)) return read_word(RT_ICO_BRIGHTNESS, out);
     uint32_t entry = 0;
     if (!entry_addr(layout, &entry)) return false;
     return read_word(entry + RT_ICO_LAYOUT_CUR_ITEM, out);
@@ -763,27 +1133,38 @@ bool read_selection(uint32_t layout, uint32_t* out) {
 bool write_selection(uint32_t owner, uint32_t item, uint32_t current) {
     const unsigned layout = (unsigned)owner;
 
-    if (layout_is_mc(owner)) {
-        if (item >= RT_ICO_MC_COUNT) {
-            rt_log("guest", "guest menu: layout 0x%x selector item 0x%x is outside 0..%u;"
-                            " not written", layout, (unsigned)item,
-                   (unsigned)(RT_ICO_MC_COUNT - 1));
+    if (layout_is_adjust(owner)) {
+        if (item >= RT_ICO_ADJUST_COUNT) {
+            if (!g_logged_adjust_range) {
+                g_logged_adjust_range = true;
+                rt_log_warn("guest", "guest menu: layout 0x%x bar position 0x%x is outside 0..%u;"
+                                " not written (this line is not repeated)", layout, (unsigned)item,
+                       (unsigned)(RT_ICO_ADJUST_COUNT - 1));
+            }
             return false;
         }
-        if (!write_word(RT_ICO_MC_SELECT, item)) {
-            rt_log("guest", "guest menu: the memory card selector at 0x%08x is not mapped;"
-                            " item 0x%x not written", (unsigned)RT_ICO_MC_SELECT, (unsigned)item);
+        if (!write_word(RT_ICO_BRIGHTNESS, item)) {
+            if (!g_logged_adjust_unmapped) {
+                g_logged_adjust_unmapped = true;
+                rt_log_warn("guest", "guest menu: the screen adjustment level at 0x%08x is not"
+                                " mapped; item 0x%x not written (this line is not repeated)",
+                       (unsigned)RT_ICO_BRIGHTNESS, (unsigned)item);
+            }
             return false;
         }
-        g_state.mcsel = item;
+        g_state.adjust_level = item;
     } else {
         uint32_t entry = 0;
         int32_t first = 0, end = 0;
         if (!entry_addr(owner, &entry) ||
             !read_i32(entry + RT_ICO_LAYOUT_FIRST_OBJ, &first) ||
             !read_i32(entry + RT_ICO_LAYOUT_END_OBJ, &end)) {
-            rt_log("guest", "guest menu: the layout table entry for 0x%x is not mapped;"
-                            " item 0x%x not written", layout, (unsigned)item);
+            if (!g_logged_entry_unmapped) {
+                g_logged_entry_unmapped = true;
+                rt_log_warn("guest", "guest menu: the layout table entry for 0x%x is not mapped;"
+                                " item 0x%x not written (this line is not repeated)", layout,
+                       (unsigned)item);
+            }
             return false;
         }
         /* The scene object range the layout owns. lt_link_layout draws the
@@ -792,14 +1173,21 @@ bool write_selection(uint32_t owner, uint32_t item, uint32_t current) {
          * no highlight. Every item this module offers came out of that
          * range, so reaching this line means the range moved under it. */
         if ((int32_t)item < first || (int32_t)item >= end) {
-            rt_log("guest", "guest menu: item 0x%x is outside layout 0x%x's items"
-                            " 0x%x..0x%x; not written",
-                   (unsigned)item, layout, (unsigned)first, (unsigned)(end - 1));
+            if (!g_logged_item_range) {
+                g_logged_item_range = true;
+                rt_log_warn("guest", "guest menu: item 0x%x is outside layout 0x%x's items"
+                                " 0x%x..0x%x; not written (this line is not repeated)",
+                       (unsigned)item, layout, (unsigned)first, (unsigned)(end - 1));
+            }
             return false;
         }
         if (!write_word(entry + RT_ICO_LAYOUT_CUR_ITEM, item)) {
-            rt_log("guest", "guest menu: the layout table entry for 0x%x is not mapped;"
-                            " item 0x%x not written", layout, (unsigned)item);
+            if (!g_logged_entry_unmapped) {
+                g_logged_entry_unmapped = true;
+                rt_log_warn("guest", "guest menu: the layout table entry for 0x%x is not mapped;"
+                                " item 0x%x not written (this line is not repeated)", layout,
+                       (unsigned)item);
+            }
             return false;
         }
         /* The mirror the game refreshes from that field at the top of every
@@ -807,14 +1195,16 @@ bool write_selection(uint32_t owner, uint32_t item, uint32_t current) {
          * for the current layout: lt_next_layout loads the mirror from each
          * chain layout in turn and the current one is last, so after a
          * frame it holds that one's field and nothing else's. */
-        if (owner == g_state.layout) {
+        if (owner == g_state.layout && !g_kanban_active) {
             write_word(RT_ICO_ITEM_ID, item);
             g_state.item = item;
         }
     }
 
-    rt_log("guest", "guest menu: select item 0x%x on layout 0x%x (was 0x%x)",
-           (unsigned)item, layout, (unsigned)current);
+    if (take_action_line()) {
+        rt_log_info("guest", "guest menu: select item 0x%x on layout 0x%x (was 0x%x)",
+               (unsigned)item, layout, (unsigned)current);
+    }
     return true;
 }
 
@@ -832,7 +1222,7 @@ const RtGuestMenuItem* hit_test(float nx, float ny) {
 
 /* The D-pad press one wheel tick asks for on this screen, taken from the
  * links the selected object actually has: a row steps left and right, a
- * column up and down. The memory card check screen's handler only reads
+ * column up and down. The screen adjustment screen's handler only reads
  * LEFT and RIGHT. Zero when the selection has no links at all, which is a
  * screen a wheel cannot move.
  *
@@ -844,7 +1234,7 @@ const RtGuestMenuItem* hit_test(float nx, float ny) {
 uint16_t wheel_bits(bool up) {
     if (g_items.empty()) return 0;
     const uint32_t owner = g_items.front().layout;
-    if (layout_is_mc(owner)) return up ? RT_PAD_LEFT : RT_PAD_RIGHT;
+    if (layout_is_adjust(owner)) return up ? RT_PAD_LEFT : RT_PAD_RIGHT;
 
     uint32_t sel = 0;
     uint32_t base = 0;
@@ -866,7 +1256,7 @@ void queue_pulse(uint16_t bits) {
     if (g_queue.size() >= kMaxQueue) {
         if (!g_queue_dropped) {
             g_queue_dropped = true;
-            rt_log("guest", "guest menu: more than %zu presses queued; dropping the newest"
+            rt_log_warn("guest", "guest menu: more than %zu presses queued; dropping the newest"
                             " (this line is not repeated)", kMaxQueue);
         }
         return;
@@ -914,7 +1304,7 @@ bool selection_now(uint32_t layout, uint32_t* out) {
     if (read_selection(layout, out)) return true;
     if (!g_logged_no_selection) {
         g_logged_no_selection = true;
-        rt_log("guest", "guest menu: layout 0x%x's selection word is not mapped; the pointer"
+        rt_log_warn("guest", "guest menu: layout 0x%x's selection word is not mapped; the pointer"
                         " does nothing on this screen (this line is not repeated)",
                (unsigned)layout);
     }
@@ -964,9 +1354,9 @@ bool navigation_swallowed() {
     if (!read_word(RT_ICO_NAV_SWALLOW, &v) || v == 0) return false;
     if (!g_logged_swallowed) {
         g_logged_swallowed = true;
-        rt_log("guest", "guest menu: the game is swallowing this frame's navigation"
-                        " (D_00633160); the hover write waits for the next field"
-                        " (this line is not repeated)");
+        rt_log_info("guest", "guest menu: the game is swallowing this frame's navigation"
+                        " (0x%08x); the hover write waits for the next field"
+                        " (this line is not repeated)", (unsigned)RT_ICO_NAV_SWALLOW);
     }
     return true;
 }
@@ -1013,13 +1403,30 @@ void pointer_tick() {
     if (!hovered || g_hover_layout != hovered->layout || g_hover_item != hovered->item) {
         forget_hover();
     }
-    if (hovered && !g_hover_acted && !navigation_swallowed()) {
-        g_hover_acted = true;
-        g_hover_layout = hovered->layout;
-        g_hover_item = hovered->item;
+    /* The swallow flag belongs to lt_next_layout, which does not run a
+     * kanban screen: display_layout and func_001B8B10 never read it, so a
+     * hover there writes on its own field rather than waiting for a frame
+     * the game was not going to sit still through anyway. */
+    if (hovered && !g_hover_acted && (g_kanban_active || !navigation_swallowed())) {
+        /* The hover is consumed by the write actually happening, or by the
+         * item already being the selected one, and by nothing else. A write
+         * that is refused (an unmapped word, or an item outside the
+         * layout's own range) leaves the three fields clear, so the next
+         * field tries again while the cursor stays on the item; the refusal
+         * itself is latched inside write_selection, so retrying costs no
+         * further log lines. Consuming the hover on a refusal would leave
+         * the item pointed at and never selected for as long as the cursor
+         * did not move. */
         uint32_t current = 0;
-        if (selection_now(hovered->layout, &current) && current != hovered->item) {
-            write_selection(hovered->layout, hovered->item, current);
+        bool acted = false;
+        if (selection_now(hovered->layout, &current)) {
+            acted = current == hovered->item ||
+                    write_selection(hovered->layout, hovered->item, current);
+        }
+        if (acted) {
+            g_hover_acted = true;
+            g_hover_layout = hovered->layout;
+            g_hover_item = hovered->item;
         }
     }
 
@@ -1072,13 +1479,11 @@ bool motion_scale(float* sx, float* sy) {
     *sy = g_test_scale_y;
     return true;
 #elif defined(RT_MENU_NAV_HAVE_CURSOR)
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) return false;
-    SDL_Window* win = (SDL_Window*)rt_pgs_window_handle(pgs);
+    SDL_Window* win = (SDL_Window*)rt_window_handle();
     if (!win) return false;
 
     int32_t rx = 0, ry = 0, rw = 0, rh = 0, bb_w = 0, bb_h = 0;
-    rt_pgs_present_rect(pgs, &rx, &ry, &rw, &rh, &bb_w, &bb_h);
+    rt_window_present_rect(&rx, &ry, &rw, &rh, &bb_w, &bb_h);
     if (rw <= 0 || rh <= 0 || bb_w <= 0 || bb_h <= 0) return false;
 
     int win_w = 0, win_h = 0;
@@ -1110,7 +1515,7 @@ bool owner_line_ok() {
     if (g_owner_capped) return false;
     if (g_owner_lines >= kMaxOwnerLines) {
         g_owner_capped = true;
-        rt_log("guest", "guest menu: further pointer handovers not logged");
+        rt_log_info("guest", "guest menu: further pointer handovers not logged");
         return false;
     }
     ++g_owner_lines;
@@ -1126,12 +1531,27 @@ void update_motion_owner() {
      * mouse there would be a line about something that did not happen. */
     const bool owns = pointer_may_act() && rt_guest_menu_active();
     if (g_had_mouse_known && owns == g_had_mouse) return;
+
+    /* Which screen the line is about: the one being taken, or, on the way
+     * out, the one that was held. Empty for a layout-table screen, which the
+     * chain line already named. */
+    char screen[96];
+    screen[0] = '\0';
+    const bool kanban = owns ? g_kanban_active : g_had_kanban;
+    const uint32_t kanban_layout = owns ? g_kanban_layout : g_had_kanban_layout;
+    if (kanban) {
+        std::snprintf(screen, sizeof(screen), " on kanban layout 0x%x (%s)",
+                      (unsigned)kanban_layout, kanban_screen_name(kanban_layout));
+    }
+
     g_had_mouse_known = true;
     g_had_mouse = owns;
+    g_had_kanban = owns && g_kanban_active;
+    if (g_had_kanban) g_had_kanban_layout = g_kanban_layout;
 
     if (!owns) {
         if (owner_line_ok()) {
-            rt_log("guest", "guest menu: pointer hands the mouse back to mouse look");
+            rt_log_info("guest", "guest menu: pointer hands the mouse back to mouse look%s", screen);
         }
         return;
     }
@@ -1139,19 +1559,21 @@ void update_motion_owner() {
         /* Mouse look is off, so the pointer was never captured and the OS
          * cursor is on screen already. Nothing is drawn over it. */
         if (owner_line_ok()) {
-            rt_log("guest", "guest menu: pointer takes the mouse, following the system cursor");
+            rt_log_info("guest", "guest menu: pointer takes the mouse%s, following the system"
+                            " cursor", screen);
         }
         return;
     }
     if (start_drawn_cursor()) {
         if (owner_line_ok()) {
-            rt_log("guest", "guest menu: pointer takes the mouse, drawn cursor at centre");
+            rt_log_info("guest", "guest menu: pointer takes the mouse%s, drawn cursor at centre",
+                   screen);
         }
         return;
     }
     if (owner_line_ok()) {
-        rt_log("guest", "guest menu: pointer takes the mouse, drawn cursor at %.3f,%.3f",
-               (double)g_vc_x, (double)g_vc_y);
+        rt_log_info("guest", "guest menu: pointer takes the mouse%s, drawn cursor at %.3f,%.3f",
+               screen, (double)g_vc_x, (double)g_vc_y);
     }
 }
 
@@ -1163,11 +1585,28 @@ void rt_guest_menu_tick(uint64_t field) {
     g_field = field;
     g_have_field = true;
 
+    /* This module is nothing but reads and two writes at the addresses in
+     * guest/ico_syms.h. Without every one of those addresses read off the
+     * retail ELF there is no honest thing to read, so the pointer does
+     * nothing at all rather than poking at an address that belongs to
+     * something else. */
+    if (!RT_ICO_MENU_NAV_KNOWN) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            rt_log_warn("menu", "the mouse pointer on the game's own menus is off: this build"
+                " does not have every address it needs (guest/ico_syms.h names which)."
+                " The menus still work from the pad and the keyboard.");
+        }
+        g_state = RtGuestMenuState{};
+        return;
+    }
+
     RtGuestMenuState s;
     if (!read_word(RT_ICO_LAYOUT_ID, &s.layout) ||
         !read_word(RT_ICO_ITEM_ID, &s.item) ||
         !read_word(RT_ICO_FADE_STATE, &s.fade) ||
-        !read_word(RT_ICO_MC_SELECT, &s.mcsel)) {
+        !read_word(RT_ICO_BRIGHTNESS, &s.adjust_level)) {
         g_state = RtGuestMenuState{};
         rebuild_items();
         update_motion_owner();
@@ -1179,6 +1618,16 @@ void rt_guest_menu_tick(uint64_t field) {
 
     /* Where this screen's items are, from the game's own scene objects. */
     rebuild_items();
+    /* The kanban screens are not in the four words above: the state words
+     * say nothing about them, so what the tuple reports for one is read
+     * here, after the screen has been resolved. */
+    g_state.kanban = g_kanban_active;
+    g_state.kanban_layout = g_kanban_layout;
+    g_state.kanban_item = 0;
+    if (g_kanban_active) {
+        uint32_t sel = 0;
+        if (read_selection(g_kanban_layout, &sel)) g_state.kanban_item = sel;
+    }
     /* Only for a screen this module has something to say about: one the
      * pointer could act on, or one it refused to act on because a chain
      * layout the game will not navigate is what stopped it. Gating on fade 2
@@ -1198,7 +1647,10 @@ void rt_guest_menu_tick(uint64_t field) {
     if (g_capped) return;
     if (g_have_logged &&
         g_logged.layout == g_state.layout && g_logged.item == g_state.item &&
-        g_logged.fade == g_state.fade && g_logged.mcsel == g_state.mcsel) {
+        g_logged.fade == g_state.fade && g_logged.adjust_level == g_state.adjust_level &&
+        g_logged.kanban == g_state.kanban &&
+        g_logged.kanban_layout == g_state.kanban_layout &&
+        g_logged.kanban_item == g_state.kanban_item) {
         return;
     }
     g_have_logged = true;
@@ -1206,13 +1658,21 @@ void rt_guest_menu_tick(uint64_t field) {
 
     if (g_lines >= kMaxLines) {
         g_capped = true;
-        rt_log("guest", "guest menu: further changes not logged");
+        rt_log_debug("guest", "guest menu: further changes not logged");
         return;
     }
     ++g_lines;
-    rt_log("guest", "guest menu: layout 0x%x item 0x%x fade %u mcsel %u",
-           (unsigned)g_state.layout, (unsigned)g_state.item, (unsigned)g_state.fade,
-           (unsigned)g_state.mcsel);
+    if (g_state.kanban) {
+        rt_log_debug("guest", "guest menu: layout 0x%x item 0x%x fade %u adjust_level %u,"
+                        " kanban layout 0x%x item 0x%x",
+               (unsigned)g_state.layout, (unsigned)g_state.item, (unsigned)g_state.fade,
+               (unsigned)g_state.adjust_level, (unsigned)g_state.kanban_layout,
+               (unsigned)g_state.kanban_item);
+    } else {
+        rt_log_debug("guest", "guest menu: layout 0x%x item 0x%x fade %u adjust_level %u",
+               (unsigned)g_state.layout, (unsigned)g_state.item, (unsigned)g_state.fade,
+               (unsigned)g_state.adjust_level);
+    }
 }
 
 const RtGuestMenuState& rt_guest_menu_state() {
@@ -1233,7 +1693,13 @@ bool rt_guest_menu_active() {
      * and it has no parent, so the chain is one layout with nothing to
      * reach and g_items is empty. The pre-title cinematic (0x33) is empty
      * the same way. */
-    if (!g_state.valid || g_state.fade != 2) return false;
+    if (!g_state.valid) return false;
+    /* A kanban screen is gated by the kanban system instead: the node at
+     * 0x0063C39C says the game is navigating it, rebuild_items has already
+     * refused a node that is fading out, and the layout fade state means
+     * nothing on these screens. */
+    if (g_kanban_active) return !g_items.empty();
+    if (g_state.fade != 2) return false;
     return !g_items.empty();
 }
 
@@ -1241,7 +1707,7 @@ uint16_t rt_guest_menu_pulse_bits(uint64_t field) {
     if (!g_have_field || field != g_field) {
         if (!g_logged_field_mismatch) {
             g_logged_field_mismatch = true;
-            rt_log("guest", "guest menu: pulse bits asked for field %llu but the last tick was"
+            rt_log_warn("guest", "guest menu: pulse bits asked for field %llu but the last tick was"
                             " field %llu; no bits (this line is not repeated)",
                    (unsigned long long)field, (unsigned long long)g_field);
         }
@@ -1291,8 +1757,10 @@ void rt_guest_menu_on_button(uint8_t sdl_button, bool down) {
         g_hover_item = item;
 
         start_or_queue(RT_PAD_CROSS);
-        rt_log("guest", "guest menu: click item 0x%x on layout 0x%x",
-               (unsigned)item, (unsigned)owner);
+        if (take_action_line()) {
+            rt_log_info("guest", "guest menu: click item 0x%x on layout 0x%x",
+                   (unsigned)item, (unsigned)owner);
+        }
         return;
     }
 
@@ -1319,7 +1787,7 @@ void rt_guest_menu_on_motion(float dx, float dy) {
     if (!std::isfinite(dx) || !std::isfinite(dy)) {
         if (!g_logged_motion_nonfinite) {
             g_logged_motion_nonfinite = true;
-            rt_log("guest", "guest menu: non-finite pointer motion (%f, %f); the drawn cursor"
+            rt_log_warn("guest", "guest menu: non-finite pointer motion (%f, %f); the drawn cursor"
                             " did not move (this line is not repeated)",
                    (double)dx, (double)dy);
         }
@@ -1330,7 +1798,7 @@ void rt_guest_menu_on_motion(float dx, float dy) {
     if (!motion_scale(&sx, &sy)) {
         if (!g_logged_motion_no_rect) {
             g_logged_motion_no_rect = true;
-            rt_log("guest", "guest menu: pointer motion arrived with nothing presented yet;"
+            rt_log_warn("guest", "guest menu: pointer motion arrived with nothing presented yet;"
                             " the drawn cursor cannot move (this line is not repeated)");
         }
         return;
@@ -1369,15 +1837,13 @@ bool rt_guest_menu_cursor(float* nx, float* ny) {
         x = g_test_cursor_x;
         y = g_test_cursor_y;
 #else
-        RtPgs* pgs = rt_gs_parallel_handle();
-        if (!pgs) return false;
-        SDL_Window* win = (SDL_Window*)rt_pgs_window_handle(pgs);
+        SDL_Window* win = (SDL_Window*)rt_window_handle();
         if (!win) return false;
         /* A cursor the window does not own is a cursor somewhere else. */
         if (!rt_mouse_focused()) return false;
 
         int32_t rx = 0, ry = 0, rw = 0, rh = 0, bb_w = 0, bb_h = 0;
-        rt_pgs_present_rect(pgs, &rx, &ry, &rw, &rh, &bb_w, &bb_h);
+        rt_window_present_rect(&rx, &ry, &rw, &rh, &bb_w, &bb_h);
         if (rw <= 0 || rh <= 0 || bb_w <= 0 || bb_h <= 0) return false;
 
         int win_w = 0, win_h = 0;
@@ -1439,9 +1905,16 @@ void rt_guest_menu_test_reset() {
     g_state = RtGuestMenuState{};
     g_items.clear();
     g_chain.clear();
-    g_mc_layouts.clear();
+    g_adjust_layouts.clear();
     g_chain_no_selection.clear();
+    g_kanban_active = false;
+    g_kanban_layout = 0;
+    g_logged_kanban_node = false;
+    g_logged_kanban_entry = false;
+    g_logged_kanban_no_items = false;
+    g_logged_kanban_no_selection = false;
     g_logged_layouts.clear();
+    g_logged_kanban_layouts.clear();
     g_layout_log_capped = false;
     g_logged_long_range = false;
     g_logged_long_chain = false;
@@ -1468,6 +1941,8 @@ void rt_guest_menu_test_reset() {
     g_vc_y = 0.5f;
     g_had_mouse = false;
     g_had_mouse_known = false;
+    g_had_kanban = false;
+    g_had_kanban_layout = 0;
     g_owner_lines = 0;
     g_owner_capped = false;
     g_logged_motion_no_rect = false;

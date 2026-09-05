@@ -7,7 +7,8 @@
  *
  *          <field_number> [button ...] [lx ly rx ry]
  *
- *      field_number  pad field counter (one per NTSC field, ~59.94/s,
+ *      field_number  pad field counter (one per field of the programmed
+ *                    video mode, 59.94/s on NTSC and 50/s on PAL,
  *                    counted from boot) at which this step takes effect.
  *      button        any of: up down left right cross circle square triangle
  *                    l1 l2 r1 r2 start select l3 r3 none
@@ -20,7 +21,20 @@
  *   2. SDL3 keyboard + mouse + gamepad, active only when the paraLLEl-GS
  *      window path already initialized SDL video (the dump/headless path
  *      never touches SDL; without the window there is no key focus anyway).
- *      First detected gamepad is opened.
+ *      The first two detected gamepads are opened, one per pad port.
+ *
+ *      Two players. Pad port 0 is player 1: the keyboard, the mouse and the
+ *      first gamepad all feed it. Pad port 1 is player 2 and is fed by the
+ *      second gamepad alone, through its own binding table input.gamepad2
+ *      (the same sixteen DS2 slots, and neither host hotkey: the menu key
+ *      and the screenshot key are player 1's). Port 1 reports "no
+ *      controller" until a second gamepad is open, so the PAL disc's
+ *      two-player mode sees an empty port exactly as it would with nothing
+ *      plugged in. Unplugging player 1's pad moves player 2's down to port
+ *      0 rather than leaving port 0 empty. The deadzones,
+ *      gameplay.run_any_direction and the rumble the game sends are per
+ *      port; the mouse, mouse look, the wheel queue and the menu pointer
+ *      are player 1's only.
  *
  *      Both maps come from rt_settings().input (host/settings.h), rebuilt
  *      whenever rt_settings_generation() moves. The compiled-in defaults
@@ -84,7 +98,9 @@
  * the pointer takes the mouse.
  *
  * Both providers can be inactive (headless, no script): every port then
- * reports "no controller" and sif/pad.cpp presents an empty port.
+ * reports "no controller" and sif/pad.cpp presents an empty port. The
+ * scripted provider drives port 0 only, so port 1 is an empty port for
+ * every scripted run and a scripted run's input stays bit-identical.
  *
  * While the settings menu is up (rt_ui_wants_input(), ui/ui.h) the SDL
  * provider reports a centered pad with no buttons instead of sampling the
@@ -142,6 +158,12 @@ struct RtPadState {
     uint8_t rx = 0x80, ry = 0x80;   /* right stick */
 };
 
+/* Pad ports the virtual IOP serves, and the one authority for that count:
+ * sif/pad.cpp sizes its port array from this. Two, because the PAL disc's
+ * two-player mode opens port 1 for the second player, who drives Yorda.
+ * Slot 0 only on each: neither disc opens a multitap. */
+constexpr int RT_PAD_PORTS = 2;
+
 /* Selects the provider (script beats SDL; neither = no controller). Safe to
  * call before or after the GS backend exists; the SDL provider re-probes
  * lazily on the first poll. */
@@ -153,7 +175,10 @@ void rt_input_init();
 void rt_input_poll(uint64_t field);
 
 /* Current state of the virtual controller on `port`. Returns false when no
- * controller should appear on that port (no provider, or port != 0). */
+ * controller should appear on that port: no provider at all, a port outside
+ * RT_PAD_PORTS, or port 1 with no second gamepad open. Port 0 answers true
+ * whenever a provider is live, with or without a pad attached, because the
+ * keyboard and the mouse are player 1's controller. */
 bool rt_input_get(int port, RtPadState* out);
 
 /* Which kind of device the player last used. The drawn cursor on the game's
@@ -196,7 +221,7 @@ bool rt_input_sdl_active();
  * window existed the first time the launcher tried. */
 void rt_input_sdl_gamepad_probe();
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Forward-declared, not included: this header is included by files that see
  * no SDL. SDL3/SDL.h's own typedef agrees with it, so either include order
  * works (same pattern as ui/ui_internal.h). */
@@ -205,21 +230,25 @@ union SDL_Event;
 /* SDL_EVENT_GAMEPAD_ADDED / SDL_EVENT_GAMEPAD_REMOVED hot-plug, from the
  * one event pump (host/window.cpp's rt_window_pump), ahead of rt_ui_
  * handle_sdl_event so the pad this module tracks stays current whether or
- * not a document is up. ADDED opens the new pad only when none is open yet,
- * otherwise it logs and keeps the one already open (SDL3 also reports every
- * pad already attached at init as ADDED, which SDL_GetGamepadFromID
- * answering non-null tells apart from a fresh attach, so this never
- * reopens the pad it is already using). REMOVED closes the pad that was
- * unplugged and opens whichever other one SDL still lists, if any. A no-op
- * for the script provider and for every event type but these two. Plain SDL
- * calls, legal from the pump. */
+ * not a document is up. ADDED opens the new pad onto the first free pad
+ * port, so the second pad attached becomes player 2; with both ports taken
+ * it logs the pad's name and closes it again rather than displacing a
+ * player mid-run (SDL3 also reports every pad already attached at init as
+ * ADDED, which SDL_GetGamepadFromID answering non-null tells apart from a
+ * fresh attach, so this never reopens a pad it is already using). REMOVED
+ * closes the pad that was unplugged, moves a pad on a higher port down into
+ * the gap, and then fills whatever port is still free from any pad SDL
+ * still lists that is not already open. A no-op for the script provider and
+ * for every event type but these two. Plain SDL calls, legal from the
+ * pump. */
 void rt_input_on_sdl_event(const SDL_Event& e);
 #endif
 
 /* Actuator (rumble) values from the game: small motor 0/1, big motor
- * 0..255. Forwarded to SDL gamepad rumble whenever that provider is active,
- * and recorded for the log on every change, so the log shows what the game
- * asked for. */
+ * 0..255, for one pad port. Forwarded to the gamepad open on that port
+ * whenever the SDL provider is active, and recorded per port for the log on
+ * every change, so the log shows what the game asked each player's pad
+ * for. */
 void rt_input_set_actuators(int port, uint8_t small_motor, uint8_t big_motor);
 
 #endif /* ICORECOMP_HOST_INPUT_H */

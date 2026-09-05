@@ -1,7 +1,10 @@
 /* hw/geomcheck.cpp: vertex-level validation of the GIF stream.
  *
- * Off by default; ICORECOMP_VERBOSE=geom turns it on. It re-parses every
- * packet the runtime hands to the GS and reports, per field, the two
+ * Compiled out by default; building with -DICORECOMP_GEOM_CHECK turns it
+ * on (docs/GS_RENDERER.md). It was a run-time verbose channel until
+ * 2026-09-05, which was a per-packet gate on a path that ships. It
+ * re-parses every packet the runtime hands to the GS and reports, per
+ * field, the two
  * conditions that mark geometry the VU1 program should never have emitted:
  *
  *   Q <= 0 (or not finite) on a perspective-textured vertex. Q is 1/w, so
@@ -20,13 +23,18 @@
  * the packet was kicked, which is what turns "the picture is wrong" into
  * "this microprogram's clip path is wrong".
  *
- * GIF tag and register layouts here (PACKED/REGLIST field placement,
- * XYOFFSET, the 12.4 screen coordinate format) are public PS2 hardware
- * documentation (ps2tek), same as the framing in gif.cpp.
+ * The packet is decoded by gs/render/gif_decode.h, the renderer's own GIF
+ * decoder, which hw/gif.cpp also uses: the tag walk, the PACKED field
+ * placement and the ADC redirect live there once. What is here is the
+ * diagnostic itself, a sink over eight register addresses. The register
+ * layouts it still reads (XYOFFSET, the 12.4 screen coordinate format) are
+ * public PS2 hardware documentation (ps2tek), same as the framing in gif.cpp.
  *
  * This is a diagnostic reader. It never changes what is submitted.
  */
 #include "hw.h"
+
+#include "../gs/render/gif_decode.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -252,6 +260,83 @@ void rt_geom_note_clip(uint32_t clip, uint32_t vu1_hash) {
     if (clip != 0) ++b.kicks_clipped;
 }
 
+namespace {
+
+/* The sink the shared GIF decoder delivers register writes to.
+ *
+ * gs/render/gif_decode.h is the renderer's decoder and the authority for
+ * PACKED field placement and the ADC redirect; this file used to carry a
+ * second copy of the tag walk, the PACKED switch and the ADC bit, which was a
+ * second place those could drift with no selftest of its own. What is left
+ * here is the diagnostic: eight register addresses and the vertex assembly.
+ *
+ * Two of the decoder's rules replace things this file did for itself, with
+ * the same result:
+ *
+ *   ADC. The decoder redirects a PACKED XYZ2/XYZF2 whose ADC bit is set to
+ *   the XYZ3/XYZF3 address, which is the same register the A+D and REGLIST
+ *   forms of "queue, do not kick" already used, so the kick decision is one
+ *   address test here rather than a bit test in one layout and an address
+ *   test in two others.
+ *
+ *   Q. A PACKED ST latches Q into the decoder's own Q register, exactly as
+ *   the hardware does, and the latch is what this file used to read off the
+ *   ST qword itself. Watching q_bits change picks up that latch and nothing
+ *   else: a REGLIST ST carries no Q and leaves it alone, which is what this
+ *   file did before. An RGBAQ write, from PACKED, A+D or REGLIST, carries Q
+ *   in bits 32..63 of the register value in all three.
+ *
+ * The decoder's low 32 bits of an XYZ value are X in 0..15 and Y in 16..31 in
+ * all three layouts, which is what add_vertex takes. */
+struct GeomSink {
+    ScanState& st;
+    const gsr::GifDecodeState& dec;
+    uint32_t seen_q = 0x3F800000u;  /* the decoder's Q at reset */
+
+    void reg(uint32_t addr, uint64_t value) {
+        if (dec.q_bits != seen_q) {
+            /* A PACKED ST latched a new Q one call ago. */
+            seen_q = dec.q_bits;
+            st.q = bits2f(seen_q);
+        }
+        switch (addr) {
+            case gsr::GS_REG_PRIM:
+                set_prim(st, (uint32_t)(value & 0x7FF));
+                break;
+            case gsr::GS_REG_RGBAQ:
+                st.q = bits2f((uint32_t)((value >> 32) & 0xFFFFFFFFu));
+                break;
+            case gsr::GS_REG_XYZF2:
+            case gsr::GS_REG_XYZ2:
+                add_vertex(st, (uint32_t)(value & 0xFFFFFFFFu), false);
+                break;
+            case gsr::GS_REG_XYZF3:
+            case gsr::GS_REG_XYZ3:
+                add_vertex(st, (uint32_t)(value & 0xFFFFFFFFu), true);
+                break;
+            case 0x18: /* XYOFFSET_1 */
+                st.nverts = 0;
+                g_off.x1 = float(value & 0xFFFFu) / 16.0f;
+                g_off.y1 = float((value >> 32) & 0xFFFFu) / 16.0f;
+                break;
+            case 0x19: /* XYOFFSET_2 */
+                st.nverts = 0;
+                g_off.x2 = float(value & 0xFFFFu) / 16.0f;
+                g_off.y2 = float((value >> 32) & 0xFFFFu) / 16.0f;
+                break;
+            default:
+                break;
+        }
+    }
+
+    /* Image payload and decoder remarks are hw/gif.cpp's to report; this is a
+     * vertex diagnostic and neither carries a vertex. */
+    void image(const uint8_t*, uint32_t) {}
+    void note(const char*) {}
+};
+
+} // namespace
+
 void rt_geom_scan(int path, const uint8_t* data, uint32_t qwords, uint32_t vu1_hash) {
     Key key = path1_key(vu1_hash, rt_vu1_entry_pc());
     if (path == 1) key = kKeyPath2;
@@ -260,110 +345,20 @@ void rt_geom_scan(int path, const uint8_t* data, uint32_t qwords, uint32_t vu1_h
     ScanState st;
     st.key = key;
     st.b = &g_field[key]; /* one map lookup for the whole packet */
-    uint32_t i = 0;
-    while (i < qwords) {
-        uint64_t lo, hi;
-        std::memcpy(&lo, data + (size_t)i * 16, 8);
-        std::memcpy(&hi, data + (size_t)i * 16 + 8, 8);
-        ++i;
-        const uint32_t nloop = (uint32_t)(lo & 0x7FFF);
-        const bool pre = (lo >> 46) & 1;
-        const uint32_t prim = (uint32_t)((lo >> 47) & 0x7FF);
-        const uint32_t flg = (uint32_t)((lo >> 58) & 3);
-        uint32_t nreg = (uint32_t)((lo >> 60) & 15);
-        if (nreg == 0) nreg = 16;
-        if (pre) set_prim(st, prim);
 
-        if (flg == 0) { /* PACKED */
-            for (uint32_t l = 0; l < nloop; ++l) {
-                for (uint32_t r = 0; r < nreg; ++r) {
-                    if (i >= qwords) return;
-                    uint64_t d0, d1;
-                    std::memcpy(&d0, data + (size_t)i * 16, 8);
-                    std::memcpy(&d1, data + (size_t)i * 16 + 8, 8);
-                    ++i;
-                    switch ((uint32_t)((hi >> (4 * r)) & 15)) {
-                        case 0x0: /* PRIM */
-                            set_prim(st, (uint32_t)(d0 & 0x7FF));
-                            break;
-                        case 0x2: /* ST: S, T, and the Q that the next XYZ uses */
-                            st.q = bits2f((uint32_t)(d1 & 0xFFFFFFFFu));
-                            break;
-                        case 0x4: /* XYZF2 */
-                        case 0x5: /* XYZ2 */
-                            /* PACKED XYZ2/XYZF2 carry ADC at bit 111. */
-                            add_vertex(st, (uint32_t)((d0 & 0xFFFFu) | (((d0 >> 32) & 0xFFFFu) << 16)),
-                                       ((d1 >> 47) & 1) != 0);
-                            break;
-                        case 0xE: { /* A+D */
-                            const uint32_t addr = (uint32_t)(d1 & 0xFF);
-                            if (addr == 0x00) {
-                                set_prim(st, (uint32_t)(d0 & 0x7FF));
-                            } else if (addr == 0x01) { /* RGBAQ carries Q too */
-                                st.q = bits2f((uint32_t)((d0 >> 32) & 0xFFFFFFFFu));
-                            } else if (addr == 0x05 || addr == 0x04) {
-                                /* XYZ2/XYZF2 as a register value carry no
-                                 * ADC bit; that exists only in the PACKED
-                                 * layout. The no-draw form is a different
-                                 * register, handled below. */
-                                add_vertex(st, (uint32_t)(d0 & 0xFFFFFFFFu), false);
-                            } else if (addr == 0x0D || addr == 0x0C) {
-                                /* XYZ3/XYZF3: queued, never kicked. */
-                                add_vertex(st, (uint32_t)(d0 & 0xFFFFFFFFu), true);
-                            } else if (addr == 0x18) { /* XYOFFSET_1 */
-                                st.nverts = 0;
-                                g_off.x1 = float(d0 & 0xFFFFu) / 16.0f;
-                                g_off.y1 = float((d0 >> 32) & 0xFFFFu) / 16.0f;
-                            } else if (addr == 0x19) { /* XYOFFSET_2 */
-                                st.nverts = 0;
-                                g_off.x2 = float(d0 & 0xFFFFu) / 16.0f;
-                                g_off.y2 = float((d0 >> 32) & 0xFFFFu) / 16.0f;
-                            }
-                            break;
-                        }
-                        default:
-                            break;
-                    }
-                }
-            }
-        } else if (flg == 1) { /* REGLIST: two 64-bit register writes per qword */
-            const uint64_t total = (uint64_t)nloop * nreg;
-            for (uint64_t n = 0; n < total; ++n) {
-                if (i >= qwords) return;
-                uint64_t qw[2];
-                std::memcpy(qw, data + (size_t)i * 16, 16);
-                const uint64_t d = qw[n & 1];
-                switch ((uint32_t)((hi >> (4 * (n % nreg))) & 15)) {
-                    case 0x0:
-                        set_prim(st, (uint32_t)(d & 0x7FF));
-                        break;
-                    case 0x1: /* RGBAQ */
-                        st.q = bits2f((uint32_t)((d >> 32) & 0xFFFFFFFFu));
-                        break;
-                    case 0x4:
-                    case 0x5: /* XYZ2/XYZF2: X in 0..15, Y in 16..31. No ADC
-                               * bit in this layout; bit 47 is Z bit 15. */
-                        add_vertex(st, (uint32_t)(d & 0xFFFFFFFFu), false);
-                        break;
-                    case 0xC:
-                    case 0xD: /* XYZ3/XYZF3: queued, never kicked. */
-                        add_vertex(st, (uint32_t)(d & 0xFFFFFFFFu), true);
-                        break;
-                    default:
-                        break;
-                }
-                if (n & 1) ++i;
-            }
-            if (total & 1) ++i; /* odd count leaves a half-used qword */
-        } else if (flg == 2) { /* IMAGE */
-            i += nloop;
-        }
-    }
+    /* A fresh decode state per call, which is what this diagnostic assumed
+     * before: every submission it is handed starts on a tag boundary, and a
+     * tag left open at the end of one submission is not carried into the
+     * next. hw/gif.cpp keeps the per-path state that does carry, and it is
+     * the one that judges whether a split packet is legal. */
+    gsr::GifDecodeState dec;
+    GeomSink sink{st, dec};
+    gsr::gif_decode(dec, data, qwords, sink);
 }
 
 /* Names one bucket: which path, and for PATH1 which microprogram and
  * which of its entry points. Hashes are not resolved to names here; that
- * would copy the decomp's symbols into this repo. `recomp-cli vu1` prints
+ * would put a symbol list in this repo. `recomp-cli vu1` prints
  * the hash for each name. */
 namespace {
 
@@ -394,7 +389,7 @@ extern "C" void rt_geom_prof_report(double fields) {
         g_window_fields = 0;
         return;
     }
-    rt_log("prof", "  geom: %" PRIu64 " verts, %" PRIu64 " prims over %" PRIu64
+    rt_log_info("prof", "  geom: %" PRIu64 " verts, %" PRIu64 " prims over %" PRIu64
         " fields with geometry (%.0f verts/field)  behind-eye %" PRIu64 " (%.2f%%)"
         "  oversized %" PRIu64 " (%.2f%%)",
         t.verts, t.prims, g_window_fields,
@@ -405,7 +400,7 @@ extern "C" void rt_geom_prof_report(double fields) {
         if (kv.second.verts == 0) continue;
         char who[64];
         describe(who, sizeof(who), kv.first);
-        rt_log("prof", "    %-26s verts=%-9" PRIu64 " behind-eye=%-8" PRIu64
+        rt_log_info("prof", "    %-26s verts=%-9" PRIu64 " behind-eye=%-8" PRIu64
             " oversized=%-7" PRIu64 " kicks=%" PRIu64,
             who, kv.second.verts, kv.second.bad_q, kv.second.wild_prims, kv.second.kicks);
     }
@@ -434,7 +429,7 @@ void rt_geom_field(unsigned field) {
         return;
     }
     ++g_window_fields;
-    rt_logv("geom", "field %" PRIu64 " (parity %u): prims=%" PRIu64 " verts=%" PRIu64
+    rt_log_debug("geom", "field %" PRIu64 " (parity %u): prims=%" PRIu64 " verts=%" PRIu64
         "  behind-eye verts=%" PRIu64 " (%.2f%%)  oversized prims=%" PRIu64 " (%.2f%%)",
         g_field_no, field, prims, verts,
         bad_q, 100.0 * double(bad_q) / double(verts),
@@ -444,7 +439,7 @@ void rt_geom_field(unsigned field) {
         if (kv.second.bad_q == 0 && kv.second.wild_prims == 0) continue;
         char who[64];
         describe(who, sizeof(who), kv.first);
-        rt_logv("geom", "  %-28s prims=%" PRIu64 " verts=%" PRIu64
+        rt_log_debug("geom", "  %-28s prims=%" PRIu64 " verts=%" PRIu64
             " behind-eye=%" PRIu64 " oversized=%" PRIu64 " kicks=%" PRIu64 " with-clip=%" PRIu64,
             who, kv.second.prims, kv.second.verts, kv.second.bad_q, kv.second.wild_prims,
             kv.second.kicks, kv.second.kicks_clipped);
@@ -452,7 +447,7 @@ void rt_geom_field(unsigned field) {
     if (g_worst.seen) {
         char who[64];
         describe(who, sizeof(who), g_worst.key);
-        rt_logv("geom", "  worst: %s prim=0x%03x %s%s%s n=%u  x %.0f..%.0f  y %.0f..%.0f  Q %g..%g",
+        rt_log_debug("geom", "  worst: %s prim=0x%03x %s%s%s n=%u  x %.0f..%.0f  y %.0f..%.0f  Q %g..%g",
             who, g_worst.prim, prim_kind(g_worst.prim),
             ((g_worst.prim >> 4) & 1) ? " tme" : "",
             ((g_worst.prim >> 6) & 1) ? " abe" : "",
@@ -465,12 +460,12 @@ void rt_geom_field(unsigned field) {
 
 void rt_geom_report() {
     if (g_run.verts == 0) return;
-    rt_log("geom", "totals over %" PRIu64 " fields: prims=%" PRIu64 " verts=%" PRIu64
+    rt_log_info("geom", "totals over %" PRIu64 " fields: prims=%" PRIu64 " verts=%" PRIu64
         "  behind-eye verts=%" PRIu64 " (%.2f%%)  oversized prims=%" PRIu64 " (%.2f%%)",
         g_field_no, g_run.prims, g_run.verts,
         g_run.bad_q, 100.0 * double(g_run.bad_q) / double(g_run.verts),
         g_run.wild_prims, 100.0 * double(g_run.wild_prims) / double(g_run.prims ? g_run.prims : 1));
-    rt_log("geom", "XGKICKs=%" PRIu64 ", of which %" PRIu64 " (%.2f%%) carried a nonzero CLIP judgment",
+    rt_log_info("geom", "XGKICKs=%" PRIu64 ", of which %" PRIu64 " (%.2f%%) carried a nonzero CLIP judgment",
         g_run.kicks, g_run.kicks_clipped,
         100.0 * double(g_run.kicks_clipped) / double(g_run.kicks ? g_run.kicks : 1));
 }

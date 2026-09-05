@@ -21,12 +21,13 @@
  *                         when one exists.
  *
  * Presentation modes, decided once at rt_pgs_create:
- *   windowed  SDL3 window + Granite WSI swapchain (built only when CMake
- *             found the vendored SDL3: ICORECOMP_PGS_SDL). Requires a
- *             display (always assumed present on Windows); closing the
- *             window is reported to the host via RT_PGS_VSYNC_WINDOW_CLOSED.
- *   headless  Vulkan device without a surface (no display, or
- *             ICORECOMP_GS_HEADLESS=1). Renders every field for real; with
+ *   windowed  the host's SDL3 window (RtPgsCreateOptions::host_window) plus
+ *             a Granite WSI swapchain on the surface the host makes from it.
+ *             Built only where CMake found SDL3 (ICORECOMP_PGS_SDL). Closing
+ *             the window is reported to the host via
+ *             RT_PGS_VSYNC_WINDOW_CLOSED.
+ *   headless  Vulkan device without a surface (the host passed no window).
+ *             Renders every field for real; with
  *             ICORECOMP_GS_SCREENSHOT=/path/out.ppm the latest scanout is
  *             written after each field so the file holds the final frame at
  *             exit (path must be outside the repo; scanout pixels are
@@ -64,13 +65,83 @@ bool env_is_1(const char* name) {
     return v && std::strcmp(v, "1") == 0;
 }
 
+/* Granite and paraLLEl-GS report their own failures through LOGE/LOGW/LOGI,
+ * which without an interface installed end up as fprintf(stderr) from inside
+ * this shared library (Granite/util/logging.hpp). The WSI is the reason this
+ * matters: end_frame and begin_frame hand the caller a bare bool, and the
+ * VkResult behind it is only ever named in Granite's own line
+ * (Granite/vulkan/wsi.cpp). Util::set_thread_logging_interface routes those
+ * lines into the host log at the level Granite tagged them with, so a driver
+ * or swapchain failure sits next to the shim's own line about it whatever
+ * the host did with stderr.
+ *
+ * One instance, never destroyed, holding the owner as an atomic that
+ * ~RtPgs clears: the interface pointer is thread local and outlives the
+ * instance on any thread that installed it, so a line logged after teardown
+ * has to fall back to Granite's own stderr path rather than call into freed
+ * memory. Returning false is what asks for that fallback. */
+struct PgsGraniteLog final : Util::LoggingInterface {
+    std::atomic<RtPgs*> owner{nullptr};
+
+    bool log(const char* tag, const char* fmt, va_list va) override {
+        RtPgs* o = owner.load(std::memory_order_acquire);
+        if (!o) return false;
+        char buf[1024];
+        std::vsnprintf(buf, sizeof(buf), fmt, va);
+        /* Granite's messages end in a newline and this log adds its own. */
+        for (size_t n = std::strlen(buf); n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'); --n) {
+            buf[n - 1] = '\0';
+        }
+        /* The tag is Granite's own "[ERROR]: " / "[WARN]: " / "[INFO]: ",
+         * matched loosely so a reworded tag lands on info rather than being
+         * dropped. */
+        if (std::strstr(tag, "ERROR")) o->errorf("paraLLEl-GS: Granite: %s", buf);
+        else if (std::strstr(tag, "WARN")) o->warnf("paraLLEl-GS: Granite: %s", buf);
+        else o->logf("paraLLEl-GS: Granite: %s", buf);
+        return true;
+    }
+};
+
+PgsGraniteLog& granite_log() {
+    static PgsGraniteLog log;
+    return log;
+}
+
 } // namespace
+
+void RtPgs::install_granite_log() {
+    granite_log().owner.store(this, std::memory_order_release);
+    Util::set_thread_logging_interface(&granite_log());
+}
 
 void RtPgs::logf(const char* fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    m_host.log("gs", buf);
+}
+
+/* The two levelled twins. The tag is part of the message because the host
+ * callback has no level parameter; see RT_PGS_LOG_TAG_WARN in
+ * gs_parallel_impl.h for the whole of that arrangement. */
+void RtPgs::warnf(const char* fmt, ...) {
+    char buf[1024] = RT_PGS_LOG_TAG_WARN;
+    const size_t head = sizeof(RT_PGS_LOG_TAG_WARN) - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf + head, sizeof(buf) - head, fmt, ap);
+    va_end(ap);
+    m_host.log("gs", buf);
+}
+
+void RtPgs::errorf(const char* fmt, ...) {
+    char buf[1024] = RT_PGS_LOG_TAG_ERROR;
+    const size_t head = sizeof(RT_PGS_LOG_TAG_ERROR) - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf + head, sizeof(buf) - head, fmt, ap);
     va_end(ap);
     m_host.log("gs", buf);
 }
@@ -93,6 +164,10 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
      * the test, and the WSI platform uses it to decide whether it may poll
      * at all. See the threads section of gs_parallel_api.h. */
     m_owner_thread = std::this_thread::get_id();
+    /* First, before anything that can fail: device creation and swapchain
+     * setup report through Granite's logger, and those are exactly the
+     * failures a run has nothing else to say about. */
+    install_granite_log();
     m_have_opts = opts != nullptr;
     if (m_have_opts) {
         m_opts = *opts;
@@ -129,14 +204,18 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
     m_screenshot_path = std::getenv("ICORECOMP_GS_SCREENSHOT");
 
 #ifdef ICORECOMP_PGS_SDL
-#ifdef _WIN32
-    const bool display_available = true;
-#else
-    const bool display_available =
-        (std::getenv("DISPLAY") && *std::getenv("DISPLAY")) ||
-        (std::getenv("WAYLAND_DISPLAY") && *std::getenv("WAYLAND_DISPLAY"));
-#endif
-    if (display_available && !env_is_1("ICORECOMP_GS_HEADLESS")) {
+    /* Windowed exactly when the host handed a window in. The library no
+     * longer guesses from DISPLAY or WAYLAND_DISPLAY: those were a stand-in
+     * for "can SDL_CreateWindow succeed here", and the host now answers that
+     * question by having already succeeded or failed
+     * (host/window_service.cpp). ICORECOMP_GS_HEADLESS is read on the host
+     * side for the same reason. */
+    if (m_opts.host_window) {
+        if (!m_host.create_vulkan_surface) {
+            fatalf("paraLLEl-GS: a host window was passed with no create_vulkan_surface"
+                   " callback; a window with no way to make a surface from it cannot be"
+                   " presented into (see RtPgsHost in gs_parallel_api.h)");
+        }
         init_windowed();
     }
 #endif
@@ -193,12 +272,22 @@ RtPgs::RtPgs(const RtPgsHost& host, const RtPgsCreateOptions* opts) : m_host(hos
     logf("paraLLEl-GS: raster %s", rt_pgs_raster_log_text(m_opts.raster));
     /* Same reason as the raster line: an interlaced scanout can reach the
      * window three different ways and none of the other lines say which. */
-    logf("paraLLEl-GS: deinterlace %s (display.deinterlace)",
+    logf("paraLLEl-GS: deinterlace %s (compiled in; the display.deinterlace key"
+         " was retired 2026-09-04)",
          rt_pgs_deinterlace_name(m_opts.deinterlace));
 }
 
 RtPgs::~RtPgs() {
     if (m_device) m_device->wait_idle();
+    /* Teardown logs through Granite too, and the host callback outlives this
+     * instance, so the routing is left in place until the members below are
+     * about to go and then dropped by the store at the end of this body. */
+    /* Releases any screenshot staging buffer still in flight while the device
+     * is up. The fence it waits on has already been signalled by the idle
+     * wait above; what matters is that the BufferHandle is dropped here and
+     * not by the member destructor pass, which runs after the device below
+     * has gone (the same trap m_overlay_textures and m_held_scanout have). */
+    drain_screenshots();
     /* Every pipeline this run created is in the device's cache now; store
      * it before the device members below take the VkPipelineCache with
      * them. */
@@ -212,13 +301,37 @@ RtPgs::~RtPgs() {
      * owned by the device's cache; only the pointer is dropped. */
     m_overlay_textures.clear();
     m_overlay_white.reset();
-    /* Same reason, and the same trap: ScanoutResult holds a
-     * Vulkan::ImageHandle, and m_held_scanout is declared after m_iface, m_wsi
-     * and the headless device, so the member destructor pass reaches it only
-     * after this body has already destroyed the device the image belongs to.
-     * Reachable whenever the window is closed during the attract movie, which
-     * is exactly when a pair is held. */
+    /* Same reason, and the same trap, for both scanout slots: a
+     * ScanoutResult holds a Vulkan::ImageHandle, and m_held_scanout and
+     * m_latest_scanout are declared after m_iface, m_wsi and the headless
+     * device, so the member destructor pass reaches them only after this
+     * body has already destroyed the device the image belongs to.
+     * m_held_scanout only holds a pair during the attract movie;
+     * m_latest_scanout is written on every windowed field, so it is
+     * populated at every normal exit.
+     *
+     * The full list of members that keep a Vulkan object alive and are
+     * declared after the device members in gs_parallel_impl.h, so every one
+     * of them has to be released by this body:
+     *   m_shot[]            BufferHandle + Fence, dropped by drain_screenshots
+     *   m_boot_sample       BufferHandle + Fence, dropped just below
+     *   m_held_scanout      ImageHandle inside a ScanoutResult
+     *   m_latest_scanout    ImageHandle inside a ScanoutResult
+     *   m_overlay_textures  ImageHandle per guest texture
+     *   m_overlay_white     ImageHandle
+     *   m_overlay_program   raw pointer into the device's cache, only cleared
+     * Any future slot that keeps a device object alive belongs in this list
+     * too. */
     m_held_scanout = {};
+    m_latest_scanout = {};
+    /* The boot trace's 16x16 sample is armed on every present for the first
+     * kBootTraceFields fields and cleared only by drain_boot_sample at the
+     * top of the next present_frame, which a launcher present does not run.
+     * So an exit inside the first ten seconds, or one whose last present was
+     * a launcher present, leaves a live BufferHandle here. The fence is
+     * already signalled by the wait_idle above. */
+    m_boot_sample = BootSample{};
+    m_latest_aspect = 0.0;
     m_overlay_program = nullptr;
     m_iface.reset();
 #ifdef ICORECOMP_PGS_SDL
@@ -227,10 +340,27 @@ RtPgs::~RtPgs() {
 #endif
     m_headless_device.reset();
     m_headless_context.reset();
+    /* Nothing may reach this instance through Granite's thread-local
+     * interface from here on; see PgsGraniteLog. */
+    granite_log().owner.store(nullptr, std::memory_order_release);
 }
 
 void RtPgs::submit_gif(int path, const uint8_t* data, uint32_t qwords) {
-    if (path < 0 || path > 2 || qwords == 0) return;
+    if (path < 0 || path > 2) {
+        /* Guest traffic thrown away. rt_pgs_submit_gif is documented for
+         * paths 0..2, so this is a caller bug, and a dropped packet that
+         * said nothing would show up only as a missing piece of picture.
+         * One line, then a count in report_stats: a caller stuck on a bad
+         * path submits thousands. */
+        ++m_gif_dropped;
+        if (!m_gif_path_logged) {
+            m_gif_path_logged = true;
+            warnf("paraLLEl-GS: rt_pgs_submit_gif path %d is outside 0..2; the transfer of %u"
+                  " qword(s) is dropped and further drops are counted, not logged", path, qwords);
+        }
+        return;
+    }
+    if (qwords == 0) return;
     snoop_display_copy_phase(data, qwords);
     m_iface->gif_transfer(uint32_t(path), data, size_t(qwords) * 16);
     m_transfer_since_vsync = true;
@@ -330,18 +460,32 @@ uint64_t RtPgs::read_priv(uint32_t offset) {
 void RtPgs::report_stats() {
     logf("paraLLEl-GS: %llu vsyncs rendered (%s)",
          (unsigned long long)m_vsyncs, m_wsi_active ? "windowed" : "headless");
+    /* The counters behind the once-only lines. Each of these is a picture
+     * the user did not get, so a run that looked wrong has the totals in its
+     * log even when the reason came and went in one line hours earlier.
+     * Warn, not info, whenever any of them is non-zero: the run did not do
+     * what it was asked to. */
+    if (m_present_skipped_total || m_begin_frame_failures || m_end_frame_failures ||
+        m_no_image_total || m_gif_dropped) {
+        warnf("paraLLEl-GS: totals: %llu field(s) not presented, %llu begin_frame failure(s),"
+              " %llu end_frame failure(s), %llu field(s) with no scanout image,"
+              " %llu GIF transfer(s) dropped",
+              (unsigned long long)m_present_skipped_total,
+              (unsigned long long)m_begin_frame_failures,
+              (unsigned long long)m_end_frame_failures,
+              (unsigned long long)m_no_image_total,
+              (unsigned long long)m_gif_dropped);
+    }
 }
 
-void RtPgs::present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
-                            uint64_t* present_ns, uint64_t* fields) {
+void RtPgs::present_timings(RtPgsPresentTimings* out) {
+    if (!out) return;
     /* Read and cleared in one step each: the writer is the GS consumer
      * thread and it does not stop for this. */
-    const uint64_t flush = m_flush_ns.exchange(0, std::memory_order_relaxed);
-    const uint64_t scanout = m_scanout_ns.exchange(0, std::memory_order_relaxed);
-    const uint64_t present = m_present_ns.exchange(0, std::memory_order_relaxed);
-    const uint64_t n = m_timing_fields.exchange(0, std::memory_order_relaxed);
-    if (flush_ns) *flush_ns = flush;
-    if (scanout_ns) *scanout_ns = scanout;
-    if (present_ns) *present_ns = present;
-    if (fields) *fields = n;
+    out->flush_ns = m_flush_ns.exchange(0, std::memory_order_relaxed);
+    out->scanout_ns = m_scanout_ns.exchange(0, std::memory_order_relaxed);
+    out->present_ns = m_present_ns.exchange(0, std::memory_order_relaxed);
+    out->fields = m_timing_fields.exchange(0, std::memory_order_relaxed);
+    out->presents = m_presents.exchange(0, std::memory_order_relaxed);
+    out->repeats = m_present_repeats.exchange(0, std::memory_order_relaxed);
 }

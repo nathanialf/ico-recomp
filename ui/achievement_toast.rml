@@ -1,0 +1,28 @@
+<rml>
+<head>
+	<title>Achievement unlocked</title>
+	<link type="text/rcss" href="style/base.rcss"/>
+	<link type="text/rcss" href="style/achievements.rcss"/>
+</head>
+<!--
+	The unlock toast. Its own document because it is shown with or without
+	the menu, on the UI clock, for four seconds at a time with the rest
+	queued behind it: src/runtime/ui/ui_achievements_model.cpp shows and
+	hides it and fills the three strings below from
+	src/runtime/guest/achievements.h.
+
+	The whole document is pointer-events: none (see the stylesheet): it is a
+	notice, never a control, and a click aimed at the game or at the menu
+	must not land on it.
+-->
+<body class="ach-toast" data-model="achievements">
+	<div class="ach-toast-panel">
+		<div class="ach-toast-head">
+			<span class="ach-toast-tier">{{toast_tier}}</span>
+			<span class="ach-toast-label">Achievement unlocked</span>
+		</div>
+		<div class="ach-toast-name">{{toast_name}}</div>
+		<div class="ach-toast-desc">{{toast_description}}</div>
+	</div>
+</body>
+</rml>

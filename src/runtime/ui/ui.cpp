@@ -20,6 +20,7 @@
 #include "../host/input.h"
 #include "../host/settings.h"
 #include "../host/window.h"
+#include "../host/window_service.h"
 #include "../runtime.h"
 
 #include <RmlUi/Core/Core.h>
@@ -35,30 +36,29 @@ UiState g_ui;
 /* ---- overlay backend wrappers ------------------------------------------- */
 
 /* Anything that changes what the GS renders or presents goes through the GS
- * backend (gs/gs_backend.h) rather than calling the paraLLEl-GS library on
- * rt_gs_parallel_handle() directly, which is what these did before. The
- * backend is becoming a command ring with a worker thread on the far end
- * (gs/gs_threaded.cpp), and a call that skips it would be invisible to the
- * ring and so would land out of order against the guest's own GIF traffic.
+ * backend (gs/gs_backend.h) rather than calling a particular renderer
+ * directly. The backend is a command ring with a worker thread on the far
+ * end (gs/gs_threaded.cpp), and a call that skips it would be invisible to
+ * the ring and so would land out of order against the guest's own GIF
+ * traffic.
  *
  * No ICORECOMP_HAVE_PARALLEL_GS guard is needed for these: GsBackend's
  * defaults are no-ops returning 0, which is exactly what the dump backend
- * and a build with no live backend want, and it is what these stubs
- * returned. rt_gs_backend() never has to create the backend from here
- * either: rt_hw_init() builds it, and main.cpp runs that before rt_ui_init()
- * on both of its orderings.
+ * and a build with no live backend want. rt_gs_backend() never has to create
+ * the backend from here either: rt_hw_init() builds it, and main.cpp runs
+ * that before rt_ui_init() on both of its orderings.
  *
- * Four things stay direct because none of them is a GS command: the SDL
- * window handle, the surface size, the present mode the library resolved at
- * create time, and the present rectangle the last present blitted the
- * scanout into. The first two are main-thread reads the UI lays itself out
- * from; sending a query through the ring would mean blocking on the consumer
- * for a value only this thread can change. The present rectangle is the one
- * of the four the consumer side writes: present_frame stores it on the GS
- * command ring's worker thread and it is read back here on the EE thread,
- * both under the library's own mutex, so the six values always describe one
- * present rather than a mix of two (gs/gs_parallel_impl.h and
- * rt_pgs_present_rect in gs/gs_parallel_api.h carry the same note). */
+ * Four things go to the window service instead, because none of them is a GS
+ * command: the SDL window handle, the surface size, the resolved present
+ * mode, and the present rectangle the last present blitted the scanout into.
+ * The first two are main-thread reads the UI lays itself out from; sending a
+ * query through the ring would mean blocking on the consumer for a value
+ * only this thread can change. The present rectangle is the one of the four
+ * the consumer side writes: whichever backend presented publishes it on the
+ * GS command ring's worker thread and it is read back here on the EE thread,
+ * both under the service's own mutex, so the six values always describe one
+ * present rather than a mix of two (host/window_service.h carries the same
+ * note). */
 
 uint32_t backend_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height) {
     return rt_gs_backend()->overlay_texture_create(rgba8, width, height);
@@ -80,50 +80,32 @@ void backend_set_present_mode(uint32_t mode) {
     rt_gs_backend()->set_present_mode(mode);
 }
 
-#ifdef ICORECOMP_HAVE_PARALLEL_GS
+/* The window and its present rectangle are the executable's now
+ * (host/window_service.h), not a GS backend's, so these five are plain
+ * forwards with no ICORECOMP_HAVE_PARALLEL_GS split: a build with no live
+ * backend at all has a window service that reports no window, which is
+ * exactly what stops rt_ui_init before anything else here can run. */
 
 bool backend_window_live() {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    return pgs && rt_pgs_window_handle(pgs) != nullptr;
+    return rt_window_exists();
 }
 
 void* backend_window_handle() {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    return pgs ? rt_pgs_window_handle(pgs) : nullptr;
+    return rt_window_handle();
 }
 
 void backend_surface_size(uint32_t* width, uint32_t* height) {
-    *width = 0;
-    *height = 0;
-    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_surface_size(pgs, width, height);
+    rt_window_surface_size(width, height);
 }
 
 void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
                           int32_t* bb_w, int32_t* bb_h) {
-    *x = 0; *y = 0; *w = 0; *h = 0; *bb_w = 0; *bb_h = 0;
-    if (RtPgs* pgs = rt_gs_parallel_handle()) rt_pgs_present_rect(pgs, x, y, w, h, bb_w, bb_h);
+    rt_window_present_rect(x, y, w, h, bb_w, bb_h);
 }
 
 uint32_t backend_present_mode() {
-    return rt_gs_parallel_present_mode();
+    return rt_gs_present_mode();
 }
-
-#else /* !ICORECOMP_HAVE_PARALLEL_GS */
-
-/* No library to call: this build has no live backend at all (the CI gate
- * builds the UI sources exactly this way, which is what makes it cheap).
- * backend_window_live() false stops rt_ui_init before anything else here
- * can run. */
-bool backend_window_live() { return false; }
-void* backend_window_handle() { return nullptr; }
-void backend_surface_size(uint32_t* width, uint32_t* height) { *width = 0; *height = 0; }
-void backend_present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
-                          int32_t* bb_w, int32_t* bb_h) {
-    *x = 0; *y = 0; *w = 0; *h = 0; *bb_w = 0; *bb_h = 0;
-}
-uint32_t backend_present_mode() { return 0; }
-
-#endif /* ICORECOMP_HAVE_PARALLEL_GS */
 
 namespace {
 
@@ -142,7 +124,7 @@ float density_for(uint32_t surface_height) {
     return std::min(std::max(ratio, 1.0f), 4.0f);
 }
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 /* Re-resolves the menu hotkey whenever the committed settings have moved
  * (rt_settings_generation), and names the key in force in the document's
  * "press X to close" line, which ships with the compiled-in default. Cheap:
@@ -208,11 +190,11 @@ void log_menu_metrics() {
     /* g_ui.menu is never null here: rt_ui_init fails without menu.rml, and
      * the flag that brings this here is set right after menu->Show(). */
     if (!shell || !pane) {
-        rt_log("ui", "menu heights: no %s in the menu document; this file and menu.rml disagree",
+        rt_log_warn("ui", "menu heights: no %s in the menu document; this file and menu.rml disagree",
             !shell ? ".shell" : ".pane");
         return;
     }
-    rt_log("ui", "menu heights: body %.1f, shell %.1f, pane %.1f (client %.1f, scroll %.1f)",
+    rt_log_info("ui", "menu heights: body %.1f, shell %.1f, pane %.1f (client %.1f, scroll %.1f)",
         double(g_ui.menu->GetOffsetHeight()), double(shell->GetOffsetHeight()),
         double(pane->GetOffsetHeight()), double(pane->GetClientHeight()),
         double(pane->GetScrollHeight()));
@@ -228,7 +210,7 @@ bool rt_ui_init() {
     if (g_ui.initialized) return true;
 
     if (!backend_window_live()) {
-        rt_log("ui", "no live windowed backend in this run; the settings UI is disabled");
+        rt_log_warn("ui", "no live windowed backend in this run; the settings UI is disabled");
         return false;
     }
 
@@ -243,7 +225,7 @@ bool rt_ui_init() {
     const std::string ui_dir = base + "/ui";
     std::error_code ec;
     if (!std::filesystem::is_directory(ui_dir, ec)) {
-        rt_log("ui", "no UI assets at %s; the settings UI is disabled (the game runs without it)",
+        rt_log_warn("ui", "no UI assets at %s; the settings UI is disabled (the game runs without it)",
             ui_dir.c_str());
         return false;
     }
@@ -258,7 +240,7 @@ bool rt_ui_init() {
      * this module hands it is already absolute (built from rt_base_dir()),
      * and documents reference their stylesheets relatively from there. */
     if (!Rml::Initialise()) {
-        rt_log("ui", "Rml::Initialise() failed; the settings UI is disabled");
+        rt_log_warn("ui", "Rml::Initialise() failed; the settings UI is disabled");
         return false;
     }
 
@@ -276,24 +258,24 @@ bool rt_ui_init() {
     const std::string serif_path = ui_dir + "/fonts/PlayfairDisplay[wght].ttf";
     const std::string mono_path = ui_dir + "/fonts/JetBrainsMono-Regular.ttf";
     if (!Rml::LoadFontFace(serif_path)) {
-        rt_log("ui", "font %s failed to load; the settings UI is disabled", serif_path.c_str());
+        rt_log_warn("ui", "font %s failed to load; the settings UI is disabled", serif_path.c_str());
         return false;
     }
     if (!Rml::LoadFontFace(mono_path)) {
-        rt_log("ui", "font %s failed to load; the settings UI is disabled", mono_path.c_str());
+        rt_log_warn("ui", "font %s failed to load; the settings UI is disabled", mono_path.c_str());
         return false;
     }
 
     uint32_t width = 0, height = 0;
     backend_surface_size(&width, &height);
     if (width == 0 || height == 0) {
-        rt_log("ui", "surface size reported as %ux%u; the settings UI is disabled", width, height);
+        rt_log_warn("ui", "surface size reported as %ux%u; the settings UI is disabled", width, height);
         return false;
     }
 
     g_ui.context = Rml::CreateContext("main", Rml::Vector2i(int(width), int(height)));
     if (!g_ui.context) {
-        rt_log("ui", "Rml::CreateContext failed; the settings UI is disabled");
+        rt_log_warn("ui", "Rml::CreateContext failed; the settings UI is disabled");
         return false;
     }
     apply_surface_size(width, height);
@@ -302,10 +284,17 @@ bool rt_ui_init() {
      * parsed, so the model has to exist first. */
     if (!settings_model_init(g_ui.context)) return false;
 
+    /* The same rule, for the same reason: menu.rml's Achievements tab is a
+     * nested data-model="achievements" subtree, so that model has to exist
+     * before menu.rml is parsed. This call also loads the unlock toast
+     * document. A failure costs the tab and the toast and is logged inside,
+     * so it is not checked for here. */
+    achievements_model_init(g_ui.context, ui_dir);
+
     const std::string doc_path = ui_dir + "/menu.rml";
     g_ui.menu = g_ui.context->LoadDocument(doc_path);
     if (!g_ui.menu) {
-        rt_log("ui", "document %s failed to load; the settings UI is disabled", doc_path.c_str());
+        rt_log_warn("ui", "document %s failed to load; the settings UI is disabled", doc_path.c_str());
         return false;
     }
 
@@ -315,7 +304,7 @@ bool rt_ui_init() {
     const std::string fps_path = ui_dir + "/fps.rml";
     g_ui.fps = g_ui.context->LoadDocument(fps_path);
     if (!g_ui.fps) {
-        rt_log("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
+        rt_log_warn("ui", "document %s failed to load; the fps readout is unavailable", fps_path.c_str());
     }
 
     /* The drawn cursor for the game's own menus, another always-loaded pair.
@@ -324,21 +313,21 @@ bool rt_ui_init() {
     ui_menu_cursor_init(g_ui.context, ui_dir);
 
     /* The launcher's model and its document. A failure here costs the
-     * launcher, not the settings menu, so it is logged inside and not
+     * launcher, not the menu, so it is logged inside and not
      * checked for here. */
     launcher_init(g_ui.context, ui_dir);
 
     g_ui.visible = false;
     g_ui.initialized = true;
 
-    rt_log("ui", "RmlUi %s up: fonts %s and %s, document %s, surface %ux%u, dp ratio %.2f",
+    rt_log_info("ui", "RmlUi %s up: fonts %s and %s, document %s, surface %ux%u, dp ratio %.2f",
         Rml::GetVersion().c_str(), serif_path.c_str(), mono_path.c_str(), doc_path.c_str(),
         width, height, double(density_for(height)));
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     sync_menu_hotkey();
 #else
-    rt_log("ui", "no SDL in this build: the menu has no hotkey and cannot be opened");
+    rt_log_warn("ui", "no SDL in this build: the menu has no hotkey and cannot be opened");
 #endif
 
     /* Fills the model from the loaded settings and puts the fps readout in
@@ -361,7 +350,7 @@ void rt_ui_tick() {
     if (width != 0 && height != 0 &&
         (width != g_ui.surface_width || height != g_ui.surface_height)) {
         apply_surface_size(width, height);
-        rt_log("ui", "surface now %ux%u, dp ratio %.2f", width, height,
+        rt_log_info("ui", "surface now %ux%u, dp ratio %.2f", width, height,
             double(density_for(height)));
     }
 
@@ -369,7 +358,7 @@ void rt_ui_tick() {
      * and hides a document happens here, at the field boundary, never in the
      * event handler: see the reentrancy rules in ui.h. */
     settings_model_tick();
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     /* After the model's own tick: a capture that was accepted this field
      * commits here, and a queued control change has already gone through, so
      * the two never write the settings in the same call. */
@@ -393,11 +382,17 @@ void rt_ui_tick() {
      * call is what sets it. */
     ui_menu_cursor_tick();
 
+    /* Also before the early-out, and for the same reason: this call is what
+     * sets g_ui.toast_visible, and polling is what starts an unlock toast's
+     * four seconds (guest/achievements.h). */
+    achievements_model_tick();
+
     /* The tick renders whenever any document is up: the launcher (which owns
      * the whole window while it is, and draws over an empty backbuffer), the
-     * menu, the fps readout, or the drawn cursor on the game's own menus. */
+     * menu, the fps readout, the drawn cursor on the game's own menus, or an
+     * achievement unlock toast. */
     if (!g_ui.visible && !g_ui.fps_visible && !g_ui.launcher_visible &&
-        !g_ui.cursor_visible) {
+        !g_ui.cursor_visible && !g_ui.toast_visible) {
         /* Exactly one clear on the way down, keyed on whether anything was
          * drawn last time; never a set_frame call while nothing is up. */
         if (g_ui.frame_posted) {
@@ -434,7 +429,7 @@ void rt_ui_tick() {
     static bool logged_geometry = false, logged_empty = false;
     if (frame.cmd_count != 0 && !logged_geometry) {
         logged_geometry = true;
-        rt_log("ui", "first overlay frame: %u vertices, %u indices, %u cmds for a %ux%u surface"
+        rt_log_info("ui", "first overlay frame: %u vertices, %u indices, %u cmds for a %ux%u surface"
                      " (menu %d, fps %d, launcher %d, cursor %d)",
             frame.vertex_count, frame.index_count, frame.cmd_count,
             frame.surface_width, frame.surface_height,
@@ -442,7 +437,7 @@ void rt_ui_tick() {
             g_ui.cursor_visible ? 1 : 0);
     } else if (frame.cmd_count == 0 && !logged_empty) {
         logged_empty = true;
-        rt_log("ui", "a document is up but RmlUi produced no geometry this field"
+        rt_log_warn("ui", "a document is up but RmlUi produced no geometry this field"
                      " (menu %d, fps %d, launcher %d, cursor %d)",
             g_ui.visible ? 1 : 0, g_ui.fps_visible ? 1 : 0, g_ui.launcher_visible ? 1 : 0,
             g_ui.cursor_visible ? 1 : 0);
@@ -472,6 +467,9 @@ void rt_ui_set_visible(bool visible) {
          * window resize, an env-overridden key) may have moved a value since
          * the menu was last up. */
         settings_model_refresh();
+        /* And on what has actually been unlocked, for the same reason: the
+         * tab's own change check only runs while the menu is already up. */
+        achievements_model_refresh();
         /* Over the launcher, the launcher goes away first: the menu's
          * backdrop is translucent for the game's scanout behind it, and
          * two documents through one another is unreadable. No-op when the
@@ -487,7 +485,7 @@ void rt_ui_set_visible(bool visible) {
          * out. */
         g_ui.menu_metrics_pending = true;
     } else {
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         /* An armed capture never outlives the menu. That is what keeps
          * rt_ui_wants_input() (and so the neutral pad in host/input.cpp) true
          * for the whole of a capture: the menu is up for all of it. A capture
@@ -508,12 +506,12 @@ void rt_ui_set_visible(bool visible) {
          * it. */
         g_ui.flush_save_pending = true;
     }
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
     /* SDL3 gates SDL_EVENT_TEXT_INPUT on this, so the text fields in the
      * menu stay dead without it. */
     menu_set_text_input(visible);
 #endif
-    rt_log("ui", "menu %s", visible ? "opened" : "closed");
+    rt_log_info("ui", "menu %s", visible ? "opened" : "closed");
 }
 
 bool rt_ui_wants_input() {

@@ -75,6 +75,7 @@ constexpr BindDef kKeyboardBinds[RT_KB_COUNT] = {
     {"lstick_up", "W"}, {"lstick_down", "S"}, {"lstick_left", "A"}, {"lstick_right", "D"},
     {"rstick_up", "I"}, {"rstick_down", "K"}, {"rstick_left", "J"}, {"rstick_right", "L"},
     {"menu", "F1"},
+    {"screenshot", "F12"},
 };
 
 constexpr BindDef kGamepadBinds[RT_GP_COUNT] = {
@@ -83,6 +84,11 @@ constexpr BindDef kGamepadBinds[RT_GP_COUNT] = {
     {"l1", "leftshoulder"}, {"r1", "rightshoulder"}, {"l2", "lefttrigger+"}, {"r2", "righttrigger+"},
     {"l3", "leftstick"}, {"r3", "rightstick"}, {"start", "start"}, {"select", "back"},
     {"menu", "guide"},
+    /* The screenshot hotkey ships on the keyboard only. A pad button spare
+     * enough to give it does not exist on a DS2 layout once the menu chord
+     * has taken guide, and binding one by default would take a button the
+     * game can see away from every player who never wanted the feature. */
+    {"screenshot", ""},
 };
 
 /* The mouse ships with two slots bound: square (the attack button, on the
@@ -99,17 +105,23 @@ constexpr BindDef kMouseBinds[RT_MB_COUNT] = {
     {"l1", ""}, {"r1", rt_mouse_input_name(RT_MOUSE_RIGHT)},
     {"l2", ""}, {"r2", ""}, {"l3", ""}, {"r3", ""},
     {"start", ""}, {"select", ""},
+    /* Same reason as the gamepad row above: unbound by default. */
+    {"screenshot", ""},
 };
 
 /* One binding table plus the two facts every rule about it needs: how many
  * slots it has, and which of them is the menu key (-1 for the mouse, which
  * has none). Indexed by RtBindDevice, so the loaders, the validators and
- * the public accessors all walk the same list and a fourth device would be
+ * the public accessors all walk the same list and a fifth device would be
  * one row here. */
 struct BindTable {
     const BindDef* defs;
     int count;
     int menu_slot;
+    /* The screenshot hotkey's slot. Every device has one, unlike the menu
+     * key, because the mouse can carry it: it is consumed in the event pump
+     * and does not compete with the pointer the menu itself draws. */
+    int screenshot_slot;
     const char* json_key;  /* the object key under "input" */
     const char* section;   /* dotted key of the section, for log lines */
     /* Whether this device's names are ever chord-parsed. Gamepad only: a
@@ -119,10 +131,25 @@ struct BindTable {
 };
 
 constexpr BindTable kBindTables[RT_BIND_DEVICE_COUNT] = {
-    {kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, "keyboard", "input.keyboard", false},
-    {kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, "gamepad", "input.gamepad", true},
-    {kMouseBinds, RT_MB_COUNT, -1, "mouse", "input.mouse", false},
+    {kKeyboardBinds, RT_KB_COUNT, RT_KB_MENU, RT_KB_SCREENSHOT, "keyboard", "input.keyboard", false},
+    {kGamepadBinds, RT_GP_COUNT, RT_GP_MENU, RT_GP_SCREENSHOT, "gamepad", "input.gamepad", true},
+    /* Player 2 reads the same default table with a shorter count: the first
+     * sixteen entries are the sixteen DS2 buttons and the two past them are
+     * the host hotkeys, which this device does not have (host/settings.h
+     * RT_GP2_COUNT). Chords stay parsed so rule 3 rejects one anywhere here;
+     * with no menu slot there is nowhere a chord is legal. */
+    {kGamepadBinds, RT_GP2_COUNT, -1, -1, "gamepad2", "input.gamepad2", true},
+    {kMouseBinds, RT_MB_COUNT, -1, RT_MB_SCREENSHOT, "mouse", "input.mouse", false},
 };
+
+/* True for the slots the host consumes in the event pump: the menu key
+ * (ui/ui_events.cpp) and the screenshot key (host/screenshot.cpp). Neither
+ * ever reaches the virtual pad, so neither takes part in the "one host input
+ * cannot press two DS2 buttons" rule, and a name shared with an ordinary slot
+ * is a button the game can never see. */
+bool is_hotkey_slot(const BindTable& t, int slot) {
+    return slot >= 0 && (slot == t.menu_slot || slot == t.screenshot_slot);
+}
 
 bool valid_device(RtBindDevice d) {
     return d >= 0 && d < RT_BIND_DEVICE_COUNT;
@@ -133,6 +160,7 @@ std::string* bind_values(RtSettings* s, RtBindDevice d) {
     switch (d) {
     case RT_BIND_KEYBOARD: return s->input.keyboard;
     case RT_BIND_GAMEPAD:  return s->input.gamepad;
+    case RT_BIND_GAMEPAD2: return s->input.gamepad2;
     case RT_BIND_MOUSE:    return s->input.mouse;
     default:               return nullptr;
     }
@@ -168,13 +196,23 @@ struct EnvTwin {
 };
 
 constexpr EnvTwin kEnvTwins[] = {
-    {"display.present", "ICORECOMP_GS_PRESENT", false},
     {"debug.fps_limit_hz", "ICORECOMP_FPS_LIMIT", false},
-    {"debug.verbose", "ICORECOMP_VERBOSE", false},
+    {"debug.log_level", "ICORECOMP_LOG_LEVEL", false},
     {"debug.profile_fields", "ICORECOMP_PROFILE", false},
     {"debug.log_file", "ICORECOMP_LOG", true},
     {"audio.mute", "ICORECOMP_NO_AUDIO", false},
 };
+
+/* Two environment variables that were twins and are not any more, because
+ * the settings key each stood over is gone: ICORECOMP_GS_PRESENT (the
+ * swapchain present mode, read in gs/gs_select.cpp) and ICORECOMP_VERBOSE
+ * (the log channel spec, read in log.cpp's rt_log_init). Both still do
+ * exactly what they did, at those same call sites, so every script and CI
+ * invocation keeps behaving as it always has; there is simply no file key
+ * left for them to win over, so they are not in the table above and
+ * rt_settings_overridden() answers false for them. docs/SETTINGS.md section
+ * 3 lists them as environment-only.
+ */
 
 /* The value this twin overrides its setting with, or null when it is not
  * set in the sense its consumer means (see `nonempty` above). The startup
@@ -199,11 +237,6 @@ constexpr EnumEntry kDisplayModeNames[] = {
     {"fullscreen_desktop", (int)RtDisplayMode::FullscreenDesktop},
     {"fullscreen_exclusive", (int)RtDisplayMode::FullscreenExclusive},
 };
-constexpr EnumEntry kPresentNames[] = {
-    {"mailbox", (int)RtPresentMode::Mailbox},
-    {"fifo", (int)RtPresentMode::Fifo},
-    {"immediate", (int)RtPresentMode::Immediate},
-};
 constexpr EnumEntry kFitNames[] = {
     {"letterbox", (int)RtFit::Letterbox},
     {"integer", (int)RtFit::IntegerScale},
@@ -213,14 +246,28 @@ constexpr EnumEntry kRasterNames[] = {
     {"crt", (int)RtRaster::Crt},
     {"window", (int)RtRaster::Window},
 };
-constexpr EnumEntry kDeinterlaceNames[] = {
-    {"adaptive", (int)RtDeinterlace::Adaptive},
-    {"bob", (int)RtDeinterlace::Bob},
-    {"weave", (int)RtDeinterlace::Weave},
+/* "16_9" rather than "16:9": a colon in a JSON string is legal but reads as
+ * structure, and the same token is the option value in ui/menu.rml. */
+constexpr EnumEntry kWidescreenNames[] = {
+    {"off", (int)RtWidescreen::Off},
+    {"window", (int)RtWidescreen::Window},
+    {"16_9", (int)RtWidescreen::SixteenNine},
 };
+/* display.backend had a name table here until 2026-09-05. The key is
+ * retired and the struct no longer carries a field for it, so the only
+ * spelling of a backend name left in the tree is gs/gs_select.cpp's, which
+ * parses ICORECOMP_GS_BACKEND. */
 constexpr EnumEntry kFilterNames[] = {
     {"linear", (int)RtFilter::Linear},
     {"nearest", (int)RtFilter::Nearest},
+};
+/* Highest first, the way the level ordering reads: a line shows when its
+ * own level is at or above the one selected here. */
+constexpr EnumEntry kLogLevelNames[] = {
+    {"error", (int)RT_LOG_ERROR},
+    {"warn", (int)RT_LOG_WARN},
+    {"info", (int)RT_LOG_INFO},
+    {"debug", (int)RT_LOG_DEBUG},
 };
 
 /* 2x is deliberately not offered: SuperSampling::X2 only doubles the
@@ -289,7 +336,7 @@ bool is_one_of(const std::string& k, std::initializer_list<const char*> set) {
 void load_bool(const RtJson* v, const char* dotted, bool* out) {
     if (!v) return;
     if (v->type != RtJson::Type::Bool) {
-        rt_log("settings", "settings: %s is not a boolean (kept default %s)", dotted, *out ? "true" : "false");
+        rt_log_warn("settings", "settings: %s is not a boolean (kept default %s)", dotted, *out ? "true" : "false");
         return;
     }
     *out = v->boolean;
@@ -298,7 +345,7 @@ void load_bool(const RtJson* v, const char* dotted, bool* out) {
 void load_string(const RtJson* v, const char* dotted, std::string* out) {
     if (!v) return;
     if (v->type != RtJson::Type::String) {
-        rt_log("settings", "settings: %s is not a string (kept default \"%s\")", dotted, out->c_str());
+        rt_log_warn("settings", "settings: %s is not a string (kept default \"%s\")", dotted, out->c_str());
         return;
     }
     *out = v->str;
@@ -307,12 +354,12 @@ void load_string(const RtJson* v, const char* dotted, std::string* out) {
 void load_int_range(const RtJson* v, const char* dotted, int lo, int hi, int* out) {
     if (!v) return;
     if (v->type != RtJson::Type::Number) {
-        rt_log("settings", "settings: %s is not a number (kept default %d)", dotted, *out);
+        rt_log_warn("settings", "settings: %s is not a number (kept default %d)", dotted, *out);
         return;
     }
     double d = v->number;
     if (d != std::floor(d) || d < lo || d > hi) {
-        rt_log("settings", "settings: %s = %.6g is out of range [%d, %d] (kept default %d)", dotted, d, lo, hi, *out);
+        rt_log_warn("settings", "settings: %s = %.6g is out of range [%d, %d] (kept default %d)", dotted, d, lo, hi, *out);
         return;
     }
     *out = (int)d;
@@ -321,13 +368,13 @@ void load_int_range(const RtJson* v, const char* dotted, int lo, int hi, int* ou
 void load_double_range(const RtJson* v, const char* dotted, double lo, double hi, bool lo_exclusive, double* out) {
     if (!v) return;
     if (v->type != RtJson::Type::Number) {
-        rt_log("settings", "settings: %s is not a number (kept default %.6g)", dotted, *out);
+        rt_log_warn("settings", "settings: %s is not a number (kept default %.6g)", dotted, *out);
         return;
     }
     double d = v->number;
     bool ok = (lo_exclusive ? d > lo : d >= lo) && d <= hi;
     if (!ok) {
-        rt_log("settings", "settings: %s = %.6g is out of range %c%.6g, %.6g] (kept default %.6g)",
+        rt_log_warn("settings", "settings: %s = %.6g is out of range %c%.6g, %.6g] (kept default %.6g)",
             dotted, d, lo_exclusive ? '(' : '[', lo, hi, *out);
         return;
     }
@@ -346,11 +393,13 @@ void load_float_range(const RtJson* v, const char* dotted, double lo, double hi,
     *out = (float)d;
 }
 
-/* fps_limit_hz: 0 disables pacing, otherwise [1, 1000]. */
-void load_fps_limit(const RtJson* v, const char* dotted, double* out) {
+/* A rate in Hz: 0 has the key's own "off" meaning, otherwise [1, 1000].
+ * debug.fps_limit_hz (0 disables the guest field pacer) is the only key
+ * that uses it now. */
+void load_hz(const RtJson* v, const char* dotted, double* out) {
     if (!v) return;
     if (v->type != RtJson::Type::Number) {
-        rt_log("settings", "settings: %s is not a number (kept default %.6g)", dotted, *out);
+        rt_log_warn("settings", "settings: %s is not a number (kept default %.6g)", dotted, *out);
         return;
     }
     double d = v->number;
@@ -358,13 +407,26 @@ void load_fps_limit(const RtJson* v, const char* dotted, double* out) {
         *out = d;
         return;
     }
-    rt_log("settings", "settings: %s = %.6g is out of range (must be 0 or [1, 1000]) (kept default %.6g)", dotted, d, *out);
+    rt_log_warn("settings", "settings: %s = %.6g is out of range (must be 0 or [1, 1000]) (kept default %.6g)", dotted, d, *out);
+}
+
+/* debug.fps_limit_hz: load_hz plus RT_FPS_LIMIT_MODE_RATE, which is the
+ * default and means "the rate of the video mode the game programmed". A
+ * negative number that is not exactly that sentinel is still out of
+ * range. */
+void load_fps_limit(const RtJson* v, const char* dotted, double* out) {
+    if (!v) return;
+    if (v->type == RtJson::Type::Number && v->number == RT_FPS_LIMIT_MODE_RATE) {
+        *out = RT_FPS_LIMIT_MODE_RATE;
+        return;
+    }
+    load_hz(v, dotted, out);
 }
 
 void load_int_set(const RtJson* v, const char* dotted, const int* set, size_t n, int* out) {
     if (!v) return;
     if (v->type != RtJson::Type::Number) {
-        rt_log("settings", "settings: %s is not a number (kept default %d)", dotted, *out);
+        rt_log_warn("settings", "settings: %s is not a number (kept default %d)", dotted, *out);
         return;
     }
     double d = v->number;
@@ -382,14 +444,14 @@ void load_int_set(const RtJson* v, const char* dotted, const int* set, size_t n,
         if (k) allowed += ", ";
         allowed += std::to_string(set[k]);
     }
-    rt_log("settings", "settings: %s = %.6g is not one of {%s} (kept default %d)", dotted, d, allowed.c_str(), *out);
+    rt_log_warn("settings", "settings: %s = %.6g is not one of {%s} (kept default %d)", dotted, d, allowed.c_str(), *out);
 }
 
 template <size_t N>
 void load_enum(const RtJson* v, const char* dotted, const EnumEntry (&table)[N], int* out) {
     if (!v) return;
     if (v->type != RtJson::Type::String) {
-        rt_log("settings", "settings: %s is not a string (kept default \"%s\")", dotted, enum_name(table, *out));
+        rt_log_warn("settings", "settings: %s is not a string (kept default \"%s\")", dotted, enum_name(table, *out));
         return;
     }
     for (size_t k = 0; k < N; ++k) {
@@ -403,7 +465,7 @@ void load_enum(const RtJson* v, const char* dotted, const EnumEntry (&table)[N],
         if (k) allowed += "/";
         allowed += table[k].name;
     }
-    rt_log("settings", "settings: %s = \"%s\" is not one of %s (kept default \"%s\")",
+    rt_log_warn("settings", "settings: %s = \"%s\" is not one of %s (kept default \"%s\")",
         dotted, v->str.c_str(), allowed.c_str(), enum_name(table, *out));
 }
 
@@ -415,8 +477,23 @@ void log_unknown_keys(const RtJson& obj, const std::string& parent, Pred is_know
     for (const auto& kv : obj.obj) {
         if (is_known(kv.first)) continue;
         std::string dotted = parent.empty() ? kv.first : parent + "." + kv.first;
-        rt_log("settings", "settings: unknown key \"%s\" kept as-is", dotted.c_str());
+        rt_log_warn("settings", "settings: unknown key \"%s\" kept as-is", dotted.c_str());
     }
+}
+
+/* A key this build no longer reads, present in the file a user already
+ * has. One info line names it and says what stands in its place; the value
+ * itself is left exactly as it was, because the retained DOM carries
+ * unknown and retired keys across a save (write_struct_into_dom sets known
+ * keys only). Info, not warn: nothing was refused and nothing was
+ * overridden. The key stays in the section's known-key list so this line is
+ * the only one it produces.
+ *
+ * Settings handling is never fatal, and a stale key is the ordinary state
+ * of a settings.json written by an older build. */
+void load_retired(const RtJson* v, const char* dotted, const char* instead) {
+    if (!v) return;
+    rt_log_info("settings", "settings: %s is no longer read; %s", dotted, instead);
 }
 
 /* ---- DOM -> struct ------------------------------------------------------- */
@@ -424,7 +501,7 @@ void log_unknown_keys(const RtJson& obj, const std::string& parent, Pred is_know
 void map_bind_section(const RtJson* sec, const char* dotted_parent, const BindDef* defs, int count, std::string* out) {
     if (!sec) return;
     if (sec->type != RtJson::Type::Object) {
-        rt_log("settings", "settings: %s is not an object (kept defaults)", dotted_parent);
+        rt_log_warn("settings", "settings: %s is not an object (kept defaults)", dotted_parent);
         return;
     }
     log_unknown_keys(*sec, dotted_parent, [&](const std::string& k) {
@@ -441,57 +518,83 @@ void map_bind_section(const RtJson* sec, const char* dotted_parent, const BindDe
 
 void map_from_dom(const RtJson& dom, RtSettings* out) {
     log_unknown_keys(dom, "", [](const std::string& k) {
-        return is_one_of(k, {"version", "display", "audio", "input", "gameplay", "debug", "launcher"});
+        /* Every section write_struct_into_dom writes, "system" included: a
+         * section missing from this list is reported as an unknown key on
+         * the next load of a file this build itself saved. */
+        return is_one_of(k, {"version", "display", "audio", "input", "gameplay", "system",
+            "achievements", "debug", "launcher"});
     });
 
     if (const RtJson* d = dom.find("display")) {
         if (d->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"display\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"display\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*d, "display", [](const std::string& k) {
                 return is_one_of(k, {"mode", "window_width", "window_height", "remember_window_size",
-                    "present", "fit", "filter", "raster", "deinterlace", "render_scale",
-                    "show_fps"});
+                    "present", "present_rate", "fit", "filter", "raster", "deinterlace",
+                    "widescreen", "backend", "render_scale", "show_fps", "screenshot_dir"});
             });
             load_enum(d->find("mode"), "display.mode", kDisplayModeNames, (int*)&out->display.mode);
             load_int_range(d->find("window_width"), "display.window_width", 320, 16384, &out->display.window_width);
             load_int_range(d->find("window_height"), "display.window_height", 320, 16384, &out->display.window_height);
             load_bool(d->find("remember_window_size"), "display.remember_window_size", &out->display.remember_window_size);
-            load_enum(d->find("present"), "display.present", kPresentNames, (int*)&out->display.present);
+            load_retired(d->find("present"), "display.present",
+                "the present mode is mailbox, and ICORECOMP_GS_PRESENT still selects another"
+                " one for this run");
+            load_retired(d->find("present_rate"), "display.present_rate",
+                "the window is refreshed once per field");
             load_enum(d->find("fit"), "display.fit", kFitNames, (int*)&out->display.fit);
             load_enum(d->find("raster"), "display.raster", kRasterNames, (int*)&out->display.raster);
-            load_enum(d->find("deinterlace"), "display.deinterlace", kDeinterlaceNames, (int*)&out->display.deinterlace);
+            load_retired(d->find("deinterlace"), "display.deinterlace",
+                "the two fields of an interlaced scanout are always bobbed, which is what shows"
+                " the attract movie as the disc holds it");
+            load_enum(d->find("widescreen"), "display.widescreen", kWidescreenNames, (int*)&out->display.widescreen);
+            load_retired(d->find("backend"), "display.backend",
+                "the renderer is paraLLEl-GS (the native renderers were withdrawn from settings on"
+                " 2026-09-05; ICORECOMP_GS_BACKEND still selects one for a replay or a CI run)");
             load_enum(d->find("filter"), "display.filter", kFilterNames, (int*)&out->display.filter);
             load_int_set(d->find("render_scale"), "display.render_scale", kRenderScales, std::size(kRenderScales), &out->display.render_scale);
             if (d->find("hires_scanout")) {
                 /* Retired key. It is not in the known-key list above, so it is
                  * also reported by log_unknown_keys and kept in the file across
                  * a save; this line says why it no longer does anything. */
-                rt_log("settings", "settings: display.hires_scanout is no longer a setting;"
+                rt_log_warn("settings", "settings: display.hires_scanout is no longer a setting;"
                     " display.render_scale 4 and up now requests high-resolution scanout");
             }
             load_bool(d->find("show_fps"), "display.show_fps", &out->display.show_fps);
+            /* Any path is accepted as written, including one that does not
+             * exist yet or is not writable: host/screenshot.cpp creates it on
+             * the first capture and, when it cannot, logs once and skips.
+             * There is no allowed set to validate against here, so there is
+             * nothing for the loader or commit_validate to revert. */
+            load_string(d->find("screenshot_dir"), "display.screenshot_dir", &out->display.screenshot_dir);
         }
     }
 
     if (const RtJson* a = dom.find("audio")) {
         if (a->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"audio\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"audio\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*a, "audio", [](const std::string& k) {
-                return is_one_of(k, {"master_volume", "mute"});
+                return is_one_of(k, {"master_volume", "mute", "music_volume", "effects_volume",
+                                     "movie_volume", "chime_volume"});
             });
             load_int_range(a->find("master_volume"), "audio.master_volume", 0, 100, &out->audio.master_volume);
             load_bool(a->find("mute"), "audio.mute", &out->audio.mute);
+            load_int_range(a->find("music_volume"), "audio.music_volume", 0, 100, &out->audio.music_volume);
+            load_int_range(a->find("effects_volume"), "audio.effects_volume", 0, 100, &out->audio.effects_volume);
+            load_int_range(a->find("movie_volume"), "audio.movie_volume", 0, 100, &out->audio.movie_volume);
+            load_int_range(a->find("chime_volume"), "audio.chime_volume", 0, 100, &out->audio.chime_volume);
         }
     }
 
     if (const RtJson* i = dom.find("input")) {
         if (i->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"input\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"input\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*i, "input", [](const std::string& k) {
-                return is_one_of(k, {"keyboard", "gamepad", "mouse", "left_deadzone", "right_deadzone",
+                return is_one_of(k, {"keyboard", "gamepad", "gamepad2", "mouse",
+                    "left_deadzone", "right_deadzone",
                     "mouse_look", "mouse_look_sensitivity", "mouse_look_invert_y"});
             });
             for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
@@ -509,11 +612,11 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
              * also reported by log_unknown_keys and kept in the file across a
              * save; these lines say what happens instead. */
             if (i->find("trigger_threshold")) {
-                rt_log("settings", "settings: input.trigger_threshold is no longer a setting;"
+                rt_log_warn("settings", "settings: input.trigger_threshold is no longer a setting;"
                     " an axis bound to a button is pressed past a compiled-in raw value of 8192 of 32767");
             }
             if (i->find("rumble")) {
-                rt_log("settings", "settings: input.rumble is no longer a setting;"
+                rt_log_warn("settings", "settings: input.rumble is no longer a setting;"
                     " the host pad motors follow the game's actuator requests");
             }
         }
@@ -521,7 +624,7 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
 
     if (const RtJson* g = dom.find("gameplay")) {
         if (g->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"gameplay\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"gameplay\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*g, "gameplay", [](const std::string& k) {
                 return is_one_of(k, {"run_any_direction"});
@@ -530,14 +633,49 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
         }
     }
 
+    if (const RtJson* sys = dom.find("system")) {
+        if (sys->type != RtJson::Type::Object) {
+            rt_log_warn("settings", "settings: \"system\" is not an object (section kept as defaults)");
+        } else {
+            log_unknown_keys(*sys, "system", [](const std::string& k) {
+                return is_one_of(k, {"language"});
+            });
+            load_retired(sys->find("language"), "system.language",
+                "the game's own language screen is where this disc's language is chosen");
+        }
+    }
+
+    if (const RtJson* ac = dom.find("achievements")) {
+        if (ac->type != RtJson::Type::Object) {
+            rt_log_warn("settings", "settings: \"achievements\" is not an object (section kept as defaults)");
+        } else {
+            log_unknown_keys(*ac, "achievements", [](const std::string& k) {
+                return is_one_of(k, {"enabled", "toast", "sound", "sound_volume",
+                                     "log_progress_bits"});
+            });
+            load_bool(ac->find("enabled"), "achievements.enabled", &out->achievements.enabled);
+            load_bool(ac->find("toast"), "achievements.toast", &out->achievements.toast);
+            load_bool(ac->find("sound"), "achievements.sound", &out->achievements.sound);
+            load_retired(ac->find("sound_volume"), "achievements.sound_volume",
+                "the chime's volume is audio.chime_volume, with the other host output gains");
+            load_retired(ac->find("log_progress_bits"), "achievements.log_progress_bits",
+                "the progress-bit diagnostic is always on, at info level");
+        }
+    }
+
     if (const RtJson* dbg = dom.find("debug")) {
         if (dbg->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"debug\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"debug\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*dbg, "debug", [](const std::string& k) {
-                return is_one_of(k, {"verbose", "log_file", "profile_fields", "fps_limit_hz"});
+                return is_one_of(k, {"verbose", "log_level", "console", "log_file",
+                    "profile_fields", "fps_limit_hz"});
             });
-            load_string(dbg->find("verbose"), "debug.verbose", &out->debug.verbose);
+            load_retired(dbg->find("verbose"), "debug.verbose",
+                "ICORECOMP_VERBOSE is where log channels are named");
+            load_enum(dbg->find("log_level"), "debug.log_level", kLogLevelNames,
+                (int*)&out->debug.log_level);
+            load_bool(dbg->find("console"), "debug.console", &out->debug.console);
             load_bool(dbg->find("log_file"), "debug.log_file", &out->debug.log_file);
             load_int_range(dbg->find("profile_fields"), "debug.profile_fields", 0, 100000, &out->debug.profile_fields);
             load_fps_limit(dbg->find("fps_limit_hz"), "debug.fps_limit_hz", &out->debug.fps_limit_hz);
@@ -545,7 +683,7 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
                 /* Retired key. It is not in the known-key list above, so it is
                  * also reported by log_unknown_keys and kept in the file across
                  * a save; this line says why it no longer does anything. */
-                rt_log("settings", "settings: debug.menu_hit_editor is no longer a setting;"
+                rt_log_warn("settings", "settings: debug.menu_hit_editor is no longer a setting;"
                     " the pointer on the game's menus reads the game's own scene objects,"
                     " so there are no hit boxes to author");
             }
@@ -554,7 +692,7 @@ void map_from_dom(const RtJson& dom, RtSettings* out) {
 
     if (const RtJson* lc = dom.find("launcher")) {
         if (lc->type != RtJson::Type::Object) {
-            rt_log("settings", "settings: \"launcher\" is not an object (section kept as defaults)");
+            rt_log_warn("settings", "settings: \"launcher\" is not an object (section kept as defaults)");
         } else {
             log_unknown_keys(*lc, "launcher", [](const std::string& k) {
                 return is_one_of(k, {"show_at_startup", "disc_path"});
@@ -576,7 +714,7 @@ RtJson& get_or_make_object(RtJson* parent, const char* key) {
     RtJson* existing = parent->find(key);
     if (existing) {
         if (existing->type == RtJson::Type::Object) return *existing;
-        rt_log("settings", "settings: \"%s\" was not an object; replacing it with one on save", key);
+        rt_log_warn("settings", "settings: \"%s\" was not an object; replacing it with one on save", key);
     }
     return parent->set(key, RtJson::make_object());
 }
@@ -596,17 +734,21 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     d.set("window_width", RtJson::make_number(s.display.window_width));
     d.set("window_height", RtJson::make_number(s.display.window_height));
     d.set("remember_window_size", RtJson::make_bool(s.display.remember_window_size));
-    d.set("present", RtJson::make_string(enum_name(kPresentNames, (int)s.display.present)));
     d.set("fit", RtJson::make_string(enum_name(kFitNames, (int)s.display.fit)));
     d.set("raster", RtJson::make_string(enum_name(kRasterNames, (int)s.display.raster)));
-    d.set("deinterlace", RtJson::make_string(enum_name(kDeinterlaceNames, (int)s.display.deinterlace)));
+    d.set("widescreen", RtJson::make_string(enum_name(kWidescreenNames, (int)s.display.widescreen)));
     d.set("filter", RtJson::make_string(enum_name(kFilterNames, (int)s.display.filter)));
     d.set("render_scale", RtJson::make_number(s.display.render_scale));
     d.set("show_fps", RtJson::make_bool(s.display.show_fps));
+    d.set("screenshot_dir", RtJson::make_string(s.display.screenshot_dir));
 
     RtJson& a = get_or_make_object(dom, "audio");
     a.set("master_volume", RtJson::make_number(s.audio.master_volume));
     a.set("mute", RtJson::make_bool(s.audio.mute));
+    a.set("music_volume", RtJson::make_number(s.audio.music_volume));
+    a.set("effects_volume", RtJson::make_number(s.audio.effects_volume));
+    a.set("movie_volume", RtJson::make_number(s.audio.movie_volume));
+    a.set("chime_volume", RtJson::make_number(s.audio.chime_volume));
 
     RtJson& in = get_or_make_object(dom, "input");
     for (int d = 0; d < RT_BIND_DEVICE_COUNT; ++d) {
@@ -622,8 +764,18 @@ void write_struct_into_dom(const RtSettings& s, RtJson* dom) {
     RtJson& g = get_or_make_object(dom, "gameplay");
     g.set("run_any_direction", RtJson::make_bool(s.gameplay.run_any_direction));
 
+    /* No "system" section is written: system.language was its only key and
+     * this build does not read it. A file that already has one keeps it
+     * untouched, like every other retired key. */
+
+    RtJson& ac = get_or_make_object(dom, "achievements");
+    ac.set("enabled", RtJson::make_bool(s.achievements.enabled));
+    ac.set("toast", RtJson::make_bool(s.achievements.toast));
+    ac.set("sound", RtJson::make_bool(s.achievements.sound));
+
     RtJson& dbg = get_or_make_object(dom, "debug");
-    dbg.set("verbose", RtJson::make_string(s.debug.verbose));
+    dbg.set("log_level", RtJson::make_string(enum_name(kLogLevelNames, (int)s.debug.log_level)));
+    dbg.set("console", RtJson::make_bool(s.debug.console));
     dbg.set("log_file", RtJson::make_bool(s.debug.log_file));
     dbg.set("profile_fields", RtJson::make_number(s.debug.profile_fields));
     dbg.set("fps_limit_hz", RtJson::make_number(s.debug.fps_limit_hz));
@@ -642,7 +794,7 @@ void write_bad_copy(const std::string& path, const std::string& text) {
     std::string bad = path + ".bad";
     std::FILE* f = rt_fopen_utf8(bad.c_str(), "wb");
     if (!f) {
-        rt_log("settings", "settings: could not write %s: %s", bad.c_str(), std::strerror(errno));
+        rt_log_warn("settings", "settings: could not write %s: %s", bad.c_str(), std::strerror(errno));
         return;
     }
     std::fwrite(text.data(), 1, text.size(), f);
@@ -687,7 +839,7 @@ bool read_whole_file(const std::string& path, std::string* out) {
 void load_file(const std::string& path) {
     std::string text;
     if (!read_whole_file(path, &text)) {
-        rt_log("settings", "settings: %s not found yet; running on defaults, will create it on first save", path.c_str());
+        rt_log_warn("settings", "settings: %s not found yet; running on defaults, will create it on first save", path.c_str());
         return;
     }
 
@@ -695,33 +847,33 @@ void load_file(const std::string& path) {
     std::string err;
     if (!rt_json_parse(text, &parsed, &err)) {
         write_bad_copy(path, text);
-        rt_log("settings", "settings: %s:%s; running on defaults, file copied to %s.bad", path.c_str(), err.c_str(), path.c_str());
+        rt_log_warn("settings", "settings: %s:%s; running on defaults, file copied to %s.bad", path.c_str(), err.c_str(), path.c_str());
         block_saving_for_broken_file(path);
         return;
     }
     if (parsed.type != RtJson::Type::Object) {
         write_bad_copy(path, text);
-        rt_log("settings", "settings: %s: top level is not an object; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
+        rt_log_warn("settings", "settings: %s: top level is not an object; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
         block_saving_for_broken_file(path);
         return;
     }
     const RtJson* ver = parsed.find("version");
     if (!ver || ver->type != RtJson::Type::Number) {
         write_bad_copy(path, text);
-        rt_log("settings", "settings: %s: missing or non-numeric \"version\"; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
+        rt_log_warn("settings", "settings: %s: missing or non-numeric \"version\"; running on defaults, file copied to %s.bad", path.c_str(), path.c_str());
         block_saving_for_broken_file(path);
         return;
     }
     if (ver->number > 1.0) {
         g_save_allowed = false;
         g_save_blocked_reason = "the loaded file has version " + std::to_string((long long)ver->number) + ", written by a newer build";
-        rt_log("settings", "settings: %s was written by a newer build (version %.0f); running on defaults, the file is left untouched",
+        rt_log_warn("settings", "settings: %s was written by a newer build (version %.0f); running on defaults, the file is left untouched",
             path.c_str(), ver->number);
         return;
     }
     if (ver->number != 1.0) {
         write_bad_copy(path, text);
-        rt_log("settings", "settings: %s: unsupported \"version\" %.6g (expected 1); running on defaults, file copied to %s.bad",
+        rt_log_warn("settings", "settings: %s: unsupported \"version\" %.6g (expected 1); running on defaults, file copied to %s.bad",
             path.c_str(), ver->number, path.c_str());
         block_saving_for_broken_file(path);
         return;
@@ -729,7 +881,7 @@ void load_file(const std::string& path) {
 
     g_dom = std::move(parsed);
     map_from_dom(g_dom, &g_current);
-    rt_log("settings", "settings: loaded from %s", path.c_str());
+    rt_log_info("settings", "settings: loaded from %s", path.c_str());
 }
 
 /* ---- source resolution ---------------------------------------------------- */
@@ -777,7 +929,7 @@ ResolvedSource resolve_source() {
 
 void revert_int(int* v, int prev, const char* dotted, int lo, int hi) {
     if (*v >= lo && *v <= hi) return;
-    rt_log("settings", "settings: %s = %d is out of range [%d, %d]; reverted to %d", dotted, *v, lo, hi, prev);
+    rt_log_warn("settings", "settings: %s = %d is out of range [%d, %d]; reverted to %d", dotted, *v, lo, hi, prev);
     *v = prev;
 }
 
@@ -787,7 +939,7 @@ void revert_float(float* v, float prev, const char* dotted, double lo, double hi
     const double d = *v;
     bool ok = (lo_exclusive ? d > lo : d >= lo) && d <= hi;
     if (ok) return;
-    rt_log("settings", "settings: %s = %.6g is out of range %c%.6g, %.6g]; reverted to %.6g",
+    rt_log_warn("settings", "settings: %s = %.6g is out of range %c%.6g, %.6g]; reverted to %.6g",
         dotted, d, lo_exclusive ? '(' : '[', lo, hi, (double)prev);
     *v = prev;
 }
@@ -796,10 +948,13 @@ void revert_float(float* v, float prev, const char* dotted, double lo, double hi
  *
  * Two rules, both about one name being claimed twice on one device:
  *
- *   1. The menu key (input.keyboard.menu / input.gamepad.menu) is consumed
- *      in the event pump and never reaches the pad (ui/ui_events.cpp), so a
- *      menu key that is also a pad binding is a pad button the game can
- *      never see. Rejected.
+ *   1. A host hotkey (the menu key, input.<device>.menu, consumed by
+ *      ui/ui_events.cpp; and the screenshot key, input.<device>.screenshot,
+ *      consumed by host/screenshot.cpp) is taken in the event pump and never
+ *      reaches the pad, so a hotkey name that is also a pad binding is a pad
+ *      button the game can never see. Rejected. The same rule catches the two
+ *      hotkeys sharing a name: the menu key is resolved first in the pump, so
+ *      the screenshot would never fire.
  *   2. Two ordinary slots holding the same name means one host key or button
  *      presses two DS2 buttons at once. That is a legal thing to want but
  *      almost never a thing anyone meant, and the menu offers no way to say
@@ -822,8 +977,10 @@ void revert_float(float* v, float prev, const char* dotted, double lo, double hi
  * shipped state of most slots. Either way two of them are not a collision
  * the user made.
  *
- * Rule 1 does not apply to a device with no menu slot (`menu_slot` -1, the
- * mouse); rule 2 applies to all three.
+ * Rule 1 runs once per hotkey slot the device has. The mouse has no menu
+ * slot (`menu_slot` -1) so it gets the screenshot pass only, and player 2's
+ * pad has neither, so rule 1 does not run for it at all. Rule 2 applies to
+ * every device and skips whichever hotkeys it has.
  *
  * Comparison is case-insensitive because that is how SDL_GetScancodeFromName
  * resolves ("f1" and "F1" are the same key), so a case difference in a
@@ -866,7 +1023,12 @@ void note_reject(const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    rt_log("settings", "settings: %s", buf);
+    /* warn, not info: a reject is a refusal, which is what runtime.h's
+     * table grades warn, and it is what every other revert in this file
+     * uses. The menu shows it live through rt_settings_last_reject, but a
+     * log built into a bug report has to carry it too, and the shipped
+     * level is warn. */
+    rt_log_warn("settings", "settings: %s", buf);
     if (!g_last_reject.empty()) g_last_reject += "; ";
     g_last_reject += buf;
 }
@@ -892,29 +1054,38 @@ void validate_binds(std::string* cur, const std::string* prev, const BindTable& 
     std::string menu_chord_a, menu_chord_b;
     const bool menu_is_chord = t.chords && menu_slot >= 0 &&
         rt_settings_split_chord(cur[menu_slot], &menu_chord_a, &menu_chord_b);
-    if (menu_slot >= 0 && !menu_is_chord) {
+    /* Menu first, then screenshot: run in that order, a name the two hotkeys
+     * share is reported by the menu pass, and that is the honest way round.
+     * ui/ui_events.cpp resolves the menu key first in the pump and consumes
+     * it, so it is the screenshot that would never fire. */
+    for (int h = 0; h < 2; ++h) {
+        const int hotkey = (h == 0) ? menu_slot : t.screenshot_slot;
+        if (hotkey < 0) continue;
+        if (hotkey == menu_slot && menu_is_chord) continue;
         for (int i = 0; i < count; ++i) {
-            if (i == menu_slot) continue;
-            if (!bind_name_equal(cur[menu_slot], cur[i])) continue;
-            const bool menu_changed = cur[menu_slot] != prev[menu_slot];
+            if (i == hotkey) continue;
+            if (!bind_name_equal(cur[hotkey], cur[i])) continue;
+            const bool hotkey_changed = cur[hotkey] != prev[hotkey];
             const bool other_changed = cur[i] != prev[i];
-            if (!menu_changed && !other_changed) continue;
-            note_reject("%s.menu and %s.%s are both \"%s\"; the menu key never reaches the pad,"
-                " so %s%s%s reverted",
-                section, section, defs[i].json_key, cur[menu_slot].c_str(),
-                menu_changed ? "menu" : "",
-                (menu_changed && other_changed) ? " and " : "",
+            if (!hotkey_changed && !other_changed) continue;
+            note_reject("%s.%s and %s.%s are both \"%s\"; the host takes %s.%s in the event"
+                " pump, so %s.%s would never fire; %s%s%s reverted",
+                section, defs[hotkey].json_key, section, defs[i].json_key, cur[hotkey].c_str(),
+                section, defs[hotkey].json_key, section, defs[i].json_key,
+                hotkey_changed ? defs[hotkey].json_key : "",
+                (hotkey_changed && other_changed) ? " and " : "",
                 other_changed ? defs[i].json_key : "");
-            if (menu_changed) cur[menu_slot] = prev[menu_slot];
+            if (hotkey_changed) cur[hotkey] = prev[hotkey];
             if (other_changed) cur[i] = prev[i];
         }
     }
 
-    /* Rule 2, the same way: only the slots this commit moved revert. */
+    /* Rule 2, the same way: only the slots this commit moved revert. Neither
+     * hotkey slot takes part; rule 1 above is what covers those. */
     for (int i = 0; i < count; ++i) {
-        if (i == menu_slot) continue;
+        if (is_hotkey_slot(t, i)) continue;
         for (int j = i + 1; j < count; ++j) {
-            if (j == menu_slot) continue;
+            if (is_hotkey_slot(t, j)) continue;
             if (!bind_name_equal(cur[i], cur[j])) continue;
             const bool i_changed = cur[i] != prev[i];
             const bool j_changed = cur[j] != prev[j];
@@ -964,12 +1135,19 @@ void log_bind_duplicates(const std::string* v, const BindTable& t) {
     for (int i = 0; i < t.count; ++i) {
         for (int j = i + 1; j < t.count; ++j) {
             if (!bind_name_equal(v[i], v[j])) continue;
-            if (i == t.menu_slot || j == t.menu_slot) {
-                rt_log("settings", "settings: %s.menu and %s.%s are both \"%s\"; the menu key is"
-                    " consumed by the menu, so that pad binding will never fire",
-                    t.section, t.section, t.defs[i == t.menu_slot ? j : i].json_key, v[i].c_str());
+            if (is_hotkey_slot(t, i) || is_hotkey_slot(t, j)) {
+                /* Which of the pair is the hotkey decides the wording: the
+                 * host takes it in the event pump, so it is the other slot
+                 * that never fires. Two hotkeys sharing a name land here too,
+                 * and the menu is the one the pump resolves first. */
+                const int hot = is_hotkey_slot(t, i) ? i : j;
+                const int lost = (hot == i) ? j : i;
+                rt_log_warn("settings", "settings: %s.%s and %s.%s are both \"%s\"; the host takes"
+                    " %s.%s in the event pump, so %s.%s will never fire",
+                    t.section, t.defs[hot].json_key, t.section, t.defs[lost].json_key, v[i].c_str(),
+                    t.section, t.defs[hot].json_key, t.section, t.defs[lost].json_key);
             } else {
-                rt_log("settings", "settings: %s.%s and %s.%s are both \"%s\"; that one input will"
+                rt_log_warn("settings", "settings: %s.%s and %s.%s are both \"%s\"; that one input will"
                     " press both buttons", t.section, t.defs[i].json_key, t.section, t.defs[j].json_key,
                     v[i].c_str());
             }
@@ -985,7 +1163,7 @@ void log_bind_duplicates(const std::string* v, const BindTable& t) {
             if (i == t.menu_slot) continue;
             std::string a, b;
             if (!rt_settings_split_chord(v[i], &a, &b)) continue;
-            rt_log("settings", "settings: %s.%s = \"%s\" is a chord, which only %s.menu accepts;"
+            rt_log_warn("settings", "settings: %s.%s = \"%s\" is a chord, which only %s.menu accepts;"
                 " that slot cannot resolve it and host/input.cpp falls back to its default",
                 t.section, t.defs[i].json_key, v[i].c_str(), t.section);
         }
@@ -1000,17 +1178,37 @@ void log_bind_duplicates(const std::string* v, const BindTable& t) {
         std::string menu_a, menu_b;
         if (t.menu_slot >= 0 && rt_settings_split_chord(v[t.menu_slot], &menu_a, &menu_b) &&
             bind_name_equal(menu_a, menu_b)) {
-            rt_log("settings", "settings: %s.menu = \"%s\" chords a button with itself, which is one"
+            rt_log_warn("settings", "settings: %s.menu = \"%s\" chords a button with itself, which is one"
                 " button, not two; that one press will open and close the menu",
                 t.section, v[t.menu_slot].c_str());
         }
     }
 }
 
+/* The commit-time twin of load_hz: 0 or [1, 1000], reverted to the value the
+ * running commit started from rather than to the compiled-in default, which
+ * is the rule every revert_* here follows. */
+void revert_hz(double* cur, double prev, const char* dotted) {
+    if (*cur == 0.0 || (*cur >= 1.0 && *cur <= 1000.0)) return;
+    rt_log_warn("settings", "settings: %s = %.6g is out of range (must be 0 or [1, 1000]);"
+        " reverted to %.6g", dotted, *cur, prev);
+    *cur = prev;
+}
+
+/* The commit-time twin of load_fps_limit. */
+void revert_fps_limit(double* cur, double prev, const char* dotted) {
+    if (*cur == RT_FPS_LIMIT_MODE_RATE) return;
+    revert_hz(cur, prev, dotted);
+}
+
 void commit_validate(RtSettings* cur, const RtSettings& prev) {
     revert_int(&cur->display.window_width, prev.display.window_width, "display.window_width", 320, 16384);
     revert_int(&cur->display.window_height, prev.display.window_height, "display.window_height", 320, 16384);
     revert_int(&cur->audio.master_volume, prev.audio.master_volume, "audio.master_volume", 0, 100);
+    revert_int(&cur->audio.music_volume, prev.audio.music_volume, "audio.music_volume", 0, 100);
+    revert_int(&cur->audio.effects_volume, prev.audio.effects_volume, "audio.effects_volume", 0, 100);
+    revert_int(&cur->audio.movie_volume, prev.audio.movie_volume, "audio.movie_volume", 0, 100);
+    revert_int(&cur->audio.chime_volume, prev.audio.chime_volume, "audio.chime_volume", 0, 100);
     revert_int(&cur->debug.profile_fields, prev.debug.profile_fields, "debug.profile_fields", 0, 100000);
 
     revert_float(&cur->input.left_deadzone, prev.input.left_deadzone, "input.left_deadzone", 0.0, 0.95, false);
@@ -1018,10 +1216,41 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
     revert_float(&cur->input.mouse_look_sensitivity, prev.input.mouse_look_sensitivity,
         "input.mouse_look_sensitivity", 0.05, 20.0, false);
 
-    if (!(cur->debug.fps_limit_hz == 0.0 || (cur->debug.fps_limit_hz >= 1.0 && cur->debug.fps_limit_hz <= 1000.0))) {
-        rt_log("settings", "settings: debug.fps_limit_hz = %.6g is out of range (must be 0 or [1, 1000]); reverted to %.6g",
-            cur->debug.fps_limit_hz, prev.debug.fps_limit_hz);
-        cur->debug.fps_limit_hz = prev.debug.fps_limit_hz;
+    revert_fps_limit(&cur->debug.fps_limit_hz, prev.debug.fps_limit_hz, "debug.fps_limit_hz");
+
+    /* Four enums are re-checked below, not all of them: display.mode, fit,
+     * raster and filter are not. The asymmetry is deliberate. Both entry
+     * points already refuse a value outside the table, load_enum for the
+     * file and value_of (ui/ui_settings_model.cpp) for the menu, so no enum
+     * can reach a commit wrong and none of these four is the only gate on
+     * its value. They are a second refusal on the ones whose consumers sit
+     * furthest from this file: the log level the sink reads on every
+     * thread, the widescreen mode the translator's entry hook reads, the
+     * backend selection gs_select.cpp turns into a library, and
+     * render_scale, which is an int with an allowed set rather than a name
+     * and so has no enum table behind it at either entry point. Adding the
+     * rest would be harmless and would prove nothing more than value_of
+     * already does. */
+    bool ll_ok = false;
+    for (const EnumEntry& e : kLogLevelNames) {
+        if ((int)cur->debug.log_level == e.value) ll_ok = true;
+    }
+    if (!ll_ok) {
+        rt_log_warn("settings", "settings: debug.log_level = %d is not one of error/warn/info/debug;"
+            " reverted to \"%s\"", (int)cur->debug.log_level,
+            enum_name(kLogLevelNames, (int)prev.debug.log_level));
+        cur->debug.log_level = prev.debug.log_level;
+    }
+
+    bool ws_ok = false;
+    for (const EnumEntry& e : kWidescreenNames) {
+        if ((int)cur->display.widescreen == e.value) ws_ok = true;
+    }
+    if (!ws_ok) {
+        rt_log_warn("settings", "settings: display.widescreen = %d is not one of off/window/16_9;"
+            " reverted to \"%s\"", (int)cur->display.widescreen,
+            enum_name(kWidescreenNames, (int)prev.display.widescreen));
+        cur->display.widescreen = prev.display.widescreen;
     }
 
     bool rs_ok = false;
@@ -1029,7 +1258,7 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
         if (cur->display.render_scale == allowed) rs_ok = true;
     }
     if (!rs_ok) {
-        rt_log("settings", "settings: display.render_scale = %d is not one of {1, 4, 8, 16}; reverted to %d",
+        rt_log_warn("settings", "settings: display.render_scale = %d is not one of {1, 4, 8, 16}; reverted to %d",
             cur->display.render_scale, prev.display.render_scale);
         cur->display.render_scale = prev.display.render_scale;
     }
@@ -1038,11 +1267,38 @@ void commit_validate(RtSettings* cur, const RtSettings& prev) {
         validate_binds(bind_values(cur, (RtBindDevice)d), bind_values(prev, (RtBindDevice)d),
             kBindTables[d]);
     }
+
+    /* The two cold keys, once the guest is running (settings.h). Before
+     * that, a change to one of them is applied by restarting the program,
+     * which is only legal while the launcher owns the window; from the
+     * first guest field on there is a save, a memory card and a GS worker
+     * in flight, so the change is refused here rather than half-applied.
+     * The menu disables those controls (ui/menu.rml), so what this catches
+     * is the other writers of rt_settings_mutable(): a hand-edited struct,
+     * a script, a future caller that does not know the rule. */
+    if (rt_settings_gameplay_active()) {
+        if (cur->debug.console != prev.debug.console) {
+            rt_log_warn("settings", "settings: debug.console can only be changed before the game"
+                " starts, because the program restarts to apply it; reverted to %s",
+                prev.debug.console ? "true" : "false");
+            cur->debug.console = prev.debug.console;
+        }
+        if (cur->debug.log_file != prev.debug.log_file) {
+            rt_log_warn("settings", "settings: debug.log_file can only be changed before the game"
+                " starts, because the program restarts to apply it; reverted to %s",
+                prev.debug.log_file ? "true" : "false");
+            cur->debug.log_file = prev.debug.log_file;
+        }
+    }
 }
 
 } // namespace
 
-bool rt_settings_peek_log_file() {
+/* The shared half of the two peeks: resolve the file, parse it, and hand
+ * back the "debug" object, or null when anything at all is not as
+ * expected. Neither peek reports a problem: rt_settings_init reads the
+ * same file properly a moment later and logs every one of them. */
+static const RtJson* peek_debug_object(RtJson* parsed_out) {
     ResolvedSource src = resolve_source();
     std::string path;
     switch (src.kind) {
@@ -1053,27 +1309,49 @@ bool rt_settings_peek_log_file() {
         break;
     case SourceKind::EnvDisabled:
     case SourceKind::None:
-        return true;
+        return nullptr;
     }
 
     std::string text;
-    if (!read_whole_file(path, &text)) return true;
+    if (!read_whole_file(path, &text)) return nullptr;
 
-    RtJson parsed;
     std::string err;
-    if (!rt_json_parse(text, &parsed, &err)) return true;
-    if (parsed.type != RtJson::Type::Object) return true;
+    if (!rt_json_parse(text, parsed_out, &err)) return nullptr;
+    if (parsed_out->type != RtJson::Type::Object) return nullptr;
 
-    const RtJson* ver = parsed.find("version");
-    if (!ver || ver->type != RtJson::Type::Number || ver->number != 1.0) return true;
+    const RtJson* ver = parsed_out->find("version");
+    if (!ver || ver->type != RtJson::Type::Number || ver->number != 1.0) return nullptr;
 
-    const RtJson* dbg = parsed.find("debug");
-    if (!dbg || dbg->type != RtJson::Type::Object) return true;
+    const RtJson* dbg = parsed_out->find("debug");
+    if (!dbg || dbg->type != RtJson::Type::Object) return nullptr;
+    return dbg;
+}
 
-    const RtJson* lf = dbg->find("log_file");
-    if (!lf || lf->type != RtJson::Type::Bool) return true;
+/* One key out of an already-parsed "debug" object, or the fallback. A null
+ * `dbg` is every failure the peeks share (no file, no parse, wrong
+ * version, no debug object), and they all read as the fallback. */
+static bool peek_debug_bool(const RtJson* dbg, const char* key, bool fallback) {
+    if (!dbg) return fallback;
+    const RtJson* v = dbg->find(key);
+    if (!v || v->type != RtJson::Type::Bool) return fallback;
+    return v->boolean;
+}
 
-    return lf->boolean;
+bool rt_settings_peek_console() {
+    RtJson parsed;
+    return peek_debug_bool(peek_debug_object(&parsed), "console", false);
+}
+
+bool rt_settings_peek_log_file() {
+    RtJson parsed;
+    return peek_debug_bool(peek_debug_object(&parsed), "log_file", true);
+}
+
+void rt_settings_peek_boot(bool* log_file, bool* console) {
+    RtJson parsed;
+    const RtJson* dbg = peek_debug_object(&parsed);
+    if (log_file) *log_file = peek_debug_bool(dbg, "log_file", true);
+    if (console) *console = peek_debug_bool(dbg, "console", false);
 }
 
 void rt_settings_init() {
@@ -1089,7 +1367,7 @@ void rt_settings_init() {
     case SourceKind::EnvDisabled:
         g_save_allowed = false;
         g_save_blocked_reason = "ICORECOMP_SETTINGS=" + src.raw_env + " selects defaults-only";
-        rt_log("settings", "settings: ICORECOMP_SETTINGS=%s selects defaults-only, saving disabled", src.raw_env.c_str());
+        rt_log_info("settings", "settings: ICORECOMP_SETTINGS=%s selects defaults-only, saving disabled", src.raw_env.c_str());
         break;
     case SourceKind::EnvPath:
         g_path = src.path;
@@ -1098,7 +1376,7 @@ void rt_settings_init() {
     case SourceKind::BaseDir:
         g_path = src.path;
         if (!src.shadow_path.empty()) {
-            rt_log("settings", "settings: %s and %s both exist; using %s, the per-user copy is shadowed",
+            rt_log_info("settings", "settings: %s and %s both exist; using %s, the per-user copy is shadowed",
                 src.path.c_str(), src.shadow_path.c_str(), src.path.c_str());
         }
         load_file(src.path);
@@ -1108,7 +1386,7 @@ void rt_settings_init() {
         load_file(src.path);
         break;
     case SourceKind::None:
-        rt_log("settings", "settings: no settings file found; running on defaults (save target chosen on first save)");
+        rt_log_info("settings", "settings: no settings file found; running on defaults (save target chosen on first save)");
         break;
     }
 
@@ -1122,7 +1400,7 @@ void rt_settings_init() {
 
     for (const EnvTwin& t : kEnvTwins) {
         if (const char* v = env_twin_value(t)) {
-            rt_log("settings", "settings: %s is overridden by %s=%s", t.dotted_key, t.env_var, v);
+            rt_log_info("settings", "settings: %s is overridden by %s=%s", t.dotted_key, t.env_var, v);
         }
     }
 }
@@ -1133,6 +1411,26 @@ const RtSettings& rt_settings() {
 
 RtSettings& rt_settings_mutable() {
     return g_current;
+}
+
+/* settings.h: set once by main.cpp, just before rt_sched_boot. Its own
+ * variable here rather than a question asked of main.cpp, so the refusal in
+ * commit_validate above and the settings selftest can both reach it without
+ * linking the runtime's boot path. */
+static bool g_gameplay_active = false;
+
+void rt_settings_set_gameplay_active(bool active) {
+    g_gameplay_active = active;
+}
+
+bool rt_settings_gameplay_active() {
+    return g_gameplay_active;
+}
+
+const char* rt_settings_cold_key_changed(const RtSettings& before, const RtSettings& now) {
+    if (before.debug.console != now.debug.console) return "debug.console";
+    if (before.debug.log_file != now.debug.log_file) return "debug.log_file";
+    return nullptr;
 }
 
 void rt_settings_commit(bool save) {
@@ -1165,7 +1463,7 @@ void rt_settings_flush_save_if_due() {
 
 bool rt_settings_save() {
     if (!g_save_allowed) {
-        rt_log("settings", "settings: saving is disabled (%s); ignoring rt_settings_save()", g_save_blocked_reason.c_str());
+        rt_log_warn("settings", "settings: saving is disabled (%s); ignoring rt_settings_save()", g_save_blocked_reason.c_str());
         return false;
     }
 
@@ -1193,7 +1491,7 @@ bool rt_settings_save() {
             return true;
         }
     }
-    rt_log("settings", "settings: could not save to %s or the per-user config directory; settings will not persist",
+    rt_log_warn("settings", "settings: could not save to %s or the per-user config directory; settings will not persist",
         base_target.c_str());
     return false;
 }
@@ -1228,6 +1526,10 @@ int rt_settings_bind_slot_count(RtBindDevice device) {
 
 int rt_settings_bind_menu_slot(RtBindDevice device) {
     return valid_device(device) ? kBindTables[device].menu_slot : -1;
+}
+
+int rt_settings_bind_screenshot_slot(RtBindDevice device) {
+    return valid_device(device) ? kBindTables[device].screenshot_slot : -1;
 }
 
 const char* rt_settings_last_reject() {

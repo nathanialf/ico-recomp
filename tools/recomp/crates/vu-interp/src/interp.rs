@@ -638,7 +638,7 @@ pub fn run(bundles: &[Bundle], st: &mut VuState, budget: u64) -> Result<Outcome>
         executed += 1;
 
         // Only a branch or the E bit has a delay slot; everything else
-        // simply falls through to the next bundle.
+        // falls through to the next bundle.
         let has_delay = e_bit || !matches!(ctl, Ctl::None);
         if !has_delay {
             idx += 1;

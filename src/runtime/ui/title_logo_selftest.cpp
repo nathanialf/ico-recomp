@@ -294,6 +294,10 @@ bool write_cursor_png(const std::string& path, const RtCursorImage& img) {
 } // namespace
 
 int main(int argc, char** argv) {
+    /* Info, not the runtime's warn default: this tool's output is its
+     * progress lines, and they are all info. */
+    rt_log_set_initial_level(RT_LOG_INFO);
+
     /* No default output path. The PNG is game-derived pixels and the obvious
      * default, the working directory, is the repository root often enough to
      * have put one in the tracked tree once already. */

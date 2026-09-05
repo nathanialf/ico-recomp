@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 
 #ifdef ICORECOMP_PGS_SDL
 
@@ -104,8 +105,8 @@ uint32_t RtPgs::overlay_texture_create(const uint8_t* rgba8, uint32_t width, uin
                " overlay textures must be created between frames");
     }
     if (!rgba8 || !width || !height) {
-        logf("paraLLEl-GS: rt_pgs_overlay_texture_create: invalid arguments (rgba8=%p, %ux%u)",
-             (const void*)rgba8, width, height);
+        warnf("paraLLEl-GS: rt_pgs_overlay_texture_create: invalid arguments (rgba8=%p, %ux%u);"
+              " no texture created", (const void*)rgba8, width, height);
         return 0;
     }
     ensure_overlay_white();
@@ -115,7 +116,8 @@ uint32_t RtPgs::overlay_texture_create(const uint8_t* rgba8, uint32_t width, uin
     auto info = Vulkan::ImageCreateInfo::immutable_2d_image(width, height, VK_FORMAT_R8G8B8A8_UNORM);
     Vulkan::ImageHandle img = m_device->create_image(info, &initial);
     if (!img) {
-        logf("paraLLEl-GS: rt_pgs_overlay_texture_create failed (%ux%u)", width, height);
+        warnf("paraLLEl-GS: rt_pgs_overlay_texture_create failed (%ux%u); the device would not"
+              " create the image", width, height);
         return 0;
     }
     const uint32_t id = m_overlay_next_texture++;
@@ -131,9 +133,10 @@ void RtPgs::overlay_texture_destroy(uint32_t texture) {
     if (!texture) return;
     /* Erasing an id still referenced by the retained overlay frame is the
      * caller's bug (the ABI doc says so); the library does not scan
-     * m_overlay_cmds for it, draw_overlay would just fail the lookup. */
+     * m_overlay_cmds for it, draw_overlay would fail the lookup. */
     if (m_overlay_textures.erase(texture) == 0) {
-        logf("paraLLEl-GS: rt_pgs_overlay_texture_destroy: unknown texture id %u", texture);
+        warnf("paraLLEl-GS: rt_pgs_overlay_texture_destroy: unknown texture id %u; nothing"
+              " destroyed", texture);
     }
 }
 
@@ -153,7 +156,8 @@ void RtPgs::overlay_set_frame(const RtPgsOverlayFrame* frame) {
     if ((frame->vertex_count && !frame->vertices) ||
         (frame->index_count && !frame->indices) ||
         !frame->cmds) {
-        logf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: null array pointer with nonzero count");
+        warnf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: null array pointer with nonzero"
+              " count; the previous overlay frame keeps drawing");
         return;
     }
 
@@ -163,22 +167,24 @@ void RtPgs::overlay_set_frame(const RtPgsOverlayFrame* frame) {
     for (uint32_t i = 0; i < frame->cmd_count; ++i) {
         const RtPgsOverlayCmd& c = frame->cmds[i];
         if (c.texture != 0 && m_overlay_textures.find(c.texture) == m_overlay_textures.end()) {
-            logf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u references unknown texture %u",
-                 i, c.texture);
+            warnf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u references unknown"
+                  " texture %u; the previous overlay frame keeps drawing", i, c.texture);
             return;
         }
         const uint64_t index_end = uint64_t(c.index_offset) + c.index_count;
         if (index_end > frame->index_count) {
-            logf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u index range [%u, %llu) exceeds %u indices",
-                 i, c.index_offset, (unsigned long long)index_end, frame->index_count);
+            warnf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u index range [%u, %llu)"
+                  " exceeds %u indices; the previous overlay frame keeps drawing",
+                  i, c.index_offset, (unsigned long long)index_end, frame->index_count);
             return;
         }
         for (uint32_t k = c.index_offset; k < c.index_offset + c.index_count; ++k) {
             const int64_t v = int64_t(frame->indices[k]) + c.vertex_offset;
             if (v < 0 || uint64_t(v) >= frame->vertex_count) {
-                logf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u index %u"
-                     " (vertex_offset %d) is out of range [0, %u)",
-                     i, frame->indices[k], c.vertex_offset, frame->vertex_count);
+                warnf("paraLLEl-GS: rt_pgs_overlay_set_frame rejected: cmd %u index %u"
+                      " (vertex_offset %d) is out of range [0, %u); the previous overlay"
+                      " frame keeps drawing",
+                      i, frame->indices[k], c.vertex_offset, frame->vertex_count);
                 return;
             }
         }
@@ -201,7 +207,8 @@ uint32_t RtPgs::present_ui() {
 #endif
     if (!m_overlay_ui_headless_logged) {
         m_overlay_ui_headless_logged = true;
-        logf("paraLLEl-GS: rt_pgs_present_ui ignored (headless, no window)");
+        warnf("paraLLEl-GS: rt_pgs_present_ui ignored (headless, no window); the overlay frame"
+              " is dropped");
     }
     return 0;
 }
@@ -340,11 +347,19 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
         const Vulkan::ImageView* view = &m_overlay_white->get_view();
         if (c.texture != 0) {
             auto it = m_overlay_textures.find(c.texture);
-            if (it != m_overlay_textures.end()) view = &it->second->get_view();
-            /* Else: set_frame already rejected an unknown id whole; a
-             * texture destroyed after the frame was set is a caller bug
-             * (documented on rt_pgs_overlay_texture_destroy) -- fall back
-             * to white rather than reading a dangling ImageView. */
+            if (it != m_overlay_textures.end()) {
+                view = &it->second->get_view();
+            } else if (!m_overlay_missing_tex_logged) {
+                /* set_frame already rejected an unknown id whole; a texture
+                 * destroyed after the frame was set is a caller bug
+                 * (documented on rt_pgs_overlay_texture_destroy). Falling
+                 * back to white rather than reading a dangling ImageView is
+                 * still a different picture from the one asked for, so it
+                 * says so. Once per run: this runs per command per frame. */
+                m_overlay_missing_tex_logged = true;
+                warnf("paraLLEl-GS: overlay: texture %u was destroyed while the retained frame"
+                      " still referenced it; that draw uses the white fallback", c.texture);
+            }
         }
         cmd.set_texture(0, 0, *view, Vulkan::StockSampler::LinearClamp);
 
@@ -377,16 +392,24 @@ void RtPgs::draw_overlay(Vulkan::CommandBuffer& cmd) {
  * since there is no scanout-producing caller to do it afterwards. */
 uint32_t RtPgs::present_ui_windowed() {
     uint32_t flags = 0;
+    /* The launcher can present for many fields without present_frame running
+     * at all, so this path drains a pending screenshot copy too; otherwise a
+     * capture taken on the last guest field before a hand-off would sit
+     * unread with its staging buffer held. */
+    drain_screenshots();
     m_platform->sync_from_host();
-    if (!m_platform->presentable()) {
+    if (const char* why = m_platform->not_presentable_reason()) {
         /* Same reasoning as present_frame: begin_frame() would park the
-         * calling thread while minimized, so poll here instead. */
+         * calling thread while minimized, so poll here instead. The overlay
+         * frame for this field is dropped, which is what the shared skip
+         * accounting counts. */
         m_platform->poll_input();
+        note_present_skipped(why);
     } else {
         m_in_frame = true;
         if (!m_wsi->begin_frame()) {
             m_in_frame = false;
-            logf("paraLLEl-GS: WSI begin_frame failed (rt_pgs_present_ui)");
+            note_begin_frame_failed("this overlay frame (rt_pgs_present_ui)");
         } else {
             auto& device = m_wsi->get_device();
             auto cmd = device.request_command_buffer();
@@ -420,17 +443,31 @@ uint32_t RtPgs::present_ui_windowed() {
             cmd->end_render_pass();
             device.submit(cmd);
 
-            if (!m_wsi->end_frame()) {
-                logf("paraLLEl-GS: WSI end_frame failed (rt_pgs_present_ui)");
-            }
+            if (!m_wsi->end_frame()) note_end_frame_failed("this overlay frame (rt_pgs_present_ui)");
             m_in_frame = false;
+            note_present_resumed();
             flags |= RT_PGS_VSYNC_PRESENTED;
+
+            /* No scanout was blitted, so the present rectangle is empty and
+             * a reader is right to treat it as "no picture". The backbuffer
+             * size is knowable here, though, and reporting it as zero would
+             * be a worse answer than reporting it: ParallelBackend::present_ui
+             * republishes these six values, and the launcher is a window with
+             * a size like any other. */
+            auto& bb = device.get_swapchain_view().get_image();
+            std::lock_guard<std::mutex> lk(m_present_rect_mu);
+            m_present_x = 0;
+            m_present_y = 0;
+            m_present_w = 0;
+            m_present_h = 0;
+            m_present_bb_w = int32_t(bb.get_width());
+            m_present_bb_h = int32_t(bb.get_height());
         }
     }
 
     /* Same window-closed bookkeeping present() does around present_frame,
      * inlined here since rt_pgs_present_ui has no separate wrapper. */
-    if (!m_platform->alive(*m_wsi)) m_window_closed.store(true, std::memory_order_release);
+    if (!m_platform->alive(*m_wsi)) note_window_closed("the overlay present (rt_pgs_present_ui)");
     if (m_window_closed.load(std::memory_order_acquire)) flags |= RT_PGS_VSYNC_WINDOW_CLOSED;
     return flags;
 }

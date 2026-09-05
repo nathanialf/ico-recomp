@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the runtime's VAG decoder against the decomp repo's reference.
+"""Compare the runtime's VAG decoder against an external reference.
 
 Usage:
   1. Boot the runtime with ICORECOMP_SND_SELFTEST=/tmp/vagtest (any
@@ -10,7 +10,7 @@ Usage:
   2. python3 src/runtime/snd/tests/vag_compare.py /tmp/vagtest \
        --ref /path/to/ico/tools/decode_vag.py
 
-Runs the reference decoder (MIT, lives in the decomp repo; not copied here)
+Runs the reference decoder (MIT, external to this repo; not copied here)
 on the .vag bytes and requires an exact sample-for-sample match with the
 .s16 output. Exit 0 on match, 1 on any mismatch.
 """
@@ -26,7 +26,7 @@ from pathlib import Path
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("prefix", help="selftest dump prefix (expects .vag and .s16)")
-    ap.add_argument("--ref", required=True, help="path to the decomp repo's tools/decode_vag.py")
+    ap.add_argument("--ref", required=True, help="path to a reference decode_vag.py")
     args = ap.parse_args()
 
     vag = Path(args.prefix + ".vag")

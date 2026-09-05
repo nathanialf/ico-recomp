@@ -46,6 +46,22 @@ void rt_hw_init();
  * make_backend in step. */
 bool rt_gs_backend_selects_live();
 
+/* The device the active GS backend created, as two lines of text:
+ *   renderer  the device name plus the driver and API version the backend
+ *             reports for it;
+ *   features  for paraLLEl-GS, "all required features present" or "missing: "
+ *             and the requirements the device failed; for the native
+ *             renderer, the RHI backend it came up on.
+ * Both read what that backend published into the window service just after
+ * it created its device (host/window_service.h); nothing here creates a
+ * device to answer, which is the change from the startup probe these
+ * replaced. A run with no live backend answers "no renderer device created
+ * yet" to both. gs/gs_select.cpp logs them once the backend exists and the
+ * settings menu shows them on its Display tab, which is what a Mac user is
+ * asked to send back (docs/MACOS.md). */
+const char* rt_gs_probe_renderer_line();
+const char* rt_gs_probe_features_line();
+
 /* ---- DMAC (dmac.cpp) ---------------------------------------------------- */
 
 bool rt_dmac_mmio_read(uint32_t addr, uint32_t* out);
@@ -149,6 +165,14 @@ size_t rt_ipu_test_resident_qw();
  * data must be a contiguous host buffer of qwords*16 bytes. */
 void rt_gif_submit(int path, const uint8_t* data, uint32_t qwords);
 
+/* Per-field summary of the widescreen 2D transform (display.widescreen) and
+ * of the VU1 kicks the field carried, for comparing a dump taken with the
+ * mode off against one taken with it on. Called from the vsync path and does
+ * nothing unless ICORECOMP_VERBOSE names "widescreen". (debug.verbose is a
+ * retired settings key, host/settings.cpp load_retired, so the environment
+ * variable is the only way to reach the channel.) */
+void rt_gif_widescreen_field(unsigned field);
+
 /* ---- geometry diagnostics (geomcheck.cpp) -------------------------------- */
 
 /* Validates one submitted packet. `vu1_hash` attributes PATH1 traffic to
@@ -207,13 +231,16 @@ void rt_gs_vsync_hook(unsigned field);
  *
  * This counts vsync hook calls, which are fields: when the window is live
  * every one of them ends in a present, so it is the presented field rate.
- * A dump or headless backend still counts fields; it just never presents
+ * A dump or headless backend still counts fields; it never presents
  * them. */
 void rt_gs_field_stats(double* fields_per_second, double* field_ms);
 /* Called from the SetGsCrt syscall HLE: programs SMODE1/SMODE2 in the
  * backend priv shadow the way the real kernel does. Without SMODE1 (games
  * never write it directly) the GS cannot deduce the video mode and refuses
- * to scan out. Fatal on modes outside NTSC/PAL (not used by this binary). */
+ * to scan out. Also the one setter of the field timeline (rt_video_set_mode,
+ * ../video_mode.h): the length of a field is the programmed mode's. Fatal on
+ * modes outside NTSC and PAL, which are the DTV and VESA modes; no retail
+ * path programs one and this runtime does not model them. */
 void rt_gs_program_crt(uint32_t interlace, uint32_t mode, uint32_t ffmd);
 
 #endif /* ICORECOMP_HW_H */

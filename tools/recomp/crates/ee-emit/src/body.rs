@@ -13,6 +13,12 @@
 //!    put the slot inside the taken arm. If the slot address is itself a
 //!    branch target, the slot is re-emitted under its label so a direct
 //!    jump to the slot executes it without the branch (hardware behavior).
+//!  - A function whose entry address is listed in the target's entry hook
+//!    table gets one `rt_entry_hook(ctx, <entry>)` call as the first
+//!    statement of its body, before the first translated instruction, on
+//!    every path that enters it. It is a prefix and nothing else: no
+//!    instruction is added, removed, reordered or changed, so our
+//!    disassembly and the per-op three-way tests are untouched.
 //!  - `jalr` dispatches through `rt_call_indirect` (runtime does the
 //!    functab lookup and the bad-target diagnostics). `jr $ra` is
 //!    `return`. `jr <other>` becomes a switch keyed on the *loaded target
@@ -25,6 +31,7 @@ use std::fmt::Write as _;
 use anyhow::{bail, Result};
 use r5900_decode::Insn;
 
+use crate::entry_hooks::EntryHooks;
 use crate::flow::{classify, is_control, Flow};
 use crate::ops::{self, ru32, OpStats};
 
@@ -50,6 +57,10 @@ pub struct Resolver<'a> {
     pub entry_by_vram: &'a HashMap<u32, usize>,
     /// Sanitized identifier per ProgramDb function index.
     pub fn_ident: &'a [String],
+    /// Function entry addresses the runtime wants a callback at (the
+    /// target's entry hook table). `emit_all` has already checked every
+    /// address in it is a real function entry.
+    pub hooks: &'a EntryHooks,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -65,6 +76,7 @@ pub struct GroupStats {
     pub fallthrough_calls: usize,
     pub jtbl_switches: usize,
     pub jtbl_cases: usize,
+    pub entry_hooks: usize,
     pub ops: OpStats,
 }
 
@@ -81,6 +93,7 @@ impl GroupStats {
         self.fallthrough_calls += o.fallthrough_calls;
         self.jtbl_switches += o.jtbl_switches;
         self.jtbl_cases += o.jtbl_cases;
+        self.entry_hooks += o.entry_hooks;
         for (k, v) in &o.ops.unimplemented {
             *self.ops.unimplemented.entry(k.clone()).or_insert(0) += v;
         }
@@ -139,10 +152,33 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
 
     // ---- prologue ----------------------------------------------------------
     let leader = &g.members[0];
+    // The hook call for one entry address, or the empty string.
+    //
+    // Where it goes depends on how many ways there are into the function. A
+    // single-member group is only ever entered through its `F_` wrapper, so
+    // the call goes there and runs once per call, before anything the
+    // function does, whether the caller arrived by `jal`, by a tail jump or
+    // through `rt_call_indirect`. A merged group has three more entry paths:
+    // an in-group branch or `j` to a member's own entry address becomes a
+    // `goto` to that member's `L_<vram>` label, and a member whose
+    // predecessor runs off its end falls straight into it. Neither passes
+    // through `F_`. So in a merged group the call goes at the member's
+    // `L_<vram>` label instead, which every path into that member reaches,
+    // and the `F_` wrappers carry none.
+    let hook_call = |vram: u32, st: &mut GroupStats| -> String {
+        if !r.hooks.contains(vram) {
+            return String::new();
+        }
+        st.entry_hooks += 1;
+        format!("rt_entry_hook(ctx, 0x{vram:X}u);")
+    };
     if multi {
         let gb = format!("GB_{:08X}", leader.vram);
         let _ = writeln!(out, "static void {gb}(R5900Context* ctx, uint32_t entry);");
         for m in &g.members {
+            // No hook here: it is emitted at this member's own label below,
+            // which this wrapper's `goto` passes through along with every
+            // other entry path into the member.
             let _ = writeln!(
                 out,
                 "void F_{}(R5900Context* ctx) {{ {gb}(ctx, 0x{:X}u); }}",
@@ -161,6 +197,10 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
         );
     } else {
         let _ = writeln!(out, "void F_{}(R5900Context* ctx) {{", leader.ident);
+        let hook = hook_call(leader.vram, &mut st);
+        if !hook.is_empty() {
+            let _ = writeln!(out, "{hook}");
+        }
     }
 
     // ---- bodies ------------------------------------------------------------
@@ -176,6 +216,16 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
             if labels.contains(&vram) {
                 let _ = writeln!(out, "L_{vram:08X}: ;");
                 reachable = true;
+            }
+            if multi && vram == m.vram {
+                // Every entry path into this member arrives at the label
+                // just above: the `F_` wrapper's `goto`, an in-group branch
+                // to this address, and a fallthrough from the member before
+                // it. The hook is the first statement after it.
+                let hook = hook_call(m.vram, &mut st);
+                if !hook.is_empty() {
+                    let _ = writeln!(out, "{hook}");
+                }
             }
             let fl = classify(insn);
             if matches!(fl, Flow::Normal) {
@@ -393,4 +443,140 @@ pub fn emit_group(g: &Group<'_>, r: &Resolver<'_>) -> Result<(String, GroupStats
 
     out.push_str("}\n");
     Ok((out, st))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use r5900_decode::decode;
+
+    const JR_RA: u32 = 0x03E0_0008;
+    const NOP: u32 = 0x0000_0000;
+
+    /// One function at `vram` whose whole body is `jr $ra; nop`. Enough to
+    /// exercise the prologue, which is where the hook prefix goes.
+    fn insns_at(vram: u32) -> Vec<Insn> {
+        vec![decode(JR_RA, vram), decode(NOP, vram + 4)]
+    }
+
+    fn run(members: &[(&str, u32, &[Insn])], hooks: &EntryHooks) -> (String, GroupStats) {
+        let g = Group {
+            members: members
+                .iter()
+                .map(|&(ident, vram, insns)| Member {
+                    ident: ident.to_string(),
+                    vram,
+                    end: vram + 8,
+                    insns,
+                })
+                .collect(),
+            jtbl_targets: BTreeSet::new(),
+        };
+        let entry_by_vram: HashMap<u32, usize> = HashMap::new();
+        let fn_ident: Vec<String> = Vec::new();
+        let r = Resolver {
+            entry_by_vram: &entry_by_vram,
+            fn_ident: &fn_ident,
+            hooks,
+        };
+        emit_group(&g, &r).expect("emit_group should succeed")
+    }
+
+    #[test]
+    fn no_hook_emits_no_call() {
+        let insns = insns_at(0x0011_46F0);
+        let (code, st) = run(&[("gsb_SetVSMatrixSub", 0x0011_46F0, insns.as_slice())], &EntryHooks::empty());
+        assert!(!code.contains("rt_entry_hook"), "{code}");
+        assert_eq!(st.entry_hooks, 0);
+    }
+
+    #[test]
+    fn a_listed_entry_gets_one_prefix_call() {
+        let hooks = EntryHooks::parse("0x001146F0 // the matrix composer").unwrap();
+        let insns = insns_at(0x0011_46F0);
+        let (code, st) = run(&[("gsb_SetVSMatrixSub", 0x0011_46F0, insns.as_slice())], &hooks);
+        assert_eq!(st.entry_hooks, 1);
+        assert_eq!(code.matches("rt_entry_hook").count(), 1, "{code}");
+        assert!(
+            code.contains(
+                "void F_gsb_SetVSMatrixSub(R5900Context* ctx) {\nrt_entry_hook(ctx, 0x1146F0u);\n"
+            ),
+            "the call must be the first statement of the body: {code}"
+        );
+        // The prefix is all that changes: the translated instructions are
+        // exactly what the same group emits with no hook configured.
+        let (plain, _) = run(&[("gsb_SetVSMatrixSub", 0x0011_46F0, insns.as_slice())], &EntryHooks::empty());
+        assert_eq!(code.replace("rt_entry_hook(ctx, 0x1146F0u);\n", ""), plain);
+    }
+
+    #[test]
+    fn an_unlisted_member_of_a_merged_group_gets_no_call() {
+        let hooks = EntryHooks::parse("0x001146F0 // the matrix composer").unwrap();
+        let a = insns_at(0x0011_46F0);
+        let b = insns_at(0x0011_46F8);
+        let (code, st) = run(&[("hooked", 0x0011_46F0, a.as_slice()), ("plain", 0x0011_46F8, b.as_slice())], &hooks);
+        assert_eq!(st.entry_hooks, 1);
+        // In a merged group the hook sits at the hooked member's own label,
+        // which every entry path into it passes through, and neither `F_`
+        // wrapper carries it.
+        assert_eq!(code.matches("rt_entry_hook").count(), 1, "{code}");
+        assert!(
+            code.contains("void F_hooked(R5900Context* ctx) { GB_001146F0(ctx, 0x1146F0u); }"),
+            "{code}"
+        );
+        assert!(
+            code.contains("void F_plain(R5900Context* ctx) { GB_001146F0(ctx, 0x1146F8u); }"),
+            "{code}"
+        );
+        assert!(
+            code.contains("L_001146F0: ;\nrt_entry_hook(ctx, 0x1146F0u);\n"),
+            "the call must be the first statement after the member's label: {code}"
+        );
+    }
+
+    /// An in-group `j` to a hooked member's entry becomes `goto L_<vram>`,
+    /// never a call through `F_`. The hook has to be on that path.
+    #[test]
+    fn an_in_group_jump_to_a_hooked_entry_runs_the_hook() {
+        let hooks = EntryHooks::parse("0x001146F8 // the hooked member").unwrap();
+        let target = 0x0011_46F8u32;
+        let j = (2u32 << 26) | ((target >> 2) & 0x03FF_FFFF);
+        let a = vec![decode(j, 0x0011_46F0), decode(NOP, 0x0011_46F4)];
+        let b = insns_at(target);
+        let (code, st) = run(
+            &[("jumper", 0x0011_46F0, a.as_slice()), ("hooked", target, b.as_slice())],
+            &hooks,
+        );
+        assert_eq!(st.entry_hooks, 1);
+        assert_eq!(code.matches("rt_entry_hook").count(), 1, "{code}");
+        assert!(code.contains("goto L_001146F8;"), "{code}");
+        assert!(
+            code.contains("L_001146F8: ;\nrt_entry_hook(ctx, 0x1146F8u);\n"),
+            "the goto must land on the hook: {code}"
+        );
+    }
+
+    /// A member that runs off its end into the next one emits nothing at
+    /// the boundary, so the hook has to be at the next member's label.
+    #[test]
+    fn a_fallthrough_into_a_hooked_member_runs_the_hook() {
+        let hooks = EntryHooks::parse("0x001146F8 // the hooked member").unwrap();
+        let target = 0x0011_46F8u32;
+        // Two straight-line words: the member ends reachable and falls into
+        // the next one.
+        let a = vec![decode(NOP, 0x0011_46F0), decode(NOP, 0x0011_46F4)];
+        let b = insns_at(target);
+        let (code, st) = run(
+            &[("faller", 0x0011_46F0, a.as_slice()), ("hooked", target, b.as_slice())],
+            &hooks,
+        );
+        assert_eq!(st.entry_hooks, 1);
+        assert_eq!(code.matches("rt_entry_hook").count(), 1, "{code}");
+        // Nothing is emitted at the boundary itself.
+        assert!(!code.contains("fallthrough into adjacent function"), "{code}");
+        assert!(
+            code.contains("L_001146F8: ;\nrt_entry_hook(ctx, 0x1146F8u);\n"),
+            "the fallthrough must land on the hook: {code}"
+        );
+    }
 }

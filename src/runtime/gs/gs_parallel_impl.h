@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,6 +49,15 @@ inline const char* rt_pgs_raster_log_text(uint32_t raster) {
         : "crt (display.raster): the renderer's mode area, a window past it is cropped";
 }
 
+/* The host's one log callback carries no level of its own (RtPgsHost in
+ * gs_parallel_api.h), so a line that has to reach a reader at the default
+ * warn level says so in its own text: warnf and errorf below prefix these
+ * tags, and gs_parallel.cpp's host_log strips the tag and picks the level
+ * from it. A host that does not know the tags prints it inline, which keeps
+ * the line readable instead of losing it. Keep the two files in step. */
+#define RT_PGS_LOG_TAG_WARN  "[warn] "
+#define RT_PGS_LOG_TAG_ERROR "[error] "
+
 inline const char* rt_pgs_deinterlace_name(uint32_t mode) {
     switch (mode) {
     case RT_PGS_DEINTERLACE_BOB: return "bob";
@@ -64,6 +74,12 @@ struct RtPgs {
     ~RtPgs();
 
     void logf(const char* fmt, ...);
+    /* Same, at the two levels above it: warnf for something that happened
+     * differently from what was asked (a refusal, a fallback, a skipped
+     * present), errorf for something that did not happen at all. See the
+     * level table in src/runtime/runtime.h. */
+    void warnf(const char* fmt, ...);
+    void errorf(const char* fmt, ...);
     [[noreturn]] void fatalf(const char* fmt, ...);
 
     void submit_gif(int path, const uint8_t* data, uint32_t qwords);
@@ -76,37 +92,63 @@ struct RtPgs {
     void write_priv(uint32_t offset, uint64_t v);
     uint64_t read_priv(uint32_t offset);
     uint32_t vsync(unsigned field);
+    /* See rt_pgs_present_pump in gs_parallel_api.h. Consumer thread only. */
+    uint32_t present_pump(double max_hz, uint64_t* serial);
     void report_stats();
     /* See rt_pgs_present_timings in gs_parallel_api.h. Reading clears. */
-    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
-                         uint64_t* present_ns, uint64_t* fields);
+    void present_timings(RtPgsPresentTimings* out);
 
     /* Threads; see the threads section of gs_parallel_api.h.
      * on_owner_thread() is what the WSI platform above asks before it does
      * anything SDL: true only on the thread that created this instance and
      * the window. */
     void bind_consumer_thread();
+    /* Points Granite's thread-local logging interface at this instance, so
+     * its own LOGE/LOGW/LOGI lines (the WSI's VkResult reports among them)
+     * reach the host log at their own level instead of an fprintf(stderr)
+     * from inside this shared library. Thread local, so every thread that
+     * calls into Granite installs it: the creating thread from the
+     * constructor, the consumer thread from bind_consumer_thread. */
+    void install_granite_log();
     bool window_closed() const { return m_window_closed.load(std::memory_order_acquire); }
     void sample_window_state();
     bool on_owner_thread() const { return std::this_thread::get_id() == m_owner_thread; }
 
-    /* Window control / event pump inversion (shim 3); see gs_parallel_api.h. */
-    void* window_handle();
+    /* Window control / event pump inversion (shim 3); see gs_parallel_api.h.
+     * The window handle and the surface size are host_window_service.h's to
+     * answer (rt_window_handle, rt_window_surface_size); the library keeps no
+     * entry point for either. */
     void notify_quit();
     void notify_resize();
-    void surface_size(uint32_t* width, uint32_t* height);
     void present_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
                       int32_t* bb_w, int32_t* bb_h);
+    void request_screenshot(uint32_t slots);
+    size_t take_screenshot(uint32_t slot, uint32_t* w, uint32_t* h, uint8_t* dst, size_t dst_bytes);
     void set_present_mode(uint32_t mode);
     void set_presentation(uint32_t fit, uint32_t filter);
     void set_raster(uint32_t raster);
     void set_deinterlace(uint32_t deinterlace);
+    void set_widescreen_aspect(double aspect);
     void set_render_scale(uint32_t factor);
 
     /* Overlay rendering (milestone 4); see gs_parallel_api.h. Works headless
      * or windowed (texture upload/retained frame are plain Vulkan::Device
      * operations); only present_ui's actual draw needs a swapchain, and
      * logs once and no-ops when there is none. */
+    /* The Vulkan device this instance is running on, windowed or headless.
+     * gs_probe_lib.cpp's rt_pgs_live_probe reads its properties so the
+     * Display tab reports the device the run actually created rather than
+     * one a startup probe made and threw away. Null before construction
+     * finishes. */
+    Vulkan::Device* live_device() { return m_device; }
+
+    /* Whether this instance's own context dropped the descriptor-buffer bit
+     * (gs_pgs_context.h). rt_pgs_live_probe reports it, because it is the
+     * one fact about the running device that only the instance that made it
+     * knows: the properties every other probe field comes from are readable
+     * off the device, and this one is not. */
+    bool descriptor_buffer_disabled() const { return m_descbuf_disabled; }
+
     uint32_t overlay_texture_create(const uint8_t* rgba8, uint32_t width, uint32_t height);
     void overlay_texture_destroy(uint32_t texture);
     void overlay_set_frame(const RtPgsOverlayFrame* frame);
@@ -115,6 +157,23 @@ struct RtPgs {
 private:
     void init_headless();
     void ensure_overlay_white();
+    /* Finishes every screenshot slot whose copy has been submitted: waits its
+     * fence, converts the staging bytes to tightly packed RGBA8 and publishes
+     * them for rt_pgs_take_screenshot. Called at the top of each present, so
+     * the wait is on a submit a whole present old and returns at once, and
+     * once more from the destructor before the device goes. Outside the SDL
+     * guard in gs_parallel_present.cpp, next to present_rect, because the
+     * teardown path reaches it in a headless build too. */
+    void drain_screenshots();
+    /* Presentation accounting (gs_parallel_present.cpp). Every path that
+     * leaves present_frame or present_ui_windowed without a picture on the
+     * swapchain calls note_present_skipped with its reason, and every one
+     * that finishes a present calls note_present_resumed: one warn when the
+     * window stops being fed and one info naming the count when it starts
+     * again, never a line a field. Consumer-thread state, like the rest of
+     * the present path. */
+    void note_present_skipped(const char* reason);
+    void note_present_resumed();
 
 #ifdef ICORECOMP_PGS_SDL
     /* Minimal Vulkan::WSIPlatform on SDL3. Only what a fixed-function "blit
@@ -125,8 +184,8 @@ private:
      * inside the WSI, which after the host starts its GS command ring worker
      * is not the thread that owns the window. SDL's video functions belong to
      * the thread that created the window (on Windows the message queue is
-     * per thread), so nothing here calls SDL except init(), the destructor,
-     * and sample_state(), all of which run on the creating thread. What the
+     * per thread), so the only SDL calls left here are the two queries in
+     * sample_state(), which runs on the creating thread. What the
      * WSI asks for between frames -- surface size, minimized, alive, resize
      * -- is served from the atomics below, refreshed by sample_state() from
      * the host's own event pump once per field. */
@@ -134,17 +193,15 @@ private:
     public:
         explicit SdlWsiPlatform(RtPgs& owner) : m_owner(owner) {}
 
-        bool init(unsigned width, unsigned height) {
-            if (!SDL_Init(SDL_INIT_VIDEO)) {
-                m_owner.logf("paraLLEl-GS: SDL_Init failed: %s", SDL_GetError());
-                return false;
-            }
-            m_window = SDL_CreateWindow("ico-recomp", int(width), int(height),
-                                        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-            if (!m_window) {
-                m_owner.logf("paraLLEl-GS: SDL_CreateWindow failed: %s", SDL_GetError());
-                return false;
-            }
+        /* Adopts the host's window. This library creates no window of its
+         * own any more: the executable owns the one window of the run
+         * (host/window_service.h), created with SDL_WINDOW_VULKAN before
+         * this instance existed, and passes it in through
+         * RtPgsCreateOptions::host_window. So there is no SDL_Init here, no
+         * SDL_CreateWindow, and no SDL_DestroyWindow in the destructor. */
+        bool adopt(SDL_Window* window) {
+            if (!window) return false;
+            m_window = window;
             /* Primes the cache the WSI reads from before the first
              * begin_frame asks for a surface size. */
             sample_state();
@@ -152,7 +209,7 @@ private:
         }
 
         /* Creating thread only: the two SDL queries below are the reason.
-         * Called from init(), from the host's event pump every field, and
+         * Called from adopt(), from the host's event pump every field, and
          * from notify_resize. */
         void sample_state() {
             if (!m_window) return;
@@ -164,17 +221,37 @@ private:
                               std::memory_order_relaxed);
         }
 
-        ~SdlWsiPlatform() override {
-            if (m_window) SDL_DestroyWindow(m_window);
-            m_window = nullptr;
-        }
+        /* The window belongs to the host, which destroys it after
+         * rt_pgs_destroy has returned. Dropping the pointer is the whole of
+         * this platform's teardown. */
+        ~SdlWsiPlatform() override { m_window = nullptr; }
 
+        /* The host makes the surface, because the host owns the window: the
+         * callback is host/window_service.cpp's
+         * rt_window_create_vulkan_surface, reached through the C ABI as a
+         * pair of uint64_t so no Vulkan type crosses it. RtPgs's constructor
+         * has already made a NULL callback with an adopted window fatal, so
+         * the pointer is valid here whenever m_window is. */
         VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override {
-            VkSurfaceKHR surface = VK_NULL_HANDLE;
-            if (!SDL_Vulkan_CreateSurface(m_window, instance, nullptr, &surface)) {
-                m_owner.logf("paraLLEl-GS: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+            uint64_t inst_bits = 0;
+            static_assert(sizeof(instance) == sizeof(void*), "VkInstance is a pointer handle");
+            void* raw = (void*)instance;
+            std::memcpy(&inst_bits, &raw, sizeof(raw));
+
+            const uint64_t surface_bits = m_owner.m_host.create_vulkan_surface(inst_bits);
+            if (surface_bits == 0) {
+                m_owner.errorf("paraLLEl-GS: the host could not create a Vulkan surface for its"
+                               " window; this run falls back to headless and nothing reaches"
+                               " the screen");
                 return VK_NULL_HANDLE;
             }
+            /* memcpy rather than a cast: VkSurfaceKHR is a pointer on 64-bit
+             * targets and a uint64_t on 32-bit ones, and only one of the two
+             * casts compiles in each case. */
+            static_assert(sizeof(VkSurfaceKHR) == sizeof(uint64_t),
+                          "VkSurfaceKHR is 64 bits wide");
+            VkSurfaceKHR surface = VK_NULL_HANDLE;
+            std::memcpy(&surface, &surface_bits, sizeof(surface));
             return surface;
         }
 
@@ -219,9 +296,17 @@ private:
          * would back up and the EE would stall on it at the next field sync
          * for as long as the window stays minimized. Callers skip the frame
          * instead. */
-        bool presentable() {
-            if (!m_window || !m_alive.load(std::memory_order_acquire)) return false;
-            return !m_minimized.load(std::memory_order_relaxed);
+        bool presentable() { return not_presentable_reason() == nullptr; }
+
+        /* Why begin_frame would park, as a fixed phrase for the log, or NULL
+         * when it would not. Split out of presentable() so the skip lines in
+         * present_frame and present_ui_windowed can say which of the three
+         * it was instead of "not presentable". */
+        const char* not_presentable_reason() {
+            if (!m_window) return "the WSI platform has no window";
+            if (!m_alive.load(std::memory_order_acquire)) return "the window has closed";
+            if (m_minimized.load(std::memory_order_relaxed)) return "the window is minimized";
+            return nullptr;
         }
 
         /* Reached only if the window is minimized between presentable() and
@@ -248,7 +333,12 @@ private:
          * with ICORECOMP_GS_THREAD=0, icorecomp-gs-replay -- so it keeps the
          * old exit(0) instead of hanging the process. */
         void block_until_wsi_forward_progress(Vulkan::WSI& wsi) override {
-            m_owner.logf("paraLLEl-GS: window cannot present (minimized), the GS consumer is blocked");
+            /* Warn, not info: the consumer thread stops here, so the picture
+             * stops with it, and a reader at the default level has to see
+             * why. One line per park, and the matching line below says the
+             * park ended. */
+            m_owner.warnf("paraLLEl-GS: window cannot present (minimized), the GS consumer is"
+                          " blocked until the window comes back");
             /* Leaves on any of three: a resize, the window coming back from
              * minimized, or the window going away. The minimized test is not
              * redundant with the resize one. Restoring a minimized window on
@@ -275,14 +365,19 @@ private:
             if (!alive(wsi)) {
                 m_owner.m_window_closed.store(true, std::memory_order_release);
                 if (m_owner.on_owner_thread()) {
-                    m_owner.logf("paraLLEl-GS: window closed while the swapchain was unusable,"
-                                 " exiting");
+                    m_owner.errorf("paraLLEl-GS: window closed while the swapchain was unusable,"
+                                   " exiting");
                     std::exit(0);
                 }
-                m_owner.logf("paraLLEl-GS: window closed while the swapchain was unusable;"
-                             " the GS consumer is parked and the host exits from its own thread");
+                m_owner.errorf("paraLLEl-GS: window closed while the swapchain was unusable;"
+                               " the GS consumer is parked and the host exits from its own thread");
                 for (;;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
+            /* The park ended and the consumer is running again. The pair of
+             * lines is what tells a reader whether a run that went quiet was
+             * blocked here or somewhere else. */
+            m_owner.logf("paraLLEl-GS: window can present again (%s), the GS consumer is running",
+                         resize ? "resized" : "restored");
         }
 
         /* Event pump inversion: when the host supplied pump_events (the exe
@@ -309,19 +404,15 @@ private:
                 m_owner.m_host.pump_events();
                 return;
             }
-            SDL_Event e;
-            while (SDL_PollEvent(&e)) {
-                switch (e.type) {
-                    case SDL_EVENT_QUIT:
-                        handle_quit();
-                        break;
-                    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-                    case SDL_EVENT_WINDOW_RESIZED:
-                        handle_resize();
-                        break;
-                    default:
-                        break;
-                }
+            /* No fallback poll any more. The window is the host's, so a host
+             * that has a window has an event loop for it; a host that
+             * supplied no pump_events also supplied no host_window and is
+             * headless, where this platform does not exist at all. Polling
+             * SDL from here would take events out of the host's own queue. */
+            if (!m_pump_missing_logged) {
+                m_pump_missing_logged = true;
+                m_owner.warnf("paraLLEl-GS: the WSI asked for an event pump and the host supplied"
+                              " none; events are the host's to deliver");
             }
         }
 
@@ -338,13 +429,37 @@ private:
         std::atomic<uint32_t> m_surface_w{1};
         std::atomic<uint32_t> m_surface_h{1};
         bool m_pump_skipped_logged = false;
+        bool m_pump_missing_logged = false;
     };
 
     void init_windowed();
-    void present(const ParallelGS::ScanoutResult& scanout, double aspect);
-    void present_frame(const ParallelGS::ScanoutResult& scanout, double aspect);
+    /* Both return true only when a frame was handed to the swapchain. False
+     * means the window was not presentable (minimized, zero-sized) or
+     * begin_frame failed, and nothing reached the screen: present_pump uses
+     * that answer to decide whether the serial, the clock and the counters
+     * advance, so a minimized window cannot report presents it never made. */
+    bool present(const ParallelGS::ScanoutResult& scanout, double aspect);
+    bool present_frame(const ParallelGS::ScanoutResult& scanout, double aspect);
+    /* Screenshot capture (gs_parallel_present.cpp): records a copy of the
+     * rectangle out of the backbuffer into slot `slot`'s staging buffer,
+     * leaving the image in `layout` again so the code after it is unchanged.
+     * The matching drain_screenshots() is not SDL-only and lives below. */
+    void capture_backbuffer(Vulkan::CommandBuffer& cmd, const Vulkan::Image& backbuffer,
+                            VkImageLayout layout, uint32_t slot,
+                            int32_t x, int32_t y, int32_t w, int32_t h);
     void draw_overlay(Vulkan::CommandBuffer& cmd);
     uint32_t present_ui_windowed();
+    /* The two swapchain calls that can fail, reported in one place because
+     * Granite gives both of them to us as a bare bool. `where` names what
+     * the user lost, a guest field or the overlay. Both count every failure
+     * and write one warn carrying the state the call was made in; the
+     * begin_frame one also opens a present-skip stop. */
+    void note_begin_frame_failed(const char* where);
+    void note_end_frame_failed(const char* where);
+    /* Raises the sticky window-closed flag the host exits on, and says who
+     * raised it and what it consulted. One line per run: the flag is read
+     * every field once it is up. */
+    void note_window_closed(const char* site);
 #endif /* ICORECOMP_PGS_SDL */
 
     RtPgsHost m_host;
@@ -397,6 +512,11 @@ private:
     std::atomic<uint64_t> m_scanout_ns{0};
     std::atomic<uint64_t> m_present_ns{0};
     std::atomic<uint64_t> m_timing_fields{0};
+    /* Presents and, of those, repeats of a serial already on screen. Same
+     * reason for the atomics as the four above: written by present_pump on
+     * the consumer thread, read by the profiler on the EE thread. */
+    std::atomic<uint64_t> m_presents{0};
+    std::atomic<uint64_t> m_present_repeats{0};
     bool m_transfer_since_vsync = false;
     bool m_wsi_active = false;
     /* Sticky, and read by the host from its own thread through
@@ -438,6 +558,110 @@ private:
     int32_t m_present_x = 0, m_present_y = 0;
     int32_t m_present_w = 0, m_present_h = 0;
     int32_t m_present_bb_w = 0, m_present_bb_h = 0;
+
+    /* Screenshot of the presented picture (rt_pgs_request_screenshot; see
+     * gs_parallel_api.h for what the two slots are and why the pre one is
+     * the picture without the overlay).
+     *
+     * Three pieces of state with three different owners:
+     *
+     *   m_shot_slots      the arm. Consumer-thread only: the request rides
+     *                     the host's command ring, so it is set on the same
+     *                     thread present_frame runs on and needs no atomic.
+     *                     0 means nothing is armed.
+     *   m_shot[]          the in-flight copy: a CachedHost staging buffer and
+     *                     the fence of the submit that filled it, plus the
+     *                     size that was copied. Consumer-thread only as well,
+     *                     written by capture_backbuffer and cleared by
+     *                     drain_screenshots.
+     *   m_shot_ready[]    the published pixels, tightly packed RGBA8 rows
+     *                     from the top. Written by drain_screenshots on the
+     *                     consumer thread and read by rt_pgs_take_screenshot
+     *                     from the host's EE thread, so both sides take
+     *                     m_shot_mu. The same reasoning as m_present_rect_mu:
+     *                     a reader needs one whole image with its own size,
+     *                     not a size from one field and rows from another.
+     *
+     * The fence is deliberately not waited on where the copy is recorded.
+     * present_frame runs on the GS worker thread and a fence wait there is a
+     * stall on the field the user is looking at; drain_screenshots is called
+     * at the top of the next present instead, by which time a whole present
+     * has completed and the wait returns immediately. */
+    struct ShotPending {
+        Vulkan::BufferHandle buffer;
+        Vulkan::Fence fence;
+        uint32_t width = 0, height = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+    };
+    struct ShotReady {
+        std::vector<uint8_t> rgba;
+        uint32_t width = 0, height = 0;
+    };
+    /* Set at context creation in init_headless / init_windowed; see
+     * descriptor_buffer_disabled() above. */
+    bool m_descbuf_disabled = false;
+    uint32_t m_shot_slots = 0;
+    ShotPending m_shot[RT_PGS_SHOT_SLOTS];
+    mutable std::mutex m_shot_mu;
+    ShotReady m_shot_ready[RT_PGS_SHOT_SLOTS];
+    /* Once-only: a swapchain format shot_format_layout does not know, so the
+     * capture is refused rather than published as if it were RGBA8, and the
+     * line says so. Two latches, not one: the boot trace samples on field 1
+     * and the screenshot only when the user presses the key, so one shared
+     * latch would let the boot sample fire first and leave every later
+     * screenshot refused with nothing in the log. */
+    bool m_shot_format_logged = false;   /* rt_pgs_request_screenshot path */
+    bool m_sample_format_logged = false; /* boot trace sample path */
+
+    /* Boot trace, display half. Why: see guest/boot_trace.cpp (the two
+     * white flashes reported 2026-09-05). Two streams here, both bounded to
+     * the first kBootTraceFields fields and to changes only:
+     *   boot_trace_registers  in vsync, the CRTC registers the field was
+     *                         scanned out from (PMODE enables, the read
+     *                         circuit's DISPFB and DISPLAY, BGCOLOR, SMODE1
+     *                         CMOD, SMODE2) and whether the renderer gave
+     *                         an image;
+     *   sample_backbuffer /   in present_frame, a 16x16 copy out of the
+     *   drain_boot_sample     backbuffer centre after the scanout blit (or
+     *                         the clear, on a field with no image) and
+     *                         before the overlay, read back at the top of
+     *                         the next present the way screenshots are,
+     *                         and logged as its mean colour whenever the
+     *                         colour class (black, white, other) changes.
+     * The count matches guest/boot_trace.h RT_BOOT_TRACE_FIELDS so the
+     * three logs cover one span; it is repeated here because this file
+     * builds into the renderer shared library and includes nothing from
+     * guest/. */
+    static constexpr uint64_t kBootTraceFields = 600;
+    struct BootRegSig {
+        uint32_t en1 = 0, en2 = 0, fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0;
+        uint32_t dx = 0, dy = 0, dw = 0, dh = 0, magh = 0, magv = 0;
+        uint32_t bgr = 0, bgg = 0, bgb = 0, cmod = 0, inter = 0, ffmd = 0;
+        bool image = false;
+        bool operator==(const BootRegSig& o) const {
+            return en1 == o.en1 && en2 == o.en2 && fbp == o.fbp && fbw == o.fbw &&
+                   psm == o.psm && dbx == o.dbx && dby == o.dby && dx == o.dx &&
+                   dy == o.dy && dw == o.dw && dh == o.dh && magh == o.magh &&
+                   magv == o.magv && bgr == o.bgr && bgg == o.bgg && bgb == o.bgb &&
+                   cmod == o.cmod && inter == o.inter && ffmd == o.ffmd && image == o.image;
+        }
+    };
+    bool m_boot_sig_valid = false;
+    BootRegSig m_boot_sig;
+    void boot_trace_registers(bool have_image);
+    struct BootSample {
+        Vulkan::BufferHandle buffer;
+        Vulkan::Fence fence;
+        uint64_t field = 0;
+        bool image = false;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+    };
+    BootSample m_boot_sample;
+    /* -1 nothing logged yet; 0 black, 1 white, 2 neither. */
+    int m_boot_class = -1;
+    void sample_backbuffer(Vulkan::CommandBuffer& cmd, const Vulkan::Image& backbuffer,
+                           VkImageLayout layout, int bb_w, int bb_h, bool have_image);
+    void drain_boot_sample();
     /* Last (internal w, internal h, mode w, mode h, deinterlaced,
      * render scale, high-resolution scanout, deinterlace mode) whose aspect
      * was logged, so a geometry, scale or mode change is visible in the log
@@ -454,12 +678,15 @@ private:
 
     /* Display copy phase tracking (snoop_display_copy_phase / note_xyoffset).
      *
-     * ICO's per-field half pixel lives in XYOFFSET_1: the SDK helper at
-     * 0x00243640 (../ico src/cod/vendor_2418A0.c:203-212) writes OFY = t on
-     * one field and OFY = t + 8 on the other, and nothing else in the packet
-     * stream produces a fractional OFY, because every other XYOFFSET the game
-     * builds is a whole number of pixels shifted left by 4 (gsb_setNormalReg
-     * builds its own as (0x800 - w/2) << 4 | (0x800 - h/4) << 36).
+     * ICO's per-field half pixel lives in XYOFFSET_1: the SDK helper
+     * sceGsSetHalfOffset, at 0x00261048 in the retail ELF, writes OFY = t on
+     * one field and OFY = t + 8 on the other according to its fourth
+     * argument, and nothing else in the packet stream produces a fractional
+     * OFY. That last part is inferred, not measured: every other XYOFFSET the
+     * game is believed to build is a whole number of pixels shifted left by 4,
+     * and no exhaustive search of the ELF's XYOFFSET writers has been done to
+     * confirm it. If one did carry a fraction the snoop would latch on the
+     * wrong register, which note_xyoffset's disagreement counter would show.
      *
      * So the first XYOFFSET whose OFY fraction is 8 identifies both the
      * register and the base value; from then on OFY == base + 8 means the
@@ -517,6 +744,54 @@ private:
     ParallelGS::ScanoutResult m_held_scanout = {};
     double m_held_aspect = 0.0;
     uint64_t m_pair_repeats = 0;
+
+    /* The latest-scanout slot: what vsync finished and what present_pump
+     * shows. vsync stores the result it would have presented (the held pair
+     * above still decides which result that is) and bumps the serial;
+     * present_pump presents it and records which serial reached the window.
+     *
+     * The ScanoutResult holds an image handle, so storing it keeps the image
+     * alive for as long as the slot names it, exactly as m_held_scanout
+     * does. That is what makes a repeat present legal: the image it blits is
+     * still the one the renderer produced for that field.
+     *
+     * Consumer-thread state, all of it: vsync and present_pump both run
+     * there (gs_parallel_api.h, threads). Only the counters above cross to
+     * the EE thread, and they are atomics for that.
+     *
+     * m_last_present_at is only read when m_presented_serial is nonzero, so
+     * its default-constructed value is never used as a time. */
+    ParallelGS::ScanoutResult m_latest_scanout = {};
+    double m_latest_aspect = 0.0;
+    uint64_t m_latest_serial = 0;      /* bumped by every windowed vsync */
+    uint64_t m_presented_serial = 0;   /* the serial last put on screen */
+    std::chrono::steady_clock::time_point m_last_present_at{};
+    /* The present-skip latch: the reason currently keeping pictures off the
+     * window (NULL when they are reaching it) and how many fields have been
+     * skipped since that reason started. Compared by text, so a different
+     * reason opens a new stop with its own line. */
+    const char* m_present_skip_reason = nullptr;
+    uint64_t m_present_skipped = 0;
+    uint64_t m_present_skipped_total = 0;
+    /* Once per run, then counted: begin_frame and end_frame are per-field
+     * calls, so their failures cannot each take a line. report_stats prints
+     * the totals. */
+    bool m_begin_frame_logged = false;
+    uint64_t m_begin_frame_failures = 0;
+    bool m_end_frame_logged = false;
+    uint64_t m_end_frame_failures = 0;
+    /* Fields the renderer produced no image for, in the same shape: one warn
+     * when the picture stops, one info with the count when it comes back.
+     * A field with no image presents a cleared backbuffer, which is a black
+     * window, and nothing else in the log says so. */
+    bool m_no_image_logged = false;
+    uint64_t m_no_image_fields = 0;
+    uint64_t m_no_image_total = 0;
+    /* GIF submissions dropped for a path outside 0..2 (rt_pgs_submit_gif is
+     * documented for those three). One line, then a count: a caller looping
+     * on a bad path would otherwise log every packet. */
+    bool m_gif_path_logged = false;
+    uint64_t m_gif_dropped = 0;
     /* The crop lines: the game asked for a display window wider or taller
      * than the mode area the renderer models, so the right or the bottom of
      * it is not scanned out. Loud rather than silent, per the accuracy rule.
@@ -532,6 +807,13 @@ private:
     uint32_t m_dbxy_ignored_logged = 0;
     /* Once-only: window mode on a CMOD whose window aspect is not derived. */
     bool m_window_aspect_cmod_logged = false;
+    /* display.widescreen's presentation half (rt_pgs_set_widescreen_aspect):
+     * the aspect the scanout is presented at, or 0 to keep the aspect
+     * derived from the CRTC registers. Read fresh by vsync. */
+    double m_widescreen_aspect = 0.0;
+    /* Once per distinct aspect, so a resize in `window` mode does not log a
+     * line a field. */
+    double m_widescreen_aspect_logged = -1.0;
     unsigned m_crop_log_left = 8;
     bool m_copy_ofy_logged = false;   /* the once-only calibration line */
     unsigned m_copy_ofy_search_left = 600; /* fields spent looking before saying so */
@@ -551,6 +833,10 @@ private:
     Vulkan::Program* m_overlay_program = nullptr; /* lazily requested, see draw_overlay */
     bool m_overlay_ui_headless_logged = false; /* present_ui's once-only headless log */
     bool m_overlay_diag_logged = false;        /* draw_overlay's once-only first-draw log */
+    /* Once-only: a retained frame still naming a texture that was destroyed
+     * under it, so that draw is the white fallback and not the picture the
+     * caller asked for. */
+    bool m_overlay_missing_tex_logged = false;
 
 };
 

@@ -63,10 +63,18 @@ const char* cause_name(int c) {
     return (c >= 0 && c < kNumCauses) ? names[c] : "?";
 }
 
-/* GS shadow. CSR: FINISH (bit 1) held set because the P2 runtime has no GS
- * backend and every submitted drawing "finishes" instantly; VSINT (bit 3)
- * sticky until acked; FIELD (bit 13) tracks the vblank timeline; REV/ID
- * bytes report a plausible retail GS (0x1B/0x55). */
+/* GS shadow. CSR: FINISH (bit 1) held set because DMA is synchronous in
+ * this runtime (CLAUDE.md): a GIF packet is fully submitted to the GS
+ * backend by the time the CHCR write returns, so there is no window in
+ * which the guest can look at CSR and find drawing still outstanding. The
+ * backend's own worker thread does not change that, because the GS command
+ * ring is drained in submission order and nothing the guest can read
+ * observes it. (The earlier wording said there was no GS backend at all,
+ * which stopped being true when one was added.) VSINT (bit 3) sticky until
+ * acked; FIELD (bit 13) tracks the vblank timeline; REV/ID bytes report
+ * 0x1B/0x55, which is CHOSEN, not measured: no CSR read from a retail
+ * console has been compared against it, and nothing in this binary is
+ * known to read either field. */
 uint32_t g_csr_flags = 0;    /* bits 0-4 sticky event flags */
 unsigned g_gs_field = 0;
 uint64_t g_gs_imr = 0x7F00;  /* all GS interrupt sources masked, per GS reset */
@@ -114,11 +122,11 @@ void dispatch_line(Line& line, int number, uint32_t a0, const char* kind, const 
         any = true;
         uint32_t ret = rt_intc_run_handler(h.vram, a0, 0, 0, h.gp);
         if (rt_trace()) {
-            rt_log("intc", "%s %d (%s) handler 0x%08x returned %u", kind, number, name, h.vram, ret);
+            rt_log_debug("intc", "%s %d (%s) handler 0x%08x returned %u", kind, number, name, h.vram, ret);
         }
     }
     if (!any && (line.dispatches & (line.dispatches - 1)) == 0) {
-        rt_log("intc", "%s %d (%s) raised with no handler registered [#%" PRIu64 "]",
+        rt_log_debug("intc", "%s %d (%s) raised with no handler registered [#%" PRIu64 "]",
             kind, number, name, line.dispatches);
     }
 }
@@ -174,13 +182,24 @@ uint32_t rt_cop0_status_word() {
 
 int rt_intc_add_handler(int cause, uint32_t vram, int next, uint32_t gp) {
     int id = add_handler(g_intc, kNumCauses, cause, vram, next, gp);
-    rt_log("intc", "AddIntcHandler cause=%d (%s) handler=0x%08x next=%d gp=0x%08x -> id %d",
-        cause, cause_name(cause), vram, next, gp, id);
+    /* A refusal is a fault, not a fact: the guest is handed -1 and the
+     * interrupt it wanted served never reaches its handler. Warn, so it is
+     * in a default-level log; the success line stays at info. */
+    if (id < 0) {
+        rt_log_warn("intc", "AddIntcHandler cause=%d (%s) handler=0x%08x REFUSED -> -1: %s. That "
+            "interrupt will never reach this handler",
+            cause, cause_name(cause), vram,
+            (cause < 0 || cause >= kNumCauses) ? "no such INTC cause"
+                                               : "the cause already carries the maximum handlers");
+    } else {
+        rt_log_info("intc", "AddIntcHandler cause=%d (%s) handler=0x%08x next=%d gp=0x%08x -> id %d",
+            cause, cause_name(cause), vram, next, gp, id);
+    }
     return id;
 }
 
 int rt_intc_remove_handler(int cause, int hid) {
-    rt_log("intc", "RemoveIntcHandler cause=%d id=%d", cause, hid);
+    rt_log_info("intc", "RemoveIntcHandler cause=%d id=%d", cause, hid);
     return remove_handler(g_intc, kNumCauses, cause, hid);
 }
 
@@ -189,7 +208,7 @@ int rt_intc_enable(int cause) {
     uint32_t bit = 1u << cause;
     int changed = (g_imask & bit) ? 0 : 1;
     g_imask |= bit;
-    rt_log("intc", "_EnableIntc cause=%d (%s), imask=0x%04x", cause, cause_name(cause), g_imask);
+    rt_log_info("intc", "_EnableIntc cause=%d (%s), imask=0x%04x", cause, cause_name(cause), g_imask);
     return changed;
 }
 
@@ -198,33 +217,41 @@ int rt_intc_disable(int cause) {
     uint32_t bit = 1u << cause;
     int changed = (g_imask & bit) ? 1 : 0;
     g_imask &= ~bit;
-    rt_log("intc", "_DisableIntc cause=%d (%s), imask=0x%04x", cause, cause_name(cause), g_imask);
+    rt_log_info("intc", "_DisableIntc cause=%d (%s), imask=0x%04x", cause, cause_name(cause), g_imask);
     return changed;
 }
 
 int rt_dmac_add_handler(int ch, uint32_t vram, int next, uint32_t gp) {
     int id = add_handler(g_dmac, kNumChannels, ch, vram, next, gp);
-    rt_log("intc", "AddDmacHandler channel=%d handler=0x%08x next=%d gp=0x%08x -> id %d",
-        ch, vram, next, gp, id);
+    if (id < 0) {
+        rt_log_warn("intc", "AddDmacHandler channel=%d handler=0x%08x REFUSED -> -1: %s. That "
+            "channel's completion will never reach this handler",
+            ch, vram,
+            (ch < 0 || ch >= kNumChannels) ? "no such DMAC channel"
+                                           : "the channel already carries the maximum handlers");
+    } else {
+        rt_log_info("intc", "AddDmacHandler channel=%d handler=0x%08x next=%d gp=0x%08x -> id %d",
+            ch, vram, next, gp, id);
+    }
     return id;
 }
 
 int rt_dmac_remove_handler(int ch, int hid) {
-    rt_log("intc", "RemoveDmacHandler channel=%d id=%d", ch, hid);
+    rt_log_info("intc", "RemoveDmacHandler channel=%d id=%d", ch, hid);
     return remove_handler(g_dmac, kNumChannels, ch, hid);
 }
 
 int rt_dmac_enable(int ch) {
     if (ch < 0 || ch >= kNumChannels) return 0;
     g_dmask |= 1u << ch;
-    rt_log("intc", "_EnableDmac channel=%d, dmask=0x%04x", ch, g_dmask);
+    rt_log_info("intc", "_EnableDmac channel=%d, dmask=0x%04x", ch, g_dmask);
     return 1;
 }
 
 int rt_dmac_disable(int ch) {
     if (ch < 0 || ch >= kNumChannels) return 0;
     g_dmask &= ~(1u << ch);
-    rt_log("intc", "_DisableDmac channel=%d, dmask=0x%04x", ch, g_dmask);
+    rt_log_info("intc", "_DisableDmac channel=%d, dmask=0x%04x", ch, g_dmask);
     return 1;
 }
 
@@ -266,6 +293,21 @@ void rt_intc_deliver() {
             }
         }
         if (apend) rt_alarms_dispatch_pending();
+    }
+    /* The loop above ends either quiescent or out of passes. Out of passes
+     * means handlers are raising lines as fast as they are served: the
+     * pending bits and any due alarms are carried to the next delivery
+     * point with the guest none the wiser, so say so. Folded by powers of
+     * two on its own counter, because a storm repeats. */
+    if ((g_istat & g_imask) || (g_dstat & g_dmask) || rt_alarms_pending()) {
+        static uint64_t exhausted = 0;
+        ++exhausted;
+        if ((exhausted & (exhausted - 1)) == 0) {
+            rt_log_warn("intc", "interrupt delivery used all 64 passes and work is still pending: "
+                "istat=0x%08x imask=0x%08x dstat=0x%08x dmask=0x%08x alarms=%d. The remainder is "
+                "carried to the next delivery point [#%" PRIu64 "]",
+                g_istat, g_imask, g_dstat, g_dmask, rt_alarms_pending() ? 1 : 0, exhausted);
+        }
     }
     g_in_interrupt = false;
     rt_sched_maybe_preempt();

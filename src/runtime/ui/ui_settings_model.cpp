@@ -30,7 +30,7 @@
  *      already put the validated value back, leaving the menu showing a
  *      value the settings do not hold. By the next tick both have run.
  *
- * Text fields (verbose, profiler period, fps limit) apply on Enter or blur
+ * Text fields (screenshot folder, profiler period, fps limit) apply on Enter or blur
  * only, not per keystroke. That falls out of the same one
  * callback: RmlUi's text widget puts "linebreak" in its change event
  * (WidgetTextInput::DispatchChangeEvent), false for an ordinary keystroke
@@ -46,6 +46,7 @@
 
 #include "../host/settings.h"
 #include "../host/input.h"
+#include "../host/screenshot.h"
 #include "../host/window.h"
 #include "../hw/hw.h"
 #include "../runtime.h"
@@ -54,6 +55,7 @@
 #include <RmlUi/Core/DataModelHandle.h>
 #include <RmlUi/Core/Event.h>
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -65,10 +67,10 @@ namespace rtui {
 
 namespace {
 
-/* One row of a binding table. The Input pane renders all three tables with
+/* One row of a binding table. The Input pane renders all four tables with
  * a data-for loop over an array of these rather than binding one scalar per
  * slot: that would mean a Bind() call here and a hand-written row in
- * menu.rml for each of the 57, and adding a slot would mean touching both.
+ * menu.rml for each of the 73, and adding a slot would mean touching both.
  *
  * `binding` is the name to show, which is the stored name except while that
  * row is capturing, when it is the prompt. `capturing` drives the row's
@@ -105,18 +107,34 @@ struct UiSettingsMirror {
     /* "WIDTHxHEIGHT", the value of one of window_sizes below. */
     std::string window_size;
     std::vector<UiOptionRow> window_sizes;
-    std::string present;
+    bool remember_window_size = true;
     std::string fit;
     std::string raster;
-    std::string deinterlace;
+    std::string widescreen;
+    /* What the active backend's device turned out to be, refreshed with the
+     * rest of the mirror rather than per frame. Nothing creates a device to
+     * answer: the live backend publishes this once, just after it made its
+     * own (hw/hw.h). */
+    std::string probe_renderer;
+    std::string probe_features;
     std::string filter;
     std::string render_scale;
+    std::string screenshot_dir;
     bool show_fps = false;
 
-    /* audio */
+    /* audio. The four category gains sit beside the master one; each is
+     * 0..100 and each is a host output gain (host/settings.h audio). */
     int master_volume = 100;
     std::string master_volume_text;
     bool mute = false;
+    int music_volume = 100;
+    std::string music_volume_text;
+    int effects_volume = 100;
+    std::string effects_volume_text;
+    int movie_volume = 100;
+    std::string movie_volume_text;
+    int chime_volume = 60;
+    std::string chime_volume_text;
 
     /* input */
     float left_deadzone = 0.0f;
@@ -125,6 +143,9 @@ struct UiSettingsMirror {
     std::string right_deadzone_text;
     std::vector<UiBindRow> keyboard_binds;
     std::vector<UiBindRow> gamepad_binds;
+    /* Player 2's pad: the same sixteen labels, without the two hotkey rows
+     * (host/settings.h RT_GP2_COUNT). */
+    std::vector<UiBindRow> gamepad2_binds;
     std::vector<UiBindRow> mouse_binds;
     bool mouse_look = true;
     float mouse_look_sensitivity = 1.0f;
@@ -141,30 +162,48 @@ struct UiSettingsMirror {
     /* gameplay */
     bool run_any_direction = false;
 
+    /* achievements */
+    bool ach_enabled = true;
+    bool ach_toast = true;
+    bool ach_sound = false;
+
     /* debug */
-    std::string verbose;
+    std::string log_level;
+    bool console = false;
     bool log_file = true;
     std::string profile_fields;
     std::string fps_limit_hz;
 
+    /* The cold keys (host/settings.h): debug.console and debug.log_file are
+     * applied by restarting the program, which is only offered while the
+     * launcher still owns the window. gameplay_active is what the console
+     * checkbox is disabled on; debug.log_file has an environment twin that
+     * can disable it as well, so it gets its own flag rather than an
+     * expression in the document. cold_note is the one sentence both
+     * controls show, in red (.note-restart), because it says what a change
+     * does rather than what the control is. display.backend was a third
+     * cold key until it was retired on 2026-09-05; nothing here mirrors it
+     * any more. */
+    bool gameplay_active = false;
+    bool log_file_locked = false;
+    std::string cold_note;
+
     /* Environment twins: the control is disabled and a hint names the
      * variable that owns the value for this run. */
-    bool overridden_present = false;
     bool overridden_fps_limit_hz = false;
-    bool overridden_verbose = false;
+    bool overridden_log_level = false;
     bool overridden_profile_fields = false;
     bool overridden_log_file = false;
     bool overridden_mute = false;
-    std::string override_text_present;
     std::string override_text_fps_limit_hz;
-    std::string override_text_verbose;
+    std::string override_text_log_level;
     std::string override_text_profile_fields;
     std::string override_text_log_file;
     std::string override_text_mute;
 
     /* chrome */
     std::string settings_path;
-    std::string active_tab = "display";
+    std::string active_tab = "achievements";
     std::string fps_text;
     /* The Quit button's own label: "Quit" normally, "Press again to quit"
      * for the 3 s window after the first press. No settings key -- this is
@@ -182,6 +221,7 @@ bool g_apply_pending = false;
 bool g_reset_pending = false;
 bool g_reset_keyboard_binds_pending = false;
 bool g_reset_gamepad_binds_pending = false;
+bool g_reset_gamepad2_binds_pending = false;
 bool g_reset_mouse_binds_pending = false;
 /* One bit per mouse slot an Unbind button has asked to clear, drained
  * whole by settings_model_tick(). A set rather than a single slot so that
@@ -197,7 +237,7 @@ bool g_fps_text_started = false;
 /* Quit-button press-again arming. Queued the same way every other control
  * change here is (quit_game() only sets g_quit_pressed; the work happens in
  * settings_model_tick(), at the field boundary, because the second press
- * ends in rt_request_exit -> rt_pgs_notify_quit, which is not legal from an
+ * ends in rt_request_exit -> rt_window_notify_quit, which is not legal from an
  * event callback). */
 bool g_quit_pressed = false;
 bool g_quit_armed = false;
@@ -223,11 +263,6 @@ constexpr EnumName kDisplayModes[] = {
     {"fullscreen_desktop", (int)RtDisplayMode::FullscreenDesktop},
     {"fullscreen_exclusive", (int)RtDisplayMode::FullscreenExclusive},
 };
-constexpr EnumName kPresentModes[] = {
-    {"mailbox", (int)RtPresentMode::Mailbox},
-    {"fifo", (int)RtPresentMode::Fifo},
-    {"immediate", (int)RtPresentMode::Immediate},
-};
 constexpr EnumName kFits[] = {
     {"letterbox", (int)RtFit::Letterbox},
     {"integer", (int)RtFit::IntegerScale},
@@ -237,14 +272,22 @@ constexpr EnumName kRasters[] = {
     {"crt", (int)RtRaster::Crt},
     {"window", (int)RtRaster::Window},
 };
-constexpr EnumName kDeinterlaces[] = {
-    {"adaptive", (int)RtDeinterlace::Adaptive},
-    {"bob", (int)RtDeinterlace::Bob},
-    {"weave", (int)RtDeinterlace::Weave},
+/* Matches kWidescreenNames in host/settings.cpp; the option values in
+ * ui/menu.rml are the same tokens. */
+constexpr EnumName kWidescreens[] = {
+    {"off", (int)RtWidescreen::Off},
+    {"window", (int)RtWidescreen::Window},
+    {"16_9", (int)RtWidescreen::SixteenNine},
 };
 constexpr EnumName kFilters[] = {
     {"linear", (int)RtFilter::Linear},
     {"nearest", (int)RtFilter::Nearest},
+};
+constexpr EnumName kLogLevels[] = {
+    {"error", (int)RT_LOG_ERROR},
+    {"warn", (int)RT_LOG_WARN},
+    {"info", (int)RT_LOG_INFO},
+    {"debug", (int)RT_LOG_DEBUG},
 };
 
 /* Slot labels, in the RtKeyBind and RtPadBind orders. These are what the
@@ -258,6 +301,7 @@ const char* const kKeyboardLabels[RT_KB_COUNT] = {
     "Left stick up", "Left stick down", "Left stick left", "Left stick right",
     "Right stick up", "Right stick down", "Right stick left", "Right stick right",
     "Menu key",
+    "Screenshot key",
 };
 
 /* The window sizes the Display tab offers: the integer multiples of the
@@ -289,6 +333,7 @@ const char* const kMouseLabels[RT_MB_COUNT] = {
     "Cross", "Circle", "Square", "Triangle",
     "L1", "R1", "L2", "R2", "L3", "R3",
     "Start", "Select",
+    "Screenshot button",
 };
 
 /* What the table shows for a mouse slot holding "". The stored value stays
@@ -302,6 +347,7 @@ const char* const kGamepadLabels[RT_GP_COUNT] = {
     "L1", "R1", "L2", "R2", "L3", "R3",
     "Start", "Select",
     "Menu button",
+    "Screenshot button",
 };
 
 template <size_t N>
@@ -323,7 +369,7 @@ bool value_of(const EnumName (&table)[N], const std::string& name, const char* d
             return true;
         }
     }
-    rt_log("ui", "settings menu: %s = \"%s\" is not one of the options this build knows;"
+    rt_log_warn("ui", "menu: %s = \"%s\" is not one of the options this build knows;"
                  " keeping the current value", dotted, name.c_str());
     return false;
 }
@@ -352,7 +398,7 @@ bool parse_int_field(const std::string& text, const char* dotted, int* out) {
     char* end = nullptr;
     const long v = std::strtol(begin, &end, 10);
     if (end == begin || *skip_spaces(end) != '\0') {
-        rt_log("ui", "settings menu: %s = \"%s\" is not a whole number; keeping %d",
+        rt_log_warn("ui", "menu: %s = \"%s\" is not a whole number; keeping %d",
             dotted, text.c_str(), *out);
         return false;
     }
@@ -368,7 +414,7 @@ bool parse_size_field(const std::string& text, int* width, int* height) {
     char* end = nullptr;
     const long w = std::strtol(begin, &end, 10);
     if (end == begin || *end != 'x') {
-        rt_log("ui", "settings menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
+        rt_log_warn("ui", "menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
             text.c_str(), *width, *height);
         return false;
     }
@@ -376,7 +422,7 @@ bool parse_size_field(const std::string& text, int* width, int* height) {
     char* end2 = nullptr;
     const long h = std::strtol(second, &end2, 10);
     if (end2 == second || *skip_spaces(end2) != '\0' || w <= 0 || h <= 0) {
-        rt_log("ui", "settings menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
+        rt_log_warn("ui", "menu: window size \"%s\" is not WIDTHxHEIGHT; keeping %dx%d",
             text.c_str(), *width, *height);
         return false;
     }
@@ -385,12 +431,24 @@ bool parse_size_field(const std::string& text, int* width, int* height) {
     return true;
 }
 
+/* True when the field holds exactly `word`, ignoring surrounding spaces and
+ * letter case. For the one settings field whose value can be a word rather
+ * than a number. */
+bool field_is_word(const std::string& text, const char* word) {
+    const char* p = skip_spaces(text.c_str());
+    size_t i = 0;
+    for (; word[i]; ++i) {
+        if (std::tolower((unsigned char)p[i]) != (unsigned char)word[i]) return false;
+    }
+    return *skip_spaces(p + i) == '\0';
+}
+
 bool parse_double_field(const std::string& text, const char* dotted, double* out) {
     const char* begin = skip_spaces(text.c_str());
     char* end = nullptr;
     const double v = std::strtod(begin, &end);
     if (end == begin || *skip_spaces(end) != '\0') {
-        rt_log("ui", "settings menu: %s = \"%s\" is not a number; keeping %.6g",
+        rt_log_warn("ui", "menu: %s = \"%s\" is not a number; keeping %.6g",
             dotted, text.c_str(), *out);
         return false;
     }
@@ -409,6 +467,7 @@ std::string* bind_slot_storage(RtSettings& s, RtBindDevice device, int slot) {
     switch (device) {
     case RT_BIND_KEYBOARD: return (slot >= 0 && slot < RT_KB_COUNT) ? &s.input.keyboard[slot] : nullptr;
     case RT_BIND_GAMEPAD:  return (slot >= 0 && slot < RT_GP_COUNT) ? &s.input.gamepad[slot] : nullptr;
+    case RT_BIND_GAMEPAD2: return (slot >= 0 && slot < RT_GP2_COUNT) ? &s.input.gamepad2[slot] : nullptr;
     case RT_BIND_MOUSE:    return (slot >= 0 && slot < RT_MB_COUNT) ? &s.input.mouse[slot] : nullptr;
     default: return nullptr;
     }
@@ -448,16 +507,25 @@ void refresh_window_sizes() {
     }
 }
 
+/* The Display tab's two read-only lines. See rt_gs_probe_renderer_line in
+ * hw/hw.h: they are a read of what the live backend published, not a probe
+ * that makes a device. */
+void refresh_device_lines() {
+    g_m.probe_renderer = rt_gs_probe_renderer_line();
+    g_m.probe_features = rt_gs_probe_features_line();
+}
+
 void settings_to_mirror() {
     const RtSettings& s = rt_settings();
+    refresh_device_lines();
 
     g_m.display_mode = name_of(kDisplayModes, (int)s.display.mode);
     g_m.window_size = fmt("%dx%d", s.display.window_width, s.display.window_height);
     refresh_window_sizes();
-    g_m.present = name_of(kPresentModes, (int)s.display.present);
+    g_m.remember_window_size = s.display.remember_window_size;
     g_m.fit = name_of(kFits, (int)s.display.fit);
     g_m.raster = name_of(kRasters, (int)s.display.raster);
-    g_m.deinterlace = name_of(kDeinterlaces, (int)s.display.deinterlace);
+    g_m.widescreen = name_of(kWidescreens, (int)s.display.widescreen);
     g_m.filter = name_of(kFilters, (int)s.display.filter);
     /* Unlike window_size, this select needs no entry for a value the file
      * holds: settings.cpp accepts only kRenderScales ({1, 4, 8, 16}), which
@@ -465,10 +533,19 @@ void settings_to_mirror() {
      * rejected at load and never reaches the mirror. */
     g_m.render_scale = fmt("%d", s.display.render_scale);
     g_m.show_fps = s.display.show_fps;
+    g_m.screenshot_dir = s.display.screenshot_dir;
 
     g_m.master_volume = s.audio.master_volume;
     g_m.master_volume_text = fmt("%d", s.audio.master_volume);
     g_m.mute = s.audio.mute;
+    g_m.music_volume = s.audio.music_volume;
+    g_m.music_volume_text = fmt("%d", s.audio.music_volume);
+    g_m.effects_volume = s.audio.effects_volume;
+    g_m.effects_volume_text = fmt("%d", s.audio.effects_volume);
+    g_m.movie_volume = s.audio.movie_volume;
+    g_m.movie_volume_text = fmt("%d", s.audio.movie_volume);
+    g_m.chime_volume = s.audio.chime_volume;
+    g_m.chime_volume_text = fmt("%d", s.audio.chime_volume);
 
     g_m.left_deadzone = s.input.left_deadzone;
     g_m.right_deadzone = s.input.right_deadzone;
@@ -495,6 +572,14 @@ void settings_to_mirror() {
         g_m.gamepad_binds[i].binding = s.input.gamepad[i];
         g_m.gamepad_binds[i].capturing = false;
     }
+    /* Player 2 reads the first sixteen gamepad labels: the same DS2
+     * buttons in the same order, with no hotkey rows past them. */
+    g_m.gamepad2_binds.resize(RT_GP2_COUNT);
+    for (int i = 0; i < RT_GP2_COUNT; ++i) {
+        g_m.gamepad2_binds[i].label = kGamepadLabels[i];
+        g_m.gamepad2_binds[i].binding = s.input.gamepad2[i];
+        g_m.gamepad2_binds[i].capturing = false;
+    }
     g_m.mouse_binds.resize(RT_MB_COUNT);
     for (int i = 0; i < RT_MB_COUNT; ++i) {
         g_m.mouse_binds[i].label = kMouseLabels[i];
@@ -506,17 +591,31 @@ void settings_to_mirror() {
 
     g_m.run_any_direction = s.gameplay.run_any_direction;
 
-    g_m.verbose = s.debug.verbose;
+    g_m.ach_enabled = s.achievements.enabled;
+    g_m.ach_toast = s.achievements.toast;
+    g_m.ach_sound = s.achievements.sound;
+
+    g_m.log_level = name_of(kLogLevels, (int)s.debug.log_level);
+    g_m.console = s.debug.console;
     g_m.log_file = s.debug.log_file;
     g_m.profile_fields = fmt("%d", s.debug.profile_fields);
-    g_m.fps_limit_hz = fmt("%g", s.debug.fps_limit_hz);
+    /* The default is not a rate, so it is not shown as one: the text box
+     * reads "mode", and the parse below takes that word back. "%g" of -1
+     * would look like a rate the user had typed. */
+    g_m.fps_limit_hz = s.debug.fps_limit_hz == RT_FPS_LIMIT_MODE_RATE
+        ? std::string("mode") : fmt("%g", s.debug.fps_limit_hz);
 
-    set_override("display.present", &g_m.overridden_present, &g_m.override_text_present);
     set_override("debug.fps_limit_hz", &g_m.overridden_fps_limit_hz, &g_m.override_text_fps_limit_hz);
-    set_override("debug.verbose", &g_m.overridden_verbose, &g_m.override_text_verbose);
+    set_override("debug.log_level", &g_m.overridden_log_level, &g_m.override_text_log_level);
     set_override("debug.profile_fields", &g_m.overridden_profile_fields, &g_m.override_text_profile_fields);
     set_override("debug.log_file", &g_m.overridden_log_file, &g_m.override_text_log_file);
     set_override("audio.mute", &g_m.overridden_mute, &g_m.override_text_mute);
+
+    g_m.gameplay_active = rt_settings_gameplay_active();
+    g_m.log_file_locked = g_m.overridden_log_file || g_m.gameplay_active;
+    g_m.cold_note = g_m.gameplay_active
+        ? "Change this from the launcher; the program restarts to apply it"
+        : "Changing this restarts the program";
 
     const char* path = rt_settings_path();
     g_m.settings_path = path[0] ? path : "no settings file yet";
@@ -527,17 +626,30 @@ void mirror_to_settings() {
     int e = 0;
 
     if (value_of(kDisplayModes, g_m.display_mode, "display.mode", &e)) s.display.mode = (RtDisplayMode)e;
-    if (value_of(kPresentModes, g_m.present, "display.present", &e)) s.display.present = (RtPresentMode)e;
     if (value_of(kFits, g_m.fit, "display.fit", &e)) s.display.fit = (RtFit)e;
     if (value_of(kRasters, g_m.raster, "display.raster", &e)) s.display.raster = (RtRaster)e;
-    if (value_of(kDeinterlaces, g_m.deinterlace, "display.deinterlace", &e)) s.display.deinterlace = (RtDeinterlace)e;
+    if (value_of(kWidescreens, g_m.widescreen, "display.widescreen", &e)) s.display.widescreen = (RtWidescreen)e;
+    /* A key whose environment twin is set is never applied (settings.h),
+     * and neither is a cold key once the guest is running: the select is
+     * disabled then, but the mirror is written by the refresh, not only by
+     * the control, so the guard belongs here as well. commit_validate()
+     * refuses the same change a second time, for the writers that never
+     * come through this file. */
     if (value_of(kFilters, g_m.filter, "display.filter", &e)) s.display.filter = (RtFilter)e;
 
     parse_size_field(g_m.window_size, &s.display.window_width, &s.display.window_height);
+    s.display.remember_window_size = g_m.remember_window_size;
     parse_int_field(g_m.render_scale, "display.render_scale", &s.display.render_scale);
     s.display.show_fps = g_m.show_fps;
+    /* Written back as typed: any path is accepted, and host/screenshot.cpp
+     * creates it on the first capture (or logs once and skips). */
+    s.display.screenshot_dir = g_m.screenshot_dir;
 
     s.audio.master_volume = g_m.master_volume;
+    s.audio.music_volume = g_m.music_volume;
+    s.audio.effects_volume = g_m.effects_volume;
+    s.audio.movie_volume = g_m.movie_volume;
+    s.audio.chime_volume = g_m.chime_volume;
     /* A key whose environment twin is set is never applied (settings.h);
      * the row's click expression toggles the mirror regardless of the
      * disabled box inside it, so the guard lives here, and the refresh
@@ -549,16 +661,35 @@ void mirror_to_settings() {
     s.input.mouse_look = g_m.mouse_look;
     s.input.mouse_look_sensitivity = g_m.mouse_look_sensitivity;
     s.input.mouse_look_invert_y = g_m.mouse_look_invert_y;
-    /* The three binding tables are not written back here. They are display
+    /* The four binding tables are not written back here. They are display
      * rows: ui_rebind.cpp and the unbind queue below are the only writers,
      * and both go through rt_settings_mutable() themselves. */
 
     s.gameplay.run_any_direction = g_m.run_any_direction;
 
-    s.debug.verbose = g_m.verbose;
-    if (!g_m.overridden_log_file) s.debug.log_file = g_m.log_file;
+    s.achievements.enabled = g_m.ach_enabled;
+    s.achievements.toast = g_m.ach_toast;
+    s.achievements.sound = g_m.ach_sound;
+
+    if (!g_m.overridden_log_level && value_of(kLogLevels, g_m.log_level, "debug.log_level", &e)) {
+        s.debug.log_level = (RtLogLevel)e;
+    }
+    /* Same rule as audio.mute below it in this file: the check row's click
+     * expression toggles the mirror regardless of the disabled box inside
+     * it, so the guard lives here and the refresh puts the mirror back to
+     * the value that was kept. */
+    if (!g_m.gameplay_active) s.debug.console = g_m.console;
+    /* Cold as well, and with an environment twin: log_file_locked is both
+     * reasons in one flag. */
+    if (!g_m.log_file_locked) s.debug.log_file = g_m.log_file;
     parse_int_field(g_m.profile_fields, "debug.profile_fields", &s.debug.profile_fields);
-    parse_double_field(g_m.fps_limit_hz, "debug.fps_limit_hz", &s.debug.fps_limit_hz);
+    /* "mode" (and "auto", which is what a user is as likely to type) is
+     * the sentinel: pace to the video mode the game programmed. */
+    if (field_is_word(g_m.fps_limit_hz, "mode") || field_is_word(g_m.fps_limit_hz, "auto")) {
+        s.debug.fps_limit_hz = RT_FPS_LIMIT_MODE_RATE;
+    } else {
+        parse_double_field(g_m.fps_limit_hz, "debug.fps_limit_hz", &s.debug.fps_limit_hz);
+    }
 }
 
 void sync_fps_document() {
@@ -604,6 +735,14 @@ void on_quit_game(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     g_quit_pressed = true;
 }
 
+/* The Display tab's "Take screenshot" button. Straight through to the same
+ * request the hotkey makes: the capture is taken before the overlay pass, so
+ * the menu the button lives in is not in the file, and the user does not have
+ * to close the menu and find the key to get one. */
+void on_take_screenshot(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    rt_screenshot_request();
+}
+
 /* data-for gives the row index as it_index; the document passes it through.
  * A missing or out-of-range argument means the document and this file
  * disagree about the tables, which is worth a line rather than a silent
@@ -612,7 +751,7 @@ void on_quit_game(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
 int slot_argument(const Rml::VariantList& arguments, int count) {
     const int slot = arguments.size() == 1 ? arguments[0].Get<int>(-1) : -1;
     if (slot < 0 || slot >= count) {
-        rt_log("ui", "settings menu: a binding button was pressed for slot %d, which is not one"
+        rt_log_warn("ui", "menu: a binding button was pressed for slot %d, which is not one"
             " of this device's 0..%d; the document and ui_settings_model.cpp disagree",
             slot, count - 1);
         return -1;
@@ -620,7 +759,7 @@ int slot_argument(const Rml::VariantList& arguments, int count) {
     return slot;
 }
 
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
 void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
     const int slot = slot_argument(arguments, RT_KB_COUNT);
     if (slot >= 0) rebind_begin(RT_BIND_KEYBOARD, slot);
@@ -629,6 +768,11 @@ void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantLis
 void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
     const int slot = slot_argument(arguments, RT_GP_COUNT);
     if (slot >= 0) rebind_begin(RT_BIND_GAMEPAD, slot);
+}
+
+void on_rebind_gamepad2(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
+    const int slot = slot_argument(arguments, RT_GP2_COUNT);
+    if (slot >= 0) rebind_begin(RT_BIND_GAMEPAD2, slot);
 }
 
 void on_rebind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& arguments) {
@@ -641,13 +785,16 @@ void on_rebind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& 
  * Unbind is not among them: clearing a slot is a settings write, not a
  * capture, and works in a build with no SDL. */
 void on_rebind_keyboard(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+    rt_log_warn("ui", "menu: this build has no SDL, so a binding cannot be captured");
 }
 void on_rebind_gamepad(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+    rt_log_warn("ui", "menu: this build has no SDL, so a binding cannot be captured");
+}
+void on_rebind_gamepad2(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    rt_log_warn("ui", "menu: this build has no SDL, so a binding cannot be captured");
 }
 void on_rebind_mouse(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-    rt_log("ui", "settings menu: this build has no SDL, so a binding cannot be captured");
+    rt_log_warn("ui", "menu: this build has no SDL, so a binding cannot be captured");
 }
 #endif
 
@@ -667,6 +814,10 @@ void on_reset_gamepad_binds(Rml::DataModelHandle, Rml::Event&, const Rml::Varian
     g_reset_gamepad_binds_pending = true;
 }
 
+void on_reset_gamepad2_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+    g_reset_gamepad2_binds_pending = true;
+}
+
 void on_reset_mouse_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
     g_reset_mouse_binds_pending = true;
 }
@@ -676,23 +827,34 @@ void on_reset_mouse_binds(Rml::DataModelHandle, Rml::Event&, const Rml::VariantL
 bool settings_model_init(Rml::Context* context) {
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
-        rt_log("ui", "Context::CreateDataModel(\"settings\") failed; the settings UI is disabled");
+        rt_log_warn("ui", "Context::CreateDataModel(\"settings\") failed; the settings UI is disabled");
         return false;
     }
 
     c.Bind("display_mode", &g_m.display_mode);
     c.Bind("window_size", &g_m.window_size);
-    c.Bind("present", &g_m.present);
+    c.Bind("remember_window_size", &g_m.remember_window_size);
     c.Bind("fit", &g_m.fit);
     c.Bind("raster", &g_m.raster);
-    c.Bind("deinterlace", &g_m.deinterlace);
+    c.Bind("widescreen", &g_m.widescreen);
+    c.Bind("probe_renderer", &g_m.probe_renderer);
+    c.Bind("probe_features", &g_m.probe_features);
     c.Bind("filter", &g_m.filter);
     c.Bind("render_scale", &g_m.render_scale);
     c.Bind("show_fps", &g_m.show_fps);
+    c.Bind("screenshot_dir", &g_m.screenshot_dir);
 
     c.Bind("master_volume", &g_m.master_volume);
     c.Bind("master_volume_text", &g_m.master_volume_text);
     c.Bind("mute", &g_m.mute);
+    c.Bind("music_volume", &g_m.music_volume);
+    c.Bind("music_volume_text", &g_m.music_volume_text);
+    c.Bind("effects_volume", &g_m.effects_volume);
+    c.Bind("effects_volume_text", &g_m.effects_volume_text);
+    c.Bind("movie_volume", &g_m.movie_volume);
+    c.Bind("movie_volume_text", &g_m.movie_volume_text);
+    c.Bind("chime_volume", &g_m.chime_volume);
+    c.Bind("chime_volume_text", &g_m.chime_volume_text);
 
     c.Bind("left_deadzone", &g_m.left_deadzone);
     c.Bind("right_deadzone", &g_m.right_deadzone);
@@ -712,10 +874,10 @@ bool settings_model_init(Rml::Context* context) {
         opt.RegisterMember("value", &UiOptionRow::value);
         opt.RegisterMember("label", &UiOptionRow::label);
     } else {
-        rt_log("ui", "RegisterStruct<UiOptionRow> failed; the window size select is disabled");
+        rt_log_warn("ui", "RegisterStruct<UiOptionRow> failed; the window size select is disabled");
     }
     if (!c.RegisterArray<std::vector<UiOptionRow>>()) {
-        rt_log("ui", "RegisterArray<vector<UiOptionRow>> failed; the window size select is disabled");
+        rt_log_warn("ui", "RegisterArray<vector<UiOptionRow>> failed; the window size select is disabled");
     }
     c.Bind("window_sizes", &g_m.window_sizes);
 
@@ -726,33 +888,42 @@ bool settings_model_init(Rml::Context* context) {
         row.RegisterMember("binding", &UiBindRow::binding);
         row.RegisterMember("capturing", &UiBindRow::capturing);
     } else {
-        rt_log("ui", "RegisterStruct<UiBindRow> failed; the binding tables are disabled");
+        rt_log_warn("ui", "RegisterStruct<UiBindRow> failed; the binding tables are disabled");
     }
     if (!c.RegisterArray<std::vector<UiBindRow>>()) {
-        rt_log("ui", "RegisterArray<vector<UiBindRow>> failed; the binding tables are disabled");
+        rt_log_warn("ui", "RegisterArray<vector<UiBindRow>> failed; the binding tables are disabled");
     }
     c.Bind("keyboard_binds", &g_m.keyboard_binds);
     c.Bind("gamepad_binds", &g_m.gamepad_binds);
+    c.Bind("gamepad2_binds", &g_m.gamepad2_binds);
     c.Bind("mouse_binds", &g_m.mouse_binds);
     c.Bind("rebind_status", &g_m.rebind_status);
     c.Bind("has_rebind_status", &g_m.has_rebind_status);
 
     c.Bind("run_any_direction", &g_m.run_any_direction);
 
-    c.Bind("verbose", &g_m.verbose);
+    c.Bind("ach_enabled", &g_m.ach_enabled);
+    c.Bind("ach_toast", &g_m.ach_toast);
+    c.Bind("ach_sound", &g_m.ach_sound);
+
+    c.Bind("log_level", &g_m.log_level);
+    c.Bind("console", &g_m.console);
     c.Bind("log_file", &g_m.log_file);
     c.Bind("profile_fields", &g_m.profile_fields);
     c.Bind("fps_limit_hz", &g_m.fps_limit_hz);
 
-    c.Bind("overridden_present", &g_m.overridden_present);
+    /* The cold keys' two controls read these (see the mirror). */
+    c.Bind("gameplay_active", &g_m.gameplay_active);
+    c.Bind("log_file_locked", &g_m.log_file_locked);
+    c.Bind("cold_note", &g_m.cold_note);
+
     c.Bind("overridden_fps_limit_hz", &g_m.overridden_fps_limit_hz);
-    c.Bind("overridden_verbose", &g_m.overridden_verbose);
+    c.Bind("overridden_log_level", &g_m.overridden_log_level);
     c.Bind("overridden_profile_fields", &g_m.overridden_profile_fields);
     c.Bind("overridden_log_file", &g_m.overridden_log_file);
     c.Bind("overridden_mute", &g_m.overridden_mute);
-    c.Bind("override_text_present", &g_m.override_text_present);
     c.Bind("override_text_fps_limit_hz", &g_m.override_text_fps_limit_hz);
-    c.Bind("override_text_verbose", &g_m.override_text_verbose);
+    c.Bind("override_text_log_level", &g_m.override_text_log_level);
     c.Bind("override_text_profile_fields", &g_m.override_text_profile_fields);
     c.Bind("override_text_log_file", &g_m.override_text_log_file);
     c.Bind("override_text_mute", &g_m.override_text_mute);
@@ -767,13 +938,24 @@ bool settings_model_init(Rml::Context* context) {
     c.BindEventCallback("reset_defaults", on_reset_defaults);
     c.BindEventCallback("close_menu", on_close);
     c.BindEventCallback("quit_game", on_quit_game);
+    c.BindEventCallback("take_screenshot", on_take_screenshot);
     c.BindEventCallback("rebind_keyboard", on_rebind_keyboard);
     c.BindEventCallback("rebind_gamepad", on_rebind_gamepad);
+    c.BindEventCallback("rebind_gamepad2", on_rebind_gamepad2);
     c.BindEventCallback("rebind_mouse", on_rebind_mouse);
     c.BindEventCallback("unbind_mouse", on_unbind_mouse);
     c.BindEventCallback("reset_keyboard_binds", on_reset_keyboard_binds);
     c.BindEventCallback("reset_gamepad_binds", on_reset_gamepad_binds);
+    c.BindEventCallback("reset_gamepad2_binds", on_reset_gamepad2_binds);
     c.BindEventCallback("reset_mouse_binds", on_reset_mouse_binds);
+
+    /* Read here and refreshed with the rest of the mirror on every menu
+     * open (settings_to_mirror). No device is created to answer: the two
+     * lines describe the device the active backend already made, published
+     * once into the window service (host/window_service.h). Reading them at
+     * model init alone would show "no renderer device created yet" on the
+     * boot-first ordering, where the model exists before the backend. */
+    refresh_device_lines();
 
     g_model = c.GetModelHandle();
     g_model_valid = true;
@@ -783,6 +965,7 @@ bool settings_model_init(Rml::Context* context) {
 const char* bind_slot_label(RtBindDevice device, int slot) {
     switch (device) {
     case RT_BIND_GAMEPAD: return (slot >= 0 && slot < RT_GP_COUNT) ? kGamepadLabels[slot] : "?";
+    case RT_BIND_GAMEPAD2: return (slot >= 0 && slot < RT_GP2_COUNT) ? kGamepadLabels[slot] : "?";
     case RT_BIND_MOUSE:   return (slot >= 0 && slot < RT_MB_COUNT) ? kMouseLabels[slot] : "?";
     case RT_BIND_KEYBOARD: return (slot >= 0 && slot < RT_KB_COUNT) ? kKeyboardLabels[slot] : "?";
     default: return "?";
@@ -793,6 +976,7 @@ const char* bind_device_name(RtBindDevice device) {
     switch (device) {
     case RT_BIND_KEYBOARD: return "keyboard";
     case RT_BIND_GAMEPAD:  return "gamepad";
+    case RT_BIND_GAMEPAD2: return "gamepad2";
     case RT_BIND_MOUSE:    return "mouse";
     default: return "?";
     }
@@ -801,10 +985,11 @@ const char* bind_device_name(RtBindDevice device) {
 namespace {
 /* active_tab's values (menu.rml's nav buttons set one of these) and the id
  * of the button that selects each, in the same order the tabs are laid out
- * (menu.rml section-numbers 01..05). One place, so the shoulder-cycle below
+ * (menu.rml section-numbers 01..06). One place, so the shoulder-cycle below
  * and the initial-focus fix agree with the document. */
-constexpr const char* kTabOrder[] = {"display", "audio", "input", "gameplay", "debug"};
-constexpr const char* kTabButtonIds[] = {"nav-display", "nav-audio", "nav-input", "nav-gameplay", "nav-debug"};
+constexpr const char* kTabOrder[] = {"achievements", "display", "audio", "input", "gameplay", "debug"};
+constexpr const char* kTabButtonIds[] = {"nav-achievements", "nav-display", "nav-audio", "nav-input",
+                                         "nav-gameplay", "nav-debug"};
 constexpr size_t kTabCount = sizeof(kTabOrder) / sizeof(kTabOrder[0]);
 } // namespace
 
@@ -954,6 +1139,12 @@ void settings_model_set_rebind(bool active, RtBindDevice device, int slot, const
                 ? "press a button, or hold two together"
                 : "press a button or move an axis";
             break;
+        case RT_BIND_GAMEPAD2:
+            rows = &g_m.gamepad2_binds;
+            /* No chord prompt: player 2's table has no menu slot for one to
+             * be legal in. */
+            prompt = "press a button or move an axis on player 2's pad";
+            break;
         case RT_BIND_MOUSE:
             rows = &g_m.mouse_binds;
             prompt = "press a mouse button or turn the wheel";
@@ -996,7 +1187,7 @@ void settings_model_refresh() {
  * sees the pad line without touching anything else. One string per device
  * per document; rewritten only when the device flips.
  *
- * `two_level` picks the settings menu's pair over the launcher's: the
+ * `two_level` picks the menu's pair over the launcher's: the
  * launcher has no cards and no pane, its navigation is flat, and East does
  * nothing there at all (ui_events.cpp's close_menu returns false with the
  * menu not up, so a stray press cannot quit out of the launcher). Escape is
@@ -1016,6 +1207,49 @@ void sync_nav_hint(std::string* hint, Rml::DataModelHandle* model, bool two_leve
     model->DirtyVariable("nav_hint");
 }
 
+namespace {
+
+/* The commit half of the cold-key rule (host/settings.h). Called with the
+ * committed settings as they were before the edit; when a cold key moved,
+ * the run restarts to apply it.
+ *
+ * The order matters. The file is written first, because the successor reads
+ * it at startup and the whole point is that it comes up on the new value.
+ * rt_restart_now() then prepares the new process but tears nothing down
+ * itself: it asks for the ordinary exit, so the GS backend writes its
+ * pipeline cache, the window is destroyed and the log is drained exactly as
+ * they are on Quit, and the successor is only started once all of that has
+ * happened.
+ *
+ * A restart that cannot be prepared is not fatal and reverts nothing: the
+ * new value is in the file and will be used at the next launch, which is
+ * what a cold key did before this existed. */
+void restart_if_cold_key_changed(const RtSettings& before) {
+    const char* key = rt_settings_cold_key_changed(before, rt_settings());
+    if (!key) return;
+
+    rt_log_info("settings", "restarting to apply %s", key);
+    rt_settings_flush_save();
+
+    char why[128];
+    std::snprintf(why, sizeof why, "restarting to apply %s", key);
+    char err[512];
+    /* True means the exit is under way, and with no window it does not
+     * return at all. */
+    if (rt_restart_now(why, err, sizeof err)) return;
+
+    rt_log_error("settings", "could not restart to apply %s: %s; the value is saved and takes effect"
+        " at the next launch, this run keeps the one it started with", key, err);
+    char msg[1024];
+    std::snprintf(msg, sizeof msg,
+        "ICO could not restart itself to apply %s.\n\n%s\n\n"
+        "The new value is saved and will be used the next time you start ICO."
+        " This run keeps the value it started with.\n", key, err);
+    rt_show_message("ICO", msg);
+}
+
+} // namespace
+
 void settings_model_tick() {
     if (!g_model_valid) return;
     sync_nav_hint(&g_m.nav_hint, &g_model, /*two_level=*/true);
@@ -1023,18 +1257,23 @@ void settings_model_tick() {
     if (g_reset_pending) {
         g_reset_pending = false;
         g_apply_pending = false;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         rebind_cancel("the settings were reset to defaults", /*drop_accepted=*/true);
 #endif
+        const RtSettings before = rt_settings();
         rt_settings_reset_defaults();
         rt_settings_commit(false);
         rt_settings_request_save();
         settings_model_refresh();
-        rt_log("ui", "settings menu: reset to defaults");
+        rt_log_info("ui", "menu: reset to defaults");
+        /* Reset is a commit like any other, so a default that differs from
+         * the value this run started on is a cold-key change and restarts
+         * the program, exactly as changing the control itself would. */
+        restart_if_cold_key_changed(before);
     } else if (g_reset_keyboard_binds_pending || g_reset_gamepad_binds_pending ||
-               g_reset_mouse_binds_pending) {
+               g_reset_gamepad2_binds_pending || g_reset_mouse_binds_pending) {
         /* One device per tick, in device order. Clicking more than one of
-         * the three buttons before the next field is unlikely but the later
+         * the four buttons before the next field is unlikely but the later
          * clicks must not be dropped: the other flags stay set and land on
          * the ticks after this one. */
         RtBindDevice device = RT_BIND_KEYBOARD;
@@ -1043,11 +1282,14 @@ void settings_model_tick() {
         } else if (g_reset_gamepad_binds_pending) {
             device = RT_BIND_GAMEPAD;
             g_reset_gamepad_binds_pending = false;
+        } else if (g_reset_gamepad2_binds_pending) {
+            device = RT_BIND_GAMEPAD2;
+            g_reset_gamepad2_binds_pending = false;
         } else {
             device = RT_BIND_MOUSE;
             g_reset_mouse_binds_pending = false;
         }
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         rebind_cancel("the bindings for that device were reset", /*drop_accepted=*/true);
 #endif
         RtSettings& m = rt_settings_mutable();
@@ -1059,7 +1301,7 @@ void settings_model_tick() {
         rt_settings_commit(false);
         rt_settings_request_save();
         settings_model_refresh();
-        rt_log("ui", "settings menu: %s bindings reset to defaults", bind_device_name(device));
+        rt_log_info("ui", "menu: %s bindings reset to defaults", bind_device_name(device));
     } else if (g_unbind_mouse_pending) {
         /* Every slot the Unbind buttons queued, in one commit. "" is what
          * an unbound mouse slot holds; the table renders it as "unbound".
@@ -1068,14 +1310,14 @@ void settings_model_tick() {
          * screen saying so. */
         const unsigned slots = g_unbind_mouse_pending;
         g_unbind_mouse_pending = 0;
-#ifdef ICORECOMP_PGS_SDL
+#ifdef ICORECOMP_HAVE_SDL
         rebind_cancel("a mouse binding was cleared", /*drop_accepted=*/true);
 #endif
         RtSettings& m = rt_settings_mutable();
         for (int i = 0; i < RT_MB_COUNT; ++i) {
             if (!(slots & (1u << i))) continue;
             m.input.mouse[i].clear();
-            rt_log("ui", "settings menu: input.mouse.%s unbound",
+            rt_log_info("ui", "menu: input.mouse.%s unbound",
                 rt_settings_binding_key(RT_BIND_MOUSE, i));
         }
         rt_settings_commit(false);
@@ -1083,11 +1325,17 @@ void settings_model_tick() {
         settings_model_refresh();
     } else if (g_apply_pending) {
         g_apply_pending = false;
+        /* A copy, taken before mirror_to_settings() writes the same struct:
+         * it is what a cold-key change is measured against below. */
+        const RtSettings before = rt_settings();
         mirror_to_settings();
         rt_settings_commit(false);
         rt_settings_request_save();
         /* commit_validate may have reverted a value; show what was kept. */
         settings_model_refresh();
+        /* Last, so the menu is showing the committed values if the restart
+         * cannot be prepared and the run carries on. */
+        restart_if_cold_key_changed(before);
     } else if (g_quit_pressed) {
         g_quit_pressed = false;
         if (g_quit_armed) {

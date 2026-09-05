@@ -11,7 +11,7 @@
 	boot precheck, not a setting.
 
 	Every callback below only queues work; the launcher's own frame loop does
-	it at the next iteration, for the same reason the settings menu queues
+	it at the next iteration, for the same reason the in-game menu queues
 	its changes (see ui_settings_model.cpp's file comment).
 -->
 <body class="launcher" data-model="launcher">
@@ -64,7 +64,7 @@
 
 		<div class="launcher-actions">
 			<div class="button start-button" data-class-disabled="!can_start" data-event-click="start()" autofocus>Start</div>
-			<div class="button" data-event-click="open_settings()">Settings</div>
+			<div class="button" data-event-click="open_settings()">Menu</div>
 			<div class="button" data-event-click="quit()">Quit</div>
 		</div>
 

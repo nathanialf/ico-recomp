@@ -13,9 +13,10 @@
 //! `q_commit_sites`), while vu-interp models the pipelines dynamically.
 //! That is what gives the comparison its teeth.
 //!
-//! Requires the sibling ../ico checkout; skips cleanly without it, like
-//! the other gated tests. Unix only: the generated C is loaded with dlopen,
-//! so the whole file is gated rather than the one test.
+//! Requires the boot ELF named by `[inputs]` in `config/recomp.toml`, which
+//! `setup.sh` extracts from the user's own disc; skips cleanly without it.
+//! Unix only: the generated C is loaded with dlopen, so the whole file is
+//! gated rather than the one test.
 
 #![cfg(unix)]
 
@@ -34,9 +35,10 @@ fn config_path() -> PathBuf {
     repo_root().join("config/recomp.toml")
 }
 
-fn decomp_present() -> bool {
+/// The boot ELF the translator reads. Absent on CI, which has no disc.
+fn boot_elf_present() -> bool {
     RecompConfig::load(&config_path())
-        .map(|c| c.decomp_root.is_dir())
+        .map(|c| c.elf_path.is_file())
         .unwrap_or(false)
 }
 
@@ -319,8 +321,11 @@ fn load_captures(path: &Path, state_size: usize) -> Vec<(u32, Vec<u8>)> {
 
 #[test]
 fn interpreter_and_generated_code_agree_on_all_programs() {
-    if !decomp_present() {
-        eprintln!("differential: ../ico not present, skipping");
+    if !boot_elf_present() {
+        eprintln!(
+            "differential: the boot ELF named by [inputs] in config/recomp.toml is not \
+             present, skipping"
+        );
         return;
     }
     let db = ProgramDb::load(&config_path()).unwrap();

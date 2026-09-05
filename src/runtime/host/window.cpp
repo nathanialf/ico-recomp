@@ -4,17 +4,16 @@
  * matters most here): rt_window_pump runs from inside WSI::begin_frame via
  * the pump_events callback (gs_parallel_present.cpp's RtPgs::present_frame),
  * after a swapchain image may already be acquired. From that context this
- * file may only queue/translate events and call rt_pgs_notify_quit /
- * rt_pgs_notify_resize; any rt_pgs_set_* entry point fatals mid-frame (the
- * library's m_in_frame guard). rt_window_apply_mode is a rt_pgs_set_*-shaped
- * operation in spirit (it touches the window) and must only ever be called
- * between frames -- from rt_settings_apply's hot path (settings_apply.cpp)
- * or from gs_parallel.cpp at startup, never from rt_window_pump itself.
+ * file may only queue/translate events and call rt_window_notify_quit /
+ * rt_window_notify_resize / rt_window_sample_state, whose sink callbacks are
+ * flag sets. rt_window_apply_mode touches the window itself and must only
+ * ever be called between frames -- from rt_settings_apply's hot path
+ * (settings_apply.cpp) or from gs/gs_select.cpp at startup, never from
+ * rt_window_pump.
  *
  * Guarded like host/input.cpp: SDL is only linked into the executable when
- * the live paraLLEl-GS backend was built with SDL3 window support
- * (ICORECOMP_PGS_SDL; see CMakeLists.txt). Without it every function here
- * is a no-op with no SDL calls compiled in.
+ * this build has it (ICORECOMP_HAVE_SDL; see CMakeLists.txt). Without it
+ * every function here is a no-op with no SDL calls compiled in.
  */
 #include "window.h"
 
@@ -22,32 +21,15 @@
 #include "../ui/ui.h"
 #include "input.h"
 #include "mouse.h"
+#include "screenshot.h"
+#include "window_service.h"
 
 #include <cstdlib>
 
-#ifdef ICORECOMP_PGS_SDL
-#include "../gs/gs_parallel_api.h"
+#ifdef ICORECOMP_HAVE_SDL
+
 #include <SDL3/SDL.h>
 #include <chrono>
-#endif
-
-#ifndef ICORECOMP_HAVE_PARALLEL_GS
-/* No live paraLLEl-GS backend in this build (ICORECOMP_PARALLEL_GS=OFF at
- * configure time): gs_parallel.cpp, which defines the real
- * rt_gs_parallel_handle(), is not even compiled (it is only added to
- * icorecomp-runtime's sources under that option; see CMakeLists.txt). Stub
- * it here -- window.cpp is always built -- so this file and
- * settings_apply.cpp can call it unconditionally instead of every call site
- * needing the ICORECOMP_HAVE_PARALLEL_GS guard. Exactly one of this stub or
- * gs_parallel.cpp's real definition exists in any given build. */
-RtPgs* rt_gs_parallel_handle() { return nullptr; }
-/* Same reason, same pair: RT_PGS_PRESENT_MAILBOX is 0 (gs_parallel_api.h),
- * and no caller in such a build ever hands it to a library that is not
- * there. */
-uint32_t rt_gs_parallel_present_mode() { return 0; }
-#endif
-
-#ifdef ICORECOMP_PGS_SDL
 
 namespace {
 
@@ -121,29 +103,41 @@ namespace {
  *
  *   - SDL_PumpEvents runs the platform's message loop, which is what keeps
  *     the window responsive to the compositor and what updates SDL's own
- *     window state, so the minimized flag rt_pgs_sample_window_state reads
- *     below is fresh. That is how a restore reaches a consumer parked on an
+ *     window state, so the minimized flag rt_window_sample_state reads below
+ *     is fresh. That is how a restore reaches a consumer parked on an
  *     unpresentable swapchain.
  *   - a peek (SDL_PeepEvents with SDL_PEEKEVENT, which leaves the events
- *     queued) for the quit and resize events the library has to hear about,
- *     so a close during a wait still ends the run and a resize during one
- *     still rebuilds the swapchain. Both notifications are idempotent flag
- *     sets, so the real pump seeing the same events afterwards costs
- *     nothing.
+ *     queued) for the quit and resize events the presenting backend has to
+ *     hear about, so a close during a wait still ends the run and a resize
+ *     during one still rebuilds the swapchain. Both notifications are
+ *     idempotent flag sets, so the real pump seeing the same events
+ *     afterwards costs nothing.
  *
  * Every input event stays in the queue and is delivered in order by the next
  * unheld pump, which is the field boundary. Nothing is dropped and nothing
  * is delivered out of order. */
-void restricted_pump(RtPgs* pgs) {
+void restricted_pump() {
     if (!g_restricted_pump_logged) {
         g_restricted_pump_logged = true;
-        rt_log("window", "event dispatch held: a GS ring wait pumped the window without "
+        rt_log_info("window", "event dispatch held: a GS ring wait pumped the window without "
                          "dispatching (events stay queued for the field boundary)");
     }
     SDL_PumpEvents();
     /* SDL_HasEvent scans the queue without copying, so a quit is found
-     * however much input is queued ahead of it. */
-    if (SDL_HasEvent(SDL_EVENT_QUIT)) rt_pgs_notify_quit(pgs);
+     * however much input is queued ahead of it. The close request is looked
+     * for first because it is the one that says the player asked: SDL
+     * generates SDL_EVENT_QUIT itself when the last window goes away, and a
+     * quit with no close behind it is a different event with a different
+     * cause and a different log level (window_service.h). */
+    if (SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED)) {
+        rt_window_notify_quit("the window's close button (SDL_EVENT_WINDOW_CLOSE_REQUESTED)", true);
+    }
+    if (SDL_HasEvent(SDL_EVENT_QUIT)) {
+        rt_window_notify_quit("SDL_EVENT_QUIT with no window close behind it. SDL carries no"
+            " source on this event, so what raised it (a session logout, a signal the SDL"
+            " backend translates, a window server that went away) is not knowable from here",
+            false);
+    }
     /* Window events only: the mouse-motion flood a wait can accumulate is
      * outside this range, so sixteen is far more than the queue ever holds
      * of these, and anything past it is seen by the next pump 2 ms later or
@@ -157,48 +151,57 @@ void restricted_pump(RtPgs* pgs) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         case SDL_EVENT_WINDOW_RESTORED:
         case SDL_EVENT_WINDOW_MAXIMIZED:
-            rt_pgs_notify_resize(pgs);
+            rt_window_notify_resize();
             break;
         default:
             break;
         }
     }
-    rt_pgs_sample_window_state(pgs);
+    rt_window_sample_state();
 }
 
 } // namespace
 
 void rt_window_pump() {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) return; /* no live backend (dump mode, or not built) */
-    void* raw = rt_pgs_window_handle(pgs);
-    SDL_Window* win = (SDL_Window*)raw;
+    SDL_Window* win = (SDL_Window*)rt_window_handle();
     if (!win) return; /* headless: nothing to pump */
 
     if (g_dispatch_held > 0) {
-        restricted_pump(pgs);
+        restricted_pump();
         return;
     }
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            /* The player pressed the window's close button. Handled by name
+             * rather than left to the SDL_EVENT_QUIT that SDL raises after
+             * it, so the run can tell "the user closed the window" from "a
+             * quit turned up and nothing explains it" (window_service.h).
+             * The first cause wins there, so this arriving before SDL's own
+             * quit is what makes the good one stick. */
+            rt_window_notify_quit("the window's close button (SDL_EVENT_WINDOW_CLOSE_REQUESTED)", true);
+            break;
         case SDL_EVENT_QUIT:
-            rt_pgs_notify_quit(pgs);
+            rt_window_notify_quit("SDL_EVENT_QUIT with no window close behind it. SDL carries no"
+                " source on this event, so what raised it (a session logout, a signal the SDL"
+                " backend translates, a window server that went away) is not knowable from here",
+                false);
             break;
         case SDL_EVENT_WINDOW_RESIZED:
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-            rt_pgs_notify_resize(pgs);
+            rt_window_notify_resize();
             record_window_size(win);
             break;
         /* Restoring a minimized window on Windows usually keeps the pixel
          * size, so neither event above fires and nothing would tell the
-         * library the window can be presented to again. The notification is
+         * backend the window can be presented to again. The notification is
          * a flag set plus a state resample, so raising it on these two costs
          * a swapchain rebuild that was going to happen anyway. */
         case SDL_EVENT_WINDOW_RESTORED:
         case SDL_EVENT_WINDOW_MAXIMIZED:
-            rt_pgs_notify_resize(pgs);
+            rt_window_notify_resize();
             break;
         default:
             break;
@@ -217,24 +220,35 @@ void rt_window_pump() {
          * consumed the event, and the mouse is the consumer of that answer:
          * a click or a motion the overlay took is the menu's and must not
          * also reach the game. Both calls stay inside the reentrancy rule:
-         * event translation and flag flips only, no rt_pgs_* calls, and
+         * event translation and flag flips only, no GS calls, and
          * host/mouse.cpp keeps its own SDL calls in rt_mouse_tick at the
          * field boundary. rt_ui_handle_sdl_event is a no-op (an inline stub
          * in ui.h) when this build has no UI. */
         const bool ui_took_it = rt_ui_handle_sdl_event(e);
-        rt_mouse_on_event(e, ui_took_it);
+        /* The screenshot hotkey, after the UI and only for events the UI did
+         * not take: a rebind capture in the menu has to win, so that binding
+         * the screenshot key to something else does not fire a capture on the
+         * press being bound. Before the mouse, and folded into what the mouse
+         * is told was consumed, so a mouse button bound to the screenshot does
+         * not also reach the game. It records a flag and nothing else, which
+         * is all this context allows (see the reentrancy rule above); the
+         * capture itself happens in rt_screenshot_tick at the field boundary.
+         * Not inside the UI: with ICORECOMP_UI=OFF rt_ui_handle_sdl_event is
+         * an inline stub and the hotkey still has to work. */
+        const bool shot_took_it = ui_took_it ? false : rt_screenshot_on_sdl_event(e);
+        rt_mouse_on_event(e, ui_took_it || shot_took_it);
     }
-    /* Refreshes the library's cache of the window's pixel size and minimized
-     * state. This thread is the only one that may ask SDL for either (the
-     * event queue is per thread on Windows), and the GS command ring's
-     * worker thread is what needs the answers: Granite asks the WSI platform
-     * for a surface size from inside begin_frame, on the worker. Once per
-     * pump, so once per field plus every EE-side wait that pumps; two SDL
-     * queries at that rate cost nothing. Legal from inside begin_frame like
-     * the notify_* calls above, and for the same reason: it touches the
-     * library's own state, not the swapchain. See the threads section of
-     * gs_parallel_api.h. */
-    rt_pgs_sample_window_state(pgs);
+    /* Refreshes the window's cached pixel size and minimized state, and
+     * forwards the sample to the presenting backend's sink. This thread is
+     * the only one that may ask SDL for either (the event queue is per thread
+     * on Windows), and the GS command ring's worker thread is what needs the
+     * answers: Granite asks the WSI platform for a surface size from inside
+     * begin_frame, on the worker. Once per pump, so once per field plus every
+     * EE-side wait that pumps; two SDL queries at that rate cost nothing.
+     * Legal from inside begin_frame like the notify_* calls above, and for
+     * the same reason: it touches host-side state, not the swapchain. See
+     * the threads section of host/window_service.h. */
+    rt_window_sample_state();
     /* The size commit happens in rt_window_flush_pending_save, not here:
      * rt_settings_commit runs the display applier, and this function can
      * execute from inside WSI::begin_frame via pump_events, where window and
@@ -247,10 +261,7 @@ void rt_window_flush_pending_save() {
 }
 
 void rt_window_apply_mode(const RtSettings& s) {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) return;
-    void* raw = rt_pgs_window_handle(pgs);
-    SDL_Window* win = (SDL_Window*)raw;
+    SDL_Window* win = (SDL_Window*)rt_window_handle();
     if (!win) return; /* headless */
 
     switch (s.display.mode) {
@@ -260,7 +271,7 @@ void rt_window_apply_mode(const RtSettings& s) {
          * behaves on Wayland (no compositor-granted exclusive mode there). */
         SDL_SetWindowFullscreenMode(win, nullptr);
         if (!SDL_SetWindowFullscreen(win, true)) {
-            rt_log("window", "SDL_SetWindowFullscreen (desktop) failed: %s", SDL_GetError());
+            rt_log_warn("window", "SDL_SetWindowFullscreen (desktop) failed: %s", SDL_GetError());
         }
         break;
     case RtDisplayMode::FullscreenExclusive: {
@@ -269,11 +280,11 @@ void rt_window_apply_mode(const RtSettings& s) {
             && SDL_SetWindowFullscreenMode(win, desktop)
             && SDL_SetWindowFullscreen(win, true);
         if (!ok) {
-            rt_log("window", "exclusive fullscreen failed (%s); falling back to desktop fullscreen",
+            rt_log_warn("window", "exclusive fullscreen failed (%s); falling back to desktop fullscreen",
                 SDL_GetError());
             SDL_SetWindowFullscreenMode(win, nullptr);
             if (!SDL_SetWindowFullscreen(win, true)) {
-                rt_log("window", "SDL_SetWindowFullscreen (desktop fallback) failed: %s", SDL_GetError());
+                rt_log_warn("window", "SDL_SetWindowFullscreen (desktop fallback) failed: %s", SDL_GetError());
             }
         }
         break;
@@ -286,14 +297,12 @@ void rt_window_apply_mode(const RtSettings& s) {
         break;
     }
 
-    rt_pgs_notify_resize(pgs);
+    rt_window_notify_resize();
 }
 
 void rt_window_set_icon(const uint8_t* rgba, uint32_t w, uint32_t h, const uint8_t* rgba2x, uint32_t w2,
                         uint32_t h2) {
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (!pgs) return;
-    SDL_Window* win = (SDL_Window*)rt_pgs_window_handle(pgs);
+    SDL_Window* win = (SDL_Window*)rt_window_handle();
     if (!win) return; /* headless */
     if (!rgba || w == 0 || h == 0) return;
 
@@ -304,38 +313,46 @@ void rt_window_set_icon(const uint8_t* rgba, uint32_t w, uint32_t h, const uint8
     SDL_Surface* base = SDL_CreateSurfaceFrom(int(w), int(h), SDL_PIXELFORMAT_RGBA32, (void*)rgba,
         int(w) * 4);
     if (!base) {
-        rt_log("window", "SDL_CreateSurfaceFrom (window icon) failed: %s", SDL_GetError());
+        rt_log_warn("window", "SDL_CreateSurfaceFrom (window icon) failed: %s", SDL_GetError());
         return;
     }
     SDL_Surface* alt = nullptr;
     if (rgba2x && w2 > 0 && h2 > 0) {
         alt = SDL_CreateSurfaceFrom(int(w2), int(h2), SDL_PIXELFORMAT_RGBA32, (void*)rgba2x, int(w2) * 4);
         if (!alt) {
-            rt_log("window", "SDL_CreateSurfaceFrom (window icon alternate) failed: %s", SDL_GetError());
+            rt_log_warn("window", "SDL_CreateSurfaceFrom (window icon alternate) failed: %s", SDL_GetError());
         } else if (!SDL_AddSurfaceAlternateImage(base, alt)) {
-            rt_log("window", "SDL_AddSurfaceAlternateImage (window icon) failed: %s", SDL_GetError());
+            rt_log_warn("window", "SDL_AddSurfaceAlternateImage (window icon) failed: %s", SDL_GetError());
         }
     }
     if (!SDL_SetWindowIcon(win, base)) {
-        rt_log("window", "SDL_SetWindowIcon failed: %s", SDL_GetError());
+        rt_log_warn("window", "SDL_SetWindowIcon failed: %s", SDL_GetError());
     }
     if (alt) SDL_DestroySurface(alt);
     SDL_DestroySurface(base);
 }
 
 void rt_request_exit(const char* why) {
-    rt_log("window", "exit requested: %s", why);
-    RtPgs* pgs = rt_gs_parallel_handle();
-    if (pgs) {
-        rt_pgs_notify_quit(pgs);
+    rt_log_info("window", "exit requested: %s", why);
+    /* A deliberate end, so the end-of-run summary goes out at info. Named
+     * here rather than at the exit itself because this is the only place
+     * that knows which of the several deliberate ends this is: Quit from
+     * the menu, Quit from the launcher, the window's own close button, or a
+     * restart to apply a cold key. */
+    rt_run_set_exit_reason(true, "exit requested: %s", why);
+    if (rt_window_exists()) {
+        /* A deliberate request by construction: every caller is Quit from
+         * the menu, Quit from the launcher, or the restart that applies a
+         * cold key. */
+        rt_window_notify_quit(why, true);
     } else {
-        /* No live backend to catch this at its next vsync (dump mode, or
+        /* No window to catch this at its next vsync (dump mode, or
          * headless): there is nothing left to wait for. */
         std::exit(0);
     }
 }
 
-#else /* !ICORECOMP_PGS_SDL */
+#else /* !ICORECOMP_HAVE_SDL */
 
 void rt_window_pump() {}
 void rt_window_hold_event_dispatch(bool) {}
@@ -344,8 +361,9 @@ void rt_window_apply_mode(const RtSettings&) {}
 void rt_window_set_icon(const uint8_t*, uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t) {}
 
 void rt_request_exit(const char* why) {
-    rt_log("window", "exit requested: %s", why);
+    rt_log_info("window", "exit requested: %s", why);
+    rt_run_set_exit_reason(true, "exit requested: %s", why);
     std::exit(0);
 }
 
-#endif /* ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_HAVE_SDL */

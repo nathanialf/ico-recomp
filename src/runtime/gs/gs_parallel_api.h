@@ -15,6 +15,7 @@
 #ifndef ICORECOMP_GS_PARALLEL_API_H
 #define ICORECOMP_GS_PARALLEL_API_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_WIN32)
@@ -52,6 +53,19 @@ typedef struct RtPgsHost {
      * host's own per-field pump is what delivers events; see the threads
      * section below. */
     void (*pump_events)(void);
+    /* Creates a VkSurfaceKHR for the host's window on `vk_instance`, both
+     * carried as uint64_t so that no Vulkan type crosses this ABI; returns 0
+     * on failure, having logged. The host owns the window
+     * (src/runtime/host/window_service.cpp), so it owns the
+     * SDL_Vulkan_CreateSurface call on it too.
+     *
+     * Required whenever RtPgsCreateOptions::host_window is set; NULL with a
+     * host_window is a setup failure through host->fatal, because a window
+     * with no way to make a surface from it cannot be presented into.
+     * Ignored when host_window is NULL, which is the headless case.
+     *
+     * Called once, on the creating thread, from inside device creation. */
+    uint64_t (*create_vulkan_surface)(uint64_t vk_instance);
 } RtPgsHost;
 
 /* Opaque live-backend instance (Vulkan device + optional SDL3 window +
@@ -97,6 +111,21 @@ typedef struct RtPgsCreateOptions {
     uint32_t window_width, window_height;
     uint32_t raster;         /* RT_PGS_RASTER_* */
     uint32_t deinterlace;    /* RT_PGS_DEINTERLACE_* */
+    /* The host's SDL_Window*, as an opaque pointer. This library no longer
+     * creates a window of its own: the executable owns the one window of the
+     * run (src/runtime/host/window_service.h), creates it with
+     * SDL_WINDOW_VULKAN before the backend exists, and hands it in here. The
+     * instance adopts it: it never calls SDL_Init, SDL_CreateWindow or
+     * SDL_DestroyWindow, and it asks the host for the surface through
+     * RtPgsHost::create_vulkan_surface.
+     *
+     * NULL means headless, which is what the replay path and a run with no
+     * display take. window_width/height above are then unused, since nothing
+     * is being sized.
+     *
+     * The pointer must outlive the instance. The host destroys its window
+     * only after rt_pgs_destroy has returned. */
+    void* host_window;
 } RtPgsCreateOptions;
 
 /* Creates the live backend. Never returns NULL: unrecoverable setup errors
@@ -116,32 +145,91 @@ RT_GS_API void rt_pgs_submit_gif(RtPgs* pgs, int path, const uint8_t* data, uint
 RT_GS_API void rt_pgs_write_priv(RtPgs* pgs, uint32_t offset, uint64_t v);
 RT_GS_API uint64_t rt_pgs_read_priv(RtPgs* pgs, uint32_t offset);
 
-/* End of field: render, and present when a window is up. Returns a bitmask
- * of RT_PGS_VSYNC_* flags; WINDOW_CLOSED asks the host to exit cleanly (the
- * library never terminates the process itself). */
+/* End of field: render and scan out. It does not present. The finished
+ * field is latched into the instance's latest-scanout slot with a new
+ * scanout serial, and rt_pgs_present_pump below is what puts it on the
+ * screen; that is what lets the host present at a rate of its own choosing
+ * without the guest field rate moving. Returns a bitmask of RT_PGS_VSYNC_*
+ * flags; WINDOW_CLOSED asks the host to exit cleanly (the library never
+ * terminates the process itself).
+ *
+ * RT_PGS_VSYNC_PRESENTED is never set by rt_pgs_vsync: this call presents
+ * nothing, and whether the present pump is keeping up is what
+ * rt_pgs_present_pump's own return value reports. The bit belongs to
+ * rt_pgs_present_ui, which latches and presents in one step and is the only
+ * caller that reads it (ui/ui_launcher.cpp).
+ *
+ * RT_PGS_VSYNC_LATCHED: this field carried GIF traffic, so the picture it
+ * latched is one the guest drew rather than a repeat of the register state.
+ * This is what rt_pgs_vsync's PRESENTED bit used to carry (the flag was
+ * named for a frame's worth of traffic reaching the screen, never for a
+ * swapchain present), and it is what GsBackend::vsync's bool still reports
+ * on every backend. */
 #define RT_PGS_VSYNC_PRESENTED     1u
 #define RT_PGS_VSYNC_WINDOW_CLOSED 2u
+#define RT_PGS_VSYNC_LATCHED       4u
 RT_GS_API uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field);
+
+/* Presents the latest latched scanout, at most once per call. Consumer
+ * thread only (see the threads section below): it runs the same
+ * present_frame path rt_pgs_vsync used to run inline, so it touches the
+ * swapchain and the retained overlay frame.
+ *
+ * It presents when either is true:
+ *   - the scanout serial has advanced since the last present, so there is a
+ *     new field to show;
+ *   - `max_hz` is above zero and 1/max_hz has elapsed since the last
+ *     present, which repeats the picture already on screen.
+ *
+ * max_hz 0 means one present per new serial and no repeats, which is the
+ * behaviour of the build before this entry point existed: exactly one
+ * present per field.
+ *
+ * A repeat is a recomposite, not a new frame. The scanout image is the same
+ * one, blitted again, with the retained overlay frame (rt_pgs_overlay_set_
+ * frame) drawn over it again, so the menu and the pointer are redrawn at the
+ * present rate while their geometry is still produced once per field. It
+ * cannot make the guest run faster or slower and it does not ask the
+ * renderer for anything.
+ *
+ * Returns a bitmask of RT_PGS_PUMP_*; 0 means this call presented nothing.
+ * RT_PGS_PUMP_PRESENTED is set only when a frame reached the swapchain: a
+ * window that is not presentable (minimized, zero-sized) or a swapchain
+ * acquire that failed returns 0, and the serial, the pacing clock and the
+ * present counters do not advance. A caller counting or logging presents can
+ * therefore trust the flag, which is what makes the `present` verbose channel
+ * a measurement of display.present_rate rather than of how often this was
+ * called.
+ * `serial`, when not NULL, is filled with the scanout serial that was
+ * presented, or with the latest one when nothing was presented, which is
+ * what a host-side diagnostic needs to tell a new field from a repeat. */
+#define RT_PGS_PUMP_PRESENTED 1u
+#define RT_PGS_PUMP_REPEAT    2u
+RT_GS_API uint32_t rt_pgs_present_pump(RtPgs* pgs, double max_hz, uint64_t* serial);
 
 /* ---- threads ------------------------------------------------------------
  *
  * One instance, two host threads at most, never at the same time:
  *
  *   the creating thread   the host's EE and main thread. It called
- *                         rt_pgs_create, owns the SDL window and is the only
- *                         thread that may call SDL, so it is the only thread
- *                         that may call rt_pgs_notify_* and
+ *                         rt_pgs_create, owns the SDL window (it created it
+ *                         before this instance existed; see
+ *                         host/window_service.h) and is the only thread that
+ *                         may call SDL, so it is the only thread that may
+ *                         call rt_pgs_notify_* and
  *                         rt_pgs_sample_window_state.
  *   the consumer thread   the host's GS command ring worker
  *                         (src/runtime/gs/gs_threaded.cpp). After
  *                         rt_pgs_bind_consumer_thread it is the only thread
  *                         that calls rt_pgs_submit_gif, rt_pgs_write_priv,
- *                         rt_pgs_vsync, rt_pgs_set_*, rt_pgs_overlay_* and
+ *                         rt_pgs_vsync, rt_pgs_present_pump,
+ *                         rt_pgs_set_*, rt_pgs_overlay_*,
+ *                         rt_pgs_request_screenshot and
  *                         rt_pgs_present_ui.
  *
  * The rest is readable from either thread at any time: rt_pgs_read_priv,
- * rt_pgs_present_timings, rt_pgs_present_rect, rt_pgs_surface_size,
- * rt_pgs_window_handle and rt_pgs_window_closed. The state behind those is
+ * rt_pgs_present_timings, rt_pgs_present_rect, rt_pgs_take_screenshot,
+ * and rt_pgs_window_closed. The state behind those is
  * atomic, or published under the library's own mutex, for that reason.
  *
  * rt_pgs_bind_consumer_thread registers the calling thread as the consumer:
@@ -171,23 +259,40 @@ RT_GS_API void rt_pgs_sample_window_state(RtPgs* pgs);
 
 RT_GS_API void rt_pgs_report_stats(RtPgs* pgs);
 
-/* Present-path timings for the host's profiler: nanoseconds accumulated in
- * the renderer flush, the scanout and the swapchain present since the
- * previous call, and the number of vsyncs they cover. Reading clears them.
- * The host reports per profile window and cannot see inside the library, so
- * the split has to cross the ABI. Any pointer may be NULL. */
-RT_GS_API void rt_pgs_present_timings(RtPgs* pgs, uint64_t* flush_ns,
-                                      uint64_t* scanout_ns, uint64_t* present_ns,
-                                      uint64_t* fields);
+/* Present-path timings for the host's profiler, since the previous call.
+ * Reading clears every counter. The host reports per profile window and
+ * cannot see inside the library, so the split has to cross the ABI.
+ *
+ *   flush_ns    the renderer flush at the top of rt_pgs_vsync
+ *   scanout_ns  building the scanout image
+ *   present_ns  every rt_pgs_present_pump that presented, repeats included.
+ *               Divide by `presents`, not by `fields`: with a present rate
+ *               set there is more than one present per field.
+ *   fields      the rt_pgs_vsync calls the three above cover
+ *   presents    presents that happened, new serials and repeats together
+ *   repeats     of those, the ones that showed a serial already on screen
+ *
+ * Extend at the end only. `out` may be NULL, which clears nothing. */
+typedef struct RtPgsPresentTimings {
+    uint64_t flush_ns;
+    uint64_t scanout_ns;
+    uint64_t present_ns;
+    uint64_t fields;
+    uint64_t presents;
+    uint64_t repeats;
+} RtPgsPresentTimings;
+RT_GS_API void rt_pgs_present_timings(RtPgs* pgs, RtPgsPresentTimings* out);
 
 /* Window control and event-pump inversion (shim 3). The exe owns the only
  * SDL_PollEvent loop (host/window.cpp); these let it drive the window the
  * library created without the library polling SDL itself. */
 
-/* SDL_Window* as void*, NULL when headless. Opaque on purpose: the exe must
- * not link SDL types through this boundary, only pass the pointer to SDL
- * calls it makes itself (see host/window.cpp). */
-RT_GS_API void* rt_pgs_window_handle(RtPgs* pgs);
+/* The window handle and the surface size are not answered here. The host
+ * owns the window (host/window_service.h): rt_window_handle() and
+ * rt_window_surface_size() are the readers, and rt_window_exists() answers
+ * "did the windowed path come up at all". Entry points for them existed
+ * while the library owned the window and are gone with that ownership. */
+
 /* Reported the same way the inline SDL_EVENT_QUIT handling used to: the
  * next vsync's RT_PGS_VSYNC_WINDOW_CLOSED reflects it. */
 RT_GS_API void  rt_pgs_notify_quit(RtPgs* pgs);
@@ -195,8 +300,6 @@ RT_GS_API void  rt_pgs_notify_quit(RtPgs* pgs);
  * SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED handling used to: the swapchain is
  * rebuilt at the next presentable frame. */
 RT_GS_API void  rt_pgs_notify_resize(RtPgs* pgs);
-/* Current surface size in pixels, 0x0 when headless. */
-RT_GS_API void  rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height);
 /* The window-backbuffer rectangle the last presented scanout was blitted
  * into, in backbuffer pixels, plus the backbuffer size it was measured
  * against. All zero before the first present or when headless; the size is
@@ -208,10 +311,65 @@ RT_GS_API void  rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* heigh
  * Published under the library's own mutex by the present that measured it
  * and read back under the same mutex here, so the six values always describe
  * one present and never a mix of two. Safe from pump_events and from either
- * thread at any time (see the threads section above): the host reads it on
- * the EE thread to map a mouse position into the picture while the consumer
- * thread is presenting. */
+ * thread at any time (see the threads section above).
+ *
+ * One consumer: gs_parallel.cpp's adapter, which calls this immediately
+ * after each present and republishes the six values through
+ * host/window_service.h. Host code that maps a cursor position into the
+ * picture reads rt_window_present_rect(), not this, because the window
+ * service answers for the native renderer too. */
 RT_GS_API void rt_pgs_present_rect(RtPgs* pgs, int32_t* x, int32_t* y, int32_t* w, int32_t* h, int32_t* bb_w, int32_t* bb_h);
+
+/* ---- screenshot of the presented picture ---------------------------------
+ *
+ * The user-facing capture (host/screenshot.cpp). Separate from the
+ * ICORECOMP_GS_SCREENSHOT diagnostic in gs_parallel_scanout.cpp: that one
+ * writes the raw scanout image, which is a function of the GS output alone
+ * and is not the shape the picture has on screen. This one copies the
+ * window backbuffer over exactly the rectangle rt_pgs_present_rect reports,
+ * so it is the presented picture at presented size, aspect corrected and
+ * with the letterbox bars excluded, and it is taken before the overlay pass
+ * so the menu, the pointer and the fps readout are never in it.
+ *
+ * Two slots per request:
+ *
+ *   RT_PGS_SHOT_PRE    the picture as the game drew it, copied after the
+ *                      scanout blit and before the overlay render pass.
+ *                      This is the one the feature writes.
+ *   RT_PGS_SHOT_POST   the same field copied again after the overlay render
+ *                      pass. Only filled when the host asks for two slots.
+ *                      It exists to settle one question by measurement: with
+ *                      the menu closed the two files must be byte identical,
+ *                      and with the menu open they must differ, which is what
+ *                      proves the pre copy is taken where this comment says
+ *                      it is. The host gates it on its own verbose channel.
+ *
+ * rt_pgs_request_screenshot arms one field. `slots` is 1 (pre only) or 2
+ * (pre and post); any other value is treated as 1 and logged. Consumer
+ * thread only, like every other call that changes what a present does: the
+ * host routes it through GsBackend and the GS command ring so it is ordered
+ * against the GIF and vsync traffic, and lands on the field the user asked
+ * for rather than one either side of it. A field that presents no scanout
+ * image (an empty present rectangle) does not consume the arm; it waits for
+ * the next field that has a picture.
+ *
+ * rt_pgs_take_screenshot reads one slot back. Either thread, at any time:
+ * the pixels and their size are published under the library's own mutex by
+ * the present that copied them, the same way rt_pgs_present_rect is, so it
+ * does not ride the command ring. Returns 0 when that slot holds nothing
+ * ready, otherwise the number of bytes the image occupies (width * height *
+ * 4). `dst` NULL is the size query: *w and *h are filled in and nothing is
+ * copied, so the caller can size its buffer. With `dst` non-NULL the slot is
+ * consumed: the rows are copied out tightly packed as RGBA8 from the top and
+ * the slot goes back to empty, and a `dst_bytes` smaller than the image
+ * copies nothing, keeps the slot and returns 0. Any of `w` and `h` may be
+ * NULL. */
+#define RT_PGS_SHOT_PRE   0u
+#define RT_PGS_SHOT_POST  1u
+#define RT_PGS_SHOT_SLOTS 2u
+RT_GS_API void rt_pgs_request_screenshot(RtPgs* pgs, uint32_t slots);
+RT_GS_API size_t rt_pgs_take_screenshot(RtPgs* pgs, uint32_t slot, uint32_t* w, uint32_t* h,
+                                        uint8_t* dst, size_t dst_bytes);
 /* Between frames only; fatal when called while a frame is in flight
  * (including from pump_events). Same RT_PGS_PRESENT_* values as create. */
 RT_GS_API void  rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode);
@@ -224,6 +382,12 @@ RT_GS_API void  rt_pgs_set_raster(RtPgs* pgs, uint32_t raster);
 /* Deinterlace mode for an interlaced scanout (RT_PGS_DEINTERLACE_*); takes
  * effect at the next vsync. Between frames only; fatal from pump_events. */
 RT_GS_API void  rt_pgs_set_deinterlace(RtPgs* pgs, uint32_t deinterlace);
+/* display.widescreen's presentation half: the aspect the finished scanout is
+ * presented at, overriding the one derived from the CRTC registers. 0 (the
+ * value a fresh instance holds) keeps the derivation, which is the retail
+ * 4:3. Takes effect at the next vsync. Between frames only; fatal from
+ * pump_events. */
+RT_GS_API void  rt_pgs_set_widescreen_aspect(RtPgs* pgs, double aspect);
 /* Retunes super-sampling in flight (dynamic_super_sampling was set at
  * init). Between frames only; fatal mid-frame. Invalid factor is fatal
  * (host validates). High-resolution scanout follows the factor: requested
@@ -284,7 +448,9 @@ RT_GS_API uint32_t rt_pgs_overlay_texture_create(RtPgs* pgs, const uint8_t* rgba
  * the library does not scan for that. */
 RT_GS_API void     rt_pgs_overlay_texture_destroy(RtPgs* pgs, uint32_t texture);
 /* Deep-copies frame into retained storage; drawn by every present (both
- * rt_pgs_vsync's windowed path and rt_pgs_present_ui) until replaced. NULL
+ * rt_pgs_present_pump's windowed path and rt_pgs_present_ui) until
+ * replaced, so a repeat present redraws the retained frame as it stands
+ * rather than dropping the overlay. NULL
  * or an empty frame clears it. A malformed frame (out-of-range index/vertex
  * ranges, an unknown texture id) is rejected whole with one loud log; the
  * previous frame keeps drawing rather than risk out-of-bounds geometry.

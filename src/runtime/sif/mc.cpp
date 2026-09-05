@@ -2,9 +2,11 @@
  * virtual IOP, backed by a directory on the host disk.
  *
  * The retail ICO ELF links the old (SDK 2.2, "PsIIlibmc 2240") EE libmc;
- * the wire protocol below was read out of that library's disassembly in the
- * decomp checkout (asm/.../src/cod/vendor_24E9D8, functions identified by
- * their RPC fno and argument stores; sceMcInit is func_0024F240). Server id
+ * the wire protocol below was read out of that library's own code, whose
+ * functions are identified by their RPC fno and argument stores; the bind
+ * is in sceMcInit, PAL 0x00268E78. INFERRED from that disassembly rather
+ * than from a wire capture, and not re-verified instruction by instruction
+ * against the retail ELF here. Server id
  * 0x80000400; recv is always the 4-byte result word except INIT. Send
  * blocks (offsets within the RPC send data):
  *
@@ -27,9 +29,10 @@
  *                    head bytes inline@0x20 (libmc splits at a 16-byte
  *                    boundary); result = bytes written.
  *   0x0A Flush       fd@0.
- *   0x0C ChDir       port@0 slot@4 pwd writeback addr@0x10 name@0x14; the
- *                    server writes the previous working directory string
- *                    (up to 0x400 bytes) to the writeback address.
+ *   0x0C ChDir       port@0 slot@4 pwd writeback addr@0x10 name@0x14; on
+ *                    success the server writes the directory the card is now
+ *                    in, with no leading '/', into 0x400 bytes at the
+ *                    writeback address, and on failure writes nothing.
  *   0x0D GetDir      port@0 slot@4 mode@8 maxent@0xC table@0x10 name@0x14.
  *                    mode 0 starts a new search (name may hold * and ?
  *                    wildcards in its final component), nonzero continues.
@@ -53,11 +56,37 @@
  * host filesystem cannot hold live in a JSON sidecar per entry
  * ("<name>.mcmeta.json", hidden from listings). Only port 0 has a card:
  * always present, formatted, 8 MB.
+ *
+ * What the retail game asks for (PAL SCES_507.60). INFERRED from the
+ * game's own code at the addresses named below, not from a run.
+ * Every save goes through iosMcMgrSaveSeg (0x00138FE0), one segment at a
+ * time, and it always starts by calling iosMcMgrChdirProduct (0x00138D40)
+ * with bit 1 of the request flags set, which is what turns the Mkdir on:
+ *
+ *   GetInfo(port, slot)                     0 or -1; -2 aborts the save
+ *   Open(dir, 0x40)      = sceMcMkdir       0 the first time, -4 after that
+ *   ChDir(dir)                              0; -4 becomes -14 and aborts
+ *   Open(name, 0x203)    = RD|WR|CREATE     the fd, or a negative result
+ *   Write(fd, ...)       one or more, whatever the segment handler feeds
+ *   Write(fd, tail, 4)   the trailing checksum word, product block only
+ *   Flush(fd)
+ *   Close(fd)
+ *
+ * The two results the loop depends on are the Mkdir -4 for an entry that is
+ * already there (iosMcMgrChdirProduct continues on 0 and on -4 and on
+ * nothing else) and the ChDir -4 for a directory that is not there, which
+ * the same function rewrites to -14 so its caller can tell "no save yet"
+ * apart from a card error. The listing walk in iosMcMgrGetBlockSaveInfo
+ * (0x001397E8) then calls GetDir with the pattern "*", mode 0, maxent 0x14,
+ * and reads a slot number out of the last three characters of each entry
+ * name, so the "." and ".." entries a real card returns inside a
+ * subdirectory are part of what it sees.
  */
 #include "rpc.h"
 
 #include "../host/portable.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -101,8 +130,14 @@ struct Fd {
     std::FILE* f = nullptr;
     std::string card_path;          /* for logs and close-time sidecar touch */
     bool wrote = false;
+    uint32_t bytes = 0;             /* bytes written since Open, for the log */
+    uint32_t writes = 0;            /* Write calls since Open, for the log */
 };
 Fd g_fd[kMaxFds];
+
+/* Set the first time the guest creates anything on the card, so that one
+ * grep of a plain run's log answers "did the game try to save at all". */
+bool g_saw_guest_create = false;
 
 std::string g_cwd = "/";            /* ChDir state (port 0) */
 bool g_first_getinfo = true;
@@ -172,7 +207,7 @@ void mc_init_backing() {
             g_base.c_str(), ec.message().c_str());
     }
     g_ready = true;
-    rt_log("mc", "virtual memory card (port 0): %s", g_base.c_str());
+    rt_log_info("mc", "virtual memory card (port 0): %s", g_base.c_str());
 }
 
 bool is_sidecar(const std::string& name) {
@@ -280,7 +315,7 @@ Meta read_meta(const std::string& card_path) {
 void write_meta(const std::string& card_path, const Meta& m) {
     std::FILE* f = std::fopen(sidecar_path(card_path).c_str(), "w");
     if (!f) {
-        rt_log("mc", "WARNING: cannot write sidecar for %s (errno %d)", card_path.c_str(), errno);
+        rt_log_warn("mc", "WARNING: cannot write sidecar for %s (errno %d)", card_path.c_str(), errno);
         return;
     }
     std::fprintf(f, "{\"attr\":%u,\"create\":[%d,%d,%d,%d,%d,%d],\"modify\":[%d,%d,%d,%d,%d,%d]}\n",
@@ -374,23 +409,35 @@ int do_open(uint32_t port, uint32_t mode, const char* gname) {
     std::string hp = host_path(cp);
     std::error_code ec;
     if (mode & 0x40) { /* mkdir */
-        /* An entry of that name already exists: sceMcResNoEntry (-4), as
-         * mcman's open path answers when sceMcFileCreateDir is set and the
-         * lookup finds the entry (ps2sdk mcman_open2, read as a behavioural
-         * reference). ICO re-runs GetInfo/Mkdir/ChDir before every file it
-         * writes, and its save thread continues only on 0 or -4; any other
-         * value (the -5 this used to return) aborts the save after icon.sys. */
+        /* An entry of that name already exists: sceMcResNoEntry (-4). That is
+         * what mcman answers, in ps2sdk iop/memorycard/mcman/src/ps2mc_fio.c,
+         * function mcman_open: after mcman_cachedirentry it does
+         *   "if ((r == 0) && ((flags & sceMcFileCreateDir) != 0))
+         *        return sceMcResNoEntry;"
+         * where r == 0 means the lookup found the entry. Read as a behavioural
+         * reference only. ICO re-runs GetInfo/Mkdir/ChDir before every file it
+         * writes (iosMcMgrChdirProduct, 0x00138D40) and continues only on 0 or
+         * -4; any other value (the -5 this used to return) aborts the save
+         * after icon.sys. */
         if (fs::exists(hp, ec)) return kResNoEntry;
         if (!fs::create_directory(hp, ec) || ec) {
-            rt_log("mc", "mkdir %s failed: %s", cp.c_str(), ec.message().c_str());
+            rt_log_warn("mc", "WARNING: mkdir %s failed on the host: %s", cp.c_str(),
+                ec.message().c_str());
             return kResNoEntry;
         }
         Meta m;
+        /* 0x8427 is the mode mcman gives a directory it creates: hidden bit
+         * from the flags, plus read|write|execute|subdir|0x0400|exists
+         * (ps2mc_fio.c, the sceMcFileCreateDir branch of mcman_open). */
         m.attr = kAttrDir;
         m.create = m.modify = time_now();
         m.have_attr = m.have_create = m.have_modify = true;
         write_meta(cp, m);
-        rt_log("mc", "Mkdir %s -> 0", cp.c_str());
+        if (!g_saw_guest_create) {
+            g_saw_guest_create = true;
+            rt_log_info("mc", "the guest is writing to the card: first entry created is"
+                " the directory %s", cp.c_str());
+        }
         return kResOk;
     }
     bool exists = fs::exists(hp, ec);
@@ -408,7 +455,8 @@ int do_open(uint32_t port, uint32_t mode, const char* gname) {
     else fmode = "rb";
     std::FILE* f = std::fopen(hp.c_str(), fmode);
     if (!f) {
-        rt_log("mc", "Open %s mode=0x%x: fopen(%s) failed (errno %d)", cp.c_str(), mode, fmode, errno);
+        rt_log_warn("mc", "WARNING: Open %s mode=0x%x: fopen(%s) failed on the host"
+            " (errno %d); the guest sees %d", cp.c_str(), mode, fmode, errno, kResNoEntry);
         return kResNoEntry;
     }
     if (!exists) {
@@ -417,11 +465,18 @@ int do_open(uint32_t port, uint32_t mode, const char* gname) {
         m.create = m.modify = time_now();
         m.have_attr = m.have_create = m.have_modify = true;
         write_meta(cp, m);
+        if (!g_saw_guest_create) {
+            g_saw_guest_create = true;
+            rt_log_info("mc", "the guest is writing to the card: first entry created is"
+                " the file %s", cp.c_str());
+        }
     }
     g_fd[fd].used = true;
     g_fd[fd].f = f;
     g_fd[fd].card_path = cp;
     g_fd[fd].wrote = false;
+    g_fd[fd].bytes = 0;
+    g_fd[fd].writes = 0;
     return fd;
 }
 
@@ -444,16 +499,31 @@ int do_getdir(uint32_t port, uint32_t mode, int maxent, uint32_t table,
         std::error_code ec;
         if (!fs::is_directory(hp, ec)) return kResNoEntry;
         if (cp != "/") {
-            /* Real cards list "." and ".." first inside a subdirectory. */
+            /* Inside a subdirectory mcman starts the walk at directory entry
+             * 0, so "." and ".." are listed and are matched against the
+             * pattern like any other name; in the root it starts at entry 2
+             * and they are not listed. ps2sdk ps2mc_fio.c, mcman_getdir2:
+             * "if ((fse->cluster == mcdi->rootdir_cluster) && (fse->dir_entry
+             * == 0)) mcman_curdirmaxent = 2; else mcman_curdirmaxent = 0;".
+             * ICO's own listing walk depends on this: iosMcMgrGetBlockSaveInfo
+             * asks for "*" and reads a slot index out of every name it gets
+             * back, dot entries included. */
             if (wild_match(pat.c_str(), ".")) {
                 DirEnt e = entry_info(cp, ".", true);
                 g_listing.push_back(e);
             }
             if (wild_match(pat.c_str(), "..")) {
-                DirEnt e = entry_info(cp, "..", true);
+                /* ".." describes the parent directory, so its times and
+                 * attributes come from the parent, not from the directory
+                 * being listed. Both used to be read off cp. */
+                const size_t slash = cp.find_last_of('/');
+                const std::string parent =
+                    (slash == std::string::npos || slash == 0) ? "/" : cp.substr(0, slash);
+                DirEnt e = entry_info(parent, "..", true);
                 g_listing.push_back(e);
             }
         }
+        size_t dot_entries = g_listing.size();
         for (auto it = fs::directory_iterator(hp, ec);
              !ec && it != fs::directory_iterator(); it.increment(ec)) {
             std::string nm = it->path().filename().string();
@@ -463,7 +533,25 @@ int do_getdir(uint32_t port, uint32_t mode, int maxent, uint32_t table,
             std::error_code ec2;
             g_listing.push_back(entry_info(child, nm, fs::is_directory(it->path(), ec2)));
         }
-        rt_log("mc", "GetDir '%s' (dir=%s pat=%s): %zu entries", gname, cp.c_str(),
+        /* A card returns entries in directory-entry order, which for entries
+         * that have only ever been added is the order they were created in
+         * (mcman_getdir2 walks the entry list by index). fs::directory_iterator
+         * has no order at all, so sort by the creation time this card keeps in
+         * the sidecar, with the name as the tie-break for the same second.
+         * That is an approximation of allocation order, not a measurement of
+         * it: a card that has had entries deleted and re-added would fill the
+         * hole and list the new entry early, and nothing here models that. */
+        std::stable_sort(g_listing.begin() + (std::ptrdiff_t)dot_entries, g_listing.end(),
+            [](const DirEnt& a, const DirEnt& b) {
+                if (a.create.y != b.create.y) return a.create.y < b.create.y;
+                if (a.create.mo != b.create.mo) return a.create.mo < b.create.mo;
+                if (a.create.d != b.create.d) return a.create.d < b.create.d;
+                if (a.create.h != b.create.h) return a.create.h < b.create.h;
+                if (a.create.mi != b.create.mi) return a.create.mi < b.create.mi;
+                if (a.create.s != b.create.s) return a.create.s < b.create.s;
+                return a.name < b.name;
+            });
+        rt_log_info("mc", "GetDir '%s' (dir=%s pat=%s): %zu entries", gname, cp.c_str(),
             pat.c_str(), g_listing.size());
     }
     int written = 0;
@@ -527,7 +615,7 @@ int do_setfileinfo(uint32_t port, uint32_t flags, const uint8_t info[0x40],
         if (fs::exists(sidecar_path(cp), ec2)) {
             fs::rename(sidecar_path(cp), sidecar_path(dest), ec2);
         }
-        rt_log("mc", "Rename %s -> %s", cp.c_str(), dest.c_str());
+        rt_log_info("mc", "Rename %s -> %s", cp.c_str(), dest.c_str());
         return kResOk;
     }
     bool is_dir = fs::is_directory(hp, ec);
@@ -548,7 +636,7 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 uint8_t* recv, uint32_t recv_size) {
     mc_init_backing();
     if (!send || send_size < 0x20) {
-        rt_log("mc", "WARNING mcserv fno=0x%02x with short send (%u bytes): denied", fno, send_size);
+        rt_log_warn("mc", "WARNING mcserv fno=0x%02x with short send (%u bytes): denied", fno, send_size);
         if (recv_size >= 4) wr32(recv, 0, (uint32_t)kResDenied);
         return;
     }
@@ -561,12 +649,18 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 e = Fd{};
             }
             g_cwd = "/";
+            /* The card-changed answer belongs to the session this Init
+             * starts: mcman reports it once after a (re)connect, and libmc
+             * clears its own state here too. Leaving it set meant a second
+             * Init got kResOk on its first GetInfo where the first got
+             * kResChangedCard. */
+            g_first_getinfo = true;
             wr32(recv, 0, 0);
             if (recv_size >= 12) {
                 wr32(recv, 4, 0x20A);   /* mcserv version: libmc needs >= 0x20A */
                 wr32(recv, 8, 0x20E);   /* mcman version: libmc needs >= 0x20E */
             }
-            rt_log("mc", "Init -> 0 (mcserv 0x20A, mcman 0x20E)");
+            rt_log_info("mc", "Init -> 0 (mcserv 0x20A, mcman 0x20E)");
             return;
         case 0x01: { /* GetInfo */
             port = rd32(send, 4);
@@ -587,7 +681,7 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 wr32(blk, 0x90, formatted);
                 rt_gwrite_bytes(wb, blk, sizeof(blk));
             }
-            rt_log("mc", "GetInfo port=%u slot=%u -> %d (type=%u free=%uKB formatted=%u)",
+            rt_log_info("mc", "GetInfo port=%u slot=%u -> %d (type=%u free=%uKB formatted=%u)",
                 port, rd32(send, 8), result, type, free_kb, formatted);
             break;
         }
@@ -596,7 +690,25 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             uint32_t mode = rd32(send, 8);
             const char* nm = send_name(send, send_size);
             result = do_open(port, mode, nm);
-            rt_log("mc", "Open port=%u '%s' mode=0x%x -> %d", port, nm, mode, result);
+            if (mode & 0x40) {
+                rt_log_info("mc", "Mkdir port=%u '%s' -> %d", port, nm, result);
+                /* mcman answers 0 for a directory it created and -4 for a name
+                 * that is already taken (ps2mc_fio.c, mcman_open). Anything
+                 * else is this card diverging, and it is worth saying loudly:
+                 * iosMcMgrChdirProduct (0x00138D40) aborts the whole save on
+                 * any other value. */
+                if (result != kResOk && result != kResNoEntry) {
+                    rt_log_warn("mc", "WARNING: Mkdir '%s' answered %d; mcman answers 0 or"
+                        " -4 here, and the guest aborts the save on anything else",
+                        nm, result);
+                }
+            } else {
+                rt_log_info("mc", "Open port=%u '%s' mode=0x%x -> %d", port, nm, mode, result);
+                if (result < 0 && (mode & 0x200)) {
+                    rt_log_warn("mc", "WARNING: create-Open of '%s' failed with %d; the"
+                        " guest's save of this file cannot proceed", nm, result);
+                }
+            }
             break;
         }
         case 0x03: /* Close */
@@ -611,22 +723,41 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                     m.have_modify = true;
                     write_meta(g_fd[fd].card_path, m);
                 }
-                rt_log("mc", "Close fd=%u (%s) -> 0", fd, g_fd[fd].card_path.c_str());
+                if (g_fd[fd].wrote) {
+                    rt_log_info("mc", "Close fd=%u (%s) -> 0 after %u bytes from %u"
+                        " Write calls", fd, g_fd[fd].card_path.c_str(), g_fd[fd].bytes,
+                        g_fd[fd].writes);
+                } else {
+                    rt_log_info("mc", "Close fd=%u (%s) -> 0", fd, g_fd[fd].card_path.c_str());
+                }
                 g_fd[fd] = Fd{};
             } else {
                 result = kResDenied;
-                rt_log("mc", "Close fd=%u: not open -> %d", fd, result);
+                rt_log_warn("mc", "WARNING: Close fd=%u: not open -> %d", fd, result);
             }
             break;
         case 0x04: { /* Seek */
             fd = rd32(send, 0);
             int32_t offset = (int32_t)rd32(send, 0x10);
             uint32_t whence = rd32(send, 0x14);
-            if (fd >= kMaxFds || !g_fd[fd].used) { result = kResDenied; break; }
+            if (fd >= kMaxFds || !g_fd[fd].used) {
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Seek fd=%u: not open -> %d", fd, result);
+                break;
+            }
             int w = whence == 1 ? SEEK_CUR : (whence == 2 ? SEEK_END : SEEK_SET);
-            std::fseek(g_fd[fd].f, offset, w);
+            if (std::fseek(g_fd[fd].f, offset, w) != 0) {
+                /* ftell after a failed seek reports -1, which is also
+                 * kResChangedCard: the guest would read a card-changed
+                 * error out of a seek that simply could not be done. Say
+                 * which it is. */
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Seek fd=%u offset=%d whence=%u failed on the host "
+                    "(errno %d) -> %d", fd, offset, whence, errno, result);
+                break;
+            }
             result = (int)std::ftell(g_fd[fd].f);
-            rt_log("mc", "Seek fd=%u offset=%d whence=%u -> %d", fd, offset, whence, result);
+            rt_log_info("mc", "Seek fd=%u offset=%d whence=%u -> %d", fd, offset, whence, result);
             break;
         }
         case 0x05: { /* Read */
@@ -634,7 +765,21 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             uint32_t size = rd32(send, 0xC);
             uint32_t buf = rd32(send, 0x18) & 0x1FFFFFFFu;
             uint32_t edge = rd32(send, 0x1C) & 0x1FFFFFFFu;
-            if (fd >= kMaxFds || !g_fd[fd].used) { result = kResDenied; break; }
+            if (fd >= kMaxFds || !g_fd[fd].used) {
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Read fd=%u: not open -> %d", fd, result);
+                break;
+            }
+            /* size is guest supplied and used to size a host buffer. A read
+             * larger than the whole card cannot be genuine, and mcserv on
+             * hardware could not satisfy one either, so refuse it loudly
+             * rather than allocating whatever the word says. */
+            if (size > kTotalKb * 1024) {
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Read fd=%u size=%u is larger than the whole card "
+                    "(%u bytes); refused -> %d", fd, size, kTotalKb * 1024, result);
+                break;
+            }
             std::vector<uint8_t> tmp(size);
             size_t got = size ? std::fread(tmp.data(), 1, size, g_fd[fd].f) : 0;
             if (got) rt_gwrite_bytes(buf, tmp.data(), (uint32_t)got);
@@ -645,7 +790,7 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 rt_gwrite_bytes(edge, z, sizeof(z));
             }
             result = (int)got;
-            rt_log("mc", "Read fd=%u size=%u buf=0x%08x -> %d", fd, size, buf, result);
+            rt_log_info("mc", "Read fd=%u size=%u buf=0x%08x -> %d", fd, size, buf, result);
             break;
         }
         case 0x06: { /* Write: inline head bytes + remainder from EE RAM */
@@ -653,11 +798,25 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             uint32_t tail_size = rd32(send, 0xC);
             uint32_t head_size = rd32(send, 0x14);
             uint32_t tail_addr = rd32(send, 0x18) & 0x1FFFFFFFu;
-            if (fd >= kMaxFds || !g_fd[fd].used) { result = kResDenied; break; }
+            if (fd >= kMaxFds || !g_fd[fd].used) {
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Write fd=%u: not open -> %d", fd, result);
+                break;
+            }
             if (head_size > 16 || send_size < 0x20 + head_size) {
                 rt_fatal("mc", rt_sched_current_ctx(),
                     "Write fd=%u: head_size=%u exceeds the inline area (send_size=%u)",
                     fd, head_size, send_size);
+            }
+            /* Same bound as Read above: tail_size is guest supplied and
+             * sizes a host buffer. A write bigger than the card is not a
+             * write this card could take. */
+            if (tail_size > kTotalKb * 1024) {
+                result = kResDenied;
+                rt_log_warn("mc", "WARNING: Write fd=%u tail=%u is larger than the whole card "
+                    "(%u bytes); refused, nothing was written -> %d",
+                    fd, tail_size, kTotalKb * 1024, result);
+                break;
             }
             size_t wrote = 0;
             if (head_size) wrote += std::fwrite(send + 0x20, 1, head_size, g_fd[fd].f);
@@ -667,20 +826,36 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 wrote += std::fwrite(tmp.data(), 1, tail_size, g_fd[fd].f);
             }
             g_fd[fd].wrote = true;
+            g_fd[fd].bytes += (uint32_t)wrote;
+            ++g_fd[fd].writes;
             result = (int)wrote;
-            rt_log("mc", "Write fd=%u head=%u tail=%u -> %d", fd, head_size, tail_size, result);
+            rt_log_info("mc", "Write fd=%u (%s) head=%u tail=%u -> %d", fd,
+                g_fd[fd].card_path.c_str(), head_size, tail_size, result);
+            /* mcman returns the byte count it wrote; a short write is a host
+             * disk problem and the guest treats a mismatch as a failed save. */
+            if (wrote != (size_t)head_size + tail_size) {
+                rt_log_warn("mc", "WARNING: short Write to %s: %zu of %u bytes reached the"
+                    " host (errno %d)", g_fd[fd].card_path.c_str(), wrote,
+                    head_size + tail_size, errno);
+            }
             break;
         }
         case 0x0A: /* Flush */
             fd = rd32(send, 0);
-            if (fd < kMaxFds && g_fd[fd].used) std::fflush(g_fd[fd].f);
-            rt_log("mc", "Flush fd=%u -> 0", fd);
+            if (fd < kMaxFds && g_fd[fd].used) {
+                std::fflush(g_fd[fd].f);
+                rt_log_info("mc", "Flush fd=%u (%s) -> 0", fd, g_fd[fd].card_path.c_str());
+            } else {
+                /* mcman flushes the write cache for an open handle; there is
+                 * no handle here, so say so rather than answering 0 in
+                 * silence. The result stays 0: the guest ignores it. */
+                rt_log_warn("mc", "WARNING: Flush fd=%u: not open -> 0", fd);
+            }
             break;
         case 0x0C: { /* ChDir */
             port = rd32(send, 0);
             uint32_t pwd_wb = rd32(send, 0x10) & 0x1FFFFFFFu;
             const char* nm = send_name(send, send_size);
-            std::string prev = g_cwd;
             if (port != 0) { result = kResNoEntry; break; }
             std::string cp = resolve_card_path(nm);
             std::error_code ec;
@@ -689,12 +864,32 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             } else {
                 g_cwd = cp;
             }
-            if (pwd_wb) {
+            /* The 0x400-byte buffer at +0x10 receives the directory the card
+             * is now in, not the one it was in before. mcman builds it by
+             * starting from the entry it just moved to and prepending each
+             * parent's name, so it has no leading '/' and the root comes back
+             * as the empty string; it returns before writing anything when
+             * the target does not exist (ps2sdk iop/memorycard/mcman/src/
+             * ps2mc_fio.c, mcman_chdir: the sceMcResNoEntry return sits above
+             * "currentdir[0] = 0;" and the prepend loop). Read as a
+             * behavioural reference only. ICO passes a scratch buffer here
+             * and never reads the string back, so nothing in the game depends
+             * on this; it matches the reference because there is no reason
+             * for it not to. */
+            if (pwd_wb && result == kResOk) {
                 char out[0x400] = {0};
-                std::snprintf(out, sizeof(out), "%s", prev.c_str());
+                std::snprintf(out, sizeof(out), "%s", g_cwd == "/" ? "" : g_cwd.c_str() + 1);
                 rt_gwrite_bytes(pwd_wb, out, sizeof(out));
             }
-            rt_log("mc", "ChDir port=%u '%s' -> %d (cwd=%s)", port, nm, result, g_cwd.c_str());
+            rt_log_info("mc", "ChDir port=%u '%s' -> %d (cwd=%s)", port, nm, result, g_cwd.c_str());
+            /* -4 is the reference answer for a directory that is not there,
+             * and the guest turns it into its own "no save data yet" code
+             * (iosMcMgrChdirProduct, 0x00138D40). Log it plainly: it is the
+             * line that says the card has no ICO save on it yet. */
+            if (result == kResNoEntry) {
+                rt_log_info("mc", "ChDir '%s' -> -4: that directory is not on the card,"
+                    " so the guest sees no save data there", nm);
+            }
             break;
         }
         case 0x0D: { /* GetDir */
@@ -703,7 +898,7 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             int maxent = (int)rd32(send, 0xC);
             uint32_t table = rd32(send, 0x10) & 0x1FFFFFFFu;
             result = do_getdir(port, mode, maxent, table, send_name(send, send_size));
-            rt_log("mc", "GetDir port=%u mode=%u maxent=%d -> %d", port, mode, maxent, result);
+            rt_log_info("mc", "GetDir port=%u mode=%u maxent=%d -> %d", port, mode, maxent, result);
             break;
         }
         case 0x0E: { /* SetFileInfo / Rename */
@@ -714,14 +909,14 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
             if (info_addr) rt_gread_bytes(info_addr, info, sizeof(info));
             const char* nm = send_name(send, send_size);
             result = do_setfileinfo(port, flags, info, nm);
-            rt_log("mc", "SetFileInfo port=%u '%s' flags=0x%x -> %d", port, nm, flags, result);
+            rt_log_info("mc", "SetFileInfo port=%u '%s' flags=0x%x -> %d", port, nm, flags, result);
             break;
         }
         case 0x0F: { /* Delete */
             port = rd32(send, 0);
             const char* nm = send_name(send, send_size);
             result = do_delete(port, nm);
-            rt_log("mc", "Delete port=%u '%s' -> %d", port, nm, result);
+            rt_log_info("mc", "Delete port=%u '%s' -> %d", port, nm, result);
             break;
         }
         case 0x10: { /* Format: erase the card */
@@ -735,12 +930,12 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 removed += (uint32_t)fs::remove_all(it->path(), ec2);
             }
             g_cwd = "/";
-            rt_log("mc", "Format port=%u: erased %u host entries under %s -> 0",
+            rt_log_info("mc", "Format port=%u: erased %u host entries under %s -> 0",
                 port, removed, g_base.c_str());
             break;
         }
         case 0x11: /* Unformat: the virtual card stays formatted */
-            rt_log("mc", "Unformat: ignored (virtual card is always formatted) -> 0");
+            rt_log_warn("mc", "Unformat: ignored (virtual card is always formatted) -> 0");
             break;
         case 0x12: { /* GetEntSpace */
             port = rd32(send, 0);
@@ -755,15 +950,15 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
                 if (!is_sidecar(it->path().filename().string())) ++used;
             }
             result = used < 400 ? 400 - used : 0; /* free entries in this dir */
-            rt_log("mc", "GetEntSpace port=%u '%s' -> %d", port, nm, result);
+            rt_log_info("mc", "GetEntSpace port=%u '%s' -> %d", port, nm, result);
             break;
         }
         case 0x14: case 0x15: /* thread priority housekeeping: accepted */
-            rt_log("mc", "fno=0x%02x (housekeeping) -> 0", fno);
+            rt_log_info("mc", "fno=0x%02x (housekeeping) -> 0", fno);
             break;
         default:
             result = kResDenied;
-            rt_log("mc", "WARNING mcserv fno=0x%02x NOT MODELED (send_size=%u recv_size=%u) -> %d",
+            rt_log_warn("mc", "WARNING mcserv fno=0x%02x NOT MODELED (send_size=%u recv_size=%u) -> %d",
                 fno, send_size, recv_size, result);
             break;
     }
@@ -771,6 +966,25 @@ void svc_mcserv(uint32_t fno, const uint8_t* send, uint32_t send_size,
 }
 
 } // namespace
+
+/* See rpc.h. The card lives in <saves>/mc0 by default, so "beside the card"
+ * is the parent of the backing directory; a configured [saves] dir with no
+ * parent component answers null rather than inventing one. */
+const char* rt_mc_saves_dir() {
+    mc_init_backing();
+    static std::string dir;
+    std::error_code ec;
+    dir = fs::path(g_base).parent_path().string();
+    if (dir.empty()) {
+        rt_log_warn("mc", "the memory card directory '%s' has no parent, so there is nowhere"
+                    " beside it to keep host-side state", g_base.c_str());
+        return nullptr;
+    }
+    /* The card directory was created above, so its parent exists; this only
+     * covers a [saves] dir that named a path with no card subdirectory. */
+    fs::create_directories(dir, ec);
+    return dir.c_str();
+}
 
 void rt_mc_register_service() {
     rt_rpc_register_service(0x80000400, "mcserv", svc_mcserv);

@@ -1,0 +1,911 @@
+/* gs/render/shaders/raster.comp: the fine rasteriser, one workgroup per tile.
+ *
+ * Ours (MIT). The coverage rules and the primitive record come from
+ * gs_prim.h and the addressing from gs_swizzle.h, both included verbatim
+ * from the C++ side, so a rule fixed in one place is fixed in both. The
+ * pixel pipeline below is the GS User's Manual's order: alpha test,
+ * destination alpha test, depth test, blend, alpha correction, dither,
+ * write.
+ *
+ * ---- why a tile, and why serial ---------------------------------------------
+ *
+ * One workgroup owns one 16x16 tile and holds that tile's colour and depth
+ * in threadgroup memory for the whole of its work. It walks its coarse bin's
+ * primitive list in submission order and evaluates every primitive against
+ * its own tile. Two consequences, and they are the reason the renderer is
+ * shaped this way rather than as a draw call per primitive:
+ *
+ *   - a primitive that reads the frame buffer it is writing (any blend, any
+ *     destination alpha test) reads the value the previous primitive left,
+ *     because the previous primitive has already run in this same loop;
+ *   - overlapping primitives resolve in submission order without a depth
+ *     test doing it for them.
+ *
+ * One thread owns one sample of one pixel for the life of the workgroup, so
+ * no thread ever reads a value another thread writes, and there is no barrier
+ * anywhere in this file. That is also why the early returns below are safe
+ * even though they are not workgroup uniform.
+ *
+ * Threadgroup budget: two arrays of 256 uints, 2 KiB, against the 16 KiB the
+ * RHI targets. Workgroup size 256, against 1024.
+ *
+ * ---- render scale ------------------------------------------------------------
+ *
+ * A workgroup is always 256 threads and always one thread per sample, so the
+ * tile shrinks as the sample count grows and the threadgroup arrays never do:
+ *
+ *   scale 1    16 by 16 pixels, one sample each
+ *   scale 4     8 by 8 pixels, four samples each
+ *   scale 8     8 by 4 pixels, eight samples each
+ *   scale 16    4 by 4 pixels, sixteen samples each
+ *
+ * The push constants carry the tile size and the sample count and main()
+ * decomposes gl_LocalInvocationIndex into them, so scale 1 lands on exactly
+ * the (x, y) mapping a 16 by 16 workgroup had and does exactly the arithmetic
+ * it did before. Every rule below takes the sample point rather than the
+ * pixel index, which is what makes the interpolation, the depth and the tests
+ * per sample rather than per pixel.
+ *
+ * Above scale 1 the colour and depth this pass reads and writes are the
+ * super-sampled shadow of local memory (gs_shadow.h), one plane of the whole
+ * 4 MiB per sample, and a later pass resolves that shadow into native local
+ * memory. Texture fetches always read native local memory, at native
+ * resolution, whatever the scale: that is what keeps a feedback effect exact.
+ *
+ * ---- texturing ---------------------------------------------------------------
+ *
+ * Milestone (c). The texture unit reads local memory in place: there is no
+ * upload, no cache and no second copy, so a fetch is the same swizzle the
+ * frame buffer uses against the same storage buffer. The rules it follows,
+ * the register fields and every formula are in gs_texture.h, shared verbatim
+ * with the C++ side and its selftest; what is here is the part that needs
+ * the buffer: the fetch, the CLUT read, the neighbourhood a filter takes and
+ * the mip level walk.
+ *
+ * The CLUT is not read from local memory here. It is 1 KB of state that
+ * changes far less often than a primitive, and the load rules are register
+ * events the CPU sees, so the batch carries the distinct CLUT snapshots in a
+ * storage buffer of their own and each primitive names the word its snapshot
+ * starts at. gs_clut.h states the model.
+ *
+ * ---- AA1, SCANMSK and an aliased Z buffer ------------------------------------
+ *
+ * All three are milestone (d). AA1's coverage rule and SCANMSK's row rule are
+ * written once in gs_prim.h and used here; the aliasing case, where FRAME and
+ * ZBUF name the same bits, is handled at the end of shade() by re-deriving
+ * both views of the word after the depth write. Every log line about them
+ * comes from the C++ side (gs_draw.cpp, gs_native.cpp), because a shader
+ * cannot log.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define GS_PRIM_GLSL
+#define GS_TEXTURE_GLSL
+#include "gs_prim.h"
+#include "gs_texture.h"
+
+/* 256 threads, decomposed in main() into the tile's pixels and their samples
+ * by the push constants. Declared flat rather than 16 by 16 because the tile
+ * shape depends on the render scale and a local size cannot. */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+/* rhi.h's fixed binding layout: one storage buffer array of sixteen slots,
+ * every one of them the same block type because an array of blocks cannot
+ * mix member layouts. The slots this pass uses:
+ *
+ *   0  GS local memory, read and written
+ *   1  the primitive records, GSP_STRIDE words each
+ *   2  the concatenated per-bin primitive index lists
+ *   3  the per-bin (offset, count) pairs, GSP_BIN_COUNT of them
+ *   4  the batch's CLUT snapshots, GS_CLUT_WORDS words each
+ *   5  the super-sampled shadow, one GS_VRAM_WORDS plane per sample. Bound
+ *      to the dummy buffer and never touched at render scale 1.
+ */
+layout(set = 0, binding = 1, std430) buffer GsBuffer {
+    uint data[];
+} g_buf[16];
+
+#define VRAM   0
+#define PRIMS  1
+#define BINIDX 2
+#define BINRNG 3
+#define CLUTS  4
+#define SHADOW 5
+
+layout(push_constant) uniform Push {
+    uint frame_base_block;
+    uint frame_bw;
+    uint frame_psm;
+    uint frame_mask;
+    uint z_base_block;
+    uint z_psm;
+    uint z_write;
+    uint tile_x0;
+    uint tile_y0;
+    uint fogcol;
+    uint dimx0;
+    uint dimx1;
+    uint samples;      /* 1, 4, 8 or 16; the sub-sample grid is gs_prim.h's */
+    uint tile_w;       /* the tile's pixels, so tile_w * tile_h * samples == 256 */
+    uint tile_h;
+    uint shadow;       /* 1 when colour and depth live in the super-sampled shadow */
+} pc;
+
+shared uint s_color[256];
+shared uint s_depth[256];
+
+/* Per-invocation state main() fills once and shade() reads. Globals rather
+ * than arguments because every one of them is fixed for the life of the
+ * thread: one thread owns one sample of one pixel. */
+uint g_plane;     /* this sample's word offset into the shadow, 0 without one */
+bool g_shadow;    /* pc.shadow != 0 */
+uint g_faddr;     /* the frame buffer address of this pixel, in format units */
+uint g_zaddr;     /* and the Z buffer's */
+bool g_alias;     /* the two name the same bits: see gs_alias_pixel */
+/* Whether any primitive in this tile's list wrote this sample. main() stores
+ * only what was written; the reason is at the store. */
+bool g_wrote_color;
+bool g_wrote_z;
+
+/* ---- local memory ------------------------------------------------------- */
+
+/* The word index this thread reads and writes for a local memory word. At
+ * render scale 1 that is the word itself; above it, the same word inside this
+ * sample's plane of the shadow. The plane is a whole GS_VRAM_WORDS, so the
+ * swizzle is untouched and every address rule below is the native one. */
+uint mem_index(uint word) {
+    return (word & (GS_VRAM_WORDS - 1u)) + g_plane;
+}
+
+uint mem_load(uint word) {
+    uint i = mem_index(word);
+    return g_shadow ? g_buf[SHADOW].data[i] : g_buf[VRAM].data[i];
+}
+
+/* Two atomics with a mask no other thread shares. Any interleaving of an AND
+ * that clears only these bits and an OR that sets only these bits leaves both
+ * threads' bits correct, so the pair does not have to be atomic together.
+ * The only sub-word colour and depth formats are the 16-bit ones, whose two
+ * halves are the pixels at x and x+8 of one row and therefore both inside
+ * this tile; the atomics also keep a frame buffer and a Z buffer that share
+ * a word from tearing each other. */
+void store_masked(uint word, uint value, uint mask) {
+    if (mask == 0u) return;
+    uint i = mem_index(word);
+    if (g_shadow) {
+        if (mask == 0xFFFFFFFFu) {
+            g_buf[SHADOW].data[i] = value;
+            return;
+        }
+        atomicAnd(g_buf[SHADOW].data[i], ~mask);
+        atomicOr(g_buf[SHADOW].data[i], value & mask);
+        return;
+    }
+    if (mask == 0xFFFFFFFFu) {
+        g_buf[VRAM].data[i] = value;
+        return;
+    }
+    atomicAnd(g_buf[VRAM].data[i], ~mask);
+    atomicOr(g_buf[VRAM].data[i], value & mask);
+}
+
+uint frame_load() {
+    uint psm = pc.frame_psm;
+    if (psm == GS_PSMCT16 || psm == GS_PSMCT16S) {
+        uint w = mem_load(g_faddr >> 1);
+        uint hw = ((g_faddr & 1u) != 0u) ? (w >> 16) : (w & 0xFFFFu);
+        return gs_expand16(hw);
+    }
+    /* PSMCT32 and PSMCT24 read the same word. A 24-bit buffer's top byte is
+     * whatever last wrote it, which is also what the hardware's destination
+     * alpha sees there, so it is not replaced with an invented value. */
+    return mem_load(g_faddr);
+}
+
+/* FBMSK is 32 bits wide whatever the frame buffer format is. For the 16-bit
+ * formats the bits that matter are the ones the 5-5-5-1 fields occupy inside
+ * the expanded 32-bit pixel: 3..7, 11..15, 19..23 and 31. That mapping is
+ * inferred from the field positions rather than measured; docs/GS_RENDERER.md
+ * lists it. */
+uint frame_write_mask16() {
+    uint m = ((pc.frame_mask >> 3) & 0x1Fu)
+           | (((pc.frame_mask >> 11) & 0x1Fu) << 5)
+           | (((pc.frame_mask >> 19) & 0x1Fu) << 10)
+           | (((pc.frame_mask >> 31) & 1u) << 15);
+    return (~m) & 0xFFFFu;
+}
+
+void frame_store(uint rgba) {
+    uint psm = pc.frame_psm;
+    if (psm == GS_PSMCT16 || psm == GS_PSMCT16S) {
+        uint shift = (g_faddr & 1u) * 16u;
+        store_masked(g_faddr >> 1, gs_pack16(rgba) << shift,
+                     frame_write_mask16() << shift);
+        return;
+    }
+    uint mask = (psm == GS_PSMCT24) ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    store_masked(g_faddr, rgba, mask & ~pc.frame_mask);
+}
+
+uint z_load() {
+    uint psm = pc.z_psm;
+    if (psm == GS_PSMZ16 || psm == GS_PSMZ16S) {
+        uint w = mem_load(g_zaddr >> 1);
+        return ((g_zaddr & 1u) != 0u) ? (w >> 16) : (w & 0xFFFFu);
+    }
+    uint w = mem_load(g_zaddr);
+    return (psm == GS_PSMZ24) ? (w & 0x00FFFFFFu) : w;
+}
+
+void z_store(uint z) {
+    uint psm = pc.z_psm;
+    if (psm == GS_PSMZ16 || psm == GS_PSMZ16S) {
+        uint shift = (g_zaddr & 1u) * 16u;
+        store_masked(g_zaddr >> 1, (z & 0xFFFFu) << shift, 0xFFFFu << shift);
+        return;
+    }
+    uint mask = (psm == GS_PSMZ24) ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    store_masked(g_zaddr, z & mask, mask);
+}
+
+/* ---- the texture unit ----------------------------------------------------
+ *
+ * Every function below takes the record's texture words as plain arguments
+ * rather than reading them out of the buffer again, because a fetch happens
+ * up to eight times per pixel (four texels of a bilinear neighbourhood, on
+ * two mip levels) and the words would otherwise be re-read each time.
+ */
+
+/* One texel in its stored form: the word for the 32-bit formats with the
+ * format's own field extracted, the half word, the byte or the nibble
+ * otherwise. Exactly gs_vram.h's read_pixel, in GLSL. */
+uint tex_fetch_raw(uint psm, uint base, uint bw, int x, int y) {
+    uint addr = gs_pixel_addr(psm, base, bw, uint(x), uint(y));
+    uint bits = gs_addr_bits(psm);
+    if (bits == 32u) {
+        uint w = g_buf[VRAM].data[addr & (GS_VRAM_WORDS - 1u)];
+        return (w & gs_word_mask(psm)) >> gs_word_shift(psm);
+    }
+    uint word = (addr * bits) >> 5;
+    uint shift = (addr * bits) & 31u;
+    uint w = g_buf[VRAM].data[word & (GS_VRAM_WORDS - 1u)];
+    return (w >> shift) & ((1u << bits) - 1u);
+}
+
+/* An index through the CLUT. A 32-bit entry is the colour as it stands; a
+ * 16-bit entry goes through TEXA the same way a 16-bit texel does, because
+ * it is a 16-bit colour and the alpha bit means the same thing in both. */
+uint clut_lookup(uint index, uint index_bits, uint t0hi, uint clut_base, uint texa) {
+    uint entry = gs_clut_entry(index, index_bits, gs_tex0_csm(t0hi), gs_tex0_csa(t0hi));
+    if (gs_tex0_cpsm(t0hi) == GS_PSMCT32) {
+        return g_buf[CLUTS].data[clut_base + (entry & (GS_CLUT_WORDS - 1u))];
+    }
+    uint w = g_buf[CLUTS].data[clut_base + ((entry >> 1) & (GS_CLUT_WORDS - 1u))];
+    uint hw = ((entry & 1u) != 0u) ? (w >> 16) : (w & 0xFFFFu);
+    return gs_texa_expand16(hw, texa);
+}
+
+/* One texel as RGBA: the fetch, then either the CLUT or the format's own
+ * expansion. */
+uint tex_texel(uint psm, uint base, uint bw, int x, int y, uint t0hi, uint clut_base,
+               uint texa) {
+    uint raw = tex_fetch_raw(psm, base, bw, x, y);
+    uint ibits = gs_tex_index_bits(psm);
+    if (ibits != 0u) return clut_lookup(raw, ibits, t0hi, clut_base, texa);
+    return gs_tex_direct_rgba(psm, raw, texa);
+}
+
+/* One mip level, nearest or bilinear.
+ *
+ * u16 and v16 are the pixel's texture coordinate in sixteenths of a texel at
+ * level 0; a level halves the coordinate, which is the arithmetic shift
+ * below. The wrap unit runs on whole texels, after the shift and at the
+ * level's own size, and it runs on every one of the four bilinear texels
+ * separately: that is what makes a CLAMP at a texture's edge repeat the edge
+ * texel into the blend instead of wrapping one of the four to the far side.
+ *
+ * The bilinear neighbourhood is the coordinate less half a texel, which is
+ * eight sixteenths: a sample exactly at a texel's centre then has fraction
+ * zero and returns that texel unchanged, which is the texel centre rule the
+ * manual states for LINEAR. */
+uint tex_level(uint t0lo, uint t0hi, uint t1lo, uint m1lo, uint m1hi, uint m2lo,
+               uint m2hi, uint clo, uint chi, uint texa, uint clut_base,
+               int u16, int v16, uint level, bool linear) {
+    uint psm = gs_tex0_psm(t0lo);
+    uint base = gs_mip_tbp(t0lo, t0hi, t1lo, m1lo, m1hi, m2lo, m2hi, level);
+    uint bw = gs_mip_tbw(t0lo, t1lo, m1lo, m1hi, m2lo, m2hi, level);
+    uint w = gs_tex_level_size(gs_tex0_tw(t0lo), level);
+    uint h = gs_tex_level_size(gs_tex0_th(t0lo, t0hi), level);
+    uint wms = gs_clamp_wms(clo);
+    uint wmt = gs_clamp_wmt(clo);
+    uint minu = gs_clamp_minu(clo);
+    uint maxu = gs_clamp_maxu(clo);
+    uint minv = gs_clamp_minv(clo, chi);
+    uint maxv = gs_clamp_maxv(chi);
+
+    int su = u16 >> int(level);
+    int sv = v16 >> int(level);
+
+    if (!linear) {
+        int x = gs_tex_wrap(su >> 4, wms, minu, maxu, w);
+        int y = gs_tex_wrap(sv >> 4, wmt, minv, maxv, h);
+        return tex_texel(psm, base, bw, x, y, t0hi, clut_base, texa);
+    }
+
+    int uu = su - 8;
+    int vv = sv - 8;
+    int x0 = gs_tex_wrap(uu >> 4, wms, minu, maxu, w);
+    int x1 = gs_tex_wrap((uu >> 4) + 1, wms, minu, maxu, w);
+    int y0 = gs_tex_wrap(vv >> 4, wmt, minv, maxv, h);
+    int y1 = gs_tex_wrap((vv >> 4) + 1, wmt, minv, maxv, h);
+    uint fu = uint(uu & 15);
+    uint fv = uint(vv & 15);
+    return gs_tex_bilerp(tex_texel(psm, base, bw, x0, y0, t0hi, clut_base, texa),
+                         tex_texel(psm, base, bw, x1, y0, t0hi, clut_base, texa),
+                         tex_texel(psm, base, bw, x0, y1, t0hi, clut_base, texa),
+                         tex_texel(psm, base, bw, x1, y1, t0hi, clut_base, texa),
+                         fu, fv);
+}
+
+/* The whole sampler: LOD, the filter it selects, and the one or two levels
+ * that filter reads.
+ *
+ * LOD decides between MMAG and MMIN, which is the manual's magnification and
+ * minification split: a negative LOD means one texel covers more than one
+ * pixel. MMAG is NEAREST or LINEAR and nothing else, so a magnified pixel
+ * never reads a mip level. MMIN adds the four mipmap combinations; the level
+ * is LOD's integer part clamped at MXL and the blend between two levels is
+ * its fraction. */
+uint tex_sample(uint t0lo, uint t0hi, uint t1lo, uint t1hi, uint m1lo, uint m1hi,
+                uint m2lo, uint m2hi, uint clo, uint chi, uint texa, uint clut_base,
+                int u16, int v16, float q) {
+    uint mxl = gs_tex1_mxl(t1lo);
+    int lod = gs_tex_lod(gs_tex1_lcm(t1lo), gs_tex1_l(t1lo), gs_tex1_k(t1hi), q, mxl);
+    uint filt;
+    uint level = 0u;
+    uint lfrac = 0u;
+    if (lod < 0) {
+        filt = gs_tex1_mmag(t1lo);
+    } else {
+        filt = gs_tex1_mmin(t1lo);
+        level = min(uint(lod) >> 4, mxl);
+        lfrac = uint(lod) & 15u;
+    }
+    bool linear = (filt == GS_FILT_LINEAR)
+               || (filt == GS_FILT_LINEAR_MIPMAP_NEAREST)
+               || (filt == GS_FILT_LINEAR_MIPMAP_LINEAR);
+    bool mipped = (filt >= GS_FILT_NEAREST_MIPMAP_NEAREST);
+    if (!mipped) level = 0u;
+
+    uint c = tex_level(t0lo, t0hi, t1lo, m1lo, m1hi, m2lo, m2hi, clo, chi, texa,
+                       clut_base, u16, v16, level, linear);
+    bool blend_levels = (filt == GS_FILT_NEAREST_MIPMAP_LINEAR)
+                     || (filt == GS_FILT_LINEAR_MIPMAP_LINEAR);
+    if (blend_levels && lfrac != 0u && level < mxl) {
+        uint c2 = tex_level(t0lo, t0hi, t1lo, m1lo, m1hi, m2lo, m2hi, clo, chi, texa,
+                            clut_base, u16, v16, level + 1u, linear);
+        c = gs_tex_mix16(c, c2, lfrac);
+    }
+    return c;
+}
+
+/* ---- the pixel pipeline -------------------------------------------------- */
+
+uint chan(uint rgba, uint i) { return (rgba >> (i * 8u)) & 0xFFu; }
+
+int dimx_entry(uint px, uint py) {
+    /* DIMX is sixteen 3-bit signed values at 4-bit spacing, indexed by the
+     * low two bits of y then of x. Which of the two indices the manual calls
+     * the row is inferred; docs/GS_RENDERER.md lists it. */
+    uint i = (py & 3u) * 4u + (px & 3u);
+    uint w = (i < 8u) ? pc.dimx0 : pc.dimx1;
+    uint sh = (i < 8u) ? (i * 4u) : ((i - 8u) * 4u);
+    int d = int((w >> sh) & 7u);
+    return (d > 3) ? (d - 8) : d;
+}
+
+int clamp255(int v) { return clamp(v, 0, 255); }
+
+void shade(uint pi, int px, int py, int sxp, int syp, uint idx) {
+    uint base = pi * GSP_STRIDE;
+    uint flags = g_buf[PRIMS].data[base + GSP_FLAGS];
+    uint kind = flags & GSP_KIND_MASK;
+
+    uint scx = g_buf[PRIMS].data[base + GSP_SCISSOR_X];
+    uint scy = g_buf[PRIMS].data[base + GSP_SCISSOR_Y];
+    if (px < int(scx & 0xFFFFu) || px > int(scx >> 16)) return;
+    if (py < int(scy & 0xFFFFu) || py > int(scy >> 16)) return;
+
+    /* SCANMSK, before anything is interpolated: the register masks whole
+     * raster lines out of the drawing, so a masked line costs nothing beyond
+     * this test. The rule is gs_prim.h's. */
+    if (!gs_scanmsk_draws((flags >> GSP_F_SCANMSK_SHIFT) & GSP_F_SCANMSK_MASK, py)) {
+        return;
+    }
+
+    int x0 = int(g_buf[PRIMS].data[base + GSP_X0]);
+    int y0 = int(g_buf[PRIMS].data[base + GSP_Y0]);
+    int x1 = int(g_buf[PRIMS].data[base + GSP_X1]);
+    int y1 = int(g_buf[PRIMS].data[base + GSP_Y1]);
+    int x2 = int(g_buf[PRIMS].data[base + GSP_X2]);
+    int y2 = int(g_buf[PRIMS].data[base + GSP_Y2]);
+
+    /* Coverage, and the weights the colour interpolation needs. w0..w2 are
+     * the unnormalised barycentric weights of the three vertices; wsum is
+     * their total. Flat primitives leave them alone. */
+    float w0 = 0.0, w1 = 0.0, w2 = 0.0, wsum = 1.0;
+    float tline = 0.0;
+
+    /* AA1. The coverage rule applies at render scale 1 and to the line and
+     * triangle families, which is what the manual gives it for. Above scale 1
+     * the sub-samples resolve the edge themselves, so coverage is left at one
+     * and the primitive is blended exactly as an unantialiased one would be;
+     * that is a difference between scale 1 and the scales above it, and
+     * docs/GS_RENDERER.md names it.
+     *
+     * `inside` is the ordinary sample rule. With AA1 a pixel the sample rule
+     * rejects can still be drawn, because part of it is covered, but only
+     * when alpha blending is on: with ABE clear there is nothing for a
+     * partial coverage to do and drawing it would just make the primitive
+     * bigger. */
+    bool aa1 = (flags & GSP_F_AA1) != 0u && pc.samples == 1u
+               && (kind == GSP_KIND_TRIANGLE || kind == GSP_KIND_LINE);
+    bool abe = (flags & GSP_F_ABE) != 0u;
+    float cover = 1.0;
+
+    if (kind == GSP_KIND_TRIANGLE) {
+        gs_i64 ea = gs_cross64(x1 - x0, syp - y0, y1 - y0, sxp - x0);
+        gs_i64 eb = gs_cross64(x2 - x1, syp - y1, y2 - y1, sxp - x1);
+        gs_i64 ec = gs_cross64(x0 - x2, syp - y2, y0 - y2, sxp - x2);
+        bool inside = gs_edge_accept_value(ea, x1 - x0, y1 - y0)
+                   && gs_edge_accept_value(eb, x2 - x1, y2 - y1)
+                   && gs_edge_accept_value(ec, x0 - x2, y0 - y2);
+        if (aa1) {
+            cover = gs_aa_triangle_cover(x0, y0, x1, y1, x2, y2, sxp, syp);
+            if (cover <= 0.0) return;
+            if (!inside && !abe) return;
+        } else if (!inside) {
+            return;
+        }
+        /* The weight of a vertex is the edge opposite it. Outside the
+         * triangle, which only an AA1 edge pixel can be, one weight is
+         * negative and the interpolation extrapolates; the channel clamp
+         * below is what keeps that in range. */
+        w0 = gs_i64_float(eb);
+        w1 = gs_i64_float(ec);
+        w2 = gs_i64_float(ea);
+        wsum = w0 + w1 + w2;
+        if (wsum == 0.0) wsum = 1.0;
+    } else if (kind == GSP_KIND_SPRITE) {
+        if (!gs_covers_sprite_at(x0, y0, x1, y1, sxp, syp)) return;
+    } else if (kind == GSP_KIND_POINT) {
+        if (!gs_covers_point(x0, y0, px, py)) return;
+    } else if ((flags & GSP_F_LINE_DOT) != 0u) {
+        /* A line that never left one pixel of its major axis. */
+        if (!gs_covers_line_dot(x0, y0, px, py)) return;
+    } else {
+        bool major_x = (flags & GSP_F_MAJOR_X) != 0u;
+        int m0 = major_x ? x0 : y0;
+        int m1 = major_x ? x1 : y1;
+        int p = major_x ? px : py;
+        int smin = major_x ? syp : sxp;
+        int refp = major_x ? int(g_buf[PRIMS].data[base + GSP_REFX])
+                           : int(g_buf[PRIMS].data[base + GSP_REFY]);
+        int slope = int(g_buf[PRIMS].data[base + GSP_LINE_SLOPE]);
+        int lo = min(m0, m1);
+        int hi = max(m0, m1);
+        if (!gs_covers_line_span(lo, hi, p)) return;
+        if (aa1) {
+            cover = gs_aa_line_cover(x2, slope, refp, p, smin);
+            if (cover <= 0.0) return;
+            if (!gs_covers_line_at(lo, hi, x2, slope, refp, p, smin) && !abe) return;
+        } else if (!gs_covers_line_at(lo, hi, x2, slope, refp, p, smin)) {
+            return;
+        }
+        tline = (m1 != m0) ? (float(p * 16 + 8 - m0) / float(m1 - m0)) : 0.0;
+        tline = clamp(tline, 0.0, 1.0);
+    }
+
+    /* ---- Z ---- */
+    uint dxp = uint(px - int(g_buf[PRIMS].data[base + GSP_REFX]));
+    uint dyp = uint(py - int(g_buf[PRIMS].data[base + GSP_REFY]));
+    uint zsrc = gs_z_at(g_buf[PRIMS].data[base + GSP_Z_I],
+                        g_buf[PRIMS].data[base + GSP_Z_F],
+                        g_buf[PRIMS].data[base + GSP_ZDX_I],
+                        g_buf[PRIMS].data[base + GSP_ZDX_F],
+                        g_buf[PRIMS].data[base + GSP_ZDY_I],
+                        g_buf[PRIMS].data[base + GSP_ZDY_F],
+                        dxp, dyp) & gs_z_precision_mask(pc.z_psm);
+
+    /* ---- colour ----
+     *
+     * Interpolated from the same exact edge values coverage used, converted
+     * to float. A channel is 8 bits and the weights carry a relative error
+     * near 2^-24, so the rounded result is the integer the exact rational
+     * would give except within about 1e-4 of a half. Rounding to nearest
+     * rather than truncating is a decision: it reproduces a vertex's own
+     * colour at that vertex, which truncation would miss by one whenever the
+     * float lands just below. */
+    uint rgba;
+    bool iip = (flags & GSP_F_IIP) != 0u;
+    if (kind == GSP_KIND_TRIANGLE && iip) {
+        uint c0 = g_buf[PRIMS].data[base + GSP_RGBA0];
+        uint c1 = g_buf[PRIMS].data[base + GSP_RGBA1];
+        uint c2 = g_buf[PRIMS].data[base + GSP_RGBA2];
+        float inv = 1.0 / wsum;
+        uint acc = 0u;
+        for (uint i = 0u; i < 4u; ++i) {
+            float v = (w0 * float(chan(c0, i)) + w1 * float(chan(c1, i))
+                       + w2 * float(chan(c2, i))) * inv;
+            acc |= uint(clamp255(int(floor(v + 0.5)))) << (i * 8u);
+        }
+        rgba = acc;
+    } else if (kind == GSP_KIND_LINE && iip) {
+        uint c0 = g_buf[PRIMS].data[base + GSP_RGBA0];
+        uint c1 = g_buf[PRIMS].data[base + GSP_RGBA1];
+        uint acc = 0u;
+        for (uint i = 0u; i < 4u; ++i) {
+            float v = mix(float(chan(c0, i)), float(chan(c1, i)), tline);
+            acc |= uint(clamp255(int(floor(v + 0.5)))) << (i * 8u);
+        }
+        rgba = acc;
+    } else {
+        rgba = g_buf[PRIMS].data[base + GSP_RGBA_FLAT];
+    }
+
+    /* ---- texture ----
+     *
+     * The coordinate first. FST 1 interpolates the UV registers, which are
+     * already sixteenths of a texel, linearly in window space. FST 0
+     * interpolates S, T and Q and divides per pixel, which is what makes the
+     * mapping perspective correct, and multiplies by the texture's size
+     * because S and T are normalised: U = S / Q * 2^TW. The result is
+     * rounded to the same sixteenth of a texel the UV path carries, so
+     * everything downstream has one representation to reason about
+     * (gs_texture.h says why).
+     *
+     * A sprite is axis aligned, so its parameter along each axis is the
+     * sample point's position between the two corners; there is nothing
+     * perspective about it and its Q is the second vertex's, constant over
+     * the rectangle. A line interpolates along its major axis, which is the
+     * same tline the colour used. A point takes vertex 0 outright. */
+    if ((flags & GSP_F_TME) != 0u) {
+        uint t0lo = g_buf[PRIMS].data[base + GSP_TEX0_LO];
+        uint t0hi = g_buf[PRIMS].data[base + GSP_TEX0_HI];
+        bool fst = (flags & GSP_F_FST) != 0u;
+
+        float fu = 0.0, fv = 0.0;   /* FST 1: sixteenths of a texel */
+        float fs = 0.0, ft = 0.0;   /* FST 0: the normalised coordinate */
+        float fq = 1.0;
+
+        if (kind == GSP_KIND_TRIANGLE) {
+            float inv = 1.0 / wsum;
+            if (fst) {
+                uint a0 = g_buf[PRIMS].data[base + GSP_UV0];
+                uint a1 = g_buf[PRIMS].data[base + GSP_UV1];
+                uint a2 = g_buf[PRIMS].data[base + GSP_UV2];
+                fu = (w0 * float(a0 & 0xFFFFu) + w1 * float(a1 & 0xFFFFu)
+                      + w2 * float(a2 & 0xFFFFu)) * inv;
+                fv = (w0 * float(a0 >> 16) + w1 * float(a1 >> 16)
+                      + w2 * float(a2 >> 16)) * inv;
+            } else {
+                fs = (w0 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S0])
+                    + w1 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S1])
+                    + w2 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S2])) * inv;
+                ft = (w0 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T0])
+                    + w1 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T1])
+                    + w2 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T2])) * inv;
+                fq = (w0 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q0])
+                    + w1 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q1])
+                    + w2 * uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q2])) * inv;
+            }
+        } else if (kind == GSP_KIND_SPRITE) {
+            float tx = (x1 != x0) ? (float(sxp - x0) / float(x1 - x0)) : 0.0;
+            float ty = (y1 != y0) ? (float(syp - y0) / float(y1 - y0)) : 0.0;
+            if (fst) {
+                uint a0 = g_buf[PRIMS].data[base + GSP_UV0];
+                uint a1 = g_buf[PRIMS].data[base + GSP_UV1];
+                fu = mix(float(a0 & 0xFFFFu), float(a1 & 0xFFFFu), tx);
+                fv = mix(float(a0 >> 16), float(a1 >> 16), ty);
+            } else {
+                fs = mix(uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S0]),
+                         uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S1]), tx);
+                ft = mix(uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T0]),
+                         uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T1]), ty);
+                fq = uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q0]);
+            }
+        } else if (kind == GSP_KIND_LINE) {
+            if (fst) {
+                uint a0 = g_buf[PRIMS].data[base + GSP_UV0];
+                uint a1 = g_buf[PRIMS].data[base + GSP_UV1];
+                fu = mix(float(a0 & 0xFFFFu), float(a1 & 0xFFFFu), tline);
+                fv = mix(float(a0 >> 16), float(a1 >> 16), tline);
+            } else {
+                fs = mix(uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S0]),
+                         uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S1]), tline);
+                ft = mix(uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T0]),
+                         uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T1]), tline);
+                fq = mix(uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q0]),
+                         uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q1]), tline);
+            }
+        } else {
+            uint a0 = g_buf[PRIMS].data[base + GSP_UV0];
+            fu = float(a0 & 0xFFFFu);
+            fv = float(a0 >> 16);
+            fs = uintBitsToFloat(g_buf[PRIMS].data[base + GSP_S0]);
+            ft = uintBitsToFloat(g_buf[PRIMS].data[base + GSP_T0]);
+            fq = uintBitsToFloat(g_buf[PRIMS].data[base + GSP_Q0]);
+        }
+
+        int u16, v16;
+        if (fst) {
+            u16 = int(floor(fu + 0.5));
+            v16 = int(floor(fv + 0.5));
+            /* No Q in the UV path, so the LOD formula's log2(1/|Q|) term is
+             * zero and LOD is K alone, which is what LCM 1 gives. Passing
+             * one rather than the vertex Q is what makes the two agree. */
+            fq = 1.0;
+        } else {
+            float iq = (fq != 0.0) ? (1.0 / fq) : 0.0;
+            u16 = int(floor(fs * iq * float(1u << gs_tex0_tw(t0lo)) * 16.0 + 0.5));
+            v16 = int(floor(ft * iq * float(1u << gs_tex0_th(t0lo, t0hi)) * 16.0 + 0.5));
+        }
+
+        uint texel = tex_sample(t0lo, t0hi,
+                                g_buf[PRIMS].data[base + GSP_TEX1_LO],
+                                g_buf[PRIMS].data[base + GSP_TEX1_HI],
+                                g_buf[PRIMS].data[base + GSP_MIPTBP1_LO],
+                                g_buf[PRIMS].data[base + GSP_MIPTBP1_HI],
+                                g_buf[PRIMS].data[base + GSP_MIPTBP2_LO],
+                                g_buf[PRIMS].data[base + GSP_MIPTBP2_HI],
+                                g_buf[PRIMS].data[base + GSP_CLAMP_LO],
+                                g_buf[PRIMS].data[base + GSP_CLAMP_HI],
+                                g_buf[PRIMS].data[base + GSP_TEXA],
+                                g_buf[PRIMS].data[base + GSP_CLUT_BASE],
+                                u16, v16, fq);
+        rgba = gs_tex_function(texel, rgba, gs_tex0_tfx(t0hi), gs_tex0_tcc(t0hi));
+    }
+
+    /* ---- fog ----
+     *
+     * Cv = C * F / 255 + FOGCOL * (1 - F / 255), with F the 8-bit fog value.
+     * The manual gives the formula; it does not give the rounding, so this
+     * rounds to nearest and says so. */
+    if ((flags & GSP_F_FGE) != 0u) {
+        uint f;
+        if (kind == GSP_KIND_TRIANGLE && iip) {
+            uint fp = g_buf[PRIMS].data[base + GSP_FOG012];
+            float v = (w0 * float(fp & 0xFFu) + w1 * float((fp >> 8) & 0xFFu)
+                       + w2 * float((fp >> 16) & 0xFFu)) / wsum;
+            f = uint(clamp255(int(floor(v + 0.5))));
+        } else if (kind == GSP_KIND_LINE && iip) {
+            uint fp = g_buf[PRIMS].data[base + GSP_FOG012];
+            float v = mix(float(fp & 0xFFu), float((fp >> 8) & 0xFFu), tline);
+            f = uint(clamp255(int(floor(v + 0.5))));
+        } else {
+            f = g_buf[PRIMS].data[base + GSP_FOG_FLAT] & 0xFFu;
+        }
+        uint acc = rgba & 0xFF000000u;
+        for (uint i = 0u; i < 3u; ++i) {
+            uint fc = (pc.fogcol >> (i * 8u)) & 0xFFu;
+            uint v = (chan(rgba, i) * f + fc * (255u - f) + 127u) / 255u;
+            acc |= (v & 0xFFu) << (i * 8u);
+        }
+        rgba = acc;
+    }
+
+    uint test = g_buf[PRIMS].data[base + GSP_TEST];
+    uint alpha = g_buf[PRIMS].data[base + GSP_ALPHA];
+
+    uint dst = s_color[idx];
+    uint src_a = (rgba >> 24) & 0xFFu;
+
+    /* ---- alpha test ---- */
+    bool write_rgb = true;
+    bool write_a = true;
+    bool write_z = true;
+    if ((test & GSP_T_ATE) != 0u) {
+        uint atst = (test >> GSP_T_ATST_SHIFT) & 7u;
+        uint aref = (test >> GSP_T_AREF_SHIFT) & 0xFFu;
+        bool pass;
+        if (atst == GSP_ATST_NEVER) pass = false;
+        else if (atst == GSP_ATST_ALWAYS) pass = true;
+        else if (atst == GSP_ATST_LESS) pass = src_a < aref;
+        else if (atst == GSP_ATST_LEQUAL) pass = src_a <= aref;
+        else if (atst == GSP_ATST_EQUAL) pass = src_a == aref;
+        else if (atst == GSP_ATST_GEQUAL) pass = src_a >= aref;
+        else if (atst == GSP_ATST_GREATER) pass = src_a > aref;
+        else pass = src_a != aref;
+        if (!pass) {
+            uint afail = (test >> GSP_T_AFAIL_SHIFT) & 3u;
+            if (afail == GSP_AFAIL_KEEP) return;
+            if (afail == GSP_AFAIL_FB_ONLY) {
+                write_z = false;
+            } else if (afail == GSP_AFAIL_ZB_ONLY) {
+                write_rgb = false;
+                write_a = false;
+            } else { /* RGB_ONLY: the colour goes in, alpha and Z do not */
+                write_z = false;
+                write_a = false;
+            }
+        }
+    }
+
+    /* ---- destination alpha test ---- */
+    if ((test & GSP_T_DATE) != 0u) {
+        uint datm = (test & GSP_T_DATM) != 0u ? 1u : 0u;
+        if (((dst >> 31) & 1u) != datm) return;
+    }
+
+    /* ---- depth test ----
+     *
+     * ZTE clear is treated as ZTST ALWAYS: the manual describes ZTE as the
+     * test's enable and says nothing about it disabling the write, so ZMSK
+     * stays the only thing that stops a Z write. Inferred. */
+    if ((test & GSP_T_ZTE) != 0u) {
+        uint ztst = (test >> GSP_T_ZTST_SHIFT) & 3u;
+        uint zdst = s_depth[idx];
+        bool pass;
+        if (ztst == GSP_ZTST_NEVER) pass = false;
+        else if (ztst == GSP_ZTST_ALWAYS) pass = true;
+        else if (ztst == GSP_ZTST_GEQUAL) pass = zsrc >= zdst;
+        else pass = zsrc > zdst;
+        if (!pass) return;
+    }
+
+    /* ---- blend ----
+     *
+     * Cv = ((A - B) * C) >> 7 + D, with A, B and D selecting the source
+     * colour, the destination colour or zero, and C selecting the source
+     * alpha, the destination alpha or FIX. The shift is arithmetic, so a
+     * negative intermediate floors; the manual does not state the rounding
+     * and this is the choice a shift-and-add unit makes.
+     *
+     * PABE narrows blending to the pixels whose source alpha has its top bit
+     * set; the rest take the source colour unblended. PABE reads the
+     * primitive's own alpha, not AA1's coverage: coverage is what the C
+     * selector reads, and nothing else.
+     *
+     * AA1: with coverage in hand, the C selector's "source alpha" becomes the
+     * coverage, so an edge pixel mixes into the destination in proportion to
+     * how much of it the primitive covers. gs_prim.h states the rule and what
+     * about it is inferred. */
+    uint cov_alpha = aa1 ? gs_aa_alpha(cover) : 128u;
+    uint outc = rgba;
+    bool blend = (flags & GSP_F_ABE) != 0u;
+    if (blend && (alpha & GSP_A_PABE) != 0u && src_a < 128u) blend = false;
+    if (blend) {
+        uint sa = (alpha >> GSP_A_A_SHIFT) & 3u;
+        uint sb = (alpha >> GSP_A_B_SHIFT) & 3u;
+        uint sc = (alpha >> GSP_A_C_SHIFT) & 3u;
+        uint sd = (alpha >> GSP_A_D_SHIFT) & 3u;
+        uint fix = (alpha >> GSP_A_FIX_SHIFT) & 0xFFu;
+        int c;
+        if (sc == 0u) c = int(aa1 ? cov_alpha : src_a);
+        else if (sc == 1u) c = int((dst >> 24) & 0xFFu);
+        else c = int(fix);
+        bool cclamp = (alpha & GSP_A_COLCLAMP) != 0u;
+        uint res = 0u;
+        for (uint i = 0u; i < 3u; ++i) {
+            int cs = int(chan(rgba, i));
+            int cd = int(chan(dst, i));
+            int a = (sa == 0u) ? cs : ((sa == 1u) ? cd : 0);
+            int b = (sb == 0u) ? cs : ((sb == 1u) ? cd : 0);
+            int d = (sd == 0u) ? cs : ((sd == 1u) ? cd : 0);
+            int v = (((a - b) * c) >> 7) + d;
+            v = cclamp ? clamp(v, 0, 255) : (v & 0xFF);
+            res |= uint(v) << (i * 8u);
+        }
+        outc = res | (rgba & 0xFF000000u);
+    }
+
+    /* ---- alpha correction and dither ----
+     *
+     * FBA sets the top bit of the alpha that is written. Dither adds the
+     * DIMX entry for this pixel's position before the 16-bit truncation; it
+     * is applied only for the 16-bit frame buffer formats, which are the
+     * only ones that lose bits. */
+    uint out_a = (outc >> 24) & 0xFFu;
+    if ((alpha & GSP_A_FBA) != 0u) out_a |= 0x80u;
+
+    uint out_rgb = outc & 0x00FFFFFFu;
+    if ((alpha & GSP_A_DTHE) != 0u
+        && (pc.frame_psm == GS_PSMCT16 || pc.frame_psm == GS_PSMCT16S)) {
+        int d = dimx_entry(uint(px), uint(py));
+        uint dith = 0u;
+        for (uint i = 0u; i < 3u; ++i) {
+            dith |= uint(clamp255(int(chan(out_rgb, i)) + d)) << (i * 8u);
+        }
+        out_rgb = dith;
+    }
+
+    uint written = (write_rgb ? out_rgb : (dst & 0x00FFFFFFu))
+                 | ((write_a ? out_a : ((dst >> 24) & 0xFFu)) << 24);
+    bool wrote_color = write_rgb || write_a;
+    bool wrote_z = write_z && pc.z_write != 0u;
+    if (wrote_color) { s_color[idx] = written; g_wrote_color = true; }
+    if (wrote_z) { s_depth[idx] = zsrc; g_wrote_z = true; }
+
+    /* FRAME and ZBUF over the same bits of the same word. The two are one
+     * storage cell that the pixel pipeline writes twice, colour first and
+     * depth second, so after this primitive the word holds the depth and the
+     * colour a later primitive reads back is those bits read as a colour.
+     * Both views are re-derived here rather than at the store, because the
+     * next primitive in this tile's list reads them. gs_prim.h states the
+     * test; the write order is inferred and docs/GS_RENDERER.md lists it.
+     *
+     * Only when something was written: with neither view written the two are
+     * already the pair frame_load and z_load read out of one word, and
+     * re-deriving them would mark a sample dirty that no primitive touched. */
+    if (g_alias && (wrote_color || wrote_z)) {
+        uint bits = gs_alias_word(pc.frame_psm, s_color[idx], pc.z_psm, zsrc, wrote_z);
+        s_color[idx] = gs_frame_unpack(pc.frame_psm, bits);
+        s_depth[idx] = bits & gs_z_precision_mask(pc.z_psm);
+        g_wrote_color = true;
+        g_wrote_z = true;
+    }
+}
+
+void main() {
+    /* One thread per sample of one pixel. tile_w * tile_h * samples is 256 by
+     * construction (gs_native.cpp picks the tile for the scale), so the
+     * decomposition below covers the workgroup exactly and at scale 1 gives
+     * the same (x, y) a 16 by 16 workgroup gave. */
+    uint tw = pc.tile_w;
+    uint th = pc.tile_h;
+    uint idx = gl_LocalInvocationIndex;
+    uint lx = idx % tw;
+    uint ly = (idx / tw) % th;
+    uint smp = idx / (tw * th);
+    if (smp >= pc.samples) return;
+
+    uint px = (pc.tile_x0 + gl_WorkGroupID.x) * tw + lx;
+    uint py = (pc.tile_y0 + gl_WorkGroupID.y) * th + ly;
+
+    uint binx = px / GSP_BIN_PIXELS;
+    uint biny = py / GSP_BIN_PIXELS;
+    if (binx >= GSP_BINS_X || biny >= GSP_BINS_Y) return;
+
+    uint bin = biny * GSP_BINS_X + binx;
+    uint off = g_buf[BINRNG].data[bin * 2u];
+    uint cnt = g_buf[BINRNG].data[bin * 2u + 1u];
+    if (cnt == 0u) return;
+
+    g_shadow = pc.shadow != 0u;
+    g_plane = g_shadow ? smp * GS_VRAM_WORDS : 0u;
+    g_faddr = gs_pixel_addr(pc.frame_psm, pc.frame_base_block, pc.frame_bw, px, py);
+    g_zaddr = gs_pixel_addr(pc.z_psm, pc.z_base_block, pc.frame_bw, px, py);
+    g_alias = gs_alias_pixel(pc.frame_psm, g_faddr, pc.z_psm, g_zaddr);
+
+    s_color[idx] = frame_load();
+    s_depth[idx] = z_load();
+    g_wrote_color = false;
+    g_wrote_z = false;
+
+    int sxp = int(px) * 16 + gs_sample_x(pc.samples, smp);
+    int syp = int(py) * 16 + gs_sample_y(pc.samples, smp);
+
+    for (uint i = 0u; i < cnt; ++i) {
+        shade(g_buf[BINIDX].data[off + i], int(px), int(py), sxp, syp, idx);
+    }
+
+    /* Only the samples a primitive wrote go back.
+     *
+     * Storing an untouched sample looks like an identity, and it is one only
+     * while gs_pixel_addr is injective over the dispatched rectangle. It is
+     * not: with FBW 8, pixel (512 + u, v) and pixel (u, v + 32) are the same
+     * word, and both are inside the dispatch whenever the scissor is wider or
+     * taller than the frame buffer the addressing describes. Two workgroups
+     * then load that word, one shades it and the other writes back the value
+     * it loaded, and which of the two lands last is not ordered. The shaded
+     * pixel would be lost, and nothing would say so.
+     *
+     * A pair of per-thread flags costs two registers and removes the case
+     * entirely for an untouched sample. Two primitives writing the same word
+     * through two aliased pixels in one batch is a different thing, and one
+     * the hardware orders and this pass does not; a dump that reaches it is
+     * the measurement that would settle what to do about it. */
+    if (g_wrote_color) frame_store(s_color[idx]);
+    if (g_wrote_z && pc.z_write != 0u) z_store(s_depth[idx]);
+}

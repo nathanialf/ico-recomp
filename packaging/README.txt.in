@@ -1,29 +1,32 @@
 icorecomp @ICORECOMP_PACKAGE_PLATFORM@
 ======================================
 
-A native PC port of ICO (PlayStation 2, retail US), produced by static
+A native PC port of ICO (PlayStation 2, retail @ICORECOMP_PACKAGE_REGION@), produced by static
 recompilation. No game data ships with this build. You supply your own
 disc image, dumped from your own copy.
+
+This build runs the @ICORECOMP_PACKAGE_REGION@ disc and only that one. It looks for
+@ICORECOMP_PACKAGE_BOOT_ELF@ on the image, and if that file is not there it says the
+image is not an ICO @ICORECOMP_PACKAGE_REGION@ disc rather than reporting a bad image.
 
 
 Getting it running
 ------------------
 
-1. Put your ICO (USA) disc image in this folder, named ico.iso.
-   A raw bin/cue dump works too: name it ico.bin. The .cue file is not
-   needed.
+1. Put your ICO (@ICORECOMP_PACKAGE_REGION@) disc image in this folder, named ico.iso. A raw
+   bin/cue dump works too: name it ico.bin. The .cue file is not needed.
 
 2. Run @ICORECOMP_PACKAGE_EXE@.
 
 That is the whole install. Nothing is written outside this folder, and
-nothing needs to be configured first.
+nothing needs to be configured first.@ICORECOMP_PACKAGE_LAYOUT_NOTE@
 
 If you would rather keep the image somewhere else, pass it on the command
 line instead of step 1:
 
-    @ICORECOMP_PACKAGE_EXE@ --disc "path/to/Ico (USA).iso"
+    @ICORECOMP_PACKAGE_EXE@ --disc "path/to/Ico (PAL).iso"
 
-The image is checked against the SHA-1 of the retail US boot ELF. A
+The image is checked against the SHA-1 of the retail boot ELF. A
 mismatch is reported and the run stops, rather than failing strangely
 later.
 
@@ -35,31 +38,130 @@ What this folder holds
 @ICORECOMP_PACKAGE_LIBS@
     README.txt@ICORECOMP_PACKAGE_UI@
 
-The two libraries are the renderer (paraLLEl-GS) and SDL3, which provides
-the window, controller input and audio. Both must stay next to the
-executable.@ICORECOMP_PACKAGE_UI_NOTE@
+@ICORECOMP_PACKAGE_LIBS_NOTE@@ICORECOMP_PACKAGE_UI_NOTE@
 
-After the first run you will also see icorecomp.log, the last run's log,
-and saves/mc0, the virtual memory card. After the second run you will
-also see icorecomp.prev.log, the log from the run before that.
+Everything else here is written by the port itself, each one when it is
+first needed:
+
+    icorecomp.log       the last run's log
+    icorecomp.prev.log  the log from the run before that
+    settings.json       written the first time a setting is saved
+    saves/mc0           the virtual memory card
+    saves/achievements.json
+                        what the achievement observer has unlocked
+    screenshots/        where F12 writes its PNGs
+
+
+On macOS
+--------
+
+This build has never been run on a Mac. Nobody working on the port owns
+one, so what follows is what the build is meant to do, not what has been
+observed. It is Apple Silicon only and needs macOS 14 or newer.
+
+You need nothing but "ICO Recomp.app" and your own disc image. There is
+no Vulkan SDK to install and no Homebrew package to add: MoltenVK, which
+is what runs the renderer on Metal, ships inside the app along with
+everything else it opens.
+
+The executable and everything beside it live in
+ICO Recomp.app/Contents/MacOS, so that is where the disc image goes:
+right-click the app, choose Show Package Contents, and put ico.iso in
+Contents/MacOS.
+
+The app is signed ad-hoc, which is what lets it run at all on Apple
+Silicon, but it is not signed with a Developer ID and not notarised.
+Gatekeeper refuses a downloaded ad-hoc-signed bundle on a double click.
+Two ways past it: right-click the app and choose Open, which offers to run
+it anyway, or clear the download flag from a terminal:
+
+    xattr -dr com.apple.quarantine "ICO Recomp.app"
+
+Clearing the flag is the one worth doing. While the app is quarantined
+macOS also runs it from a read-only copy at a path of its own choosing,
+so saves, settings.json and the log go to ~/Library/Application
+Support/icorecomp instead of Contents/MacOS, and a disc image you put in
+Contents/MacOS may not be found there at all. Clearing the flag as above
+puts all of it back beside the executable.
+
+If no picture ever appears, the log says which of two things happened.
+"no Vulkan loader" means the copy of MoltenVK inside Contents/MacOS was
+not reached, which is this package being wrong rather than your machine.
+A device name followed by a list of missing features means the Mac is
+short of something the renderer needs. Either way the two lines to send
+are the ones starting "Renderer:" and "Feature support:", which are also
+the last two rows of the menu's Display tab.
 
 
 Settings
 --------
 
-The first time you change a setting and it saves, settings.json appears
-next to the executable. It travels with the folder, so a copy on a USB
-stick keeps its own settings.
+The first time a setting is saved, settings.json appears next to the
+executable. It travels with the folder, so a copy on a USB stick keeps
+its own settings.
 
 Press F1 (or Guide on a gamepad) at any time to open the in-game menu.
-The game keeps running behind it. On Windows, and on Linux when the live
-renderer is selected, a launcher window appears at startup first, with a
-disc picker plus Start, Settings and Quit buttons; pass --no-launcher to
-skip it and boot straight into the game. The menu's Input tab lets you
-remap keys and gamepad buttons to any DS2 button. The Gameplay tab holds
-one toggle, "Run in every stick direction", off by default; off matches
-retail, where only a near-cardinal tilt runs, and on lets a full tilt run
-at any angle.
+The game keeps running behind it. On a build that opens its own window
+(the Windows and macOS packages do) a launcher window comes up at startup
+first, with a disc picker plus Start, Menu and Quit buttons; pass
+--no-launcher to skip it and boot straight into the game.
+
+The menu has six tabs:
+
+    Achievements  what has been unlocked, and three switches: watch for
+                  unlocks, show a notice on one, play a sound on one.
+    Display       window mode and size; how the picture fills the window
+                  (letterbox, integer or stretch); linear or nearest
+                  filtering; whether the output frame is the hardware's
+                  visible area ("crt") or the whole window ("window", the
+                  default, which is what shows the attract movie's whole
+                  picture); widescreen; render scale; an fps readout; the
+                  screenshots folder and a Take screenshot button.
+    Audio         master volume and mute, then one 0-100 gain each for
+                  music and ambience, sound effects, the attract movie's
+                  soundtrack and the achievement chime. Every one of them
+                  applies to the port's own output only; none of them
+                  changes a value the game itself set.
+    Input         remap keys, both gamepads and the mouse buttons to any
+                  DS2 button, plus stick dead zones and mouse look.
+    Gameplay      one toggle, "Run in every stick direction", off by
+                  default; off matches retail, where only a near-cardinal
+                  tilt runs, and on lets a full tilt run at any angle.
+    Debug         log level, the console window, the log file, the
+                  profiler period and the frame-rate limit.
+
+The renderer is paraLLEl-GS and there is nothing to pick: the port's own
+renderer is not finished and is not offered to a player. For the record,
+ICORECOMP_GS_BACKEND still names one for the replay tool and for CI; it
+is not something to set for playing.
+
+Widescreen ("widescreen" under "display", off by default) is the one
+setting besides the output frame above that reaches into the game. It
+multiplies the X scale of the game's own projection block, so the frustum
+grows sideways while the camera, the field of view and the vertical
+framing stay exactly as the retail game left them. "window" follows the
+window's own shape, and keeps following it across a resize; "16_9" holds
+16:9 whatever shape the window is. 2D is held at retail proportions.
+Which of this game's 2D passes that rule gets right is still being
+measured, so if a menu page or a fade looks wrong, turning widescreen off
+is the answer, and the log lines starting "widescreen:" are what to send.
+
+Screenshots: F12 writes a PNG into the screenshots folder, named
+ico-YYYYMMDD-HHMMSS.png. What lands in the file is the picture as the
+window showed it, without the menu, the launcher, the drawn pointer or
+the fps readout, which is why the Display tab's Take screenshot button
+gives the same picture the key does. A folder that cannot be created is
+logged once and the capture is skipped.
+
+Achievements: sixteen local trophies, the public PS3 "ICO Classics HD"
+set, unlocked by watching the game's own progress bits. Nothing leaves
+the machine and nothing is uploaded anywhere; the observer reads guest
+memory and never writes it, so turning it off changes nothing the game
+does. What has been unlocked is kept in saves/achievements.json, one
+entry per playthrough. An unlock shows a toast (on by default) and can
+play a short chime the port synthesises itself (off by default; its
+volume is on the Audio tab). Not every trophy is resolved yet; which ones
+and why is in docs/ACHIEVEMENTS.md in the source tree.
 
 Any of the environment variables below always wins over the matching
 settings.json value for that run, so an existing script keeps behaving
@@ -67,7 +169,9 @@ the same way it always did.
 
 If settings.json fails to parse, the runtime copies it to
 settings.json.bad and runs on defaults rather than stopping, so a bad
-hand-edit is never silently lost.
+hand-edit is never silently lost. One bad value keeps that one setting's
+default and logs what was wrong with it; the rest of the file still
+loads.
 
 Full schema and every settings key: docs/SETTINGS.md in the source tree
 (https://github.com/nathanialf/ico-recomp).
@@ -77,14 +181,28 @@ Controls
 --------
 
 Any SDL3-supported controller (Xbox, DualSense, DualShock 4) is picked up
-automatically. On the keyboard:
+automatically. A second controller is player 2, which is the pad this
+disc's two-player mode reads. On the keyboard:
 
     arrows          d-pad
     WASD / IJKL     left / right stick
-    X C Z V         cross / circle / square / triangle
+    X C Z Space     cross / circle / square / triangle
     Q E 1 3         L1 / R1 / L2 / R2
+    T Y             L3 / R3
     Enter           start
     Backspace       select
+    F1              open and close the menu
+    F12             screenshot
+
+The mouse is on by default. Moving it aims the camera, which is the right
+stick; the left button is square (attack) and the right button is R1
+(call). All of that can be remapped on the menu's Input tab, and mouse
+look can be turned off there.
+
+On the game's own menus the mouse is a pointer instead. The item under
+the cursor becomes the selected one, exactly as the game's own d-pad
+navigation would have left it; a left click confirms it (cross), a right
+click goes back (triangle), and the wheel steps the selection.
 
 
 When something goes wrong
@@ -103,8 +221,21 @@ read-only share), the log goes to %LOCALAPPDATA%\icorecomp instead, and
 then to the temp folder. Whichever it picks, its first line names the
 file, and the console says which locations it tried and why each failed.
 
+How much the log holds is the log level, in the Debug tab of the in-game
+menu or as "log_level" under "debug" in settings.json. It ships at warn,
+which keeps everything the port refused, fell back on, or could not make
+sense of, and the failure itself. Turn it up to info for the startup
+facts and the frame-time summaries, or to debug for everything, which is
+slow. A bug report is more useful at info than at warn.
+
+Double-clicking ico.exe opens no console window. A run started from a
+command prompt still prints there. If you want a console for a
+double-clicked run, turn on "Show a console window" in the Debug tab; it
+applies at the next start. Either way the log file has the same lines.
+
 The log can also carry diagnostic channels, which are never printed to
-the console. They are off by default because they cost frame time.
+the console. A channel named here is on whatever the log level is. They
+are off by default because they cost frame time.
 ICORECOMP_VERBOSE=geom turns on the graphics one: it checks every
 primitive sent to the graphics chip and reports, once per field, the ones
 projected behind the eye or stretched past the hardware guard band, along
@@ -119,11 +250,13 @@ Environment variables
 ---------------------
 
     ICORECOMP_LOG=path        write the log somewhere else ("-" disables)
+    ICORECOMP_LOG_LEVEL=name  error, warn (the default), info or debug
     ICORECOMP_VERBOSE=list    extra diagnostic channels, comma separated,
                               or "all". Off by default: "geom" re-reads
                               every packet sent to the graphics chip, so
                               it costs frame time and is only worth it
                               when diagnosing the picture.
+    ICORECOMP_NO_AUDIO=1      open no audio device
     ICORECOMP_GS=dump         headless, no window
     ICORECOMP_MAX_VBLANKS=N   stop after N fields
     ICORECOMP_SAVES_DIR=path  memory card location
@@ -134,7 +267,12 @@ Environment variables
 License
 -------
 
-The port is MIT. It loads @ICORECOMP_PACKAGE_GSLIB@, which is paraLLEl-GS
-under LGPLv3+, and SDL3 under the zlib license, both as separate shared
-libraries. Source and the corresponding build instructions:
-https://github.com/nathanialf/ico-recomp@ICORECOMP_PACKAGE_UI_LICENSE@
+The port is MIT.
+@ICORECOMP_PACKAGE_GS_LICENSE@
+Source and the corresponding build instructions:
+https://github.com/nathanialf/ico-recomp
+
+A macOS build also carries libMoltenVK.dylib, Khronos' implementation of
+Vulkan on Metal, under the Apache License 2.0. Its license text ships in
+the app as Contents/Resources/MoltenVK-LICENSE.txt, and the source is at
+https://github.com/KhronosGroup/MoltenVK@ICORECOMP_PACKAGE_UI_LICENSE@

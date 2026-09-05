@@ -1,32 +1,34 @@
 /* sif/pad.cpp: the padman RPC service (old wire protocol) of the virtual IOP.
  *
  * The retail ICO ELF links the old (SDK 2.2-era) EE libpad; every protocol
- * fact below was read out of that library's disassembly in the decomp
- * checkout (asm/.../src/cod/vendor_24AAC8 + vendor_24E9D8, functions
+ * fact below was read out of that library's own disassembly (the libpad
+ * object beginning at PAL 0x00267C00, functions
  * identified against the Aug-6-2001 map's scePad* names) plus the game's
- * own pad layer (ios/pad.c, iosPadRead/iosPadDevInit asm). Facts, with the
+ * own pad layer (iosPadRead / iosPadDevInit). Facts, with the
  * function they were read from:
  *
  *  - RPC server ids 0x80000100 (commands) and 0x80000101 (bound but never
  *    called by this library). Every request is a 128-byte block, fno=1,
  *    word 0 = command; the server answers in-place (same block layout).
- *  - scePadPortOpen (func_0024E228): cmd 0x01, port@+4 slot@+8 and the EE
+ *  - scePadPortOpen (PAL 0x00267E60): cmd 0x01, port@+4 slot@+8 and the EE
  *    pad data area address@+16; reply result@+12 and an IOP-side actuator
  *    receive address@+20 (see actuators below).
- *  - scePadSetMainMode (func_0024EB10): cmd 0x06, offs@+12 lock@+16, reply
+ *  - scePadSetMainMode (PAL 0x00268748): cmd 0x06, offs@+12 lock@+16, reply
  *    result@+20 == 1, then the EE sets reqState=BUSY in the pad area and
  *    polls scePadGetReqState until the IOP-written frames clear it.
- *  - scePadEnterPressMode (func_0024EF20 -> func_0024EE10): cmd 0x0A,
- *    button mask@+12 (0xFFF), reply result@+16 == 1.
- *  - scePadSetActAlign (func_0024EC80): cmd 0x08, 6 align bytes@+12..17,
+ *  - scePadEnterPressMode (PAL 0x00268B58, through scePadSetButtonInfo,
+ *    PAL 0x00268A48): cmd 0x0A, button mask@+12 (0xFFF), reply
+ *    result@+16 == 1.
+ *  - scePadSetActAlign (PAL 0x002688B8): cmd 0x08, 6 align bytes@+12..17,
  *    reply result@+20. ICO sends {0,1,0xFF,0xFF,0xFF,0xFF}.
- *  - scePadInit (func_0024DFC8/func_0024E108): GET_MODVER cmd 0x12 (reply
- *    @+12, must have major 4) then INIT cmd 0x10 (reply@+12).
+ *  - scePadInit (PAL 0x00267C00) / scePadInit2 (PAL 0x00267D40):
+ *    GET_MODVER cmd 0x12 (reply@+12, must have major 4) then INIT cmd 0x10
+ *    (reply@+12).
  *
  * EE pad data area (registered at OPEN): two 128-byte pad_data halves the
  * IOP rewrites wholesale every field; libpad reads whichever half has the
- * larger frame counter (func_0024E4C8). Field offsets consumed by this
- * libpad (matching ps2sdk's old-padman pad_data struct, a public SDK
+ * larger frame counter (scePadGetDmaStr, PAL 0x00268100). Field offsets
+ * consumed by this libpad (matching ps2sdk's old-padman pad_data struct, a public SDK
  * layout):
  *    +0x00 32-byte controller frame  (scePadRead copies length bytes of it)
  *    +0x30 actuator info, 4 bytes per actuator      (scePadInfoAct)
@@ -45,8 +47,9 @@
  * right left up down triangle circle cross square L1 R1 L2 R2.
  *
  * Actuators: the EE never sends per-frame rumble over RPC. scePadSetActDirect
- * (func_0024EBC8 + func_0024DE98) raw-DMAs a 32-byte block {counter, dirty,
- * size, 6 value bytes@+12} to the IOP address the OPEN reply named,
+ * (PAL 0x00268800, through _send_to_iop at PAL 0x00267AD0) raw-DMAs a
+ * 32-byte block {counter, dirty, size, 6 value bytes@+12} to the IOP
+ * address the OPEN reply named,
  * alternating +0x00/+0x20 by counter parity. The per-field tick reads the
  * fresher block and forwards the values to the host input layer.
  *
@@ -60,8 +63,10 @@
  */
 #include "rpc.h"
 
+#include "../guest/achievements.h"
 #include "../guest/menu_nav.h"
 #include "../host/input.h"
+#include "../host/window.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -76,7 +81,10 @@ namespace {
 constexpr uint32_t kActBufBase = 0x00078000u;
 constexpr uint32_t kActBufStride = 0x40;
 
-constexpr uint32_t kPorts = 2;
+/* host/input.h is the one authority for the port count (RT_PAD_PORTS): the
+ * host input layer feeds one virtual pad per port and this file builds one
+ * frame per port from it. */
+constexpr uint32_t kPorts = (uint32_t)RT_PAD_PORTS;
 
 static_assert(kActBufBase + kPorts * kActBufStride <= RT_SIF_IOP_CMDBUF,
     "pad actuator blocks run into the sifcmd command buffer");
@@ -97,7 +105,7 @@ struct VirtualPort {
 
 VirtualPort g_port[kPorts];
 uint64_t g_field = 0;           /* pad field counter, ticks from boot */
-uint64_t g_next_tick = RT_CYCLES_PER_FIELD;
+uint64_t g_next_tick = RT_CYCLES_PER_FIELD_BOOT;
 
 /* ---- per-field frame delivery -------------------------------------------- */
 
@@ -169,7 +177,7 @@ void consume_actuators(int port, VirtualPort& vp) {
          * (iosPadRead -> ShockRequestBox -> scePadSetActDirect DMA), which
          * only runs after the DS2 init state machine consumed our frames:
          * it advancing is the "pad reads alive" acceptance signal. */
-        rt_log("pad", "port %d pad loop alive: game actuator counter=%u (pad frame %u)",
+        rt_log_info("pad", "port %d pad loop alive: game actuator counter=%u (pad frame %u)",
             port, counter, vp.frame);
     }
     vp.act_counter = counter;
@@ -186,6 +194,50 @@ void consume_actuators(int port, VirtualPort& vp) {
 
 void pad_field_tick() {
     ++g_field;
+    /* One host event pump immediately before the frame is built, so the pad
+     * the guest reads this field carries the freshest sample the host has.
+     * The vsync hook pumps too (hw/gspriv.cpp), but that pump is followed by
+     * the field sync point and the pacer's sleep, so by the time this runs
+     * the sample it took is up to a whole field old. Pumping here costs one
+     * SDL_PollEvent loop over a queue that is usually empty and moves the
+     * input's age from a field to whatever is left of the field boundary.
+     *
+     * It is legal here for the same reasons it is legal at the field
+     * boundary: this runs on the EE thread, which is the thread that owns
+     * the window and the only one allowed to call SDL, and it is not inside
+     * WSI::begin_frame, so the pump's restricted-dispatch path
+     * (host/window.cpp, rt_window_hold_event_dispatch) does not apply and
+     * full dispatch is what happens.
+     *
+     * Full dispatch does reach the settings overlay, and committing the
+     * menu runs rt_settings_apply, which calls GsBackend::set_presentation,
+     * set_raster and set_deinterlace. Those are rt_pgs_set_* entry points,
+     * so the rule to check is not "nothing here calls one". It is that
+     * every applier reachable from a hot commit stores a word and does
+     * nothing else (host/settings_apply.cpp), and the two that touch the
+     * swapchain, display.present and display.render_scale, are warm: they
+     * run from rt_settings_apply_pending at the field boundary, never from
+     * here. A hot applier that stops being a plain store breaks that, and
+     * this is where it would have to be re-argued, because pad_field_tick
+     * runs wherever a guest coroutine happened to yield rather than at a
+     * frame boundary.
+     *
+     * The catch-up loop in rt_pad_run_due below can call this several times
+     * for one clock advance; the second and later calls pump a queue the
+     * first one already drained, which costs a poll that returns nothing and
+     * keeps every field built the same way.
+     *
+     * The other property this function depends on, and the one that is not
+     * about settings: nothing reachable from here may call rt_clock_tick.
+     * This runs from inside rt_clock_tick's own event loop (rt_sif_run_due
+     * -> rt_pad_run_due), so a nested tick would re-enter that loop and run
+     * the due list underneath the iteration that is walking it. It holds
+     * today because everything below is host-side (window pump, overlay
+     * dispatch, input poll) or writes guest memory directly
+     * (rt_guest_menu_tick); nothing here issues a syscall or an MMIO
+     * access, which are the two things that bill cycles. Anything added
+     * here has to keep that true. */
+    rt_window_pump();
     /* The game's own menu state, read before the pad is polled so the log
      * line for a field precedes the input that field carried. The read and
      * the change log run for every input provider; on the SDL provider, with
@@ -193,6 +245,12 @@ void pad_field_tick() {
      * field and may write the two selection words in guest/ico_syms.h
      * (guest/menu_nav.h). No other provider writes anything. */
     rt_guest_menu_tick(g_field);
+    /* The achievement observer's one call per field, here for the same
+     * reason the line above is: it is the one point per field that runs
+     * before the pad is polled whatever the input provider is. Read-only on
+     * guest memory (guest/achievements.h) and a no-op while
+     * achievements.enabled is off. */
+    rt_achievements_tick(g_field);
     rt_input_poll(g_field);
     for (uint32_t port = 0; port < kPorts; ++port) {
         VirtualPort& vp = g_port[port];
@@ -214,7 +272,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
     /* fno is always 1 in the old protocol; the command is word 0 of the
      * 128-byte block, echoed back with result words patched in place. */
     if (!send || send_size < 20) {
-        rt_log("pad", "WARNING padman call with short send (fno=%u, %u bytes): ignored",
+        rt_log_warn("pad", "WARNING padman call with short send (fno=%u, %u bytes): ignored",
             cmd_or_fno, send_size);
         return;
     }
@@ -228,7 +286,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
             uint32_t area = rd32(send, 16) & 0x1FFFFFFFu;
             if (port >= kPorts || slot != 0) {
                 wr32(recv, 12, 0);
-                rt_log("pad", "OPEN port=%u slot=%u: out of range -> 0", port, slot);
+                rt_log_warn("pad", "OPEN port=%u slot=%u: out of range -> 0", port, slot);
                 break;
             }
             VirtualPort& vp = g_port[port];
@@ -241,7 +299,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
             vp.act_counter = 0;
             wr32(recv, 12, 1);
             wr32(recv, 20, kActBufBase + port * kActBufStride); /* IOP actuator buf */
-            rt_log("pad", "OPEN port=%u slot=%u pad_area=0x%08x -> 1 (actbuf=0x%06x, "
+            rt_log_info("pad", "OPEN port=%u slot=%u pad_area=0x%08x -> 1 (actbuf=0x%06x, "
                 "frames start next field)", port, slot, area,
                 kActBufBase + port * kActBufStride);
             break;
@@ -249,7 +307,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
         case 0x02: /* CLOSE / END */
             if (port < kPorts) g_port[port].open = false;
             wr32(recv, 12, 1);
-            rt_log("pad", "CLOSE port=%u slot=%u -> 1", port, slot);
+            rt_log_info("pad", "CLOSE port=%u slot=%u -> 1", port, slot);
             break;
         case 0x06: { /* SET_MMODE (analog lock) */
             uint32_t offs = rd32(send, 12);
@@ -259,7 +317,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
                 g_port[port].lock = (uint8_t)lock;
             }
             wr32(recv, 20, 1);
-            rt_log("pad", "SET_MMODE port=%u slot=%u offs=%u lock=%u -> 1 (%s)",
+            rt_log_info("pad", "SET_MMODE port=%u slot=%u offs=%u lock=%u -> 1 (%s)",
                 port, slot, offs, lock, offs ? "analog" : "digital");
             break;
         }
@@ -267,7 +325,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
             /* INFO_ACT / INFO_COMB / INFO_MODE over RPC: this libpad reads
              * them out of the pad data area instead; answered empty. */
             wr32(recv, 20, 0);
-            rt_log("pad", "info cmd=0x%02x port=%u slot=%u -> 0 (libpad reads the pad area)",
+            rt_log_info("pad", "info cmd=0x%02x port=%u slot=%u -> 0 (libpad reads the pad area)",
                 cmd, port, slot);
             break;
         case 0x07: { /* SET_ACTDIRECT (this game uses the raw-DMA path instead) */
@@ -281,7 +339,7 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
                 rt_input_set_actuators((int)port, small_v, big_v);
             }
             wr32(recv, 20, 1);
-            rt_log("pad", "SET_ACTDIRECT port=%u slot=%u -> 1", port, slot);
+            rt_log_info("pad", "SET_ACTDIRECT port=%u slot=%u -> 1", port, slot);
             break;
         }
         case 0x08: { /* SET_ACTALIGN */
@@ -289,26 +347,41 @@ void svc_padman(uint32_t cmd_or_fno, const uint8_t* send, uint32_t send_size,
             if (send_size >= 18) std::memcpy(a, send + 12, 6);
             if (port < kPorts) std::memcpy(g_port[port].act_align, a, 6);
             wr32(recv, 20, 1);
-            rt_log("pad", "SET_ACTALIGN port=%u slot=%u {%u,%u,%u,%u,%u,%u} -> 1",
+            rt_log_info("pad", "SET_ACTALIGN port=%u slot=%u {%u,%u,%u,%u,%u,%u} -> 1",
                 port, slot, a[0], a[1], a[2], a[3], a[4], a[5]);
             break;
         }
         case 0x0A: /* SET_BUTTON_INFO: enter press mode */
             if (port < kPorts) g_port[port].pressures = true;
             wr32(recv, 16, 1);
-            rt_log("pad", "SET_BUTTON_INFO port=%u slot=%u mask=0x%x -> 1 (pressures on)",
+            rt_log_info("pad", "SET_BUTTON_INFO port=%u slot=%u mask=0x%x -> 1 (pressures on)",
                 port, slot, send_size >= 16 ? rd32(send, 12) : 0);
             break;
         case 0x10: /* INIT */
             wr32(recv, 12, 1);
-            rt_log("pad", "INIT -> 1");
+            rt_log_info("pad", "INIT -> 1");
             break;
         case 0x12: /* GET_MODVER */
-            wr32(recv, 12, 0x0400); /* major 4: what this libpad requires */
-            rt_log("pad", "GET_MODVER -> 4.0");
+            /* 0x0402 is the version field of the PADMAN.IRX the PAL disc
+             * actually ships: read out of that file's .iopmod section
+             * (module name "padman", version 0x0402, text 31376 / data 720
+             * / bss 7120 bytes). The US disc ships the same file byte for
+             * byte, so this is not a PAL/US difference; it is a correction.
+             * The runtime used to report 0x0400.
+             *
+             * Only the major is load bearing. scePadInit (PAL 0x00267C00,
+             * in the libpad object) takes this word, shifts it right
+             * by 8 and refuses to call scePadInit2 unless the result is 4;
+             * the low byte is only fed to the "[libpad.a = %d.%d,
+             * padman.irx = %d.%d]" debug print, which this build's flag
+             * leaves off. Reporting the real minor costs nothing and stops
+             * the log from naming a module version no disc carries. */
+            wr32(recv, 12, 0x0402);
+            rt_log_info("pad", "GET_MODVER -> 4.2 (PADMAN.IRX .iopmod version 0x0402 on the "
+                "mounted disc; scePadInit only checks the major, which must be 4)");
             break;
         default:
-            rt_log("pad", "WARNING padman cmd=0x%02x NOT MODELED (fno=%u send_size=%u "
+            rt_log_warn("pad", "WARNING padman cmd=0x%02x NOT MODELED (fno=%u send_size=%u "
                 "recv_size=%u): echoed request back unchanged", cmd, cmd_or_fno,
                 send_size, recv_size);
             break;
@@ -326,8 +399,12 @@ void rt_pad_register_services() {
 uint64_t rt_pad_next_event() { return g_next_tick; }
 
 void rt_pad_run_due() {
+    /* One tick per field, at the field length of the video mode the game
+     * programmed. A tick already scheduled when the mode changes keeps its
+     * old deadline, so a mode change costs at most one field of pad phase
+     * and the loop is back on the new period from the tick after it. */
     while (g_next_tick <= rt_clock_now()) {
-        g_next_tick += RT_CYCLES_PER_FIELD;
+        g_next_tick += rt_cycles_per_field();
         pad_field_tick();
     }
 }

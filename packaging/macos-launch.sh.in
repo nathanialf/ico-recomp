@@ -1,0 +1,79 @@
+#!/bin/sh
+# The app bundle's CFBundleExecutable. Generated at configure time from
+# packaging/macos-launch.sh.in by the macOS app bundle section of
+# CMakeLists.txt, and installed only when a libMoltenVK.dylib was bundled
+# with the build. docs/MACOS.md, "MoltenVK in the bundle", is the account.
+#
+# Why a script is the bundle's executable at all. Both places this port can
+# open Vulkan from do it with dlopen() on a leaf name:
+#
+#   Granite   "libvulkan.1.dylib", then "libMoltenVK.dylib"
+#             (third_party/parallel-gs/Granite/vulkan/context.cpp)
+#   volk      "libvulkan.dylib", "libvulkan.1.dylib", then
+#             "libMoltenVK.dylib" (third_party/volk/volk.c)
+#
+# dyld resolves a leaf name against DYLD_LIBRARY_PATH, then
+# DYLD_FALLBACK_LIBRARY_PATH ($HOME/lib, /usr/local/lib, /lib, /usr/lib),
+# then the working directory. It does not consult the calling image's
+# LC_RPATH, so the @loader_path the executable is linked with never applies
+# here and a libMoltenVK.dylib sitting beside the executable is not found.
+# An app launched from Finder has / as its working directory, and Homebrew
+# on Apple Silicon installs under /opt/homebrew, which is in none of those
+# lists either.
+#
+# So the environment is the only thing that reaches those two calls, and it
+# has to be set before the process starts: dyld reads DYLD_LIBRARY_PATH once,
+# at launch, and a setenv() from inside the runtime is too late. Info.plist's
+# LSEnvironment cannot do it either, because its values are literal strings
+# with no expansion of the bundle's own location, and the path wanted here is
+# wherever the user put the app. A launcher that works its own directory out
+# from $0 and execs the real binary is what is left.
+#
+# Two consequences worth stating. The bundle must not be signed with the
+# hardened runtime (--options runtime), because dyld ignores every DYLD_
+# variable for a hardened process; the ad-hoc signature CMake applies has no
+# such flag. And nothing below overrides a variable the user already set, so
+# a machine with the LunarG Vulkan SDK keeps its own loader and its own ICD
+# list, exactly as the environment-wins rule in CLAUDE.md requires.
+set -u
+
+dir=$(cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -f "$dir/libMoltenVK.dylib" ]; then
+    if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
+        DYLD_LIBRARY_PATH="$dir:$DYLD_LIBRARY_PATH"
+    else
+        DYLD_LIBRARY_PATH="$dir"
+    fi
+    export DYLD_LIBRARY_PATH
+
+    # Granite checks this before it tries any leaf name and dlopens it by
+    # full path, which reaches MoltenVK without a Vulkan loader in between.
+    # That is the paraLLEl-GS backend's whole path on a machine with nothing
+    # installed. It also means no validation layers on that path, since
+    # layers are the loader's job; docs/MACOS.md says so.
+    if [ -z "${GRANITE_VULKAN_LIBRARY:-}" ]; then
+        GRANITE_VULKAN_LIBRARY="$dir/libMoltenVK.dylib"
+        export GRANITE_VULKAN_LIBRARY
+    fi
+fi
+
+icd="$dir/../Resources/vulkan/icd.d/MoltenVK_icd.json"
+if [ -f "$icd" ]; then
+    # Only a real Vulkan loader reads these, so they do nothing on a machine
+    # with none and everything on a machine with one: without them the
+    # loader would enumerate the drivers installed on the system and never
+    # the one in this bundle. VK_DRIVER_FILES is the current name,
+    # VK_ICD_FILENAMES the name loaders older than 1.3.207 understand; a
+    # loader that knows both ignores the older one.
+    if [ -z "${VK_DRIVER_FILES:-}" ]; then
+        VK_DRIVER_FILES="$icd"
+        export VK_DRIVER_FILES
+    fi
+    if [ -z "${VK_ICD_FILENAMES:-}" ]; then
+        VK_ICD_FILENAMES="$icd"
+        export VK_ICD_FILENAMES
+    fi
+fi
+
+exec "$dir/@ICORECOMP_BUNDLE_BINARY@" "$@"

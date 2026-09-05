@@ -144,7 +144,7 @@ BackgroundCorners background_corners(const RtPs2IconSys& icon_sys) {
         }
     }
     if (worst != 0) {
-        rt_log("ui", "ps2 icon: icon.sys has a background corner component of %u, outside 0..255;"
+        rt_log_warn("ui", "ps2 icon: icon.sys has a background corner component of %u, outside 0..255;"
                     " clamped to 255 for the render",
             worst);
     }
@@ -244,7 +244,7 @@ bool rt_ps2_icon_render(const RtPs2Icon& icon, const RtPs2IconSys& icon_sys, uin
      * the bounding box, so say up front whether it can, rather than letting
      * the loop reshape geometry without a word. */
     if (!(dist > ext[2])) {
-        rt_log("ui", "ps2 icon: camera distance %.3f is not clear of the model's z half-extent"
+        rt_log_warn("ui", "ps2 icon: camera distance %.3f is not clear of the model's z half-extent"
                     " %.3f, so the near-plane guard will move vertices and the render is not the"
                     " shape the file describes",
             double(dist), double(ext[2]));
@@ -344,11 +344,11 @@ bool rt_ps2_icon_render(const RtPs2Icon& icon, const RtPs2IconSys& icon_sys, uin
     out.height = size_px;
 
     if (factor > 1) {
-        rt_log("ui", "ps2 icon: rendered shape %u at %ux%u, box-filtered down from %ux%u (%ux),"
+        rt_log_info("ui", "ps2 icon: rendered shape %u at %ux%u, box-filtered down from %ux%u (%ux),"
                     " bbox radius %.2f, camera distance %.2f",
             shape, size_px, size_px, render_dim, render_dim, factor, double(radius), double(dist));
     } else {
-        rt_log("ui", "ps2 icon: rendered shape %u at %ux%u with no supersampling, bbox radius %.2f,"
+        rt_log_info("ui", "ps2 icon: rendered shape %u at %ux%u with no supersampling, bbox radius %.2f,"
                     " camera distance %.2f",
             shape, size_px, size_px, double(radius), double(dist));
     }

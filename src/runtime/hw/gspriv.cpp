@@ -16,9 +16,11 @@
 
 #include "../ee/kernel.h"
 #include "../gs/gs_backend.h"
+#include "../guest/boot_trace.h"
 #include "../host/audio.h"
 #include "../host/mouse.h"
 #include "../host/portable.h"
+#include "../host/screenshot.h"
 #include "../host/settings.h"
 #include "../host/window.h"
 #include "../prof.h"
@@ -41,7 +43,7 @@ void rt_hw_init() {
     rt_vu1_window_page(); /* also constructs the Vu1State overlay */
     rt_vu1_init();        /* registers generated VU1 microprograms */
     rt_gs_backend();      /* opens the dump file early if configured */
-    rt_log("hw", "graphics transport initialized (DMAC, VIF1, GIF, GS priv)");
+    rt_log_info("hw", "graphics transport initialized (DMAC, VIF1, GIF, GS priv)");
 }
 
 bool rt_gspriv_mmio_read(uint32_t addr, uint64_t* out) {
@@ -81,9 +83,14 @@ void rt_gs_program_crt(uint32_t interlace, uint32_t mode, uint32_t ffmd) {
     GsBackend* be = rt_gs_backend();
     be->write_priv(0x0010, smode1);
     be->write_priv(0x0020, smode2);
-    rt_log("gs", "SetGsCrt: SMODE1=0x%08llx SMODE2=0x%llx programmed (%s, %s, ffmd=%u)",
+    rt_log_info("gs", "SetGsCrt: SMODE1=0x%08llx SMODE2=0x%llx programmed (%s, %s, ffmd=%u)",
         (unsigned long long)smode1, (unsigned long long)smode2,
         cmod == 2 ? "NTSC" : "PAL", interlace ? "interlaced" : "progressive", ffmd);
+    /* The field timeline is the mode's, not a constant: this is the one
+     * call that changes it. The US disc programs NTSC once at boot; the PAL
+     * disc programs NTSC or PAL from its own display option, and can do so
+     * again while running. */
+    rt_video_set_mode(cmod == 2 ? RT_VIDEO_NTSC : RT_VIDEO_PAL, "SetGsCrt");
 }
 
 namespace {
@@ -97,12 +104,14 @@ namespace {
  * reports. Either way the sound is chopped. A blocking FIFO present used
  * to hide this by accident, at the cost of collapsing to half speed.
  *
- * Paces to the NTSC field rate. ICORECOMP_FPS_LIMIT=0 disables it, or set
- * it to a field rate to override. debug.fps_limit_hz is the settings.json
- * twin (0 disables the same way); the environment variable wins for the
- * life of the run when it is set, latched once on first use like the old
- * read-once static did. Bounded diagnostic runs (ICORECOMP_MAX_VBLANKS)
- * are never paced. */
+ * Paces to the field rate of the video mode the game programmed, which is
+ * 59.94 Hz on NTSC and 50 Hz on PAL. ICORECOMP_FPS_LIMIT=0 disables it, or
+ * set it to a field rate to override. debug.fps_limit_hz is the
+ * settings.json twin (0 disables the same way, and its default
+ * RT_FPS_LIMIT_MODE_RATE is the mode's own rate); the environment variable
+ * wins for the life of the run when it is set, latched once on first use
+ * like the old read-once static did. Bounded diagnostic runs
+ * (ICORECOMP_MAX_VBLANKS) are never paced. */
 using PaceClock = std::chrono::steady_clock;
 
 /* Field-boundary diagnostics for the profile summary (prof.h's
@@ -120,7 +129,11 @@ using PaceClock = std::chrono::steady_clock;
 uint32_t g_catch_up_fields = 0;
 
 double pace_period_seconds() {
-    if (std::getenv("ICORECOMP_MAX_VBLANKS")) return 0.0;
+    /* Latched: this runs once a field, and the environment cannot change
+     * under a running process. A headless run with a vblank budget is not
+     * paced. */
+    static const bool max_vblanks = std::getenv("ICORECOMP_MAX_VBLANKS") != nullptr;
+    if (max_vblanks) return 0.0;
 
     /* std::nullopt means ICORECOMP_FPS_LIMIT is unset: debug.fps_limit_hz
      * is then read fresh below on every call, so a settings reload takes
@@ -132,15 +145,21 @@ double pace_period_seconds() {
         double hz = 0.0; /* "0" or "off": disabled, same as debug.fps_limit_hz = 0 */
         if (std::strcmp(e, "0") != 0 && std::strcmp(e, "off") != 0) {
             double v = std::strtod(e, nullptr);
-            hz = v > 1.0 ? v : 59.94;
+            /* Anything that is not a usable rate means "the mode's rate",
+             * the same answer the settings default gives. */
+            hz = v > 1.0 ? v : RT_FPS_LIMIT_MODE_RATE;
         }
         if (hz != rt_settings().debug.fps_limit_hz) {
-            rt_log("gs", "debug.fps_limit_hz: using ICORECOMP_FPS_LIMIT=%s, settings.json value ignored", e);
+            rt_log_warn("gs", "debug.fps_limit_hz: using ICORECOMP_FPS_LIMIT=%s, settings.json value ignored", e);
         }
         return hz;
     }();
 
-    const double hz = env_hz.has_value() ? *env_hz : rt_settings().debug.fps_limit_hz;
+    double hz = env_hz.has_value() ? *env_hz : rt_settings().debug.fps_limit_hz;
+    /* The default: follow the mode the game programmed, so the PAL disc's
+     * 50 Hz option is paced at 50 and its 60 Hz option at 59.94 without the
+     * player touching a setting. */
+    if (hz == RT_FPS_LIMIT_MODE_RATE) hz = rt_field_rate_hz();
     return hz > 0.0 ? 1.0 / hz : 0.0;
 }
 
@@ -164,7 +183,7 @@ void pace_field() {
         started = true;
         deadline = now;
     }
-    /* Lock to the audio device's clock, not just the host wall clock.
+    /* Lock to the audio device's clock, not only the host wall clock.
      * They are independent crystals: pacing purely on wall time drifts a
      * fraction of a percent and the device eventually starves (a click) or
      * overruns (a drop). Nudging the field period by the queue depth makes
@@ -210,7 +229,7 @@ void pace_field() {
      * by the cushion, six fields of guest time, because the deficit can
      * never exceed it. With no device (rt_audio_queued_frames() returns
      * -1) there is no queue to repay and no clock to lock to, so that case
-     * simply resyncs to now once it is more than one period behind. The
+     * resyncs to now once it is more than one period behind. The
      * tolerance there used to be 100 ms; one period is what a run with no
      * audio wants, because there is no debt for a sprint to put back and
      * carrying the overrun forward only makes the next field late too.
@@ -306,7 +325,9 @@ void rt_gs_field_stats(double* fields_per_second, double* field_ms) {
  * the same contract as rt_clock_sources, so a report that prints nothing
  * still resets. The present decomposition comes from the GS backend
  * (gs_backend.h present_timings); backends with no present path leave it
- * at zero and the summary drops that sub-line. */
+ * at zero and the summary drops that sub-line. The present cost is reported
+ * per present rather than per field, because display.present_rate can put
+ * more than one present in a field. */
 extern "C" void rt_gs_field_prof(RtGsFieldProf* out) {
     if (!out) return;
     *out = RtGsFieldProf{};
@@ -315,11 +336,17 @@ extern "C" void rt_gs_field_prof(RtGsFieldProf* out) {
     /* rt_gs_backend_if_created(), not rt_gs_backend(): a profile report must
      * never be the call that builds the backend, which would open the Vulkan
      * device and the window from inside the instrument (see gs_backend.h).
-     * With no backend the three present counters stay zero and the summary
+     * With no backend every present counter stays zero and the summary
      * drops that sub-line. */
     if (GsBackend* be = rt_gs_backend_if_created()) {
-        be->present_timings(&out->flush_ns, &out->scanout_ns,
-                            &out->present_ns, &out->present_fields);
+        RtGsPresentTimings pt = {};
+        be->present_timings(&pt);
+        out->flush_ns = pt.flush_ns;
+        out->scanout_ns = pt.scanout_ns;
+        out->present_ns = pt.present_ns;
+        out->present_fields = pt.fields;
+        out->presents = pt.presents;
+        out->present_repeats = pt.repeats;
         /* The GS command ring's worker, when there is one: what it spent on
          * replaying packets and on presenting, how much of the window it sat
          * idle, and what its being a thread cost this one in waiting. A
@@ -357,10 +384,35 @@ void rt_gs_vsync_hook(unsigned field) {
      * relative mouse mode) at the field boundary means the rule "the pump
      * only records, the field boundary acts" needs no exceptions to check. */
     note_field();
+    /* The field counter the end-of-run summary reports and the field
+     * watchdog watches (host/run_state.cpp). Counted here, at the top of the
+     * hook, because what the watchdog is asking is "did the EE thread reach
+     * another field boundary", not "did that field draw anything". */
+    rt_run_note_field();
+    rt_run_phase(RT_PHASE_FIRST_FIELD);
+    /* Two seconds of fields at any rate is past every boot hazard: the
+     * device is up, the swapchain works, the guest is running. A run that
+     * dies after this is a different class of problem from one that dies
+     * before it, and the phase is what separates the two in the log. The
+     * `field` argument is the field parity, 0 or 1, not a count, so this
+     * keeps its own. */
+    static unsigned fields_seen = 0;
+    if (fields_seen < 120 && ++fields_seen == 120) rt_run_phase(RT_PHASE_GAMEPLAY);
     rt_window_pump();
     rt_settings_apply_pending();
+    /* Between frames, next to the settings applier and for the same reason:
+     * it arms a pending capture through the GS backend and pulls a finished
+     * one back out of the library, neither of which may happen mid-frame.
+     * Before rt_ui_tick so a request the menu made on the previous field is
+     * armed on this one. */
+    rt_screenshot_tick();
     rt_ui_tick();
     rt_mouse_tick();
+    /* The guest half of the boot trace (guest/boot_trace.cpp): reads the
+     * game's boot state words on the EE thread, before this field's vsync
+     * is handed to the backend, so its field numbers line up with the
+     * presenter's display trace to within the ring's depth. */
+    rt_boot_trace_field();
     GsBackend* be = rt_gs_backend();
     {
         RT_PROF_ZONE(RT_PROF_PRESENT);
@@ -368,6 +420,16 @@ void rt_gs_vsync_hook(unsigned field) {
         if (rt_gs_mmio_read(0x12001000u, &csr)) be->write_priv(0x1000, csr);
         be->write_priv(0x1010, rt_gs_get_imr());
         be->vsync(field);
+        /* vsync latches the finished field; this is what shows it
+         * (gs_backend.h). With the GS command ring in front of the backend
+         * the ring's own worker does the presenting and this call is the
+         * ring's no-op default. It is here for the one configuration that
+         * has no worker: ICORECOMP_GS_THREAD=0 hands out the inner backend
+         * directly, and then this thread is the consumer and this call is
+         * the present. display.present_rate is read fresh rather than
+         * pushed, because in that configuration there is no thread for it
+         * to be pushed to. */
+        be->present_pump(rt_settings().display.present_rate);
     }
     {
         /* The one sync point with the GS command ring's worker thread
@@ -385,6 +447,11 @@ void rt_gs_vsync_hook(unsigned field) {
          * inline, and when it is bypassed. */
         RT_PROF_ZONE(RT_PROF_GSWAIT);
         be->field_sync();
+        /* This bucket no longer holds any present cost. The consumer
+         * publishes a field as done once its scanout is latched and presents
+         * afterwards (gs/gs_threaded.cpp), so what is measured here is the
+         * renderer and the handover, and the present is on the "gs worker"
+         * line. */
     }
     /* Window closure, polled here rather than acted on inside the backend:
      * the backend's vsync can run on the worker thread now, and process
@@ -392,13 +459,45 @@ void rt_gs_vsync_hook(unsigned field) {
      * wait-idle, the pipeline cache write) has to happen on this one. The
      * flag is sticky and set by the live backend for a closed window or a
      * quit request; host/window.cpp's rt_request_exit and the pump's
-     * SDL_EVENT_QUIT both reach it through rt_pgs_notify_quit. */
+     * SDL_EVENT_QUIT both reach it through rt_window_notify_quit. */
     if (be->window_closed()) {
-        rt_log("gs", "paraLLEl-GS: window closed or exit requested, exiting");
-        std::exit(0);
+        /* Whichever backend is live, so no backend name here.
+         *
+         * The level follows the cause, not the fact. A player who chose Quit
+         * or pressed the close button gets info, because that is not news. A
+         * close nobody asked for gets warn: three runs on Windows ended
+         * exactly here, after the guest had booted, with the log's last line
+         * an ordinary HLE warning and nothing saying the run was over. An
+         * info line at the shipped default level is a line nobody sees.
+         *
+         * rt_window_notify_quit already named the source and set the exit
+         * reason at the moment the close arrived (host/window_service.h);
+         * this repeats it here because this is where the process actually
+         * ends, and the two lines are what tie the cause to the exit. */
+        const bool by_user = rt_window_quit_was_user();
+        if (by_user) {
+            rt_log_info("gs", "window closed or exit requested, exiting: %s",
+                rt_window_quit_source());
+        } else {
+            rt_log_warn("gs", "the run is ending at a field boundary because the window is gone"
+                " or a quit was requested, and the player did not ask for it: %s."
+                " Exiting with status 1, because a run that ended without being asked to"
+                " did not succeed",
+                rt_window_quit_source());
+        }
+        rt_run_set_exit_reason(by_user, "the run ended at a field boundary: %s",
+            rt_window_quit_source());
+        /* The status follows the same split as the level above. A player who
+         * chose Quit exited successfully; a window that went away without
+         * being asked to did not, and reporting 0 for it would tell whatever
+         * launched the run that everything was fine. gs/gs_threaded.cpp's
+         * abandon_worker preserves a nonzero status for the same reason. */
+        std::exit(by_user ? 0 : 1);
     }
-    static const bool geom = rt_verbose("geom");
-    if (geom) rt_geom_field(field);
+#ifdef ICORECOMP_GEOM_CHECK
+    rt_geom_field(field);
+#endif
+    rt_gif_widescreen_field(field);
     rt_log_flush();
     /* One field boundary; the profile summary comes out of here every
      * ICORECOMP_PROFILE-th field. */

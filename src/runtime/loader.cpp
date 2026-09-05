@@ -1,10 +1,10 @@
-/* loader.cpp: config/recomp.toml reader, ELF SHA-1 pin check, and PT_LOAD
+/* loader.cpp: config reader, ELF SHA-1 pin check, and PT_LOAD
  * segment loader.
  *
  * TOML parsing is a hand-rolled, minimal key lookup (line-based, one section
- * tracked at a time): we only need four scalar keys out of
- * config/recomp.toml ([decomp].root, [decomp].elf, [pins].elf_sha1,
- * [target].entry/vram_base/gp). Anything else in the file (including the
+ * tracked at a time): we only need a few scalar keys out of
+ * config/recomp.toml (see target.h): [decomp].root, [decomp].elf,
+ * [pins].elf_sha1 and [target].entry/vram_base/gp. Anything else in the file (including the
  * multi-line vu1_sources array) is silently skipped -- lines without a bare
  * top-level '=' are ignored, so array continuation lines never confuse the
  * section tracker. No TOML library dependency, per CLAUDE.md's "no heavy
@@ -15,6 +15,8 @@
  * standard public ELF32 ABI, not anything decomp-derived.
  */
 #include "runtime.h"
+
+#include "target.h"
 
 #include "host/portable.h"
 #include "iso/iso9660.h"
@@ -117,15 +119,16 @@ void zero_guest_bytes(uint32_t vaddr, size_t len) {
     }
 }
 
-/* Packaged-run defaults, mirroring the committed config/recomp.toml
- * ([pins].elf_sha1 is one of the two approved SHA-1 pins; the [target]
- * values are committed config facts, not ROM data). In this mode there is
- * no decomp checkout: the boot ELF is read out of the user's disc image
- * (SCUS_971.13, byte-identical to the pinned ELF) by rt_load_elf. */
-constexpr char kPinElfSha1[] = "a4d8fc1948fb2da2395f3863a94a3b93de55de14";
-constexpr uint32_t kTargetEntry = 0x00100008;
-constexpr uint32_t kTargetVramBase = 0x00100000;
-constexpr uint32_t kTargetGp = 0x006388F0;
+/* Packaged-run defaults, mirroring the committed config/recomp.toml. The
+ * pin is the approved boot ELF SHA-1 pin and the [target] values are
+ * committed config facts, not ROM data; ../target.h says where each one was
+ * measured. In this mode there is no decomp checkout: the boot ELF is read
+ * out of the user's disc image (byte-identical to the pinned ELF) by
+ * rt_load_elf. */
+constexpr char kPinElfSha1[] = RT_TARGET_ELF_SHA1;
+constexpr uint32_t kTargetEntry = RT_TARGET_ENTRY;
+constexpr uint32_t kTargetVramBase = RT_TARGET_VRAM_BASE;
+constexpr uint32_t kTargetGp = RT_TARGET_GP;
 
 } // namespace
 
@@ -136,7 +139,7 @@ constexpr uint32_t kTargetGp = 0x006388F0;
 const char* rt_base_dir() {
     static const std::string base = [] {
         std::string root = ICORECOMP_SOURCE_ROOT;
-        std::ifstream probe(root + "/config/recomp.toml");
+        std::ifstream probe(std::string(root) + "/config/" + RT_TARGET_CONFIG_TOML);
         if (probe) return root;
         /* Packaged runtime: the build machine's source tree is not here.
          * Resolve everything against the executable's own directory, not
@@ -152,19 +155,21 @@ const char* rt_base_dir() {
 
 namespace {
 
-/* Parses config/recomp.toml (or fills in the compiled-in pins when there is
- * none). Reached only through rt_load_config, which memoizes it. */
+/* Parses this target's config file (or fills in the compiled-in pins when
+ * there is none). Reached only through rt_load_config, which memoizes
+ * it. */
 bool load_config_uncached(LoaderConfig* out) {
-    std::string path = std::string(rt_base_dir()) + "/config/recomp.toml";
+    std::string path = std::string(rt_base_dir()) + "/config/" + RT_TARGET_CONFIG_TOML;
     std::ifstream f(path);
     if (!f) {
         std::snprintf(out->elf_sha1, sizeof(out->elf_sha1), "%s", kPinElfSha1);
         out->entry = kTargetEntry;
         out->vram_base = kTargetVramBase;
         out->gp = kTargetGp;
-        rt_log("loader", "no config/recomp.toml (packaged run): using compiled-in pins/target "
-            "(elf_sha1=%s entry=0x%08x gp=0x%08x); boot ELF will come from the disc image",
-            out->elf_sha1, out->entry, out->gp);
+        rt_log_info("loader", "no config/%s (packaged run): using the compiled-in pin and "
+            "target words (elf_sha1=%s entry=0x%08x gp=0x%08x); boot ELF will come from the "
+            "disc image",
+            RT_TARGET_CONFIG_TOML, out->elf_sha1, out->entry, out->gp);
         return true;
     }
 
@@ -195,13 +200,30 @@ bool load_config_uncached(LoaderConfig* out) {
         }
     }
 
-    if (!out->decomp_root[0] || !out->decomp_elf[0] || !out->elf_sha1[0] || !out->entry) {
-        rt_log("loader", "config/recomp.toml missing required keys (root='%s' elf='%s' elf_sha1='%s' entry=0x%x)",
-            out->decomp_root, out->decomp_elf, out->elf_sha1, out->entry);
+    /* The pin and the entry are what this loader cannot do without. The
+     * [decomp] pair is optional: a config that names no checkout leaves the
+     * boot ELF to the user's disc image, which is the same path a packaged
+     * run takes. Both halves still go through the same SHA-1 pin check. */
+    if (!out->elf_sha1[0] || !out->entry) {
+        rt_log_warn("loader", "config/%s missing required keys (elf_sha1='%s' entry=0x%x)",
+            RT_TARGET_CONFIG_TOML, out->elf_sha1, out->entry);
         return false;
     }
-    rt_log("loader", "config: decomp.root=%s decomp.elf=%s pins.elf_sha1=%s target.entry=0x%08x target.vram_base=0x%08x target.gp=0x%08x",
-        out->decomp_root, out->decomp_elf, out->elf_sha1, out->entry, out->vram_base, out->gp);
+    const bool have_checkout = out->decomp_root[0] && out->decomp_elf[0];
+    if (!have_checkout) {
+        /* Half a pair is a typo, not a choice, so it is named. */
+        if (out->decomp_root[0] || out->decomp_elf[0]) {
+            rt_log_warn("loader", "config/%s names decomp.root='%s' and decomp.elf='%s';"
+                " one without the other is not usable, so the boot ELF comes from the disc image",
+                RT_TARGET_CONFIG_TOML, out->decomp_root, out->decomp_elf);
+        }
+        out->decomp_root[0] = 0;
+        out->decomp_elf[0] = 0;
+    }
+    rt_log_info("loader", "config: decomp.root=%s decomp.elf=%s pins.elf_sha1=%s target.entry=0x%08x target.vram_base=0x%08x target.gp=0x%08x",
+        have_checkout ? out->decomp_root : "(none, the boot ELF comes from the disc image)",
+        have_checkout ? out->decomp_elf : "(none)",
+        out->elf_sha1, out->entry, out->vram_base, out->gp);
     return true;
 }
 
@@ -270,12 +292,12 @@ bool read_whole_file(const char* path, std::vector<uint8_t>* out, bool* opened, 
     return true;
 }
 
-/* Reads SCUS_971.13 out of the already mounted disc image (the mount
- * verified the file is there). */
+/* Reads this build's boot ELF out of the already mounted disc image (the
+ * mount verified the file is there). */
 bool read_elf_from_disc(std::vector<uint8_t>* out, std::string* err) {
     RtIsoFile f;
-    if (!rt_iso_search("\\SCUS_971.13;1", &f)) {
-        *err = "mounted disc has no SCUS_971.13 (wrong image?)";
+    if (!rt_iso_search(RT_TARGET_BOOT_ELF_ISO_PATH, &f)) {
+        *err = std::string("mounted disc has no ") + RT_TARGET_BOOT_ELF + " (wrong image?)";
         return false;
     }
     out->resize(f.size);
@@ -283,7 +305,7 @@ bool read_elf_from_disc(std::vector<uint8_t>* out, std::string* err) {
     uint32_t remaining = f.size;
     for (uint32_t i = 0; remaining > 0; ++i) {
         if (!rt_iso_read_sector(f.lsn + i, sec)) {
-            *err = fmt("disc read failed at LBA %u while extracting SCUS_971.13", f.lsn + i);
+            *err = fmt("disc read failed at LBA %u while extracting %s", f.lsn + i, RT_TARGET_BOOT_ELF);
             out->clear();
             return false;
         }
@@ -291,13 +313,14 @@ bool read_elf_from_disc(std::vector<uint8_t>* out, std::string* err) {
         std::memcpy(out->data() + (size_t(i) * 2048), sec, chunk);
         remaining -= chunk;
     }
-    rt_log("loader", "boot ELF read from disc: SCUS_971.13, LBA %u, %u bytes", f.lsn, f.size);
+    rt_log_info("loader", "boot ELF read from disc: %s, LBA %u, %u bytes",
+        RT_TARGET_BOOT_ELF, f.lsn, f.size);
     return true;
 }
 
 /* Source label rt_load_elf has always used for the disc-supplied ELF. Also
  * the cache key for that case (see g_elf_cache). */
-constexpr char kDiscElfSrc[] = "SCUS_971.13 (from the mounted disc image)";
+constexpr char kDiscElfSrc[] = RT_TARGET_BOOT_ELF " (from the mounted disc image)";
 
 /* The ELF image rt_boot_precheck already read and pin-checked, kept so the
  * rt_load_elf that follows a successful precheck does not read the file (or
@@ -329,7 +352,7 @@ std::string elf_cache_key(const char* src) {
 
 /* Produces the boot ELF bytes and the source string used in messages: the
  * decomp checkout's ELF when the config names one and it is readable,
- * otherwise SCUS_971.13 off the disc image. mount_if_needed selects what
+ * otherwise this build's boot ELF off the disc image. mount_if_needed selects what
  * happens when the disc is needed and nothing is mounted yet:
  *   true  -> rt_iso_mount(), which is fatal when no image is found. This is
  *            rt_load_elf's historical behavior, and it mounts only on the
@@ -342,10 +365,10 @@ bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint
 
     if (cfg.decomp_root[0] && cfg.decomp_elf[0]) {
         rt_resolve_elf_path(cfg, src, src_len);
-        rt_log("loader", "ELF path: %s", src);
+        rt_log_info("loader", "ELF path: %s", src);
         if (g_elf_cache.valid && g_elf_cache.key == elf_cache_key(src)) {
             *out = g_elf_cache.bytes;
-            rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
+            rt_log_info("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
             return true;
         }
         bool opened = false;
@@ -358,7 +381,8 @@ bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint
             *err = e;
             return false;
         } else {
-            rt_log("loader", "'%s' not readable; falling back to the disc image's SCUS_971.13", src);
+            rt_log_warn("loader", "'%s' not readable; falling back to the disc image's %s",
+                src, RT_TARGET_BOOT_ELF);
         }
         out->clear();
     }
@@ -366,12 +390,13 @@ bool acquire_elf(const LoaderConfig& cfg, bool mount_if_needed, std::vector<uint
     std::snprintf(src, src_len, "%s", kDiscElfSrc);
     if (g_elf_cache.valid && g_elf_cache.key == elf_cache_key(src)) {
         *out = g_elf_cache.bytes;
-        rt_log("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
+        rt_log_info("loader", "reusing the %zu-byte ELF image the boot precheck already read", out->size());
         return true;
     }
     if (!rt_iso_mounted()) {
         if (!mount_if_needed) {
-            *err = "no disc image is mounted, so SCUS_971.13 cannot be read";
+            *err = std::string("no disc image is mounted, so ") + RT_TARGET_BOOT_ELF
+                 + " cannot be read";
             return false;
         }
         rt_iso_mount(); /* fatal when no image is found, as before */
@@ -391,7 +416,7 @@ bool check_elf_pin(const std::vector<uint8_t>& elf, const LoaderConfig& cfg, con
             src, hex, cfg.elf_sha1);
         return false;
     }
-    rt_log("loader", "SHA-1 pin OK: %s", hex);
+    rt_log_info("loader", "SHA-1 pin OK: %s", hex);
     return true;
 }
 
@@ -496,7 +521,8 @@ bool rt_boot_precheck(char* err, size_t err_len) {
     };
 
     LoaderConfig cfg;
-    if (!rt_load_config(&cfg)) return fail("could not load config/recomp.toml");
+    if (!rt_load_config(&cfg))
+        return fail(std::string("could not load config/") + RT_TARGET_CONFIG_TOML);
 
     char disc_err[1024];
     if (!rt_iso_probe_mount(disc_err, sizeof(disc_err))) return fail(disc_err);
@@ -537,10 +563,10 @@ void rt_load_elf(const LoaderConfig& cfg) {
         rt_fatal("loader", nullptr, "%s", err.c_str());
     }
 
-    rt_log("loader", "ELF header: entry=0x%08x phoff=%u phentsize=%u phnum=%u",
+    rt_log_info("loader", "ELF header: entry=0x%08x phoff=%u phentsize=%u phnum=%u",
         eh.e_entry, eh.e_phoff, eh.e_phentsize, eh.e_phnum);
     if (eh.e_entry != cfg.entry) {
-        rt_log("loader", "note: ELF e_entry 0x%08x differs from config [target].entry 0x%08x; the config value drives the boot call",
+        rt_log_warn("loader", "note: ELF e_entry 0x%08x differs from config [target].entry 0x%08x; the config value drives the boot call",
             eh.e_entry, cfg.entry);
     }
 
@@ -551,7 +577,7 @@ void rt_load_elf(const LoaderConfig& cfg) {
             "program header", elf_src);
         if (ph.p_type != kPtLoad) continue;
 
-        rt_log("loader", "PT_LOAD[%u]: vaddr=0x%08x offset=0x%x filesz=0x%x memsz=0x%x flags=0x%x",
+        rt_log_info("loader", "PT_LOAD[%u]: vaddr=0x%08x offset=0x%x filesz=0x%x memsz=0x%x flags=0x%x",
             load_count, ph.p_vaddr, ph.p_offset, ph.p_filesz, ph.p_memsz, ph.p_flags);
 
         if (ph.p_filesz > 0) {
@@ -563,7 +589,7 @@ void rt_load_elf(const LoaderConfig& cfg) {
         if (ph.p_memsz > ph.p_filesz) {
             uint32_t bss_len = ph.p_memsz - ph.p_filesz;
             zero_guest_bytes(ph.p_vaddr + ph.p_filesz, bss_len);
-            rt_log("loader", "zeroed bss: 0x%08x-0x%08x (%u bytes)",
+            rt_log_info("loader", "zeroed bss: 0x%08x-0x%08x (%u bytes)",
                 ph.p_vaddr + ph.p_filesz, ph.p_vaddr + ph.p_memsz, bss_len);
         }
         ++load_count;
@@ -571,7 +597,19 @@ void rt_load_elf(const LoaderConfig& cfg) {
 
     if (load_count == 0) rt_fatal("loader", nullptr, "no PT_LOAD segment found in '%s'", elf_src);
     if (load_count > 1) {
-        rt_log("loader", "note: %u PT_LOAD segments found; CLAUDE.md/plan assumed exactly one (ICO's boot ELF has one)", load_count);
+        rt_log_warn("loader", "note: %u PT_LOAD segments found; CLAUDE.md/plan assumed exactly one (ICO's boot ELF has one)", load_count);
     }
-    rt_log("loader", "load complete: %u PT_LOAD segment(s)", load_count);
+    rt_log_info("loader", "load complete: %u PT_LOAD segment(s)", load_count);
+    /* The one ABI constant that follows the target rather than the machine.
+     * SCES_507.60's .text ends at 0x00289BC4 and its .vutext at 0x0028ECB0,
+     * where SCUS_971.13's .vutext ended at 0x002746C0, so the window this
+     * runtime was built with was raised from 0x00280000 to 0x00290000 for
+     * the PAL switch. Named here because a mismatch is otherwise invisible:
+     * generated/ee/funcs_table.c indexes g_functab_orig with no bound test,
+     * so a window that is too small is an out-of-bounds write. The
+     * translator emits a #error against the highest translated entry, which
+     * catches it at build time; this line is how a run says which window
+     * the binary in hand actually carries. */
+    rt_log_info("loader", "function table window: [0x%08x, 0x%08x), %u slots",
+        (unsigned)RECOMP_TEXT_BASE, (unsigned)RECOMP_TEXT_LIMIT, (unsigned)RECOMP_FUNCTAB_SLOTS);
 }

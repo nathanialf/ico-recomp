@@ -38,6 +38,25 @@ constexpr uint32_t SIF_STAT_BOOTEND = 0x40000;
 constexpr uint32_t SIF_CMD_SET_SREG = 0x80000001u;
 
 uint32_t g_reg[32];        /* kernel registers, index 1..31 */
+/* An IOP reboot in flight. The reset packet reaches the virtual IOP inside
+ * the guest's own sceSifSetDma, and the guest then clears SIFINIT and
+ * CMDINIT in SMFLAG (sceSifResetIop, PAL 0x00264918 and 0x00264924) and
+ * spins on CMDINIT in sceSifInitCmd (PAL 0x00265610). A real IOP raises
+ * those bits again only when its reboot finishes, well after the clears.
+ * Raising them at packet time, as this used to, let the clears erase them
+ * for good and left the guest spinning on SifGetReg with nothing to draw.
+ * So the reboot completes at the EE's first read of SMFLAG after the reset,
+ * which is the earliest moment the real order allows. */
+bool g_reboot_pending = false;
+
+void complete_pending_reboot() {
+    if (!g_reboot_pending) return;
+    g_reboot_pending = false;
+    g_reg[SIF_REG_SMFLAG] |= SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND;
+    rt_log_info("sif", "virtual IOP reboot complete at the EE's first SMFLAG read: SMFLAG=0x%05x "
+        "(SIFINIT|CMDINIT|BOOTEND set after the guest's own clears); sceSifSyncIop's spin on "
+        "BOOTEND and sceSifInitCmd's spin on CMDINIT can now pass", g_reg[SIF_REG_SMFLAG]);
+}
 uint32_t g_ureg[32];       /* user registers, 0x80000000|n */
 
 struct DmaRecord {
@@ -65,13 +84,14 @@ void rt_sif_init() {
     std::memset(g_ureg, 0, sizeof(g_ureg));
     g_reg[SIF_REG_SUBADDR] = RT_SIF_IOP_CMDBUF;
     g_reg[SIF_REG_SMFLAG] = SIF_STAT_SIFINIT | SIF_STAT_CMDINIT | SIF_STAT_BOOTEND;
-    rt_log("sif", "init: virtual IOP ready (SMFLAG=0x%05x, IOP cmd buffer=0x%06x)",
+    rt_log_info("sif", "init: virtual IOP ready (SMFLAG=0x%05x, IOP cmd buffer=0x%06x)",
         g_reg[SIF_REG_SMFLAG], RT_SIF_IOP_CMDBUF);
     rt_rpc_init();
 }
 
 uint32_t rt_sif_get_reg(uint32_t idx) {
     if (idx & 0x80000000u) return g_ureg[idx & 31];
+    if (idx == SIF_REG_SMFLAG) complete_pending_reboot();
     return (idx < 32) ? g_reg[idx] : 0;
 }
 
@@ -81,17 +101,67 @@ void rt_sif_set_reg(uint32_t idx, uint32_t v) {
         return;
     }
     if (idx < 32) {
-        /* MSFLAG/SMFLAG writes from the EE OR bits in (the hardware register
-         * write sets bits; clearing goes through a dedicated path we have
-         * not seen this game use). Address registers are plain writes. */
-        if (idx == SIF_REG_MSFLAG || idx == SIF_REG_SMFLAG) g_reg[idx] |= v;
+        /* The two SIF flag registers are one-directional on hardware: each
+         * side sets bits in the register it owns, and a write from the other
+         * side clears them. MSFLAG is the EE's, so an EE write sets. SMFLAG
+         * is the IOP's, so an EE write CLEARS the bits written.
+         *
+         * SCES_507.60 writes SMFLAG from exactly two places and both are
+         * clears. Measured over the whole PAL .text: these are the only
+         * sceSifSetReg call sites whose register argument is 4.
+         *   sceSifResetIop  (PAL 0x00264838, a function entry in the retail
+         *     ELF) clears SIF_STAT_SIFINIT then SIF_STAT_CMDINIT immediately
+         *     after DMAing the IOP reset packet, so that the EE can tell
+         *     the rebooted IOP's re-set of those bits from the pre-reset
+         *     ones.
+         *   sceSifSyncIop   (PAL 0x00264990, the next entry in the same
+         *     libsif object) clears
+         *     SIF_STAT_BOOTEND once it has observed it.
+         * The EE never writes MSFLAG in this binary, so the set direction
+         * there rests on the hardware rule alone, not on a measurement.
+         *
+         * This used to OR in both cases. That left SIFINIT and CMDINIT set
+         * across the reset, so sceSifInitCmd's spin on CMDINIT passed for
+         * the wrong reason. Address registers are plain writes. */
+        if (idx == SIF_REG_MSFLAG) g_reg[idx] |= v;
+        else if (idx == SIF_REG_SMFLAG) g_reg[idx] &= ~v;
         else g_reg[idx] = v;
     }
 }
 
+void rt_sif_iop_boot_end() {
+    /* See g_reboot_pending: the bits are raised at the guest's first SMFLAG
+     * read, after its post-reset clears, not here. */
+    g_reboot_pending = true;
+    rt_log_info("sif", "virtual IOP reboot in progress: SMFLAG=0x%05x now; SIFINIT|CMDINIT|BOOTEND "
+        "are raised at the EE's first SMFLAG read, after sceSifResetIop's own clears",
+        g_reg[SIF_REG_SMFLAG]);
+}
+
+/* The EE kernel's SIF DMA queue is 32 entries deep, so 32 is the bound this
+ * model keeps. What it must not do is drop the rest in silence: an entry
+ * past the bound never reaches virtual IOP RAM, and a later RPC CALL then
+ * reads whatever the staging buffer still held, which is the same failure
+ * sif/sndn2.cpp reports for bank transfers ("filled with stale staging
+ * memory") but with no witness at all. Nothing in SCES_507.60 has been seen
+ * to ask for more than 32; the first over-long call says so, then powers of
+ * two on its own counter. */
+constexpr uint32_t kSifDmaQueueDepth = 32;
+
 uint32_t rt_sif_set_dma(uint32_t tx_addr, uint32_t count) {
     uint32_t id = ++g_dma_id;
-    for (uint32_t i = 0; i < count && i < 32; ++i) {
+    if (count > kSifDmaQueueDepth) {
+        static uint64_t overlong = 0;
+        ++overlong;
+        if ((overlong & (overlong - 1)) == 0) {
+            rt_log_warn("sif", "WARNING SifSetDma(tx=0x%08x, count=%u) id=%u: only the first %u "
+                "entries are queued, the other %u are DROPPED and their payloads never reach "
+                "virtual IOP RAM. Whatever reads those addresses next gets stale staging memory "
+                "[#%" PRIu64 "]",
+                tx_addr, count, id, kSifDmaQueueDepth, count - kSifDmaQueueDepth, overlong);
+        }
+    }
+    for (uint32_t i = 0; i < count && i < kSifDmaQueueDepth; ++i) {
         /* SifDmaTransfer_t: {void* src; void* dest; int size; int attr}
          * (ps2sdk ee/kernel/include/sifdma.h). */
         uint32_t base = tx_addr + i * 16;
@@ -105,18 +175,18 @@ uint32_t rt_sif_set_dma(uint32_t tx_addr, uint32_t count) {
         }
         /* A transfer carrying an RPC command id is a rare, individually
          * meaningful event, which is why this used to log every one
-         * unconditionally through rt_logv. But rt_logv is file-only, not
-         * verbose-gated (see runtime.h): this game issues thousands of
-         * these a run, and every one of them was still landing in the
-         * default log file. Gate it on the "sif" channel explicitly.
-         * Everything else stays sampled. */
+         * unconditionally on the file-only verbose path. File-only is not
+         * the same as gated: this game issues thousands of these a run,
+         * and every one of them was still landing in the default log
+         * file. Gate it on the "sif" channel explicitly. Everything else
+         * stays sampled. */
         if (cid) {
             if (rt_verbose("sif")) {
-                rt_logv("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
+                rt_log_debug("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
                     id, i + 1, count, src, dest, size, attr, cid);
             }
         } else if (rt_trace() || (g_dma_count & (g_dma_count + 1)) == 0) {
-            rt_log("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
+            rt_log_debug("sif", "SifSetDma id=%u entry %u/%u: src=0x%08x dest(IOP)=0x%08x size=%u attr=0x%x cid=0x%08x",
                 id, i + 1, count, src, dest, size, attr, cid);
         }
         record_dma(src, dest, size, attr, id, cid);
@@ -148,7 +218,7 @@ bool rt_sif_mmio_read(uint32_t addr, uint32_t* out) {
         case 0x1000F200: *out = g_reg[SIF_REG_MAINADDR]; return true; /* MSCOM */
         case 0x1000F210: *out = g_reg[SIF_REG_SUBADDR]; return true;  /* SMCOM */
         case 0x1000F220: *out = g_reg[SIF_REG_MSFLAG]; return true;   /* MSFLG */
-        case 0x1000F230: *out = g_reg[SIF_REG_SMFLAG]; return true;   /* SMFLG */
+        case 0x1000F230: complete_pending_reboot(); *out = g_reg[SIF_REG_SMFLAG]; return true; /* SMFLG */
         case 0x1000F240: *out = 0xF0000102u; return true;             /* SIF_CTRL: idle-ish */
         case 0x1000F260: *out = 0; return true;                       /* SIF_BD6 */
         default: return false;
@@ -159,8 +229,13 @@ bool rt_sif_mmio_write(uint32_t addr, uint32_t v) {
     switch (addr) {
         case 0x1000F200: g_reg[SIF_REG_MAINADDR] = v; return true;
         case 0x1000F210: g_reg[SIF_REG_SUBADDR] = v; return true;
+        /* Same set/clear split as rt_sif_set_reg: MSFLAG is the EE's
+         * register so its write sets, SMFLAG is the IOP's so its write
+         * clears. Keeping the two paths identical matters because
+         * sceSifSetReg reaches the register through whichever of them the
+         * translated libkernel takes. */
         case 0x1000F220: g_reg[SIF_REG_MSFLAG] |= v; return true;
-        case 0x1000F230: g_reg[SIF_REG_SMFLAG] |= v; return true;
+        case 0x1000F230: g_reg[SIF_REG_SMFLAG] &= ~v; return true;
         case 0x1000F240: return true; /* SIF_CTRL pokes: accept */
         default: return false;
     }
@@ -184,7 +259,7 @@ void hle_sif_set_sreg(R5900Context* ctx) {
     uint32_t slot = sregs + sreg * 4;
     rt_gwrite32(slot, val);
     ctx->r[2].s64x[0] = (int64_t)(int32_t)slot; /* v0, matching the original leaf */
-    rt_log("sif", "HLE set_sreg: sregs[%u] = %u (sregs array at 0x%08x)", sreg, val, sregs);
+    rt_log_info("sif", "HLE set_sreg: sregs[%u] = %u (sregs array at 0x%08x)", sreg, val, sregs);
 }
 
 } // namespace
@@ -196,7 +271,7 @@ bool rt_sif_try_resolve_indirect(R5900Context* ctx, uint32_t target, uint32_t ca
      * no ROM-derived address constant lives in this source. */
     uint32_t pkt = (uint32_t)ctx->r[4].u64x[0];
     if (!rt_gptr(pkt) || rt_gread32(pkt + 8) != SIF_CMD_SET_SREG) return false;
-    rt_log("sif", "resolving untranslated sifcmd system handler at 0x%08x (caller 0x%08x) as SET_SREG HLE",
+    rt_log_warn("sif", "resolving untranslated sifcmd system handler at 0x%08x (caller 0x%08x) as SET_SREG HLE",
         target, caller_vram);
     rt_override(target, hle_sif_set_sreg);
     hle_sif_set_sreg(ctx);
@@ -204,17 +279,17 @@ bool rt_sif_try_resolve_indirect(R5900Context* ctx, uint32_t target, uint32_t ca
 }
 
 void rt_sif_dump_inventory() {
-    rt_log("sif", "regs: MAINADDR=0x%08x SUBADDR=0x%08x MSFLAG=0x%08x SMFLAG=0x%08x",
+    rt_log_info("sif", "regs: MAINADDR=0x%08x SUBADDR=0x%08x MSFLAG=0x%08x SMFLAG=0x%08x",
         g_reg[SIF_REG_MAINADDR], g_reg[SIF_REG_SUBADDR], g_reg[SIF_REG_MSFLAG], g_reg[SIF_REG_SMFLAG]);
     for (int i = 0; i < 32; ++i) {
-        if (g_ureg[i]) rt_log("sif", "ureg[0x80000000|%d] = 0x%08x", i, g_ureg[i]);
+        if (g_ureg[i]) rt_log_info("sif", "ureg[0x80000000|%d] = 0x%08x", i, g_ureg[i]);
     }
     uint32_t n = g_dma_count < kDmaRingSize ? g_dma_count : kDmaRingSize;
-    rt_log("sif", "SifSetDma transfers recorded: %u total, last %u:", g_dma_count, n);
+    rt_log_info("sif", "SifSetDma transfers recorded: %u total, last %u:", g_dma_count, n);
     for (uint32_t k = 0; k < n; ++k) {
         uint32_t idx = (g_dma_count - n + k) % kDmaRingSize;
         const DmaRecord& r = g_dma_ring[idx];
-        rt_log("sif", "  id=%-4u src=0x%08x dest=0x%08x size=%-5u attr=0x%x cid=0x%08x vclk=%" PRIu64,
+        rt_log_info("sif", "  id=%-4u src=0x%08x dest=0x%08x size=%-5u attr=0x%x cid=0x%08x vclk=%" PRIu64,
             r.id, r.src, r.dest, r.size, r.attr, r.cid, r.vclk);
     }
     rt_rpc_dump_inventory();

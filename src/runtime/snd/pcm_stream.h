@@ -4,34 +4,37 @@
  * pcm_stream_selftest.cpp can exercise the address math on its own the way
  * host/stick_shape_selftest.cpp does. engine.cpp owns the audio side.
  *
- * What the game does, from the decomp (read-only repo /primary/dev/ico):
+ * What the game does. INFERRED from the disassembly of the functions named
+ * below, at their retail addresses; not re-verified instruction by
+ * instruction against the ELF here:
  *
- *   ito/mpeg/mv_sub.c func_0023D8A8 (asm/nonmatchings/ito/mpeg/mv_sub/
- *   func_0023D8A8.s) creates the attract movie's audio stream. It allocates
- *   one IOP buffer of 0x6000 bytes (func_0024A170, result kept at self+0x44,
- *   size at self+0x48), sends cmd 0x46 (func_0025E020, no operands), then
- *   sends cmd 0x48 twice through func_0025E050 with a four word struct:
+ *   audioDecCreate (PAL 0x00257550) creates the
+ *   attract movie's audio stream. It allocates one IOP buffer of 0x6000
+ *   bytes (sceSifAllocIopHeap, result kept at self+0x44, size at self+0x48),
+ *   sends cmd 0x46 (SgStPcmInit, no operands), then sends cmd 0x48 twice
+ *   through SgStPcmOpen with a four word struct:
  *
  *       [0] channel      0 then 1
  *       [1] 0x00010400   a flags word the caller composes
  *       [2] IOP address  buf     then buf + 0x200
  *       [3] 0x6000       the ring size, the same for both
  *
- *   func_0025E050 (asm/matchings/src/cod/vendor_258CC0/func_0025E050.s)
- *   rejects a channel >= 0x10 or either address word above 0x1FFFFF, then
- *   packs w1 = (channel << 24) | flags, w2 = struct[2], w3 = struct[3].
+ *   SgStPcmOpen (PAL 0x00278640, a function entry in the retail ELF)
+ *   rejects a channel
+ *   >= 0x10 or either address word above 0x1FFFFF, then packs
+ *   w1 = (channel << 24) | flags, w2 = struct[2], w3 = struct[3].
  *
  * So both channels live inside ONE 0x6000 byte ring that the EE fills with a
- * single linear wrapping copy (func_0023DEB0 keeps one write offset at
- * self+0x4C and reduces it modulo self+0x48; func_0023DB80 does the SIF DMA
- * in at most two segments). Two channels 0x200 apart inside one linearly
- * written ring is a block interleave: 0x200 bytes of channel 0, 0x200 bytes
- * of channel 1, repeating with a period of 0x400.
+ * single linear wrapping copy (audioDecSendToIOP, PAL 0x00257B58, keeps one
+ * write offset at self+0x4C and reduces it modulo self+0x48; sendToIOP2area
+ * does the SIF DMA in at most two segments). Two channels 0x200 apart inside
+ * one linearly written ring is a block interleave: 0x200 bytes of channel 0,
+ * 0x200 bytes of channel 1, repeating with a period of 0x400.
  *
  * Where 0x400 comes from. It is the quantum the EE rounds every refill to:
- * func_0023DEB0 reduces the free-space figure with the compiler's signed
- * `x / 0x400 * 0x400` idiom (`sra $2, 10; sll $4, $2, 10` at 0023DF78 and
- * again at 0023DFDC; the addiu 0x3FF / movn pair ahead of each is the bias
+ * audioDecSendToIOP reduces the free-space figure with the compiler's signed
+ * `x / 0x400 * 0x400` idiom (`sra $2, 10; sll $4, $2, 10` at 00257C20 and
+ * again at 00257C84; the addiu 0x3FF / movn pair ahead of each is the bias
  * for a negative value). The 0x200 channel spacing tiles a period of 0x400
  * exactly, and bits 15:8 of the flags word also hold 0x400, so the same
  * number arrives three independent ways.
@@ -53,8 +56,8 @@
 
 #include <cstdint>
 
-/* func_0025E050 (open) and func_0025E238 (cursor read) both bound the channel
- * with `sltiu $2, $x, 0x10`, so the driver has 16 stream channels. */
+/* SgStPcmOpen (open) and SgStPcmIopReadAddr (cursor read) both bound the
+ * channel with `sltiu $2, $x, 0x10`, so the driver has 16 stream channels. */
 constexpr int RT_PCM_CHANNELS = 16;
 
 struct RtPcmChannel {
@@ -80,7 +83,7 @@ struct RtPcmChannel {
 
     uint32_t pos = 0;     /* byte offset into this channel's own lap of the ring */
     uint64_t consumed = 0; /* total bytes played, never wrapped, for rate checks */
-    uint16_t voll = 0, volr = 0; /* cmd 0x4A, 0..0x7FFF per func_0025E1E8 */
+    uint16_t voll = 0, volr = 0; /* cmd 0x4A, 0..0x7FFF per SgStPcmVolume */
 };
 
 /* Recomputes base/slot/chunk/lap across every open channel and sets each
@@ -156,9 +159,9 @@ inline uint32_t rt_pcm_addr(const RtPcmChannel& c, uint32_t i) {
 
 /* Byte offset within the shared ring of the next byte this channel will
  * consume, rounded down to the interleave block. This is the word the EE
- * polls: func_0025E238 (asm/matchings/src/cod/vendor_25E1E8/
- * func_0025E238.s) returns status_block[0x180 + channel * 4], and
- * func_0023DEB0 uses it as
+ * polls: SgStPcmIopReadAddr (PAL 0x00278828, a function entry in the
+ * retail ELF) returns
+ * status_block[0x180 + channel * 4], and audioDecSendToIOP uses it as
  *
  *     free = ((cursor + ring - write_ptr) - 0x400) mod ring, rounded to 0x400
  *

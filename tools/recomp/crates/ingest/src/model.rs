@@ -1,5 +1,6 @@
 //! Data model for `ProgramDb`. Every struct here is metadata (names, addresses,
-//! counts, ranges) derived from the decomp repo's inputs. Nothing here holds
+//! counts, ranges) derived from the retail ELF and the disc's own objdump
+//! listing (see `disc`). Nothing here holds
 //! raw ELF/ROM bytes or raw instruction words: that keeps `generated/programdb.json`
 //! small and keeps us honest about the "no game bytes committed" rule even
 //! though the file itself is gitignored.
@@ -29,11 +30,11 @@ impl ElfSection {
     }
 }
 
-/// Splat subsegment "type" field, generalized. Dot-prefixed splat types
-/// (`.rodata`, `.data`, `.lit4`, `.sdata`) mark a carved chunk with real
-/// symbol ownership; the bare form (`rodata`, `data`, ...) marks an
-/// unattributed resume blob owned by a `src/cod/<offset>` placeholder path.
-/// `carved` on `TranslationUnit` records that distinction.
+/// What a translation unit holds. The disc ingest produces two of these:
+/// `Code` for a run of functions sharing a donor source file, and `HandAsm`
+/// for each of the five VU1 microprograms carved out of `.vutext`. The data
+/// kinds are carried because the vocabulary is the one the generated file
+/// names and the runtime's registration table already use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubsegKind {
     /// `c`: a real, C-source translation unit's code.
@@ -49,8 +50,8 @@ pub enum SubsegKind {
     SBss,
     Bss,
     TextBin,
-    /// Anything not recognized; kept instead of hard-erroring on new splat
-    /// subsegment types, but surfaced in `stats()` so it doesn't go unnoticed.
+    /// Anything not recognized; kept instead of hard-erroring, and surfaced
+    /// in `stats()` so it does not go unnoticed.
     Other,
 }
 
@@ -64,17 +65,20 @@ impl SubsegKind {
     }
 }
 
-/// One splat subsegment: `[rom_offset, type, path]` or the bss/sbss dict form.
+/// One translation unit: a contiguous vram range and the file name the
+/// emitted C for it takes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationUnit {
-    /// Splat path, e.g. `src/delayFreeManager` or the placeholder
-    /// `src/cod/1C80` used for unattributed blobs.
+    /// Source-derived path, e.g. `src/delayFreeManager` from the donor
+    /// listing's own source file, or the placeholder `src/cod/1C80` for a
+    /// run of functions no donor function named.
     pub name: String,
     pub kind: SubsegKind,
-    /// Raw splat type string (e.g. ".rodata", "c", "hasm"), preserved for
-    /// callers that need the exact splat vocabulary.
+    /// Raw type string (e.g. "c", "hasm"), preserved for callers that need
+    /// the exact vocabulary.
     pub raw_kind: String,
-    /// True for dot-prefixed subsegment types (a carved, attributed chunk).
+    /// True for a carved, attributed chunk. Nothing on the disc path sets
+    /// it.
     pub carved: bool,
     pub rom_start: u32,
     pub rom_end: u32,
@@ -92,26 +96,9 @@ impl TranslationUnit {
     }
 }
 
-/// A non-function symbol from `symbol_addrs.us.txt` (data, jtbl markers,
-/// literal pool slots, etc). Function symbols become `Function` records
-/// instead; jtbl symbols are cross-checked against jump tables discovered by
-/// walking the asm, not represented here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Symbol {
-    pub name: String,
-    pub vram: u32,
-    /// splat `type:` attribute, e.g. "u8", "s32", "asciz", "jtbl".
-    pub kind: String,
-    pub size: Option<u32>,
-    pub vendor: bool,
-    /// splat `function_owner:` attribute, when present.
-    pub function_owner: Option<String>,
-    /// splat `defined:` attribute, when present.
-    pub defined: Option<bool>,
-}
-
-/// One function, derived primarily from `symbol_addrs.us.txt`'s `type:func`
-/// entries, sized by delta-to-next-function within its owning TU / section.
+/// One function: an entry address the correlation or one of the ELF's own
+/// entry proofs established, sized by delta-to-next-entry within its owning
+/// TU / section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
@@ -119,8 +106,9 @@ pub struct Function {
     /// Size derived from the next function's start (capped at the owning
     /// TU's end), cross-checked against `declared_size` when present.
     pub size: u32,
-    /// The `size:` attribute from symbol_addrs, when the file states one
-    /// explicitly.
+    /// A size the input stated explicitly, when it states one. Nothing on
+    /// the disc path does, so it is always `None` today; it stays because
+    /// `size` above is derived and the two are worth telling apart.
     pub declared_size: Option<u32>,
     /// Index into `ProgramDb::translation_units`.
     pub tu_index: usize,
@@ -128,41 +116,24 @@ pub struct Function {
     pub is_jtbl_target: bool,
 }
 
-/// How a `JumpTable`'s `owner` was determined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OwnerResolution {
-    /// A `glabel NAME ... endlabel NAME` body in `asm/nonmatchings` or
-    /// `asm/matchings` textually references this table (the
-    /// `%hi(jtbl_...)/%lo(jtbl_...)` load pair). This is the strong case:
-    /// the compiler-emitted reference names the owner directly.
-    GlabelReference,
-    /// No `glabel` body references the table — its owning function is
-    /// already matched from C, so splat no longer emits a per-function
-    /// `.s` stub with the load instructions, only the `.rodata` carve
-    /// under `asm/data`. Ownership was inferred instead as the function
-    /// whose `[vram, vram+size)` range contains the majority of the
-    /// table's non-null target vrams (every table's targets land in one
-    /// function in this binary, so a plurality is already decisive).
-    TargetMajority,
-}
-
-/// A jump table, discovered by walking `dlabel jtbl_XXXXXXXX` blocks in the
-/// disassembly. Deliberately holds only facts (addresses, a count, target
-/// addresses): never the raw `.word` instruction encodings.
+/// A jump table, recovered from a read-only data section by
+/// `scan::scan_jump_tables`: a run of words that all point inside one
+/// function's byte range. Deliberately holds only facts (addresses, a count,
+/// target addresses): never the raw `.word` encodings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JumpTable {
     pub name: String,
     pub vram: u32,
-    /// Name of the function whose switch/computed-jump loads this table.
+    /// Name of the function whose switch/computed-jump loads this table:
+    /// the one whose byte range its targets land in.
     pub owner: String,
-    pub owner_resolved_via: OwnerResolution,
     pub entry_count: usize,
     /// Resolved target vrams, in table order. A `0` entry is a genuine
     /// null/unreached slot present in the source (align padding etc.), not
     /// a parse failure.
     pub targets: Vec<u32>,
-    /// `size:` attribute from symbol_addrs.us.txt, when the table is also
-    /// manually annotated there.
+    /// A size the input stated explicitly. Nothing on the disc path states
+    /// one, so it is always `None` today.
     pub declared_size: Option<u32>,
 }
 
@@ -176,19 +147,13 @@ pub struct Stats {
     pub functions: usize,
     pub vendor_functions: usize,
     pub jtbl_target_functions: usize,
-    pub symbols: usize,
     pub jump_tables: usize,
-    /// Tables owned via a direct `glabel` textual reference.
-    pub jump_tables_via_glabel: usize,
-    /// Tables owned via the target-vram-majority fallback (matched-C
-    /// functions with no `.s` stub to scan).
-    pub jump_tables_via_target_majority: usize,
     pub jump_table_entries: usize,
     pub function_size_mismatches: usize,
 }
 
 /// The full parsed program: everything the translator needs to know about
-/// the ICO retail US binary, short of the raw bytes themselves.
+/// the ICO retail PAL binary, short of the raw bytes themselves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramDb {
     pub elf_sha1: String,
@@ -197,9 +162,32 @@ pub struct ProgramDb {
     pub gp: u32,
     pub sections: Vec<ElfSection>,
     pub translation_units: Vec<TranslationUnit>,
-    pub symbols: Vec<Symbol>,
     pub functions: Vec<Function>,
     pub jump_tables: Vec<JumpTable>,
+    /// Every `.text` address a `lui`/`addiu` pair forms that no entry proof
+    /// turned into a function. The whole-`.text` sweep: each of these is an
+    /// address the guest can put in a function pointer and the runtime would
+    /// have no translated function for, so each is either data or an entry
+    /// no proof reached.
+    #[serde(default)]
+    pub unresolved_pointers: Vec<UnresolvedPointer>,
+}
+
+/// One `.text` address a `lui`/`addiu` pair forms that no proof turned
+/// into a function entry. Reported because an indirect call to one of these
+/// is the runtime's `bad indirect call` fatal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedPointer {
+    /// The address the pair forms.
+    pub target: u32,
+    /// The `addiu`/`ori` that forms it.
+    pub site: u32,
+    /// The function whose range covers `target`, when one does.
+    pub containing: Option<String>,
+    pub containing_vram: Option<u32>,
+    /// What the words at `target` look like, in the terms the entry proofs
+    /// are stated in.
+    pub looks: String,
 }
 
 impl ProgramDb {
@@ -258,18 +246,7 @@ impl ProgramDb {
             functions: self.functions.len(),
             vendor_functions: self.functions.iter().filter(|f| f.vendor).count(),
             jtbl_target_functions: self.functions.iter().filter(|f| f.is_jtbl_target).count(),
-            symbols: self.symbols.len(),
             jump_tables: self.jump_tables.len(),
-            jump_tables_via_glabel: self
-                .jump_tables
-                .iter()
-                .filter(|j| j.owner_resolved_via == OwnerResolution::GlabelReference)
-                .count(),
-            jump_tables_via_target_majority: self
-                .jump_tables
-                .iter()
-                .filter(|j| j.owner_resolved_via == OwnerResolution::TargetMajority)
-                .count(),
             jump_table_entries: self.jump_tables.iter().map(|j| j.entry_count).sum(),
             function_size_mismatches: self
                 .functions

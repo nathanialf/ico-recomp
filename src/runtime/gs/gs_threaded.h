@@ -28,7 +28,10 @@
  *   - Exactly one consumer, the worker, which is the only thread that calls
  *     into the inner backend after start_worker() returns. Everything the
  *     library does per field (packet parse, flush, scanout, present, overlay
- *     upload) happens there.
+ *     upload) happens there, and so does every present between fields: the
+ *     worker calls the inner backend's present_pump() after each vsync
+ *     record and again from its park loop, which is what display.present_rate
+ *     runs on while the EE sleeps in the audio pacer.
  *   - The EE waits on the worker in exactly three places: field_sync() (one
  *     field in flight), the two calls that need a value back
  *     (overlay_texture_create, present_ui), and a full ring. Every one of
@@ -37,8 +40,8 @@
  *     that only the EE-side pump can deliver.
  *   - Values the EE reads back from the backend never cross the ring:
  *     read_priv is answered from this side's shadow, and the live backend's
- *     present rectangle, present timings and window-closed flag are atomics
- *     (or published under a mutex) on the library side.
+ *     present rectangle, present timings, screenshot pixels and window-closed
+ *     flag are atomics (or published under a mutex) on the library side.
  */
 #ifndef ICORECOMP_GS_THREADED_H
 #define ICORECOMP_GS_THREADED_H
@@ -76,8 +79,25 @@ public:
     void set_render_scale(uint32_t factor) override;
     void set_raster(uint32_t raster) override;
     void set_deinterlace(uint32_t deinterlace) override;
+    /* display.widescreen's presentation half. Rides the ring like the four
+     * above, for the reason set_present_rate does. */
+    void set_widescreen_aspect(double aspect) override;
+    /* display.present_rate. Rides the ring like the four above so the
+     * consumer picks it up in order with the fields it applies to; the
+     * consumer is the only side that can act on it. */
+    void set_present_rate(double max_hz) override;
     void overlay_set_frame(const RtPgsOverlayFrame* frame) override;
     void overlay_texture_destroy(uint32_t texture) override;
+    void request_screenshot(uint32_t slots) override;
+
+    /* Straight through to the inner backend, off the ring: the pixels are
+     * state the present that copied them already published, so the call
+     * needs no ordering against GIF traffic and must not make the caller
+     * wait for the worker. See gs_backend.h. */
+    size_t take_screenshot(uint32_t slot, uint32_t* w, uint32_t* h, uint8_t* dst,
+                           size_t dst_bytes) override {
+        return m_inner->take_screenshot(slot, w, h, dst, dst_bytes);
+    }
 
     /* Answered from this side's own shadow; the inner backend is not
      * consulted. See gs_threaded.cpp for why that is exact. */
@@ -92,9 +112,18 @@ public:
     uint32_t present_ui() override;
 
     /* The one per-field sync point (hw/gspriv.cpp): returns once the consumer
-     * has finished every vsync but the most recent one, so at most one field
-     * is in flight. Pumps the window while it waits, and gives up early if
-     * the window has closed. A no-op outside Worker mode. */
+     * has finished the scanout of every vsync but the most recent one, so at
+     * most one field is in flight. Pumps the window while it waits, and gives
+     * up early if the window has closed. A no-op outside Worker mode.
+     *
+     * Scanout, not present: the consumer publishes a vsync as done as soon
+     * as the inner backend's vsync() returns, which latches the field, and
+     * only then presents it. So a present still in flight never holds this
+     * wait. It does not make the present free: a worker that spends longer
+     * per field than the field period, present included, still falls behind
+     * and this wait is where the EE meets that. What it removes is the
+     * per-field serialization, the EE waiting for a present to finish before
+     * it may run the next field's guest code. */
     void field_sync() override;
 
     /* Asked by the EE after field_sync(); answered by the inner backend
@@ -111,8 +140,7 @@ public:
     /* Straight through: neither touches GS state, and report_stats runs at
      * exit with the worker already joined. */
     void report_stats() override;
-    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
-                         uint64_t* present_ns, uint64_t* fields) override;
+    void present_timings(RtGsPresentTimings* out) override;
 
     /* This wrapper's own consumer-side costs. See gs_backend.h. Reading
      * clears. */
@@ -152,6 +180,13 @@ private:
     /* One bounded wait on the consumer's progress, then one pump of the
      * window with event dispatch held (see wait_step's own comment). */
     void wait_step(std::unique_lock<std::mutex>& lk);
+    /* Consumer side. pump_present() presents through the inner backend and
+     * stamps when it did; repeat_wait_ns() is how long is left of the repeat
+     * interval, 0 when a repeat is due and UINT64_MAX when repeats are off
+     * (m_present_rate 0), which is what keeps the park an unbounded poll
+     * exactly as it was before the present rate existed. */
+    void pump_present();
+    uint64_t repeat_wait_ns() const;
     void worker_main();
     void replay(uint32_t kind, uint64_t arg, const uint8_t* payload);
     [[noreturn]] void abandon_worker(const char* why);
@@ -236,6 +271,20 @@ private:
      * seconds on a live window, and does not repeat it every field
      * afterwards. */
     bool m_field_sync_stuck_logged = false;
+
+    /* The same one-shot for a present that took seconds. Consumer-side only,
+     * so no atomic: only whichever thread is the consumer ever touches it. */
+    bool m_slow_present_logged = false;
+
+    /* Consumer-side present pacing. Both are touched only by whichever
+     * thread is the consumer (the worker in Worker mode, the caller in
+     * Inline and Manual), so neither needs an atomic: the rate arrives as a
+     * ring record and is applied where every other record is.
+     * m_last_pump_ns is a now_ns() stamp of the last present_pump call, not
+     * of the last present: the pump itself decides whether to present, and
+     * this only has to make sure it is asked at the interval. */
+    double m_present_rate = 0.0;
+    uint64_t m_last_pump_ns = 0;
 
     uint64_t m_records_written = 0;
     std::atomic<uint64_t> m_records_replayed{0};

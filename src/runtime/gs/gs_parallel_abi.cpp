@@ -49,6 +49,10 @@ uint32_t rt_pgs_vsync(RtPgs* pgs, unsigned field) {
     return pgs->vsync(field);
 }
 
+uint32_t rt_pgs_present_pump(RtPgs* pgs, double max_hz, uint64_t* serial) {
+    return pgs->present_pump(max_hz, serial);
+}
+
 void rt_pgs_bind_consumer_thread(RtPgs* pgs) {
     pgs->bind_consumer_thread();
 }
@@ -65,13 +69,8 @@ void rt_pgs_report_stats(RtPgs* pgs) {
     pgs->report_stats();
 }
 
-void rt_pgs_present_timings(RtPgs* pgs, uint64_t* flush_ns, uint64_t* scanout_ns,
-                            uint64_t* present_ns, uint64_t* fields) {
-    pgs->present_timings(flush_ns, scanout_ns, present_ns, fields);
-}
-
-void* rt_pgs_window_handle(RtPgs* pgs) {
-    return pgs->window_handle();
+void rt_pgs_present_timings(RtPgs* pgs, RtPgsPresentTimings* out) {
+    pgs->present_timings(out);
 }
 
 void rt_pgs_notify_quit(RtPgs* pgs) {
@@ -82,13 +81,18 @@ void rt_pgs_notify_resize(RtPgs* pgs) {
     pgs->notify_resize();
 }
 
-void rt_pgs_surface_size(RtPgs* pgs, uint32_t* width, uint32_t* height) {
-    pgs->surface_size(width, height);
-}
-
 void rt_pgs_present_rect(RtPgs* pgs, int32_t* x, int32_t* y, int32_t* w, int32_t* h,
                          int32_t* bb_w, int32_t* bb_h) {
     pgs->present_rect(x, y, w, h, bb_w, bb_h);
+}
+
+void rt_pgs_request_screenshot(RtPgs* pgs, uint32_t slots) {
+    pgs->request_screenshot(slots);
+}
+
+size_t rt_pgs_take_screenshot(RtPgs* pgs, uint32_t slot, uint32_t* w, uint32_t* h,
+                              uint8_t* dst, size_t dst_bytes) {
+    return pgs->take_screenshot(slot, w, h, dst, dst_bytes);
 }
 
 void rt_pgs_set_present_mode(RtPgs* pgs, uint32_t mode) {
@@ -105,6 +109,10 @@ void rt_pgs_set_raster(RtPgs* pgs, uint32_t raster) {
 
 void rt_pgs_set_deinterlace(RtPgs* pgs, uint32_t deinterlace) {
     pgs->set_deinterlace(deinterlace);
+}
+
+void rt_pgs_set_widescreen_aspect(RtPgs* pgs, double aspect) {
+    pgs->set_widescreen_aspect(aspect);
 }
 
 void rt_pgs_set_render_scale(RtPgs* pgs, uint32_t factor) {
@@ -203,9 +211,10 @@ int rt_pgs_replay(const char* dump_path, const char* screenshot_path, int verbos
             return 1;
         }
         /* The parser requests READ_ONLY_OPTIMAL as the scanout layout. */
+        std::string why;
         if (!rt_gs_write_scanout_ppm(device, *last.image, screenshot_path,
-                                     VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL)) {
-            std::fprintf(stderr, "gs-replay: screenshot write failed\n");
+                                     VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, &why)) {
+            std::fprintf(stderr, "gs-replay: screenshot write failed: %s\n", why.c_str());
             return 1;
         }
         std::fprintf(stderr, "gs-replay: wrote %s\n", screenshot_path);

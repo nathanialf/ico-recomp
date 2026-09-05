@@ -23,14 +23,18 @@
 #ifdef ICORECOMP_HAVE_PARALLEL_GS
 
 #include "gs_parallel_api.h"
+#include "gs_probe_api.h"
 #include "runtime.h"
 
 #include "../host/settings.h"
 #include "../host/window.h"
+#include "../host/window_service.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -47,8 +51,7 @@ uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
  * human with a GPU and eyes can confirm the pass actually draws. Gated by
  * ICORECOMP_UI_TEST=1, costs nothing when unset, removed by nobody: this is
  * the only exercise of the overlay ABI until RmlUi replaces it (milestone
- * 5). Laid out for a 640x480 surface, the historic default window size (see
- * init_windowed's comment in gs_parallel_present.cpp).
+ * 5). Laid out for a 640x480 surface, the historic default window size.
  */
 void run_overlay_ui_test(RtPgs* pgs) {
     std::vector<RtPgsOverlayVertex> verts;
@@ -88,7 +91,7 @@ void run_overlay_ui_test(RtPgs* pgs) {
     }
     const uint32_t checker_tex = rt_pgs_overlay_texture_create(pgs, checker, 8, 8);
     if (!checker_tex) {
-        rt_log("gs", "ICORECOMP_UI_TEST: checkerboard texture create failed");
+        rt_log_warn("gs", "ICORECOMP_UI_TEST: checkerboard texture create failed");
     }
     {
         RtPgsOverlayCmd c = add_quad(300, 40, 128, 128, pack_rgba(255, 255, 255, 255));
@@ -139,12 +142,47 @@ void run_overlay_ui_test(RtPgs* pgs) {
     frame.surface_height = 480;
 
     rt_pgs_overlay_set_frame(pgs, &frame);
-    rt_log("gs", "ICORECOMP_UI_TEST=1: static overlay test frame submitted (%u cmds, texture id %u)",
+    rt_log_info("gs", "ICORECOMP_UI_TEST=1: static overlay test frame submitted (%u cmds, texture id %u)",
            frame.cmd_count, checker_tex);
 }
 
+/* The GS library reaches the log through this one callback, and the ABI
+ * gives the callback no level parameter (RtPgsHost in gs_parallel_api.h).
+ * The library says the level in the message instead: a line from its warnf
+ * or errorf starts with one of the two tags below, which this strips before
+ * logging at that level. The tags are literals in gs_parallel_impl.h
+ * (RT_PGS_LOG_TAG_WARN / RT_PGS_LOG_TAG_ERROR); they are repeated here
+ * because that header is library-private and this file is the MIT side of
+ * the LGPL boundary, which may not include it. A mismatch prints the tag
+ * inline at whatever level the words below pick, which keeps the line
+ * readable rather than losing it.
+ *
+ * Everything untagged is startup identity, per-change notes and summaries,
+ * so info is the right default for those, with one exception: the word list
+ * below still promotes a failure line that predates the tags or comes from
+ * a message this repo does not own. Substring matching rather than a table
+ * of exact strings, for the same reason it always was. */
+const char* const kPgsTagWarn = "[warn] ";
+const char* const kPgsTagError = "[error] ";
+
+bool pgs_message_is_warning(const char* message) {
+    static const char* const kWords[] = {"failed", "refused", "missing", "unsupported", "fallback"};
+    for (const char* w : kWords) {
+        if (std::strstr(message, w) != nullptr) return true;
+    }
+    return false;
+}
+
 void host_log(const char* component, const char* message) {
-    rt_log(component, "%s", message);
+    if (std::strncmp(message, kPgsTagError, std::strlen(kPgsTagError)) == 0) {
+        rt_log_error(component, "%s", message + std::strlen(kPgsTagError));
+    } else if (std::strncmp(message, kPgsTagWarn, std::strlen(kPgsTagWarn)) == 0) {
+        rt_log_warn(component, "%s", message + std::strlen(kPgsTagWarn));
+    } else if (pgs_message_is_warning(message)) {
+        rt_log_warn(component, "%s", message);
+    } else {
+        rt_log_info(component, "%s", message);
+    }
 }
 
 void host_fatal(const char* component, const char* message) {
@@ -159,18 +197,77 @@ void host_pump_events() {
     rt_window_pump();
 }
 
-/* The live backend's RtPgs*, exposed to the exe side (host/window.cpp,
- * host/settings_apply.cpp) via rt_gs_parallel_handle(). Set for the
- * lifetime of the one ParallelBackend instance gs_select.cpp ever creates;
- * RtPgs itself stays opaque here, same as everywhere else on this side of
- * the LGPL boundary. */
-RtPgs* g_live_pgs = nullptr;
+/* The window belongs to the executable, so the surface made from it does
+ * too: this hands the library's WSI straight to
+ * host/window_service.cpp's rt_window_create_vulkan_surface. Both handles
+ * travel as uint64_t so that no Vulkan type crosses the C ABI. Called once,
+ * on the creating thread, from inside device creation. */
+uint64_t host_create_vulkan_surface(uint64_t vk_instance) {
+    return rt_window_create_vulkan_surface(vk_instance);
+}
 
-/* The present mode resolve_create_options() settled on, kept for
- * rt_gs_parallel_present_mode(). The launcher forces FIFO while it is up
- * and restores this at hand-off; deriving it a second time there would mean
- * a second copy of the env-vs-settings precedence below. */
-uint32_t g_create_present_mode = RT_PGS_PRESENT_MAILBOX;
+/* The window service's sink (host/window_service.h). Every one of these runs
+ * on the main thread from inside the event pump, which is exactly the
+ * context the three library entry points below are documented as safe from
+ * (gs_parallel_api.h: they set a flag or refresh the library's own size
+ * cache, and none of them is a GS command). This is the whole of what the
+ * paraLLEl-GS backend needs to hear from the window. */
+void sink_quit(void* user) { rt_pgs_notify_quit((RtPgs*)user); }
+void sink_resize(void* user) { rt_pgs_notify_resize((RtPgs*)user); }
+void sink_sample(void* user) { rt_pgs_sample_window_state((RtPgs*)user); }
+
+/* The Display tab's two read-only lines, built once from the device this
+ * instance actually created (rt_pgs_live_probe) rather than from a probe
+ * device made and destroyed at startup. */
+void publish_device_info(RtPgs* pgs) {
+    RtPgsProbe p = {};
+    if (!rt_pgs_live_probe(pgs, &p) || !p.have_device) {
+        rt_window_set_device_info("paraLLEl-GS", "no device reported by the live backend",
+                                  "no device reported by the live backend");
+        return;
+    }
+    /* The driver version encoding is vendor specific and Vulkan does not
+     * define it, so it is printed raw rather than decoded wrongly for some
+     * vendor. Same rule as icorecomp-gs-replay --probe. */
+    /* 512, not 256: RtPgsProbe::device_name is itself 256 bytes, so a
+     * maximum-length name plus the driver and version suffix does not fit a
+     * buffer of the same size, and gcc's -Wformat-truncation says so. The
+     * window service's own slot is the same width. */
+    char renderer[512];
+    std::snprintf(renderer, sizeof(renderer), "%s, driver 0x%08x, Vulkan %u.%u.%u",
+        p.device_name, (unsigned)p.driver_version,
+        (unsigned)((p.api_version >> 22) & 0x7fu),
+        (unsigned)((p.api_version >> 12) & 0x3ffu),
+        (unsigned)(p.api_version & 0xfffu));
+
+    struct Feature { const char* name; int32_t ok; };
+    const Feature features[] = {
+        {"descriptorIndexing", p.descriptor_indexing},
+        {"timelineSemaphore", p.timeline_semaphore},
+        {"bufferDeviceAddress", p.buffer_device_address},
+        {"storageBuffer8BitAccess", p.storage_buffer_8bit},
+        {"storageBuffer16BitAccess", p.storage_buffer_16bit},
+        {"shaderInt16", p.shader_int16},
+        {"scalarBlockLayout", p.scalar_block_layout},
+        {"subgroup arithmetic/shuffle/vote/ballot/basic", p.subgroup_ops},
+        {"subgroup size control 4 to 64", p.subgroup_size_control},
+        {"32 KiB compute shared memory", p.compute_shared_memory},
+    };
+    std::string missing;
+    for (const Feature& f : features) {
+        if (f.ok) continue;
+        if (!missing.empty()) missing += ", ";
+        missing += f.name;
+    }
+    std::string line = missing.empty() ? std::string("all required features present")
+                                       : ("missing: " + missing);
+    /* Not a missing feature: the device has it or the run turned it off, and
+     * either way the descriptor-buffer path is not the one in use. It is the
+     * fact gs_pgs_context.h's fallbacks exist to make visible, so it is
+     * reported beside them. */
+    if (p.descriptor_buffer_disabled) line += "; descriptor-buffer path disabled";
+    rt_window_set_device_info("paraLLEl-GS", renderer, line.c_str());
+}
 
 /* Startup options for rt_pgs_create: env resolution plus settings.json.
  * Called from rt_hw_init() (see main.cpp), which runs after
@@ -179,35 +276,10 @@ RtPgsCreateOptions resolve_create_options() {
     RtPgsCreateOptions opts = {};
     const RtSettings& s = rt_settings();
 
-    /* present: ICORECOMP_GS_PRESENT wins when set, mapped exactly as the
-     * library mapped it itself before this option existed (vsync/fifo ->
-     * FIFO, tear/immediate -> IMMEDIATE, anything else -> MAILBOX);
-     * otherwise display.present decides. */
-    if (const char* pm = std::getenv("ICORECOMP_GS_PRESENT")) {
-        uint32_t mode = RT_PGS_PRESENT_MAILBOX;
-        if (std::strcmp(pm, "vsync") == 0 || std::strcmp(pm, "fifo") == 0) {
-            mode = RT_PGS_PRESENT_FIFO;
-        } else if (std::strcmp(pm, "tear") == 0 || std::strcmp(pm, "immediate") == 0) {
-            mode = RT_PGS_PRESENT_IMMEDIATE;
-        }
-        opts.present_mode = mode;
-
-        uint32_t settings_mode = RT_PGS_PRESENT_MAILBOX;
-        switch (s.display.present) {
-        case RtPresentMode::Fifo: settings_mode = RT_PGS_PRESENT_FIFO; break;
-        case RtPresentMode::Immediate: settings_mode = RT_PGS_PRESENT_IMMEDIATE; break;
-        default: break;
-        }
-        if (settings_mode != mode) {
-            rt_log("gs", "display.present: using ICORECOMP_GS_PRESENT=%s, settings.json value ignored", pm);
-        }
-    } else {
-        switch (s.display.present) {
-        case RtPresentMode::Fifo: opts.present_mode = RT_PGS_PRESENT_FIFO; break;
-        case RtPresentMode::Immediate: opts.present_mode = RT_PGS_PRESENT_IMMEDIATE; break;
-        default: opts.present_mode = RT_PGS_PRESENT_MAILBOX; break;
-        }
-    }
+    /* display.present, with ICORECOMP_GS_PRESENT winning when it is set.
+     * Resolved in gs_select.cpp because both live backends are created with
+     * it and the launcher reads it back; see rt_gs_present_mode. */
+    opts.present_mode = rt_gs_present_mode();
 
     /* fit/filter/render_scale/raster/deinterlace have no env twin: straight
      * from settings. */
@@ -233,36 +305,45 @@ RtPgsCreateOptions resolve_create_options() {
      * shim's fallback is only reached by a caller that passes 0. */
     opts.window_width = (uint32_t)s.display.window_width;
     opts.window_height = (uint32_t)s.display.window_height;
-    g_create_present_mode = opts.present_mode;
+    /* The window the executable already created (host/window_service.h).
+     * Null means this run has none -- no video driver, ICORECOMP_GS_HEADLESS,
+     * or a build with no SDL -- and the library goes headless, which is the
+     * same decision it used to make for itself from DISPLAY. */
+    opts.host_window = rt_window_handle();
     return opts;
 }
 
 class ParallelBackend final : public GsBackend {
 public:
     ParallelBackend() {
-        const RtPgsHost host = { host_log, host_fatal, host_pump_events };
+        const RtPgsHost host = { host_log, host_fatal, host_pump_events,
+                                 host_create_vulkan_surface };
         RtPgsCreateOptions opts = resolve_create_options();
         m_pgs = rt_pgs_create(&host, &opts); /* fatal (never null) on setup failure */
-        g_live_pgs = m_pgs;
+
+        /* The window is the exe's, so the quit and resize notifications
+         * reach this backend through the window service rather than the
+         * other way around. Registered here and cleared in the destructor,
+         * so a run with no live backend has no sink. */
+        const RtWindowSink sink = { m_pgs, sink_quit, sink_resize, sink_sample };
+        rt_window_set_sink(&sink);
+        publish_device_info(m_pgs);
 
         if (const char* v = std::getenv("ICORECOMP_UI_TEST"); v && std::strcmp(v, "1") == 0) {
             run_overlay_ui_test(m_pgs);
         }
 
-        /* init_windowed (gs_parallel_present.cpp) already opened the window at
-         * opts.window_width/height, i.e. display.window_width/height, so a
-         * Windowed-mode run needs no further action here. Either fullscreen
-         * mode still needs rt_window_apply_mode to take the window from
-         * "windowed at the configured size" (what rt_pgs_create just did)
-         * to what display.mode actually asks for. */
-        const RtSettings& s = rt_settings();
-        if (s.display.mode != RtDisplayMode::Windowed) {
-            rt_window_apply_mode(s);
-        }
+        /* display.mode is not applied here any more: gs/gs_select.cpp opens
+         * the window and puts it in the configured mode before this
+         * constructor runs, because the window is no longer this backend's
+         * to make. */
     }
 
     ~ParallelBackend() override {
-        g_live_pgs = nullptr;
+        /* Before rt_pgs_destroy: a sink callback fired after the instance is
+         * gone would use a freed pointer, and the event pump can run from
+         * anywhere on the main thread. */
+        rt_window_set_sink(nullptr);
         rt_pgs_destroy(m_pgs);
         m_pgs = nullptr;
     }
@@ -287,7 +368,39 @@ public:
      * field boundary and takes the exit there. */
     bool vsync(unsigned field) override {
         const uint32_t flags = rt_pgs_vsync(m_pgs, field);
-        return (flags & RT_PGS_VSYNC_PRESENTED) != 0;
+        /* LATCHED, not PRESENTED: rt_pgs_vsync stopped presenting when the
+         * present rate was decoupled from the field rate, and LATCHED is the
+         * bit that still answers GsBackend::vsync's question, "did a frame's
+         * worth of traffic land since the previous vsync". PRESENTED now
+         * reports on the present pump keeping up, which is not what this
+         * bool means on any other backend. See gs_parallel_api.h. */
+        return (flags & RT_PGS_VSYNC_LATCHED) != 0;
+    }
+
+    /* The present itself (gs_backend.h). Reached either from the GS command
+     * ring's worker or, with the ring bypassed, from the EE thread at the
+     * field boundary; both are the consumer in their own configuration. */
+    void present_pump(double max_hz) override {
+        /* The serial says which field reached the swapchain. Nothing here
+         * reads it any more; the pointer is still passed because the ABI
+         * takes one and a null would be a second code path in the library
+         * for no gain. */
+        uint64_t serial = 0;
+        if (!(rt_pgs_present_pump(m_pgs, max_hz, &serial) & RT_PGS_PUMP_PRESENTED)) return;
+        /* One present reached the swapchain. The end-of-run summary counts
+         * these and the phase machine uses the first one, which is what
+         * separates "the run never got a picture up" from "the picture was
+         * up and then something ended the run" (host/run_state.cpp). */
+        rt_run_note_present();
+        rt_run_phase(RT_PHASE_FIRST_PRESENT);
+        publish_present_rect();
+        /* The per-present debug line that used to be here, one line per
+         * present behind an ICORECOMP_VERBOSE=present token, was removed on
+         * 2026-09-05. It was unbounded and it only ever said anything when a
+         * reader thought to ask for it. What survives it is the present
+         * timing block rt_pgs_present_timings publishes and the
+         * presents/repeats counters in the end-of-run stats, both of which
+         * are in every log without a token. */
     }
 
     /* An atomic read inside the library, legal from any thread and true even
@@ -303,14 +416,25 @@ public:
         rt_pgs_report_stats(m_pgs);
     }
 
-    void present_timings(uint64_t* flush_ns, uint64_t* scanout_ns,
-                         uint64_t* present_ns, uint64_t* fields) override {
-        rt_pgs_present_timings(m_pgs, flush_ns, scanout_ns, present_ns, fields);
+    void present_timings(RtGsPresentTimings* out) override {
+        if (!out) return;
+        /* The two structs are the same six fields in the same order, but
+         * they belong to two different headers on purpose: gs_backend.h
+         * stays free of the paraLLEl-GS ABI (see its header comment), so
+         * this adapter is where one becomes the other. */
+        RtPgsPresentTimings t = {};
+        rt_pgs_present_timings(m_pgs, &t);
+        out->flush_ns = t.flush_ns;
+        out->scanout_ns = t.scanout_ns;
+        out->present_ns = t.present_ns;
+        out->fields = t.fields;
+        out->presents = t.presents;
+        out->repeats = t.repeats;
     }
 
     /* Presentation and overlay control (gs_backend.h). These used to be
-     * called on rt_gs_parallel_handle() straight from host/settings_apply.cpp
-     * and ui/ui.cpp, which put them outside the GS call stream. They come
+     * called on the library handle straight from host/settings_apply.cpp and
+     * ui/ui.cpp, which put them outside the GS call stream. They come
      * through the backend now so the command ring sees them in order with
      * the GIF and priv traffic they have to stay ordered against. */
     void set_presentation(uint32_t fit, uint32_t filter) override {
@@ -326,6 +450,7 @@ public:
     }
     void set_raster(uint32_t raster) override { rt_pgs_set_raster(m_pgs, raster); }
     void set_deinterlace(uint32_t deinterlace) override { rt_pgs_set_deinterlace(m_pgs, deinterlace); }
+    void set_widescreen_aspect(double aspect) override { rt_pgs_set_widescreen_aspect(m_pgs, aspect); }
 
     uint32_t overlay_texture_create(const uint8_t* rgba8, uint32_t width,
                                     uint32_t height) override {
@@ -344,11 +469,49 @@ public:
      * loop (ui/ui_launcher.cpp) reads the RT_PGS_VSYNC_* bits itself and
      * shuts down its own way. Passing the mask through unchanged is what
      * ui.cpp's wrapper did before. */
+    void request_screenshot(uint32_t slots) override {
+        rt_pgs_request_screenshot(m_pgs, slots);
+    }
+
     uint32_t present_ui() override {
-        return rt_pgs_present_ui(m_pgs);
+        const uint32_t r = rt_pgs_present_ui(m_pgs);
+        /* The launcher's own presents count too: a run that dies with the
+         * launcher on screen has reached "first present", and a run that
+         * dies before it has not. */
+        if (r & RT_PGS_VSYNC_PRESENTED) {
+            rt_run_note_present();
+            rt_run_phase(RT_PHASE_FIRST_PRESENT);
+        }
+        publish_present_rect();
+        return r;
+    }
+
+    /* The pixels of an armed capture, read back out of the library's
+     * published slot. Not a ring record and not a GS command: it is a read
+     * of state the present that copied it already published, so it answers
+     * on whichever thread asks. See gs_backend.h. */
+    size_t take_screenshot(uint32_t slot, uint32_t* w, uint32_t* h, uint8_t* dst,
+                           size_t dst_bytes) override {
+        return rt_pgs_take_screenshot(m_pgs, slot, w, h, dst, dst_bytes);
     }
 
 private:
+    /* Copies the rectangle the library just measured into the window
+     * service, which is where every host-side reader of it looks now
+     * (host/window_service.h). The library measures it inside its own
+     * present, under its own mutex; this runs on the same consumer thread
+     * immediately afterwards, so the two never describe different presents.
+     *
+     * It is a copy rather than a callback because the library must not call
+     * back into the exe from inside a present: RtPgsHost's one callback is
+     * the event pump, and adding a second reentrant one would put a host
+     * mutex inside Granite's frame. */
+    void publish_present_rect() {
+        int32_t x = 0, y = 0, w = 0, h = 0, bb_w = 0, bb_h = 0;
+        rt_pgs_present_rect(m_pgs, &x, &y, &w, &h, &bb_w, &bb_h);
+        rt_window_publish_present_rect(x, y, w, h, bb_w, bb_h);
+    }
+
     RtPgs* m_pgs = nullptr;
 };
 
@@ -356,23 +519,6 @@ private:
 
 GsBackend* rt_gs_make_parallel_backend() {
     return new ParallelBackend();
-}
-
-/* See window.h: the exe-side accessor to the live backend's RtPgs*, used by
- * host/window.cpp (the event pump) and host/settings_apply.cpp (warm
- * appliers). window.cpp carries the nullptr stub for builds with no
- * paraLLEl-GS backend at all (ICORECOMP_HAVE_PARALLEL_GS unset); this is
- * the one definition when the backend exists, regardless of whether it is
- * the one currently selected by ICORECOMP_GS. */
-RtPgs* rt_gs_parallel_handle() {
-    return g_live_pgs;
-}
-
-/* See window.h. Valid once resolve_create_options() has run, which is
- * inside the one ParallelBackend constructor; before that (and in a run
- * that never creates the live backend) it is the shim's own default. */
-uint32_t rt_gs_parallel_present_mode() {
-    return g_create_present_mode;
 }
 
 #endif /* ICORECOMP_HAVE_PARALLEL_GS */

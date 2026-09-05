@@ -22,7 +22,7 @@
  *     and MMIO work the EE triggers is subtracted out into its own
  *     bucket.
  *   - "ipu" holds a whole IPU register access, mmio.cpp's dispatch
- *     included, not just hw/ipu.cpp's handler: the movie makes tens of
+ *     included, not only hw/ipu.cpp's handler: the movie makes tens of
  *     thousands of those a field, and a second nested zone for the handler
  *     would double the clock readings on the hottest path in the port.
  *     "mmio" is therefore every access that is not an IPU one. The IPU's
@@ -71,6 +71,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -90,16 +91,24 @@ enum RtProfZone : int {
     RT_PROF_PRESENT,    /* GS vsync hook: flush, scanout, swapchain present.
                          * Separate from GS because a blocking present and a
                          * slow packet ingest need opposite fixes, and one
-                         * averaged bucket cannot tell them apart. */
+                         * averaged bucket cannot tell them apart. With the
+                         * command ring's worker up this holds only the cost
+                         * of enqueueing the vsync record; the present itself
+                         * is never on this thread. */
     RT_PROF_GSWAIT,     /* waiting on the GS command ring's worker thread at
                          * the field sync point (hw/gspriv.cpp). Zero while
                          * the ring is drained inline or bypassed. Once the
                          * worker is up, "gs" and "present" hold only the
                          * enqueue cost and this holds the field boundary's
-                         * share of the handover. The other two waits (a
-                         * reply, a full ring) happen wherever their caller
-                         * is and land in that caller's bucket; the "gs
-                         * worker" line totals all three. */
+                         * share of the handover. It excludes the present:
+                         * the worker publishes a field as done once its
+                         * scanout is latched and presents after that, so
+                         * this waits on the renderer and never on the
+                         * swapchain, and the present is on the "gs worker"
+                         * line. The other two waits (a reply, a full ring)
+                         * happen wherever their caller is and land in that
+                         * caller's bucket; the "gs worker" line totals all
+                         * three. */
     RT_PROF_DISC,       /* disc image reads (ISO sector fetch) */
     RT_PROF_LIMIT,      /* frame limiter sleeping. Large means there is
                          * headroom; near zero means the port is running
@@ -109,7 +118,7 @@ enum RtProfZone : int {
     /* Logging. Not wired up: src/runtime/log.cpp is being reworked into an
      * asynchronous writer by separate work and this instrument does not
      * contend for it. To populate the bucket, add one
-     * RT_PROF_ZONE(RT_PROF_LOG) line at the top of rt_vlog, rt_logv and
+     * RT_PROF_ZONE(RT_PROF_LOG) line at the top of rt_vlog and
      * rt_log_flush; nothing else is needed. Until then, the cost of
      * formatting and queueing a log line is billed to whichever subsystem
      * emitted it, and the file I/O is off the main thread and outside the
@@ -176,6 +185,12 @@ inline uint64_t g_worst_field_total = 0;
  * previous field's pacing sleep plus this field's work. */
 inline uint32_t g_fields_over_20ms = 0;
 inline uint32_t g_fields_over_50ms = 0;
+
+/* A subsystem may attach one detail line to the hitch report. Called once
+ * per field with hitch=false (the subsystem resets its per-field counters)
+ * and, on a field over 50 ms, first with hitch=true and a buffer to fill.
+ * Set by hw/vu1rt.cpp; null in builds that do not link it. */
+inline void (*g_rt_prof_field_hook)(bool hitch, char* buf, size_t cap) = nullptr;
 
 inline uint64_t now_ns() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -255,7 +270,7 @@ inline void rt_prof_measure_clock() {
     for (int i = 0; i < kN; ++i) acc += rt_prof_detail::now_ns();
     const uint64_t t1 = rt_prof_detail::now_ns();
     const double per = (double)(t1 - t0) / (double)kN;
-    rt_log("prof", "clock source: %.1f ns per reading, so one profiled MMIO access carries about "
+    rt_log_info("prof", "clock source: %.1f ns per reading, so one profiled MMIO access carries about "
                    "%.1f ns of instrument on this host (sum 0x%016llx)",
         per, 2.0 * per, (unsigned long long)acc);
 }
@@ -289,7 +304,7 @@ inline void rt_prof_init() {
         rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
         rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
         g_rt_prof_on = true;
-        rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE=%s)."
+        rt_log_info("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE=%s)."
                        " Buckets are exclusive self time and sum to wall clock.",
             rt_prof_detail::g_every, e);
         rt_prof_measure_clock();
@@ -305,7 +320,7 @@ inline void rt_prof_init() {
     rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
     rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
     g_rt_prof_on = true;
-    rt_log("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE unset, default)."
+    rt_log_info("prof", "profiling on: one summary every %u fields (ICORECOMP_PROFILE unset, default)."
                    " Buckets are exclusive self time and sum to wall clock.",
         rt_prof_detail::g_every);
     rt_prof_measure_clock();
@@ -338,10 +353,15 @@ extern "C" void rt_geom_prof_report(double fields);
  *                       that repaid something; with the queue at the
  *                       cushion there is no debt and a field that merely
  *                       overran its period is counted too.
- *   flush/scanout/present_ns, present_fields
+ *   flush/scanout/present_ns, present_fields, presents, present_repeats
  *                       the GS backend's present path split three ways,
  *                       summed over the fields it covers; zero when the
- *                       backend has no present path to report
+ *                       backend has no present path to report. present_ns is
+ *                       per present and not per field: with
+ *                       display.present_rate set, the newest field is
+ *                       presented again between fields, `presents` counts
+ *                       every present and `present_repeats` the ones that
+ *                       showed a picture already on screen
  *
  * Implemented in hw/gspriv.cpp; rt_disc_prof_max_ms in iso/iso9660.cpp. */
 struct RtGsFieldProf {
@@ -350,6 +370,8 @@ struct RtGsFieldProf {
     uint64_t scanout_ns;
     uint64_t present_ns;
     uint64_t present_fields;
+    uint64_t presents;
+    uint64_t present_repeats;
     /* The GS command ring's worker thread, when there is one (see
      * RtGsConsumerTimings in gs/gs_backend.h). All zero with the ring
      * drained inline or bypassed, and the summary drops the line. The three
@@ -394,25 +416,30 @@ inline void rt_prof_report() {
 
     /* Absolute field numbers, not just a count. A report of "it goes wrong
      * ten seconds in" can only be matched to a summary if the summary says
-     * which fields it covers. NTSC fields are 59.94 Hz, so the seconds are
-     * game time, not host time; the two diverge exactly when this
-     * instrument is worth reading. */
+     * which fields it covers. A field is rt_field_rate_hz() long (59.94 Hz
+     * on NTSC, 50 Hz on PAL), so the seconds are game time, not host time;
+     * the two diverge exactly when this instrument is worth reading. The
+     * rate is read now rather than accumulated per field, so a window that
+     * straddles a video mode change reports its whole span at the mode it
+     * ended in. */
     /* Inclusive range. The window's last field is g_fields, and it covers
      * g_window_fields of them, so the first is that many back plus one;
      * without the +1 the line claims one field too many and overlaps the
      * previous window's last field. */
     const uint64_t first_field = g_fields - g_window_fields + 1;
-    rt_log("prof", "fields %llu..%llu (game time %.2f..%.2f s): %.0f fields in %.1f ms host"
-                   " = %.2f fields/s (PS2 target 59.94);"
+    const double field_hz = rt_field_rate_hz();
+    rt_log_info("prof", "fields %llu..%llu (game time %.2f..%.2f s): %.0f fields in %.1f ms host"
+                   " = %.2f fields/s (PS2 %s target %.2f);"
                    " exclusive self time, buckets sum to wall",
         (unsigned long long)first_field, (unsigned long long)g_fields,
-        (double)first_field / 59.94, (double)g_fields / 59.94,
-        fields, wall_ms, wall > 0 ? fields * 1e9 / (double)wall : 0.0);
+        (double)first_field / field_hz, (double)g_fields / field_hz,
+        fields, wall_ms, wall > 0 ? fields * 1e9 / (double)wall : 0.0,
+        rt_video_mode_name(), field_hz);
     for (int i = 0; i < RT_PROF_COUNT; ++i) {
         const int z = order[i];
         if (g_ns[z] == 0) continue;
         const double ms = (double)g_ns[z] / 1e6;
-        rt_log("prof", "  %-7s %8.1f ms %5.1f%% %7.3f ms/field  n=%-9llu mean %8.2f us",
+        rt_log_info("prof", "  %-7s %8.1f ms %5.1f%% %7.3f ms/field  n=%-9llu mean %8.2f us",
             kName[z], ms, wall > 0 ? 100.0 * (double)g_ns[z] / (double)wall : 0.0,
             fields > 0 ? ms / fields : 0.0,
             (unsigned long long)g_calls[z],
@@ -432,7 +459,7 @@ inline void rt_prof_report() {
         RtGsFieldProf fp = {};
         rt_gs_field_prof(&fp);
         const double disc_ms = rt_disc_prof_max_ms();
-        rt_log("prof", "  fields: longest %.1f ms, %u over 20 ms, %u over 50 ms;"
+        rt_log_info("prof", "  fields: longest %.1f ms, %u over 20 ms, %u over 50 ms;"
                        " %u catch-up fields (ran without waiting);"
                        " longest disc read %.1f ms",
             (double)g_worst_field_total / 1e6, (unsigned)g_fields_over_20ms,
@@ -454,15 +481,26 @@ inline void rt_prof_report() {
                 len += std::snprintf(line + len, sizeof line - (size_t)len, " %s %.1f",
                                      kName[z], (double)g_worst_field[z] / 1e6);
             }
-            rt_log("prof", "%s", line);
+            rt_log_info("prof", "%s", line);
         }
         if (fp.present_fields) {
             const double pf = (double)fp.present_fields;
-            rt_log("prof", "    present flush %.3f ms/field  scanout %.3f ms/field"
-                           "  present_frame %.3f ms/field",
+            /* present_frame is per present, the other two per field: with
+             * display.present_rate set there is more than one present per
+             * field, and dividing the present cost by fields would report a
+             * present that got cheaper the more often it ran. `presents` and
+             * `repeats` are the counts that make the two divisors readable;
+             * repeats are recomposites of the field already on screen. */
+            const double pp = fp.presents ? (double)fp.presents : 1.0;
+            rt_log_info("prof", "    present flush %.3f ms/field  scanout %.3f ms/field"
+                           "  present_frame %.3f ms/present"
+                           "  (%llu presents of %llu fields, %llu repeats)",
                 (double)fp.flush_ns / 1e6 / pf,
                 (double)fp.scanout_ns / 1e6 / pf,
-                (double)fp.present_ns / 1e6 / pf);
+                (double)fp.present_ns / 1e6 / pp,
+                (unsigned long long)fp.presents,
+                (unsigned long long)fp.present_fields,
+                (unsigned long long)fp.present_repeats);
         }
         /* The other thread's budget. Read against the same field period as
          * the buckets above: the EE thread and the GS worker run at the same
@@ -476,7 +514,7 @@ inline void rt_prof_report() {
          * those two, not the field boundary. */
         if (fp.worker_fields) {
             const double wf = (double)fp.worker_fields;
-            rt_log("prof", "  gs worker: replay %.3f ms/field  present %.3f ms/field"
+            rt_log_info("prof", "  gs worker: replay %.3f ms/field  present %.3f ms/field"
                            "  idle %.3f ms/field over %llu fields;"
                            " EE waited %.3f ms/field in %llu waits",
                 (double)fp.worker_gs_ns / 1e6 / wf,
@@ -497,13 +535,13 @@ inline void rt_prof_report() {
         uint64_t subf = rt_audio_window_frames();
         if (wall > 0 && subf) {
             const double rate = (double)subf * 1e9 / (double)wall;
-            rt_log("prof", "  audio rate: %llu frames submitted = %.0f Hz "
+            rt_log_info("prof", "  audio rate: %llu frames submitted = %.0f Hz "
                            "(device is %u Hz; over means it plays fast and drops, "
                            "under means it starves)",
                 (unsigned long long)subf, rate, (unsigned)RT_AUDIO_RATE);
         }
         if (qmean || qmax || under) {
-            rt_log("prof", "  audio queue: min %u mean %u max %u frames "
+            rt_log_info("prof", "  audio queue: min %u mean %u max %u frames "
                            "(%.1f/%.1f/%.1f ms), %llu submits found it empty",
                 qmin, qmean, qmax,
                 (double)qmin / 48.0, (double)qmean / 48.0, (double)qmax / 48.0,
@@ -519,10 +557,10 @@ inline void rt_prof_report() {
     rt_clock_sources(&cb, &cm, &ci);
     const double tot = (double)(cb + cm + ci);
     if (tot > 0.0) {
-        rt_log("prof", "  vclk source: backedge %.1f%%  mmio %.1f%%  idle %.1f%% "
+        rt_log_info("prof", "  vclk source: backedge %.1f%%  mmio %.1f%%  idle %.1f%% "
                        "(%.2f fields of virtual time advanced)",
             100.0 * (double)cb / tot, 100.0 * (double)cm / tot,
-            100.0 * (double)ci / tot, tot / 2460060.0 /* RT_CYCLES_PER_FIELD */);
+            100.0 * (double)ci / tot, tot / (double)rt_cycles_per_field());
     }
 
     for (int i = 0; i < RT_PROF_COUNT; ++i) {
@@ -561,7 +599,7 @@ inline void rt_prof_field() {
             const bool differs = settings_on != g_rt_prof_on
                 || (settings_on && (unsigned)settings_fields != rt_prof_detail::g_every);
             if (differs) {
-                rt_log("prof", "debug.profile_fields: using ICORECOMP_PROFILE (applied at startup),"
+                rt_log_warn("prof", "debug.profile_fields: using ICORECOMP_PROFILE (applied at startup),"
                                " settings.json value ignored");
             }
         }
@@ -573,17 +611,17 @@ inline void rt_prof_field() {
                 rt_prof_detail::g_last_ns = rt_prof_detail::now_ns();
                 rt_prof_detail::g_window_ns = rt_prof_detail::g_last_ns;
                 rt_prof_detail::g_window_fields = 0;
-                rt_log("prof", "profiling on: one summary every %d fields (debug.profile_fields=%d)."
+                rt_log_info("prof", "profiling on: one summary every %d fields (debug.profile_fields=%d)."
                                " Buckets are exclusive self time and sum to wall clock.",
                     fields, fields);
             } else if ((unsigned)fields != rt_prof_detail::g_every) {
-                rt_log("prof", "debug.profile_fields changed to %d; one summary every %d fields from here",
+                rt_log_info("prof", "debug.profile_fields changed to %d; one summary every %d fields from here",
                     fields, fields);
             }
             rt_prof_detail::g_every = (unsigned)fields;
             g_rt_prof_on = true;
         } else if (was_on) {
-            rt_log("prof", "profiling off (debug.profile_fields=0)");
+            rt_log_info("prof", "profiling off (debug.profile_fields=0)");
             g_rt_prof_on = false;
         }
     }
@@ -605,8 +643,42 @@ inline void rt_prof_field() {
                 for (int i = 0; i < RT_PROF_COUNT; ++i) g_worst_field[i] = g_ns[i] - g_field_snap[i];
             }
             if (total > 20000000ull) ++g_fields_over_20ms;
-            if (total > 50000000ull) ++g_fields_over_50ms;
+            if (total > 50000000ull) {
+                ++g_fields_over_50ms;
+                /* A hitch names itself at warn, so a run at the default log
+                 * level says where its long fields went without the info
+                 * level summaries. 50 ms is two and a half PAL fields.
+                 * The limiter's sleep is not a hitch and is left out of
+                 * the total named here; the three largest buckets are
+                 * printed. Folded by powers of two over the run. */
+                if ((g_fields_over_50ms & (g_fields_over_50ms - 1)) == 0) {
+                    uint64_t d[RT_PROF_COUNT];
+                    uint64_t busy = 0;
+                    for (int i = 0; i < RT_PROF_COUNT; ++i) {
+                        d[i] = g_ns[i] - g_field_snap[i];
+                        if (i != RT_PROF_LIMIT) busy += d[i];
+                    }
+                    int top[3] = {-1, -1, -1};
+                    for (int k = 0; k < 3; ++k) {
+                        for (int i = 0; i < RT_PROF_COUNT; ++i) {
+                            if (i == RT_PROF_LIMIT || i == top[0] || i == top[1]) continue;
+                            if (top[k] < 0 || d[i] > d[top[k]]) top[k] = i;
+                        }
+                    }
+                    char extra[160] = "";
+                    if (g_rt_prof_field_hook) g_rt_prof_field_hook(true, extra, sizeof(extra));
+                    rt_log_warn("prof", "hitch #%llu: field %llu took %.1f ms (%.1f ms outside the "
+                        "frame limiter): %s %.1f ms, %s %.1f ms, %s %.1f ms%s%s",
+                        (unsigned long long)g_fields_over_50ms, (unsigned long long)g_fields,
+                        (double)total / 1e6, (double)busy / 1e6,
+                        top[0] >= 0 ? kName[top[0]] : "-", top[0] >= 0 ? (double)d[top[0]] / 1e6 : 0.0,
+                        top[1] >= 0 ? kName[top[1]] : "-", top[1] >= 0 ? (double)d[top[1]] / 1e6 : 0.0,
+                        top[2] >= 0 ? kName[top[2]] : "-", top[2] >= 0 ? (double)d[top[2]] / 1e6 : 0.0,
+                        extra[0] ? "; " : "", extra);
+                }
+            }
         }
+        if (g_rt_prof_field_hook) g_rt_prof_field_hook(false, nullptr, 0);
         for (int i = 0; i < RT_PROF_COUNT; ++i) g_field_snap[i] = g_ns[i];
         g_field_snap_valid = true;
     }

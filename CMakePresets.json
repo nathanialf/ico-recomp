@@ -34,11 +34,39 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "ICORECOMP_PARALLEL_GS": "ON"
             }
+        },
+        {
+            "name": "macos-arm64-release",
+            "displayName": "macOS arm64, paraLLEl-GS live backend over MoltenVK",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/macos-arm64-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
+                "ICORECOMP_UI": "ON",
+                "ICORECOMP_PARALLEL_GS": "ON"
+            }
+        },
+        {
+            "name": "macos-arm64-stub",
+            "displayName": "macOS arm64, stub mode (no live GS backend)",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/macos-arm64-stub",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
+                "ICORECOMP_UI": "ON",
+                "ICORECOMP_PARALLEL_GS": "OFF"
+            }
         }
     ],
     "buildPresets": [
         { "name": "linux-gcc-debug", "configurePreset": "linux-gcc-debug" },
         { "name": "linux-gcc-release", "configurePreset": "linux-gcc-release" },
-        { "name": "windows-mingw-cross", "configurePreset": "windows-mingw-cross" }
+        { "name": "windows-mingw-cross", "configurePreset": "windows-mingw-cross" },
+        { "name": "macos-arm64-release", "configurePreset": "macos-arm64-release" },
+        { "name": "macos-arm64-stub", "configurePreset": "macos-arm64-stub" }
     ]
 }

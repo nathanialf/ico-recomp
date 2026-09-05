@@ -19,12 +19,27 @@
  * logged as the first line of the run, so a bug report says where its own
  * log came from.
  *
+ * Levels: every line carries one of error, warn, info, debug, and is
+ * emitted only when its level is at or above the level in force
+ * (debug.log_level, default warn, environment twin ICORECOMP_LOG_LEVEL).
+ * Both sinks obey it. Debug lines additionally go to the log file only,
+ * never to the console echo, which is what the verbose channels have
+ * always done and is why turning the level down does not make the console
+ * unusable. See runtime.h for what each level is for.
+ *
  * Verbosity: ICORECOMP_VERBOSE names the components whose high-volume
- * diagnostic channel is on ("vu1,geom", or "all"). Those lines go to the
- * log file and not to the console echo, so the file can carry a full
- * trace while the console stays readable. Setting it also turns the file
- * sink on everywhere, since a trace with nowhere to go is worse than
- * none.
+ * diagnostic channel is on ("vu1,geom", or "all"). A channel named there
+ * passes its debug lines whatever the level is, so a warn-level run can
+ * still carry one full trace. Setting it also turns the file sink on
+ * everywhere, since a trace with nowhere to go is worse than none.
+ *
+ * Console: on Windows ico.exe is a GUI-subsystem binary, so a
+ * double-clicked run has no console at all. rt_console_init attaches to
+ * the console the process was launched from when there is one, and
+ * allocates one when debug.console asks for it. With neither, the console
+ * echo is off and rt_log_hold_console shows the failure in a message box
+ * instead, because a fatal that reaches nobody is the failure mode this
+ * codebase does not accept.
  *
  * Threading: no log call from guest-executing code touches a file. A
  * caller formats its line into a stack buffer, copies it into a bounded
@@ -50,6 +65,7 @@
 
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -57,6 +73,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -79,9 +96,77 @@ std::string g_log_path;
  * onto one file, so this stays null and stderr does the work. */
 std::FILE* g_logfile = nullptr;
 
-/* ICORECOMP_VERBOSE, parsed once by rt_log_init. */
-bool g_verbose_all = false;
-std::vector<std::string> g_verbose_tags;
+/* The verbose channel set: ICORECOMP_VERBOSE at startup, for CI and
+ * scripted runs; rt_log_set_verbose can replace it later.
+ *
+ * Published as an immutable snapshot rather than mutated in place. The
+ * writer is the main thread, which rebuilds the set when the menu commits
+ * at startup); the readers are every thread that logs, including the GS
+ * command ring's worker (gs/gs_threaded.cpp). Clearing a shared vector
+ * would free the strings a reader is part-way through comparing, so a new
+ * set is built off to the side and swapped in whole: a reader sees either
+ * the old set or the new one, and holds its own reference to whichever it
+ * got for as long as it walks it. This is the hazard g_rt_log_level is an
+ * atomic for (runtime.h), one level up.
+ *
+ * g_verbose_any is the fast path, and only a hint, so it needs no ordering
+ * against the snapshot: a stale false costs one debug line at the moment
+ * of an edit, a stale true costs one shared_ptr load that finds an empty
+ * set. */
+struct VerboseSet {
+    bool all = false;
+    std::vector<std::string> tags;
+};
+std::shared_ptr<const VerboseSet> g_verbose;   /* atomic_load/atomic_store only */
+std::atomic<bool> g_verbose_any{false};
+
+std::shared_ptr<const VerboseSet> verbose_set() {
+    return std::atomic_load_explicit(&g_verbose, std::memory_order_acquire);
+}
+
+void publish_verbose(const VerboseSet& set) {
+    std::shared_ptr<const VerboseSet> snapshot = std::make_shared<const VerboseSet>(set);
+    std::atomic_store_explicit(&g_verbose, snapshot, std::memory_order_release);
+    g_verbose_any.store(set.all || !set.tags.empty(), std::memory_order_relaxed);
+}
+
+/* Set by rt_console_init: whether this process has a console to echo to at
+ * all, and whether it owns that console (allocated it) rather than having
+ * attached to the one it was launched from. Owning it is what makes
+ * waiting for Enter on a fatal correct: an attached console belongs to the
+ * shell and outlives the process, so blocking it would only hang a script.
+ */
+bool g_console_present = false;
+bool g_console_owned = false;
+
+/* The first lines of whatever went wrong, kept so a run with no console
+ * can still put the failure in front of the user. Only error-level lines
+ * and rt_fatal's own message land here; capped so a fault that logs in a
+ * loop cannot grow it without bound.
+ *
+ * Its own mutex, not g_mu: every thread that can log an error can append
+ * here, and the GS worker is allowed to raise a fatal (see
+ * rt_log_hold_console), so the EE thread's error line and the worker's
+ * FATAL can arrive together. Two unsynchronised appends would corrupt the
+ * one buffer the message box is about to show, which is the last thing
+ * the process does. Error-level lines only, so the lock is never on a hot
+ * path, and it is never held across I/O. */
+std::string g_failure_text;
+std::mutex g_failure_mu;
+constexpr size_t kFailureTextMax = 1400;
+
+void record_failure(const char* text, size_t len) {
+    std::lock_guard<std::mutex> lk(g_failure_mu);
+    if (g_failure_text.size() >= kFailureTextMax) return;
+    g_failure_text.append(text, std::min(len, kFailureTextMax - g_failure_text.size()));
+}
+
+/* Only rt_log_hold_console's message box reads it, and that is Windows
+ * only, so this is unused elsewhere by design rather than by accident. */
+[[maybe_unused]] std::string failure_text_copy() {
+    std::lock_guard<std::mutex> lk(g_failure_mu);
+    return g_failure_text;
+}
 
 /* Channels a run gets without being asked, once it has a log file to put
  * them in. Deliberately empty: "geom" re-parses every GIF packet the
@@ -102,10 +187,14 @@ const char* const kDefaultVerbose = "";
  * thread afterwards:
  *
  *   file_sink()      where every line goes. stderr when the fd-2 redirect
- *                    is in place (stderr is the log file then), g_logfile
- *                    when it is not, and stderr again when there is no log
- *                    file at all, in which case stderr is still the
- *                    console and is the only sink there is.
+ *                    is in place (stderr is the log file then), stderr
+ *                    again on the Windows GUI-with-no-console path where
+ *                    stderr was reopened onto the log file, g_logfile when
+ *                    neither happened, and stderr once more when there is
+ *                    no log file at all, in which case stderr is still the
+ *                    console and is the only sink there is. It is never
+ *                    two FILE objects on one file: two would have
+ *                    independent offsets and would overwrite each other.
  *   g_console_sink   the console echo, or null when there is nothing to
  *                    echo to. Verbose lines skip it.
  */
@@ -164,6 +253,16 @@ std::once_flag g_writer_once;
 /* False until the writer thread is up, and false again once a fatal path
  * has drained it. Both states mean "write on the calling thread". */
 std::atomic<bool> g_async{false};
+
+/* False until rt_log_init has finished moving the sink globals
+ * (g_console_sink, g_logfile, stderr's buffering, fd 2). While it is
+ * false, enqueue writes on the calling thread rather than starting the
+ * writer, so nothing can bring the writer up behind rt_log_init's back
+ * while its AsyncPause guard has it nominally parked. Set from that
+ * guard's destructor, which is what covers rt_log_init's several early
+ * exits. A process that never calls rt_log_init (the standalone tools)
+ * stays synchronous, which is correct and only slower. */
+std::atomic<bool> g_sink_open{false};
 
 /* Set while this thread is inside the enqueue critical section. A crash
  * handler that finds it set must not wait on the writer: the thread it
@@ -289,7 +388,7 @@ void enqueue(uint8_t dest, const char* text, size_t len) {
     if (len == 0) return;
     if (len > kLineMax) len = kLineMax;
     if (!g_async.load(std::memory_order_acquire)) {
-        start_writer();
+        if (g_sink_open.load(std::memory_order_acquire)) start_writer();
         if (!g_async.load(std::memory_order_acquire)) {
             /* Before the thread exists, and after a fatal path took it
              * away: the calling thread does the write. */
@@ -344,13 +443,54 @@ void emit_file(const char* fmt, ...) {
     enqueue(kFileOnly, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
 }
 
-void parse_verbose(const char* spec) {
+/* Formats one already-gated line and puts it on its sink.
+ *
+ * The prefix keeps the shape every existing line and every grep in
+ * docs/SETTINGS.md already has, "[icorecomp][component] ", and marks the
+ * level after the component for everything but info. Info is the unmarked
+ * case because it is what the format has always meant; marking it would
+ * break those greps and say nothing new. */
+void write_line(RtLogLevel level, const char* component, const char* line) {
+    if (level == RT_LOG_DEBUG) {
+        emit_file("[icorecomp][%s][debug] %s\n", component, line);
+        return;
+    }
+    if (level == RT_LOG_INFO) {
+        emit("[icorecomp][%s] %s\n", component, line);
+        return;
+    }
+    const char* tag = (level == RT_LOG_ERROR) ? "error" : "warn";
+    if (level == RT_LOG_ERROR) {
+        char buf[kLineMax];
+        int n = std::snprintf(buf, sizeof(buf), "[%s] %s\n", component, line);
+        if (n > 0) record_failure(buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+    }
+    emit("[icorecomp][%s][%s] %s\n", component, tag, line);
+}
+
+/* The console half of rt_log_init's own reporting, which has to happen
+ * before the log file exists (or when it never will). Guarded rather than
+ * a bare fprintf: on a GUI-subsystem Windows run with no console there is
+ * no handle behind stdout, so a line written there reaches nobody. A macro
+ * rather than a function so the compiler keeps checking the format string
+ * against its arguments. */
+#define CONSOLE_PRINTF(...) do { \
+    if (g_console_present) { \
+        std::fprintf(stdout, __VA_ARGS__); \
+        std::fflush(stdout); \
+    } \
+} while (0)
+
+/* Adds the channels `spec` names to `out`. Builds into a caller-owned set
+ * rather than into the published one, so the snapshot readers walk is only
+ * ever replaced whole. */
+void parse_verbose(const char* spec, VerboseSet* out) {
     std::string cur;
     for (const char* p = spec;; ++p) {
         if (*p == ',' || *p == ' ' || *p == '\0') {
             if (!cur.empty()) {
-                if (cur == "all" || cur == "1") g_verbose_all = true;
-                else g_verbose_tags.push_back(cur);
+                if (cur == "all" || cur == "1") out->all = true;
+                else out->tags.push_back(cur);
                 cur.clear();
             }
             if (*p == '\0') break;
@@ -384,7 +524,7 @@ struct RotateOutcome {
 /* If a file already exists at `path`, renames it to the same path with
  * ".prev" inserted before the extension, replacing any older ".prev" file,
  * so the log about to be opened at `path` does not overwrite a crash log
- * from the previous run. Never fatal: a failed rename just falls through
+ * from the previous run. Never fatal: a failed rename falls through
  * to the normal open-and-truncate behavior. */
 RotateOutcome rotate_prev_log(const std::string& path) {
     RotateOutcome out;
@@ -434,6 +574,12 @@ std::string temp_dir() {
 
 } // namespace
 
+/* Declared in runtime.h so rt_log_level_enabled can be an inline load.
+ * Warn is the shipped default; rt_log_set_initial_level moves it before
+ * rt_log_init for the standalone tools, ICORECOMP_LOG_LEVEL moves it
+ * inside rt_log_init, and debug.log_level moves it once settings load. */
+std::atomic<int> g_rt_log_level{(int)RT_LOG_WARN};
+
 bool rt_log_on_main_thread() {
     /* Before rt_log_init nothing else has started, so the caller is the main
      * thread by construction. */
@@ -444,33 +590,102 @@ int rt_fatal_exit_code() {
     return g_fatal_exit_code.load(std::memory_order_acquire);
 }
 
-void rt_log_init(const char* dir, bool file_allowed) {
+void rt_console_init(bool want_alloc) {
+#ifdef _WIN32
+    /* Order matters. Attaching to the launching shell's console comes
+     * first so a run started from cmd, PowerShell or a CI job keeps
+     * printing where the user is already looking; only a run with no
+     * console behind it (a double-click from Explorer) can be given one of
+     * its own, and only when debug.console asks. */
+    bool have = AttachConsole(ATTACH_PARENT_PROCESS) != 0;
+    bool owned = false;
+    if (!have && GetConsoleWindow() != nullptr) {
+        /* Already has one: a console-subsystem build, or a host that
+         * handed us one. Nothing to attach or allocate. */
+        have = true;
+    }
+    if (!have && want_alloc) {
+        have = owned = AllocConsole() != 0;
+    }
+    if (!have) return;
+
+    /* The CRT's stdout/stderr/stdin are not wired to a console this
+     * process only just acquired, so point them at it. freopen replaces
+     * the underlying fd as well as the FILE*, which is what lets the
+     * fd-2 redirect in rt_log_init dup a real handle afterwards. */
+    std::FILE* f = nullptr;
+    (void)freopen_s(&f, "CONOUT$", "w", stdout);
+    (void)freopen_s(&f, "CONOUT$", "w", stderr);
+    (void)freopen_s(&f, "CONIN$", "r", stdin);
+    g_console_present = true;
+    g_console_owned = owned;
+#else
+    /* stderr is the console and always has been. debug.console names a
+     * Windows-only behaviour and changes nothing here. */
+    (void)want_alloc;
+    g_console_present = true;
+    g_console_owned = false;
+#endif
+}
+
+bool rt_console_present() { return g_console_present; }
+
+void rt_log_init(const char* dir, bool file_allowed, bool console_wanted) {
     g_main_thread = std::this_thread::get_id();
     g_main_thread_known = true;
     /* This is main's first statement, so in practice nothing has logged
      * yet and no writer thread exists. It is still cheap to be certain:
-     * park the writer for the whole of this function, not just up to the
+     * park the writer for the whole of this function, not only up to the
      * first store. g_console_sink, g_logfile, stderr's buffering and fd 2
      * all move below, and they are plain globals rather than atomics, so a
      * writer waking mid-swap would read them torn. Parking has to cover
      * every exit, and this function has several early returns, so it is a
-     * guard rather than a call. */
+     * guard rather than a call.
+     *
+     * Parking an already-running writer is only half of it: on a cold
+     * start there is no writer yet, and the first emit below would have
+     * started one from inside this function. g_sink_open is what stops
+     * that, and the destructor sets it, because the destructor is the one
+     * thing every exit from here runs. */
     struct AsyncPause {
         bool resume;
         AsyncPause() : resume(g_async.exchange(false, std::memory_order_acq_rel)) {
             wait_writer_idle();
         }
         ~AsyncPause() {
+            g_sink_open.store(true, std::memory_order_release);
             if (resume) g_async.store(true, std::memory_order_release);
         }
     } pause_writer;
+
+    rt_console_init(console_wanted);
+
+    /* ICORECOMP_LOG_LEVEL wins over debug.log_level for the whole run, as
+     * every other environment twin does. A name that is not one of the
+     * four keeps the level the caller left in place and says so; settings
+     * handling is never fatal and neither is this. The line goes to stdout
+     * because the log file does not exist yet. */
+    const char* lspec = std::getenv("ICORECOMP_LOG_LEVEL");
+    bool level_from_env = false;
+    if (lspec) {
+        RtLogLevel parsed = rt_log_get_level();
+        if (rt_log_level_parse(lspec, &parsed)) {
+            rt_log_set_level(parsed);
+            level_from_env = true;
+        } else {
+            CONSOLE_PRINTF("[icorecomp][log] ICORECOMP_LOG_LEVEL=%s is not one of"
+                " error/warn/info/debug; keeping %s\n", lspec, rt_log_level_name(rt_log_get_level()));
+        }
+    }
 
     const char* vspec = std::getenv("ICORECOMP_VERBOSE");
     /* "-", "0" or "none" turns the channels off, including the defaults. */
     const bool verbose_off = vspec && (std::strcmp(vspec, "-") == 0
         || std::strcmp(vspec, "0") == 0 || std::strcmp(vspec, "none") == 0);
-    if (vspec && !verbose_off) parse_verbose(vspec);
-    const bool verbose = g_verbose_all || !g_verbose_tags.empty();
+    VerboseSet vset;
+    if (vspec && !verbose_off) parse_verbose(vspec, &vset);
+    const bool verbose = vset.all || !vset.tags.empty();
+    publish_verbose(vset);
 
     const char* env = std::getenv("ICORECOMP_LOG");
     /* The environment always wins over debug.log_file (see settings.cpp's
@@ -478,7 +693,7 @@ void rt_log_init(const char* dir, bool file_allowed) {
      * so a run started with the old env var doesn't look like it silently
      * ignored a settings.json edit. */
     if (env && *env && !file_allowed) {
-        std::fprintf(stderr, "[icorecomp][log] debug.log_file: using ICORECOMP_LOG=%s,"
+        CONSOLE_PRINTF("[icorecomp][log] debug.log_file: using ICORECOMP_LOG=%s,"
             " settings.json value ignored\n", env);
     }
     const std::string base = (dir && *dir) ? dir : ".";
@@ -491,7 +706,7 @@ void rt_log_init(const char* dir, bool file_allowed) {
         /* "-" or "0" opts out: console only, the pre-sink behavior. */
         if (std::strcmp(env, "-") == 0 || std::strcmp(env, "0") == 0) {
             if (verbose) {
-                std::fprintf(stderr, "[icorecomp][log] ICORECOMP_LOG=%s disables the log file;"
+                CONSOLE_PRINTF("[icorecomp][log] ICORECOMP_LOG=%s disables the log file;"
                     " ICORECOMP_VERBOSE output goes to the console\n", env);
             }
             return;
@@ -503,7 +718,7 @@ void rt_log_init(const char* dir, bool file_allowed) {
          * environment. */
         if (!file_allowed) {
             if (verbose) {
-                std::fprintf(stderr, "[icorecomp][log] debug.log_file=false disables the log file\n");
+                CONSOLE_PRINTF("[icorecomp][log] debug.log_file=false disables the log file\n");
             }
             return;
         }
@@ -535,31 +750,105 @@ void rt_log_init(const char* dir, bool file_allowed) {
         /* stdout, not stderr: stderr is about to become the log file, and
          * on the failure path there is no log file to read this in. The
          * console is the only place this can land. */
-        std::fprintf(stdout, "[icorecomp][log] could not open '%s' for writing (%s)\n",
+        CONSOLE_PRINTF("[icorecomp][log] could not open '%s' for writing (%s)\n",
             c.c_str(), why.c_str());
-        std::fflush(stdout);
     }
     if (!f) {
-        std::fprintf(stdout, "[icorecomp][log] no writable log location; this run logs to the"
+        CONSOLE_PRINTF("[icorecomp][log] no writable log location; this run logs to the"
             " console only, and the console does not survive the window closing\n");
-        std::fflush(stdout);
         return;
     }
 
-    int saved = rt_dup(2);
+    /* A GUI-subsystem run with no console has no handle behind fd 2 at
+     * all (GetStdHandle returns null), and msvcrt's stderr FILE object is
+     * dead with it: _dup(2) is an invalid parameter, _dup2 onto fd 2
+     * succeeds but leaves the FILE object closed, so every fwrite(stderr)
+     * fails without a word. That happened to the first PAL packages, which
+     * rotated their log and then wrote nothing. So without a handle behind
+     * fd 2 stderr is reopened onto the log file (append) and becomes the
+     * one stream the run writes through, so that the shared library's and
+     * the driver's own stderr lines land in the same file as the runtime's
+     * own, interleaved rather than overwriting one another. */
+    bool have_stderr = true;
+#ifdef _WIN32
+    {
+        HANDLE h2 = GetStdHandle(STD_ERROR_HANDLE);
+        have_stderr = h2 != nullptr && h2 != INVALID_HANDLE_VALUE;
+    }
+#endif
+    int saved = have_stderr ? rt_dup(2) : -1;
+    bool reopened_stderr = false;
+    (void)reopened_stderr;
     std::fflush(stderr);
-    if (rt_dup2(rt_fileno(f), 2) < 0) {
+    if (!have_stderr || rt_dup2(rt_fileno(f), 2) < 0) {
         /* No redirect, so output from the GS library, SDL and the Vulkan
          * loader stays on the console. The runtime's own log is the part
          * that matters and it keeps its file: writing through the FILE*
          * directly needs nothing from fd 2. */
-        std::fprintf(stdout, "[icorecomp][log] could not point stderr at '%s'; the runtime log still"
-            " goes there, but output from the renderer and the Vulkan driver stays on the console\n",
-            path.c_str());
-        std::fflush(stdout);
-        g_logfile = f;
-        std::setvbuf(g_logfile, nullptr, _IOFBF, 1 << 16);
-        g_console_sink = stderr;
+        if (have_stderr) {
+            CONSOLE_PRINTF("[icorecomp][log] could not point stderr at '%s'; the runtime log still"
+                " goes there, but output from the renderer and the Vulkan driver stays on the console\n",
+                path.c_str());
+        }
+#ifdef _WIN32
+        else {
+            /* See above: revive the CRT's stderr onto the log file, and
+             * give fd 2 the same file for anything that writes the
+             * descriptor directly.
+             *
+             * One stream, not two. Two FILE objects on one file have
+             * independent offsets: the runtime's buffered writes at its own
+             * offset would overwrite whatever a library had appended, which
+             * is exactly the output this revival exists to keep. So on
+             * success the first handle is closed and g_logfile is left null,
+             * which makes file_sink() return stderr and puts the runtime's
+             * own lines and the library's on the same offset.
+             *
+             * The path is normalized to backslashes first, for the reason
+             * rt_fopen_log gives: the runtime joins with '/', which a UNC
+             * path does not tolerate mixed.
+             *
+             * What is lost by going through _wfreopen_s is
+             * FILE_FLAG_WRITE_THROUGH, which rt_fopen_log obtains from
+             * CreateFileW and which no CRT reopen can ask for. The writer
+             * thread already flushes once per batch, so a kill loses at most
+             * what was queued while the last batch was being written; on a
+             * network share the difference is that a flushed line may sit in
+             * the client's cache rather than on the server. That is the
+             * accepted cost of keeping the library's lines. */
+            std::string wpath_utf8 = path;
+            for (char& c : wpath_utf8) {
+                if (c == '/') c = '\\';
+            }
+            int wn = MultiByteToWideChar(CP_UTF8, 0, wpath_utf8.c_str(), -1, nullptr, 0);
+            std::wstring wpath(size_t(wn > 0 ? wn : 1), L'\0');
+            if (wn > 0) {
+                MultiByteToWideChar(CP_UTF8, 0, wpath_utf8.c_str(), -1, wpath.data(), wn);
+            }
+            std::FILE* nf = nullptr;
+            if (wn > 0 && _wfreopen_s(&nf, wpath.c_str(), L"a", stderr) == 0 && nf) {
+                /* _IOFBF and not _IOLBF: the Microsoft CRT treats _IOLBF as
+                 * _IOFBF anyway, and the other branch buffers the same way
+                 * and relies on the per-batch flush. */
+                std::setvbuf(stderr, nullptr, _IOFBF, 1 << 16);
+                (void)rt_dup2(rt_fileno(stderr), 2);
+                /* The rotate already ran and the file was created empty by
+                 * rt_fopen_log, so "a" starts at offset 0. */
+                std::fclose(f);
+                f = nullptr;
+                reopened_stderr = true;
+            }
+        }
+#endif
+        if (f) {
+            g_logfile = f;
+            std::setvbuf(g_logfile, nullptr, _IOFBF, 1 << 16);
+        }
+        /* stderr only when there is a console behind it: on a GUI-subsystem
+         * Windows run with no console, stderr has no handle and the echo
+         * has nowhere to go. It is also the file sink there, and echoing a
+         * line into the sink it already went to would double it. */
+        g_console_sink = (g_console_present && !reopened_stderr) ? stderr : nullptr;
         if (saved >= 0) {
 #ifdef _WIN32
             _close(saved);
@@ -592,7 +881,10 @@ void rt_log_init(const char* dir, bool file_allowed) {
     /* The file exists now, so the default channels have somewhere to go.
      * An explicit ICORECOMP_VERBOSE, including one that turns everything
      * off, always wins. */
-    if (!vspec) parse_verbose(kDefaultVerbose);
+    if (!vspec) {
+        parse_verbose(kDefaultVerbose, &vset);
+        publish_verbose(vset);
+    }
 
     /* Announced on stdout as well as into the log. Someone looking for
      * the file needs the answer on the console, where it is visible
@@ -602,10 +894,9 @@ void rt_log_init(const char* dir, bool file_allowed) {
      * off a network share, where a stale client-side copy of the exe is
      * indistinguishable from a fix that did not work. Naming the build in
      * the first line of every run settles that without guesswork. */
-    std::fprintf(stdout, "[icorecomp] build " __DATE__ " " __TIME__ " (exe: %s)\n",
+    CONSOLE_PRINTF("[icorecomp] build " __DATE__ " " __TIME__ " (exe: %s)\n",
         rt_exe_identity().c_str());
-    std::fprintf(stdout, "[icorecomp][log] this run's log: %s\n", path.c_str());
-    std::fflush(stdout);
+    CONSOLE_PRINTF("[icorecomp][log] this run's log: %s\n", path.c_str());
 
     {
         std::string line = "[icorecomp] build " __DATE__ " " __TIME__ " (exe: "
@@ -622,9 +913,19 @@ void rt_log_init(const char* dir, bool file_allowed) {
         }
     }
     emit("[icorecomp][log] base directory for config/, saves/ and the disc probe: %s\n", base.c_str());
-    if (g_verbose_all || !g_verbose_tags.empty()) {
-        std::string tags = g_verbose_all ? "all" : std::string();
-        for (const std::string& t : g_verbose_tags) {
+    /* Unconditional, like the rest of this prologue: a reader who cannot
+     * find a line they expected needs to know which level swallowed it. */
+    emit("[icorecomp][log] log level %s%s (error > warn > info > debug; a line shows when its"
+        " level is at or above this one)\n",
+        rt_log_level_name(rt_log_get_level()),
+        level_from_env ? " from ICORECOMP_LOG_LEVEL" : " (debug.log_level applies once settings load)");
+    emit("[icorecomp][log] console: %s\n",
+        g_console_owned ? "allocated for this run (debug.console)"
+                        : (g_console_present ? "the one this process was launched from"
+                                             : "none; failures are shown in a message box"));
+    if (vset.all || !vset.tags.empty()) {
+        std::string tags = vset.all ? "all" : std::string();
+        for (const std::string& t : vset.tags) {
             if (!tags.empty()) tags += ",";
             tags += t;
         }
@@ -632,47 +933,128 @@ void rt_log_init(const char* dir, bool file_allowed) {
             " set ICORECOMP_VERBOSE to change, or ICORECOMP_VERBOSE=none to turn off)\n",
             tags.c_str());
     }
-    if (rt_verbose("geom")) {
-        emit("[icorecomp][log] the geometry checker is on: every GIF packet is re-parsed and"
-            " counted, per microprogram and per MSCAL entry, in the profiler summary."
-            " This costs per field, so frame times from this run read high.\n");
+    if (rt_log_get_level() == RT_LOG_DEBUG) {
+        emit("[icorecomp][log] the log level is debug, so every verbose channel this build"
+            " defines is on. Set debug.log_level to info or warn and name single channels in"
+            " ICORECOMP_VERBOSE to trace one subsystem at field-rate cost.\n");
     }
+#ifdef ICORECOMP_GEOM_CHECK
+    /* Not a channel any more: the geometry checker is a build define
+     * (docs/GS_RENDERER.md), so a build that has it says so unconditionally
+     * rather than being asked. */
+    emit("[icorecomp][log] the geometry checker is compiled in: every GIF packet is re-parsed"
+        " and counted, per microprogram and per MSCAL entry, in the profiler summary."
+        " This costs per field, so frame times from this run read high.\n");
+#endif
 }
 
 bool rt_verbose(const char* component) {
-    if (g_verbose_all) return true;
-    for (const std::string& t : g_verbose_tags) {
+    return rt_log_level_enabled_for(RT_LOG_DEBUG, component);
+}
+
+bool rt_log_level_enabled_for(RtLogLevel level, const char* component) {
+    if (rt_log_level_enabled(level)) return true;
+    /* Below the level. Only a debug line can still get through, and only
+     * because ICORECOMP_VERBOSE named its channel. */
+    if (level != RT_LOG_DEBUG) return false;
+    if (!g_verbose_any.load(std::memory_order_relaxed)) return false;
+    std::shared_ptr<const VerboseSet> set = verbose_set();
+    if (!set) return false;
+    if (set->all) return true;
+    for (const std::string& t : set->tags) {
         if (t == component) return true;
     }
     return false;
 }
 
-void rt_log_set_verbose(const char* spec) {
-    g_verbose_all = false;
-    g_verbose_tags.clear();
-    if (!spec) return;
-    const bool off = std::strcmp(spec, "-") == 0 || std::strcmp(spec, "0") == 0
-        || std::strcmp(spec, "none") == 0;
-    if (!off) parse_verbose(spec);
+void rt_log_set_level(RtLogLevel level) {
+    g_rt_log_level.store((int)level, std::memory_order_relaxed);
 }
 
-void rt_logv(const char* component, const char* fmt, ...) {
-    char line[3072];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    emit_file("[icorecomp][%s] %s\n", component, line);
+RtLogLevel rt_log_get_level() {
+    return (RtLogLevel)g_rt_log_level.load(std::memory_order_relaxed);
+}
+
+void rt_log_set_initial_level(RtLogLevel level) {
+    rt_log_set_level(level);
+}
+
+const char* rt_log_level_name(RtLogLevel level) {
+    switch (level) {
+    case RT_LOG_DEBUG: return "debug";
+    case RT_LOG_INFO:  return "info";
+    case RT_LOG_WARN:  return "warn";
+    case RT_LOG_ERROR: return "error";
+    }
+    return "warn";
+}
+
+bool rt_log_level_parse(const char* name, RtLogLevel* out) {
+    if (!name || !out) return false;
+    if (std::strcmp(name, "debug") == 0) { *out = RT_LOG_DEBUG; return true; }
+    if (std::strcmp(name, "info") == 0)  { *out = RT_LOG_INFO;  return true; }
+    if (std::strcmp(name, "warn") == 0)  { *out = RT_LOG_WARN;  return true; }
+    if (std::strcmp(name, "error") == 0) { *out = RT_LOG_ERROR; return true; }
+    return false;
+}
+
+void rt_log_set_verbose(const char* spec) {
+    VerboseSet vset;
+    if (spec) {
+        const bool off = std::strcmp(spec, "-") == 0 || std::strcmp(spec, "0") == 0
+            || std::strcmp(spec, "none") == 0;
+        if (!off) parse_verbose(spec, &vset);
+    }
+    publish_verbose(vset);
 }
 
 const char* rt_log_path() {
     return g_log_path.empty() ? nullptr : g_log_path.c_str();
 }
 
-void rt_vlog(const char* component, const char* fmt, va_list ap) {
+void rt_vlog(RtLogLevel level, const char* component, const char* fmt, va_list ap) {
+    /* Gated here, not only in the four named entry points above: a caller
+     * that picks its level at run time (host/run_state.cpp's summary, which
+     * is info for a user quit and warn for anything else) reaches the sink
+     * through this function alone, and without the gate its info lines were
+     * written into a file the level had ruled out. Same rule as the named
+     * entry points, debug's verbose channel included. */
+    if (!rt_log_level_enabled_for(level, component)) return;
     char line[3072];
     std::vsnprintf(line, sizeof(line), fmt, ap);
-    emit("[icorecomp][%s] %s\n", component, line);
+    write_line(level, component, line);
+}
+
+void rt_log_error(const char* component, const char* fmt, ...) {
+    if (!rt_log_level_enabled(RT_LOG_ERROR)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vlog(RT_LOG_ERROR, component, fmt, ap);
+    va_end(ap);
+}
+
+void rt_log_warn(const char* component, const char* fmt, ...) {
+    if (!rt_log_level_enabled(RT_LOG_WARN)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vlog(RT_LOG_WARN, component, fmt, ap);
+    va_end(ap);
+}
+
+void rt_log_info(const char* component, const char* fmt, ...) {
+    if (!rt_log_level_enabled(RT_LOG_INFO)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vlog(RT_LOG_INFO, component, fmt, ap);
+    va_end(ap);
+}
+
+void rt_log_debug(const char* component, const char* fmt, ...) {
+    if (!rt_log_level_enabled_for(RT_LOG_DEBUG, component)) return;
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vlog(RT_LOG_DEBUG, component, fmt, ap);
+    va_end(ap);
 }
 
 void rt_log_flush() {
@@ -687,11 +1069,54 @@ void rt_log_drain() {
     wait_writer_idle();
 }
 
-void rt_log(const char* component, const char* fmt, ...) {
+void rt_log_write_sync(const char* text) {
+    if (!text) return;
+    const size_t len = std::strlen(text);
+    if (len == 0) return;
+    /* try_lock, never lock. This is the crash path: the thread that faulted
+     * may be the one holding g_io_mu, in which case waiting for it here is
+     * a deadlock and the dump never appears. Two writers interleaving one
+     * line is a cosmetic problem; a crash handler that hangs is the failure
+     * this whole path exists to remove. */
+    std::unique_lock<std::mutex> io(g_io_mu, std::try_to_lock);
+    write_now(kBoth, text, len);
+    flush_now();
+}
+
+void rt_log_sync(const char* component, const char* fmt, ...) {
+    /* The body is bounded by what is left of a line once the prefix and the
+     * component name have had their share, so the two buffers cannot add up
+     * to more than one line. snprintf truncates rather than overruns either
+     * way; sizing them apart is what lets the compiler see that, instead of
+     * assuming a full body behind a full prefix. */
+    constexpr size_t kSyncPrefix = 128;
+    char body[kLineMax - kSyncPrefix];
     va_list ap;
     va_start(ap, fmt);
-    rt_vlog(component, fmt, ap);
+    int n = std::vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
+    if (n < 0) return;
+    char line[kLineMax];
+    std::snprintf(line, sizeof(line), "[icorecomp][%s][error] %s\n", component, body);
+    rt_log_write_sync(line);
+}
+
+void rt_log_record_failure_text(const char* text) {
+    if (!text) return;
+    record_failure(text, std::strlen(text));
+}
+
+void rt_log_crash_write_selftest(const char* reason) {
+    /* Exactly the sequence a crash handler runs, minus the ending: the
+     * synchronous write first, then the drain that lets the queued lines
+     * out behind it. Kept here rather than in the selftest so the two
+     * cannot drift: what the test exercises is what the handler does. */
+    char line[kLineMax];
+    std::snprintf(line, sizeof(line),
+        "[icorecomp][crash][error] ---- crash ---- (selftest: %s)\n",
+        reason ? reason : "no reason given");
+    rt_log_write_sync(line);
+    rt_log_drain();
 }
 
 static const char* const kGprNames[32] = {
@@ -758,20 +1183,48 @@ void rt_log_hold_console() {
         return;
     }
 #ifdef _WIN32
-    /* Only when this process owns the console, i.e. it was double-clicked
-     * from Explorer rather than launched from an existing shell: closing
-     * would otherwise erase the failure before it can be read. A run
-     * launched from cmd or a CI job has other processes on the console
-     * list and must not block. */
-    DWORD pids[4];
-    DWORD n = GetConsoleProcessList(pids, 4);
-    if (n != 1) return;
-    if (const char* path = rt_log_path()) {
-        std::fprintf(stdout, "\nThe full log for this run is in %s\n", path);
+    if (g_console_present) {
+        /* Only when this process owns the console, i.e. debug.console
+         * allocated one for a double-clicked run: closing would otherwise
+         * erase the failure before it can be read. A run launched from cmd
+         * or a CI job has other processes on the console list and must not
+         * block. */
+        DWORD pids[4];
+        DWORD n = GetConsoleProcessList(pids, 4);
+        if (!g_console_owned && n != 1) return;
+        if (const char* path = rt_log_path()) {
+            CONSOLE_PRINTF("\nThe full log for this run is in %s\n", path);
+        }
+        CONSOLE_PRINTF("Press Enter to close this window.\n");
+        (void)std::getchar();
+        return;
     }
-    std::fprintf(stdout, "Press Enter to close this window.\n");
-    std::fflush(stdout);
-    (void)std::getchar();
+
+    /* No console: the default for a double-clicked ico.exe. Nothing this
+     * process has written is visible anywhere but the log file, so the
+     * failure goes in a message box. The launcher window reports the boot
+     * failures it can (rt_boot_precheck, see main.cpp); this is for
+     * everything that gets past it, and for the failures that happen
+     * before there is a window at all. */
+    std::string body = failure_text_copy();
+    if (body.empty()) body = "ICO stopped. No failure message was recorded.\n";
+    if (const char* path = rt_log_path()) {
+        body += "\nThe full log for this run is in:\n";
+        body += path;
+        body += "\n";
+    } else {
+        body += "\nThis run kept no log file (debug.log_file is off, or no writable"
+                " location was found).\n";
+    }
+    /* MessageBoxW, not MessageBoxA: a log path can hold characters the
+     * active code page cannot spell, and a box that mangles the path a
+     * user is being sent to is worse than no box. */
+    int wide = MultiByteToWideChar(CP_UTF8, 0, body.c_str(), (int)body.size(), nullptr, 0);
+    if (wide > 0) {
+        std::vector<wchar_t> wbuf((size_t)wide + 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, body.c_str(), (int)body.size(), wbuf.data(), wide);
+        MessageBoxW(nullptr, wbuf.data(), L"ICO stopped", MB_OK | MB_ICONERROR);
+    }
 #endif
 }
 
@@ -781,14 +1234,60 @@ void rt_log_hold_console() {
     va_start(ap, fmt);
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    /* Synchronous from here: the FATAL line and the dump must reach the
-     * file whether this exits through atexit or not. */
+
+    /* The FATAL line goes to the file first, written and flushed by this
+     * thread, before the drain, before the message box and before the exit.
+     *
+     * It used to be emitted after rt_log_drain() instead, on the reasoning
+     * that the drain puts logging back on the calling thread and everything
+     * after it is therefore synchronous. That reasoning has a hole, and
+     * three runs on Windows fell through it: every one ended with the
+     * failure box on screen and no FATAL line in the log at all, whichever
+     * backend was in use. rt_log_drain is bounded and gives up rather than
+     * hang, so a writer that is slow or wedged leaves it returning with the
+     * ring still full; and its own g_async exchange races a producer on
+     * another thread that has already passed the check, which can restart
+     * the asynchronous path underneath the very line that must not be
+     * queued. Neither is a theory worth carrying on the one path where
+     * losing the line costs the whole diagnosis.
+     *
+     * rt_log_write_sync has no such hole: it does not touch g_async, it
+     * try-locks rather than waits, and it flushes before returning. Whatever
+     * thread raises the fatal, and whatever the writer is doing, the line is
+     * on disk by the end of this statement. The drain that follows is then
+     * only about the lines queued BEFORE the fatal, which are a bonus rather
+     * than the point. */
+    {
+        char full[3400];
+        int n = std::snprintf(full, sizeof(full), "[icorecomp][%s][error] FATAL: %s\n",
+                              component, line);
+        if (n > 0) rt_log_write_sync(full);
+    }
+    /* Recorded as well as written, so a run with no console can show it in
+     * rt_log_hold_console's message box. Its own buffer, its own mutex. */
+    {
+        char full[3400];
+        int n = std::snprintf(full, sizeof(full), "[%s] FATAL: %s\n", component, line);
+        if (n > 0) record_failure(full, (size_t)n < sizeof(full) ? (size_t)n : sizeof(full) - 1);
+    }
+    /* Now the backlog: everything the run had queued before the fatal, put
+     * behind it in the file, and logging on the calling thread from here so
+     * the register dump and the end-of-run summary are synchronous too. */
     rt_log_drain();
-    emit("[icorecomp][%s] FATAL: %s\n", component, line);
     if (ctx) rt_dump_registers(ctx);
     /* Published before the exit so an atexit handler that has to end the
      * process on its own still reports a failure; see rt_fatal_exit_code. */
     g_fatal_exit_code.store(1, std::memory_order_release);
+    /* The end-of-run block, written here rather than left to the atexit
+     * chain: a fatal is the case where the reason is known exactly, and
+     * rt_log_hold_console below is about to show the user a message box
+     * built from the failure text the summary contributes to. std::exit
+     * would reach the atexit fallback too, but only after the box has
+     * already been shown, which is too late for the one reader who needs
+     * it. rt_run_summary is idempotent, so the later atexit call is a
+     * no-op. */
+    rt_run_set_exit_reason(false, "fatal in %s: %s", component, line);
+    rt_run_summary();
     rt_log_hold_console();
     std::exit(1);
 }

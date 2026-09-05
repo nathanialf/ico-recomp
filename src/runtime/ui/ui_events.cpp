@@ -20,7 +20,7 @@
  */
 #include "ui.h"
 
-#if defined(ICORECOMP_UI) && defined(ICORECOMP_PGS_SDL)
+#if defined(ICORECOMP_UI) && defined(ICORECOMP_HAVE_SDL)
 
 #include "ui_internal.h"
 
@@ -189,7 +189,7 @@ int key_modifier_state() {
 }
 
 /* SDL reports mouse positions in window (logical) coordinates; the RmlUi
- * context is sized in surface pixels (rt_pgs_surface_size), which differ on
+ * context is sized in surface pixels (rt_window_surface_size), which differ on
  * a high-DPI display. Scale with the surface size the last tick read, never
  * by querying the backend from here. */
 void window_to_surface(float x, float y, int* out_x, int* out_y) {
@@ -208,7 +208,7 @@ void window_to_surface(float x, float y, int* out_x, int* out_y) {
 bool toggle_menu() {
     /* The launcher owns the window while it is up: it has its own Settings
      * button, and the menu shows on top of it. The hotkey is still consumed
-     * here so it reaches neither RmlUi nor the pad, it just does nothing. */
+     * here so it reaches neither RmlUi nor the pad, it does nothing. */
     if (g_ui.launcher_visible) return true;
     rt_ui_set_visible(!rt_ui_visible());
     return true;
@@ -417,7 +417,7 @@ bool dispatch_nav_key(Rml::Context* context, Rml::Input::KeyIdentifier key) {
     return consumed;
 }
 
-/* ---- the settings menu's two-level pad model ------------------------------
+/* ---- the menu's two-level pad model ------------------------------
  *
  * menu.rml is two regions: the cards column on the left (five .nav-button
  * elements) and the pane on the right, which shows the active tab's
@@ -484,7 +484,7 @@ void nav_fire_pane_key(Rml::Context* context, Rml::Input::KeyIdentifier key, boo
     }
 }
 
-/* The settings menu's own direction handling (g_ui.visible), level decided
+/* The menu's own direction handling (g_ui.visible), level decided
  * fresh each call. Left to nav_fire below when only the launcher is up
  * (g_ui.launcher_visible without g_ui.visible): the launcher has no cards
  * and no pane, and keeps the flat navigation it always had. */
@@ -526,7 +526,7 @@ void nav_fire_menu(Rml::Context* context, NavDir dir) {
 }
 
 /* What a single press of `dir` does: moves the select session's highlight
- * if one is open, otherwise routes to the settings menu's two-level model
+ * if one is open, otherwise routes to the menu's two-level model
  * while it is up, or dispatches the plain arrow key everywhere else (the
  * launcher, whose navigation stays flat). Shared by the press edge
  * (BUTTON_DOWN / an axis crossing its press threshold) and by ui_nav_
@@ -605,7 +605,7 @@ void resolve_menu_hotkey() {
     const std::string& kb = rt_settings().input.keyboard[RT_KB_MENU];
     SDL_Scancode scancode = kb.empty() ? SDL_SCANCODE_UNKNOWN : SDL_GetScancodeFromName(kb.c_str());
     if (scancode == SDL_SCANCODE_UNKNOWN) {
-        rt_log("ui", "input.keyboard.menu \"%s\" is not an SDL scancode name; keeping the default %s",
+        rt_log_warn("ui", "input.keyboard.menu \"%s\" is not an SDL scancode name; keeping the default %s",
             kb.c_str(), SDL_GetScancodeName(g_menu_scancode));
     } else {
         g_menu_scancode = scancode;
@@ -617,7 +617,7 @@ void resolve_menu_hotkey() {
         const SDL_GamepadButton a = SDL_GetGamepadButtonFromString(chord_a.c_str());
         const SDL_GamepadButton b = SDL_GetGamepadButtonFromString(chord_b.c_str());
         if (a == SDL_GAMEPAD_BUTTON_INVALID || b == SDL_GAMEPAD_BUTTON_INVALID) {
-            rt_log("ui", "input.gamepad.menu \"%s\" does not resolve as a chord; keeping the default %s",
+            rt_log_warn("ui", "input.gamepad.menu \"%s\" does not resolve as a chord; keeping the default %s",
                 gp.c_str(), menu_gamepad_name());
         } else {
             g_menu_chord[0] = a;
@@ -627,7 +627,7 @@ void resolve_menu_hotkey() {
         const SDL_GamepadButton button =
             gp.empty() ? SDL_GAMEPAD_BUTTON_INVALID : SDL_GetGamepadButtonFromString(gp.c_str());
         if (button == SDL_GAMEPAD_BUTTON_INVALID) {
-            rt_log("ui", "input.gamepad.menu \"%s\" is not an SDL gamepad button name; keeping the default %s",
+            rt_log_warn("ui", "input.gamepad.menu \"%s\" is not an SDL gamepad button name; keeping the default %s",
                 gp.c_str(), menu_gamepad_name());
         } else {
             g_menu_chord[0] = button;
@@ -635,7 +635,7 @@ void resolve_menu_hotkey() {
         }
     }
 
-    rt_log("ui", "menu hotkey: keyboard %s, gamepad %s",
+    rt_log_info("ui", "menu hotkey: keyboard %s, gamepad %s",
         SDL_GetScancodeName(g_menu_scancode), menu_gamepad_name());
 }
 
@@ -769,7 +769,7 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
                 select_session_end();
                 return true;
             }
-            /* The settings menu's level 2: East backs out to level 1 (the
+            /* The menu's level 2: East backs out to level 1 (the
              * card for the tab that is still showing) rather than closing
              * the menu. A second East from there falls through to the
              * close below, since current_nav_level() now reads Cards. */
@@ -794,7 +794,7 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
 
         if (button == SDL_GAMEPAD_BUTTON_SOUTH) {
             Rml::Element* focus = context->GetFocusElement();
-            /* The settings menu's level 1: South enters the focused card,
+            /* The menu's level 1: South enters the focused card,
              * making its tab active (if it was not already) and moving
              * focus into the now-visible pane (level 2). */
             if (focus && focus->IsClassSet("nav-button")) {
@@ -893,4 +893,4 @@ bool rt_ui_handle_sdl_event(const SDL_Event& e) {
     return false;
 }
 
-#endif /* ICORECOMP_UI && ICORECOMP_PGS_SDL */
+#endif /* ICORECOMP_UI && ICORECOMP_HAVE_SDL */
