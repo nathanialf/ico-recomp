@@ -51,24 +51,22 @@ shipped mingw cross build never had the interop path.
 
 ### What CI actually gates, as of 2026-09-05
 
-Blocking: the four CPU selftests in `runtime-stub-linux`
+Blocking: the four CPU selftests in the `linux` CI job
 (`icorecomp-gs-swizzle-selftest`, `icorecomp-gif-decode-selftest`,
 `icorecomp-gs-raster-selftest`, `icorecomp-gs-texture-selftest`), plus every
 job that compiles the renderer.
 
-Not blocking: `gs-shaders-lavapipe`, `gs-shaders-warp` and `shader-blobs` are
-all `continue-on-error: true` and have never run green, so none of them can
-fail a merge. That means a green CI covers no shader, no binding layout, no
-barrier and no CRTC, and it does not check the committed SPIR-V, HLSL, MSL or
-DXIL against the GLSL they came from. The flags stay until each job has passed
-once; record here the date of that run and the commit that removed the flag,
-one line per job, so "the flag came off" is a fact and not a plan.
-
-| job | first green run | commit that removed the flag |
-| --- | --- | --- |
-| `gs-shaders-lavapipe` | not yet | |
-| `gs-shaders-warp` | not yet | |
-| `shader-blobs` | not yet | |
+Not covered by CI since 2026-09-05: the software-Vulkan and WARP replay
+jobs (`gs-shaders-lavapipe`, `gs-shaders-warp`) and the shader regeneration
+job (`shader-blobs`) were removed with the native renderer's withdrawal from
+the player build; none had ever run green (ubuntu-latest's lavapipe offers
+no Vulkan 1.3 instance), so a green CI never covered a shader, a binding
+layout, a barrier or a CRTC through them. What CI does check is the committed
+SPIR-V, HLSL, MSL and DXIL against the GLSL they came from:
+`tools/check_shaders_fresh.py` is an ALL target of every build with Python
+(the `linux` job among them). A GPU replay gate needs a runner with a real
+device; when one exists, the removed jobs' steps are in the history of
+`.github/workflows/ci.yml` at commit 9096334.
 
 Both backends can be built at once. `ICORECOMP_GS` names the transport
 (`gs/gs_select.cpp`): `dump`, `parallel`, `both`, `native`. The unset default
@@ -886,10 +884,10 @@ headers it did not write, and everything else still runs.
 Every one of those outputs is committed, and nothing that builds this project
 regenerates them, so a shader edited without rerunning the generator would
 ship three backends' worth of binaries that no longer match their own GLSL,
-and nothing would say so. CI job `shader-blobs` is what says so: it
-regenerates the lot on `ubuntu-latest` and fails if `git` reports a single
-byte of difference under `src/runtime/gs/render/shaders` or in the four index
-headers.
+and nothing would say so. `tools/check_shaders_fresh.py` is what says so: it
+runs as an ALL target of every build with a Python interpreter (the `linux`
+CI job included) and fails when a source SHA-1 recorded in the index headers
+no longer matches the GLSL under `src/runtime/gs/render/shaders`.
 
 The output is bytes, so every tool it uses is pinned. glslang and SPIRV-Cross
 are the copies vendored under the paraLLEl-GS submodule, which pins them by
@@ -2456,9 +2454,11 @@ every macOS this port targets.
 
 **Nothing here has been compiled.** There is no macOS toolchain on the
 machines this project is developed on, so every line of this backend ships
-uncompiled until the `runtime-macos-arm64-pgs` CI job builds it. That job's
-"check the Metal backend compiled in" step is the first mechanical statement
-anyone gets about it.
+uncompiled: the CI job that built it (`runtime-macos-arm64-pgs`, the
+`macos-arm64-release` preset with Homebrew's MoltenVK) never ran green and
+was removed on 2026-09-05 with the native renderer's withdrawal; its steps
+are in the history of `.github/workflows/ci.yml` at commit 9096334. The
+`macos` CI job builds the stub preset only.
 
 The device comes from `MTLCreateSystemDefaultDevice`. `MTLGPUFamilyApple7`
 (Apple silicon, M1 and later) or `MTLGPUFamilyMac2` is the floor, the highest

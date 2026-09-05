@@ -110,7 +110,7 @@ renderer names the device it picked in the log.
 The package holds no `dxcompiler.dll` and no `dxil.dll`. It stopped
 carrying them on 2026-09-05, when the native renderers were withdrawn from
 the player's build: the D3D12 backend was their only user, so
-`CMakeLists.txt` no longer installs them and the `package-windows-cross` CI
+`CMakeLists.txt` no longer installs them and the `windows-package` CI
 job asserts that the folder does not have them. See "The DXC DLLs, for the
 replay tool and CI" below for what a developer build still does with them.
 
@@ -200,9 +200,9 @@ since 2026-09-05 `CMakeLists.txt` installs neither DLL.
 What is left is the developer path. `-DICORECOMP_DXC_DIR=<bin/x64 of a DXC
 release>` still points the configure at a pair on disk, and the configure
 also needs that release's `inc/dxcapi.h` on the include path for the D3D12
-backend to be enabled at all. That is what the `package-windows-cross` CI
-job unpacks the release for, and what the `shader-blobs` job uses the Linux
-`dxc` binary for. To use the fallback in a local D3D12 run of
+backend to be enabled at all. No CI job unpacks the release any more (the
+`windows-package` job builds the player's package, which has no D3D12 in
+it), so this is a developer-only step. To use the fallback in a local D3D12 run of
 `icorecomp-gs-replay`, copy the two DLLs beside the executable yourself:
 the backend loads `dxcompiler.dll` by full path from the executable's own
 directory, and `dxcompiler.dll` then finds `dxil.dll` by base name in that

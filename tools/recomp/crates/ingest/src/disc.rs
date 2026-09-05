@@ -802,7 +802,14 @@ mod tests {
         listing.push_str("0000000000400000 <ClusterMicroProgram>:\n");
         listing.push_str("0000000000400030 <NormalCMicroProgram>:\n");
 
-        let dir = std::env::temp_dir().join(format!("icorecomp-disc-test-{}", std::process::id()));
+        // One directory per call, not per process: cargo runs the tests of
+        // this module on parallel threads, and two of them building the
+        // same synthetic ingest raced on one directory (the first to finish
+        // removed the listing under the second; CI run 33972625237).
+        static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("icorecomp-disc-test-{}-{}", std::process::id(), serial));
         std::fs::create_dir_all(&dir).unwrap();
         let objdump_path = dir.join("SRCFILE.TXT");
         std::fs::write(&objdump_path, listing).unwrap();

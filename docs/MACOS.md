@@ -41,7 +41,8 @@ needs no disc image:
 `icorecomp-title-logo-selftest` is excluded: it mounts the user's disc image,
 which CI does not have.
 
-CI job `runtime-macos-arm64-pgs` builds the `macos-arm64-release` preset,
+The former CI job `runtime-macos-arm64-pgs` (removed 2026-09-05, never green;
+steps in the workflow's history at commit 9096334) built the `macos-arm64-release` preset,
 which is the full live renderer plus the clean-room native renderer and its
 Metal backend, with Homebrew's MoltenVK handed to the configure. It then does
 five things: checks the configure log for `icorecomp: Metal backend enabled`,

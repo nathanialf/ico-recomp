@@ -16,6 +16,8 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <filesystem>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 
@@ -108,9 +110,26 @@ struct Call {
 } // namespace
 
 int main() {
+    /* The card lives under ICORECOMP_SAVES_DIR. When the caller set none
+     * (CI runs the binary bare), a fresh directory under the system temp
+     * path is used and named, so the test never touches a real saves/. */
     if (!std::getenv("ICORECOMP_SAVES_DIR")) {
-        std::printf("[test] set ICORECOMP_SAVES_DIR to a scratch directory first\n");
-        return 2;
+        const std::filesystem::path base = std::filesystem::temp_directory_path();
+        std::filesystem::path dir;
+        for (unsigned n = 0;; ++n) {
+            dir = base / ("icorecomp-mc-selftest-" + std::to_string(n));
+            std::error_code ec;
+            if (std::filesystem::create_directory(dir, ec)) break;
+            if (n > 10000) { std::printf("[test] no scratch directory under %s\n", base.string().c_str()); return 2; }
+        }
+        static std::string env_value;
+        env_value = dir.string();
+#ifdef _WIN32
+        _putenv_s("ICORECOMP_SAVES_DIR", env_value.c_str());
+#else
+        setenv("ICORECOMP_SAVES_DIR", env_value.c_str(), 1);
+#endif
+        std::printf("[test] ICORECOMP_SAVES_DIR unset; using %s\n", env_value.c_str());
     }
     rt_mc_register_service();
     if (!g_mc_fn) { std::printf("[test] no mcserv handler registered\n"); return 2; }

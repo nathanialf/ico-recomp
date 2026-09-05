@@ -129,11 +129,10 @@ set_target_properties(icorecomp-runtime PROPERTIES OUTPUT_NAME ico)
 # MSVC's /SUBSYSTEM:WINDOWS looks for WinMain instead, so it is pointed
 # back at the console startup, which calls main.
 #
-# What proves each half: the mingw half is linked by the runtime-ui-mingw CI
-# job, which is a merge blocker. The MSVC half is linked only by
-# runtime-stub-windows and runtime-pgs-windows, both continue-on-error, so a
-# link failure from this option would be a green build. A change here has to
-# be checked against an MSVC link by hand until one of those jobs blocks.
+# What proves each half: the mingw half is linked by the windows-package CI
+# job, which is a merge blocker. The MSVC half is linked by no CI job since
+# 2026-09-05 (the two MSVC jobs never ran green and were removed), so a
+# change here has to be checked against an MSVC link by hand.
 if(WIN32)
     set_target_properties(icorecomp-runtime PROPERTIES WIN32_EXECUTABLE ON)
     if(MSVC)
@@ -1209,8 +1208,8 @@ if(ICORECOMP_NATIVE_GS)
             add_dependencies(icorecomp-runtime icorecomp-shaders-fresh)
         else()
             message(STATUS "icorecomp: no Python 3 interpreter, so the committed shader "
-                           "blobs are not checked against their sources this build; the "
-                           "shader-blobs CI job still does it")
+                           "blobs are not checked against their sources this build; the linux "
+                           "CI job, which has Python, still does it")
         endif()
     endif()
 
